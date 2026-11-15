@@ -1,0 +1,7 @@
+#!/usr/bin/env sh
+# Unix launcher for conf (sets ATLASSIAN_PERSONA=confluence and delegates to ./jira).
+set -eu
+
+ROOT=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+export ATLASSIAN_PERSONA=confluence
+exec "$ROOT/jira" "$@"

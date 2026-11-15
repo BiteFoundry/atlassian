@@ -1,0 +1,309 @@
+//! Keyboard bindings & `Action` definitions for Jira + Confluence TUI.
+
+use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+
+use crate::ui::app::{PaneFocus, WorkspaceTab};
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Action {
+    Quit,
+    SwitchTab(usize),
+    FocusNextPane,
+    FocusPrevPane,
+
+    // Directional / list navigation
+    MoveUp,
+    MoveDown,
+    MoveLeft,
+    MoveRight,
+    PageUp,
+    PageDown,
+    ScrollUp,
+    ScrollDown,
+    GoTop,
+    GoBottom,
+    Activate,
+    ExpandOrToggle,
+    CollapseNode,
+
+    // Jira / Confluence domain actions
+    OpenTransition,
+    AssignToMe,
+    OpenAssignee,
+    OpenComment,
+    NewItem,
+    EditItem,
+    UploadAttachment,
+    DownloadAttachment,
+    OpenImagePreview,
+    OpenCrossLinks,
+    PopNavHistory,
+    OpenInBrowser,
+    FocusJql,
+    FocusFilter,
+    ToggleDrawerOrToc,
+    TogglePin,
+    SyncAll,
+    RemoteSearch,
+    CheckUpdate,
+    ToggleInlineImages,
+    ToggleNavRail,
+
+    // Overlays
+    OpenCommandPalette,
+    OpenHelp,
+    CloseOverlay,
+    ConfirmYes,
+    ConfirmNo,
+
+    // Text editing / forms / modals
+    Input(char),
+    Backspace,
+    Delete,
+    CursorLeft,
+    CursorRight,
+    CursorUp,
+    CursorDown,
+    CursorHome,
+    CursorEnd,
+    InsertNewline,
+    Paste(String),
+    Submit,
+    ExternalEditor,
+    NextField,
+    PrevField,
+
+    // Mouse
+    MouseClick { row: u16, col: u16 },
+    LoadPreviewImage,
+    DownloadPreviewImage,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct Keymap;
+
+impl Keymap {
+    pub fn resolve(
+        &self,
+        key: KeyEvent,
+        tab: WorkspaceTab,
+        focus: PaneFocus,
+        has_overlay: bool,
+        accepts_text: bool,
+    ) -> Option<Action> {
+        let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+        let alt = key.modifiers.contains(KeyModifiers::ALT);
+        let shift = key.modifiers.contains(KeyModifiers::SHIFT);
+
+        if ctrl && matches!(key.code, KeyCode::Char('c') | KeyCode::Char('C')) {
+            return Some(Action::Quit);
+        }
+
+        // Global workspace tab switching (Ctrl+1..6 / Alt+1..6).
+        if (ctrl || alt) && !has_overlay {
+            if let KeyCode::Char(c @ '1'..='6') = key.code {
+                return Some(Action::SwitchTab((c as usize) - ('1' as usize)));
+            }
+        }
+
+        // Alt+Left pops Cross-App nav history globally when no modal is open.
+        if alt && key.code == KeyCode::Left && !has_overlay {
+            return Some(Action::PopNavHistory);
+        }
+
+        if ctrl && matches!(key.code, KeyCode::Char('p') | KeyCode::Char('P')) {
+            return Some(Action::OpenCommandPalette);
+        }
+
+        if ctrl && matches!(key.code, KeyCode::Char('r') | KeyCode::Char('R')) && !has_overlay {
+            return Some(Action::RemoteSearch);
+        }
+
+        if ctrl && matches!(key.code, KeyCode::Char('e') | KeyCode::Char('E')) && accepts_text {
+            return Some(Action::ExternalEditor);
+        }
+
+        if (ctrl && matches!(key.code, KeyCode::Char('s') | KeyCode::Char('S')))
+            || (alt && key.code == KeyCode::Enter)
+        {
+            if accepts_text {
+                return Some(Action::Submit);
+            }
+        }
+
+        if key.code == KeyCode::Esc {
+            if has_overlay || accepts_text {
+                return Some(Action::CloseOverlay);
+            }
+            return None;
+        }
+
+        // Text-input mode (overlay form, JQL bar, filter bar, search bar).
+        if accepts_text {
+            return match key.code {
+                KeyCode::Enter if shift => Some(Action::InsertNewline),
+                KeyCode::Enter => Some(Action::Submit),
+                KeyCode::Tab => Some(Action::NextField),
+                KeyCode::BackTab => Some(Action::PrevField),
+                KeyCode::Backspace => Some(Action::Backspace),
+                KeyCode::Delete => Some(Action::Delete),
+                KeyCode::Left => Some(Action::CursorLeft),
+                KeyCode::Right => Some(Action::CursorRight),
+                KeyCode::Up => Some(Action::CursorUp),
+                KeyCode::Down => Some(Action::CursorDown),
+                KeyCode::Home => Some(Action::CursorHome),
+                KeyCode::End => Some(Action::CursorEnd),
+                KeyCode::Char(c) if !ctrl && !alt => Some(Action::Input(c)),
+                _ => None,
+            };
+        }
+
+        // Non-text overlay mode (e.g. TransitionOverlay, CrossLinkOverlay, ImagePreview, Confirm, Help).
+        if has_overlay {
+            return match key.code {
+                KeyCode::Up | KeyCode::Char('k') => Some(Action::MoveUp),
+                KeyCode::Down | KeyCode::Char('j') => Some(Action::MoveDown),
+                KeyCode::Left | KeyCode::Char('h') => Some(Action::MoveLeft),
+                KeyCode::Right | KeyCode::Char('l') => Some(Action::MoveRight),
+                KeyCode::PageUp => Some(Action::PageUp),
+                KeyCode::PageDown => Some(Action::PageDown),
+                KeyCode::Enter => Some(Action::Activate),
+                KeyCode::Backspace => Some(Action::CloseOverlay),
+                KeyCode::Char('y') | KeyCode::Char('Y') => Some(Action::ConfirmYes),
+                KeyCode::Char('n') | KeyCode::Char('N') => Some(Action::ConfirmNo),
+                KeyCode::Char(c) if !ctrl && !alt => Some(Action::Input(c)),
+                _ => None,
+            };
+        }
+
+        // Main workspace command mode.
+        if ctrl {
+            return match key.code {
+                KeyCode::Char('u') => Some(Action::PageUp),
+                KeyCode::Char('d') => Some(Action::PageDown),
+                _ => None,
+            };
+        }
+
+        match key.code {
+            KeyCode::Char(c @ '1'..='6') => Some(Action::SwitchTab((c as usize) - ('1' as usize))),
+            KeyCode::Tab => Some(Action::FocusNextPane),
+            KeyCode::BackTab => Some(Action::FocusPrevPane),
+            KeyCode::Up | KeyCode::Char('k') => Some(Action::MoveUp),
+            KeyCode::Down | KeyCode::Char('j') => Some(Action::MoveDown),
+            KeyCode::Left | KeyCode::Char('h') => {
+                if tab == WorkspaceTab::Confluence && focus == PaneFocus::Nav {
+                    Some(Action::CollapseNode)
+                } else {
+                    Some(Action::MoveLeft)
+                }
+            }
+            KeyCode::Right | KeyCode::Char('l') => {
+                if tab == WorkspaceTab::Confluence && focus == PaneFocus::Nav {
+                    Some(Action::ExpandOrToggle)
+                } else {
+                    Some(Action::MoveRight)
+                }
+            }
+            KeyCode::Char(' ') => {
+                if tab == WorkspaceTab::Confluence && focus == PaneFocus::Nav {
+                    Some(Action::ExpandOrToggle)
+                } else {
+                    Some(Action::PageDown)
+                }
+            }
+            KeyCode::PageUp => Some(Action::PageUp),
+            KeyCode::PageDown => Some(Action::PageDown),
+            KeyCode::Home | KeyCode::Char('G') => {
+                if key.code == KeyCode::Home {
+                    Some(Action::GoTop)
+                } else {
+                    Some(Action::GoBottom)
+                }
+            }
+            KeyCode::End => Some(Action::GoBottom),
+            KeyCode::Enter => Some(Action::Activate),
+            KeyCode::Backspace => Some(Action::PopNavHistory),
+            KeyCode::Char('m') => Some(Action::OpenTransition),
+            KeyCode::Char('i') => Some(Action::AssignToMe),
+            KeyCode::Char('a') => Some(Action::OpenAssignee),
+            KeyCode::Char('c') => Some(Action::OpenComment),
+            KeyCode::Char('e') => Some(Action::EditItem),
+            KeyCode::Char('n') => Some(Action::NewItem),
+            KeyCode::Char('u') => Some(Action::UploadAttachment),
+            KeyCode::Char('d') => Some(Action::DownloadAttachment),
+            KeyCode::Char('v') => Some(Action::OpenImagePreview),
+            KeyCode::Char('g') => Some(Action::OpenCrossLinks),
+            KeyCode::Char('o') => Some(Action::OpenInBrowser),
+            KeyCode::Char('J') => Some(Action::FocusJql),
+            KeyCode::Char('/') => Some(Action::FocusFilter),
+            KeyCode::Char('t') => Some(Action::ToggleDrawerOrToc),
+            KeyCode::Char('p') => Some(Action::TogglePin),
+            KeyCode::Char('r') => Some(Action::SyncAll),
+            KeyCode::Char('U') => Some(Action::CheckUpdate),
+            KeyCode::Char(':') => Some(Action::OpenCommandPalette),
+            KeyCode::Char('?') => Some(Action::OpenHelp),
+            KeyCode::Char('q') => Some(Action::Quit),
+            _ => None,
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn key(code: KeyCode) -> KeyEvent {
+        KeyEvent::new(code, KeyModifiers::NONE)
+    }
+
+    fn ctrl(code: KeyCode) -> KeyEvent {
+        KeyEvent::new(code, KeyModifiers::CONTROL)
+    }
+
+    #[test]
+    fn keymap_maps_jira_and_confluence_shortcuts() {
+        let km = Keymap;
+        assert_eq!(
+            km.resolve(key(KeyCode::Char('i')), WorkspaceTab::Issues, PaneFocus::Main, false, false),
+            Some(Action::AssignToMe)
+        );
+        assert_eq!(
+            km.resolve(key(KeyCode::Char('m')), WorkspaceTab::Board, PaneFocus::Main, false, false),
+            Some(Action::OpenTransition)
+        );
+        assert_eq!(
+            km.resolve(key(KeyCode::Char('g')), WorkspaceTab::Issues, PaneFocus::Main, false, false),
+            Some(Action::OpenCrossLinks)
+        );
+        assert_eq!(
+            km.resolve(key(KeyCode::Char('v')), WorkspaceTab::Confluence, PaneFocus::Main, false, false),
+            Some(Action::OpenImagePreview)
+        );
+        assert_eq!(
+            km.resolve(key(KeyCode::Char('J')), WorkspaceTab::Issues, PaneFocus::Main, false, false),
+            Some(Action::FocusJql)
+        );
+        assert_eq!(
+            km.resolve(ctrl(KeyCode::Char('4')), WorkspaceTab::Board, PaneFocus::Main, false, false),
+            Some(Action::SwitchTab(3))
+        );
+    }
+
+    #[test]
+    fn keymap_sends_plain_letters_as_input_when_accepting_text() {
+        let km = Keymap;
+        assert_eq!(
+            km.resolve(key(KeyCode::Char('i')), WorkspaceTab::Issues, PaneFocus::JqlBar, false, true),
+            Some(Action::Input('i'))
+        );
+        assert_eq!(
+            km.resolve(key(KeyCode::Char('J')), WorkspaceTab::Issues, PaneFocus::JqlBar, false, true),
+            Some(Action::Input('J'))
+        );
+        assert_eq!(
+            km.resolve(ctrl(KeyCode::Char('e')), WorkspaceTab::Issues, PaneFocus::Main, true, true),
+            Some(Action::ExternalEditor)
+        );
+    }
+}

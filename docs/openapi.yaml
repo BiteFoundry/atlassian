@@ -1,0 +1,1329 @@
+openapi: 3.1.0
+info:
+  title: jira / confluence HTTP JSON API
+  version: 0.1.0
+  description: |
+    Local HTTP/JSON contract exposed by `jira serve` or `confluence serve` (alias `api`).
+
+    Backed by Atlassian Jira Platform, Jira Agile, and Confluence REST APIs
+    (Cloud and Data Center), local SQLite WAL/FTS5 caching, and the background
+    sync engine. Binds to `127.0.0.1:8789` by default. When started with
+    `--token`, every endpoint except `GET /health` requires
+    `Authorization: Bearer <token>`.
+
+    All errors return `{"error": "<message>"}` with an appropriate HTTP status.
+servers:
+  - url: http://127.0.0.1:8789
+    description: Default loopback listener
+security:
+  - bearerAuth: []
+  - {}
+tags:
+  - name: health
+  - name: identity
+  - name: jira
+  - name: agile
+  - name: confluence
+  - name: search
+  - name: sync
+paths:
+  /health:
+    get:
+      tags: [health]
+      summary: Liveness probe
+      description: Always public, even when `--token` is set.
+      security: []
+      responses:
+        "200":
+          description: Server is up
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/HealthResponse"
+  /myself:
+    get:
+      tags: [identity]
+      summary: Get current authenticated Atlassian user
+      responses:
+        "200":
+          description: User profile
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [user]
+                properties:
+                  user:
+                    $ref: "#/components/schemas/UserSummary"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+  /projects:
+    get:
+      tags: [jira]
+      summary: List Jira projects
+      parameters:
+        - name: refresh
+          in: query
+          required: false
+          schema:
+            type: boolean
+            default: false
+      responses:
+        "200":
+          description: Project list
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [projects]
+                properties:
+                  projects:
+                    type: array
+                    items:
+                      $ref: "#/components/schemas/ProjectSummary"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+  /boards:
+    get:
+      tags: [agile]
+      summary: List Jira Agile boards
+      parameters:
+        - name: project
+          in: query
+          required: false
+          schema:
+            type: string
+        - name: refresh
+          in: query
+          required: false
+          schema:
+            type: boolean
+            default: false
+      responses:
+        "200":
+          description: Board list
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [boards]
+                properties:
+                  boards:
+                    type: array
+                    items:
+                      $ref: "#/components/schemas/BoardSummary"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+  /boards/{board_id}/sprints:
+    get:
+      tags: [agile]
+      summary: List sprints for a board
+      parameters:
+        - name: board_id
+          in: path
+          required: true
+          schema:
+            type: integer
+            format: int64
+        - name: offline
+          in: query
+          required: false
+          schema:
+            type: boolean
+            default: false
+      responses:
+        "200":
+          description: Sprint list
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [board_id, sprints]
+                properties:
+                  board_id:
+                    type: integer
+                    format: int64
+                  sprints:
+                    type: array
+                    items:
+                      $ref: "#/components/schemas/SprintSummary"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+  /boards/{board_id}/issues:
+    get:
+      tags: [agile]
+      summary: List issues on a board
+      parameters:
+        - name: board_id
+          in: path
+          required: true
+          schema:
+            type: integer
+            format: int64
+        - name: sprint_id
+          in: query
+          required: false
+          schema:
+            type: integer
+            format: int64
+        - name: limit
+          in: query
+          required: false
+          schema:
+            type: integer
+            minimum: 1
+            maximum: 1000
+            default: 50
+        - name: offline
+          in: query
+          required: false
+          schema:
+            type: boolean
+            default: false
+      responses:
+        "200":
+          description: Board issues
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [board_id, issues]
+                properties:
+                  board_id:
+                    type: integer
+                    format: int64
+                  sprint_id:
+                    type: [integer, "null"]
+                    format: int64
+                  issues:
+                    type: array
+                    items:
+                      $ref: "#/components/schemas/IssueSummary"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+  /issues:
+    get:
+      tags: [jira]
+      summary: List or search Jira issues
+      parameters:
+        - name: jql
+          in: query
+          required: false
+          schema:
+            type: string
+        - name: project
+          in: query
+          required: false
+          schema:
+            type: string
+        - name: limit
+          in: query
+          required: false
+          schema:
+            type: integer
+            minimum: 1
+            maximum: 1000
+            default: 50
+        - name: page_token
+          in: query
+          required: false
+          schema:
+            type: string
+        - name: offline
+          in: query
+          required: false
+          schema:
+            type: boolean
+            default: false
+      responses:
+        "200":
+          description: Jira issue page
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [issues]
+                properties:
+                  issues:
+                    type: array
+                    items:
+                      $ref: "#/components/schemas/IssueSummary"
+                  next_page_token:
+                    type: [string, "null"]
+                  next_start_at:
+                    type: [integer, "null"]
+                  total:
+                    type: [integer, "null"]
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+    post:
+      tags: [jira]
+      summary: Create a Jira issue
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/OutgoingIssue"
+      responses:
+        "200":
+          description: Created issue
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [ok, issue]
+                properties:
+                  ok:
+                    type: boolean
+                  issue:
+                    $ref: "#/components/schemas/IssueDetail"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+  /issues/{key}:
+    get:
+      tags: [jira]
+      summary: Get Jira issue details
+      parameters:
+        - name: key
+          in: path
+          required: true
+          schema:
+            type: string
+        - name: offline
+          in: query
+          required: false
+          schema:
+            type: boolean
+            default: false
+      responses:
+        "200":
+          description: Issue detail
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [issue]
+                properties:
+                  issue:
+                    $ref: "#/components/schemas/IssueDetail"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "404":
+          $ref: "#/components/responses/NotFound"
+    patch:
+      tags: [jira]
+      summary: Update Jira issue fields
+      parameters:
+        - name: key
+          in: path
+          required: true
+          schema:
+            type: string
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/IssueUpdate"
+      responses:
+        "200":
+          description: Updated issue
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [ok, issue]
+                properties:
+                  ok:
+                    type: boolean
+                  issue:
+                    $ref: "#/components/schemas/IssueDetail"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+    delete:
+      tags: [jira]
+      summary: Delete a Jira issue
+      parameters:
+        - name: key
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        "200":
+          description: Deleted issue
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [ok, key]
+                properties:
+                  ok:
+                    type: boolean
+                  key:
+                    type: string
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+  /issues/{key}/transitions:
+    get:
+      tags: [jira]
+      summary: List available transitions for an issue
+      parameters:
+        - name: key
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        "200":
+          description: Transitions
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [key, transitions]
+                properties:
+                  key:
+                    type: string
+                  transitions:
+                    type: array
+                    items:
+                      $ref: "#/components/schemas/IssueTransition"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+    post:
+      tags: [jira]
+      summary: Transition a Jira issue
+      parameters:
+        - name: key
+          in: path
+          required: true
+          schema:
+            type: string
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [transition]
+              properties:
+                transition:
+                  type: string
+                comment:
+                  type: [string, "null"]
+      responses:
+        "200":
+          description: Transitioned
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [ok, key, transition]
+                properties:
+                  ok:
+                    type: boolean
+                  key:
+                    type: string
+                  transition:
+                    type: string
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+  /issues/{key}/assignee:
+    put:
+      tags: [jira]
+      summary: Assign or unassign a Jira issue
+      parameters:
+        - name: key
+          in: path
+          required: true
+          schema:
+            type: string
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                assignee_id:
+                  type: [string, "null"]
+                  description: Account ID / username, "me", or null to unassign.
+      responses:
+        "200":
+          description: Assigned
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [ok, key]
+                properties:
+                  ok:
+                    type: boolean
+                  key:
+                    type: string
+                  assignee_id:
+                    type: [string, "null"]
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+  /issues/{key}/comments:
+    get:
+      tags: [jira]
+      summary: List comments on a Jira issue
+      parameters:
+        - name: key
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        "200":
+          description: Issue comments
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [key, comments]
+                properties:
+                  key:
+                    type: string
+                  comments:
+                    type: array
+                    items:
+                      $ref: "#/components/schemas/IssueComment"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+    post:
+      tags: [jira]
+      summary: Add a Markdown comment to a Jira issue
+      parameters:
+        - name: key
+          in: path
+          required: true
+          schema:
+            type: string
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [body_markdown]
+              properties:
+                body_markdown:
+                  type: string
+      responses:
+        "200":
+          description: Created comment
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [ok, comment]
+                properties:
+                  ok:
+                    type: boolean
+                  comment:
+                    $ref: "#/components/schemas/IssueComment"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+  /spaces:
+    get:
+      tags: [confluence]
+      summary: List Confluence spaces
+      parameters:
+        - name: refresh
+          in: query
+          required: false
+          schema:
+            type: boolean
+            default: false
+        - name: limit
+          in: query
+          required: false
+          schema:
+            type: integer
+            minimum: 1
+            maximum: 1000
+            default: 50
+      responses:
+        "200":
+          description: Space list
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [spaces]
+                properties:
+                  spaces:
+                    type: array
+                    items:
+                      $ref: "#/components/schemas/SpaceSummary"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+  /spaces/{space}/pages:
+    get:
+      tags: [confluence]
+      summary: List root pages in a Confluence space
+      parameters:
+        - name: space
+          in: path
+          required: true
+          schema:
+            type: string
+        - name: limit
+          in: query
+          required: false
+          schema:
+            type: integer
+            minimum: 1
+            maximum: 1000
+            default: 50
+        - name: offline
+          in: query
+          required: false
+          schema:
+            type: boolean
+            default: false
+      responses:
+        "200":
+          description: Root pages
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [space, pages]
+                properties:
+                  space:
+                    type: string
+                  pages:
+                    type: array
+                    items:
+                      $ref: "#/components/schemas/PageSummary"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+  /pages:
+    post:
+      tags: [confluence]
+      summary: Create a Confluence page
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/OutgoingPage"
+      responses:
+        "200":
+          description: Created page
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [ok, page]
+                properties:
+                  ok:
+                    type: boolean
+                  page:
+                    $ref: "#/components/schemas/PageDetail"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+  /pages/{id}:
+    get:
+      tags: [confluence]
+      summary: Get Confluence page detail
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+        - name: offline
+          in: query
+          required: false
+          schema:
+            type: boolean
+            default: false
+      responses:
+        "200":
+          description: Page detail
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [page]
+                properties:
+                  page:
+                    $ref: "#/components/schemas/PageDetail"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "404":
+          $ref: "#/components/responses/NotFound"
+    put:
+      tags: [confluence]
+      summary: Update a Confluence page
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/PageUpdate"
+      responses:
+        "200":
+          description: Updated page
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [ok, page]
+                properties:
+                  ok:
+                    type: boolean
+                  page:
+                    $ref: "#/components/schemas/PageDetail"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+    delete:
+      tags: [confluence]
+      summary: Delete a Confluence page
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        "200":
+          description: Deleted page
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [ok, id]
+                properties:
+                  ok:
+                    type: boolean
+                  id:
+                    type: string
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+  /pages/{id}/children:
+    get:
+      tags: [confluence]
+      summary: List direct child pages
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+        - name: offline
+          in: query
+          required: false
+          schema:
+            type: boolean
+            default: false
+      responses:
+        "200":
+          description: Child pages
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [parent_id, pages]
+                properties:
+                  parent_id:
+                    type: string
+                  pages:
+                    type: array
+                    items:
+                      $ref: "#/components/schemas/PageSummary"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+  /pages/{id}/comments:
+    get:
+      tags: [confluence]
+      summary: List comments on a Confluence page
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        "200":
+          description: Page comments
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [page_id, comments]
+                properties:
+                  page_id:
+                    type: string
+                  comments:
+                    type: array
+                    items:
+                      $ref: "#/components/schemas/ConfluenceComment"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+    post:
+      tags: [confluence]
+      summary: Add a Markdown comment to a Confluence page
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [body_markdown]
+              properties:
+                body_markdown:
+                  type: string
+      responses:
+        "200":
+          description: Created comment
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [ok, comment]
+                properties:
+                  ok:
+                    type: boolean
+                  comment:
+                    $ref: "#/components/schemas/ConfluenceComment"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+  /search:
+    get:
+      tags: [search]
+      summary: Unified local FTS5 or remote JQL/CQL search
+      parameters:
+        - name: q
+          in: query
+          required: true
+          schema:
+            type: string
+        - name: scope
+          in: query
+          required: false
+          schema:
+            type: string
+            enum: [all, jira, confluence]
+            default: all
+        - name: remote
+          in: query
+          required: false
+          schema:
+            type: boolean
+            default: false
+        - name: limit
+          in: query
+          required: false
+          schema:
+            type: integer
+            minimum: 1
+            maximum: 1000
+            default: 30
+      responses:
+        "200":
+          description: Search hits
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [query, scope, remote, hits]
+                properties:
+                  query:
+                    type: string
+                  scope:
+                    type: string
+                  remote:
+                    type: boolean
+                  hits:
+                    type: array
+                    items:
+                      $ref: "#/components/schemas/UnifiedSearchHit"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+  /sync:
+    post:
+      tags: [sync]
+      summary: Trigger full Jira & Confluence workspace sync
+      responses:
+        "200":
+          description: Sync summary and cache counts
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [ok, summary, counts]
+                properties:
+                  ok:
+                    type: boolean
+                  summary:
+                    type: string
+                  counts:
+                    $ref: "#/components/schemas/CacheCounts"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+  responses:
+    BadRequest:
+      description: Invalid request input
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/ErrorResponse"
+    Unauthorized:
+      description: Missing or invalid bearer token
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/ErrorResponse"
+    NotFound:
+      description: Resource not found
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/ErrorResponse"
+  schemas:
+    ErrorResponse:
+      type: object
+      required: [error]
+      properties:
+        error:
+          type: string
+    HealthResponse:
+      type: object
+      required: [ok, version, deployment, site_url, confluence_url]
+      properties:
+        ok:
+          type: boolean
+        version:
+          type: string
+        deployment:
+          type: string
+          enum: [cloud, datacenter]
+        site_url:
+          type: string
+        confluence_url:
+          type: string
+    UserSummary:
+      type: object
+      required: [id, display_name, active]
+      properties:
+        id:
+          type: string
+        display_name:
+          type: string
+        email:
+          type: [string, "null"]
+        avatar_url:
+          type: [string, "null"]
+        active:
+          type: boolean
+    ProjectSummary:
+      type: object
+      required: [id, key, name, project_type, pinned]
+      properties:
+        id:
+          type: string
+        key:
+          type: string
+        name:
+          type: string
+        project_type:
+          type: string
+        lead_name:
+          type: [string, "null"]
+        avatar_url:
+          type: [string, "null"]
+        pinned:
+          type: boolean
+    BoardColumn:
+      type: object
+      required: [name, status_ids, status_names, category_hint]
+      properties:
+        name:
+          type: string
+        status_ids:
+          type: array
+          items:
+            type: string
+        status_names:
+          type: array
+          items:
+            type: string
+        category_hint:
+          type: string
+          enum: [todo, inprogress, done]
+    BoardSummary:
+      type: object
+      required: [id, name, board_type, columns]
+      properties:
+        id:
+          type: integer
+          format: int64
+        name:
+          type: string
+        board_type:
+          type: string
+        project_key:
+          type: [string, "null"]
+        project_name:
+          type: [string, "null"]
+        columns:
+          type: array
+          items:
+            $ref: "#/components/schemas/BoardColumn"
+    SprintSummary:
+      type: object
+      required: [id, board_id, name, state]
+      properties:
+        id:
+          type: integer
+          format: int64
+        board_id:
+          type: integer
+          format: int64
+        name:
+          type: string
+        state:
+          type: string
+          enum: [active, future, closed]
+        start_date:
+          type: [string, "null"]
+        end_date:
+          type: [string, "null"]
+        goal:
+          type: [string, "null"]
+    IssueStatus:
+      type: object
+      required: [id, name, category]
+      properties:
+        id:
+          type: string
+        name:
+          type: string
+        category:
+          type: string
+          enum: [todo, inprogress, done]
+    IssueSummary:
+      type: object
+      required: [id, key, project_key, summary, status]
+      properties:
+        id:
+          type: string
+        key:
+          type: string
+        project_key:
+          type: string
+        summary:
+          type: string
+        status:
+          $ref: "#/components/schemas/IssueStatus"
+        priority:
+          type: [object, "null"]
+        issue_type:
+          type: object
+        assignee:
+          anyOf:
+            - $ref: "#/components/schemas/UserSummary"
+            - type: "null"
+        labels:
+          type: array
+          items:
+            type: string
+        story_points:
+          type: [number, "null"]
+        sprint_id:
+          type: [integer, "null"]
+        sprint_name:
+          type: [string, "null"]
+        web_url:
+          type: string
+    IssueDetail:
+      type: object
+      required: [summary, description_markdown]
+      properties:
+        summary:
+          $ref: "#/components/schemas/IssueSummary"
+        description_raw:
+          type: string
+        description_markdown:
+          type: string
+        subtasks:
+          type: array
+          items:
+            type: object
+        linked_issues:
+          type: array
+          items:
+            type: object
+        linked_pages:
+          type: array
+          items:
+            type: object
+        attachments:
+          type: array
+          items:
+            type: object
+        comments:
+          type: array
+          items:
+            $ref: "#/components/schemas/IssueComment"
+    OutgoingIssue:
+      type: object
+      required: [project_key, summary]
+      properties:
+        project_key:
+          type: string
+        issue_type:
+          type: string
+          default: Task
+        summary:
+          type: string
+        description_markdown:
+          type: string
+        priority:
+          type: [string, "null"]
+        assignee_id:
+          type: [string, "null"]
+        labels:
+          type: array
+          items:
+            type: string
+        parent_key:
+          type: [string, "null"]
+    IssueUpdate:
+      type: object
+      properties:
+        summary:
+          type: [string, "null"]
+        description_markdown:
+          type: [string, "null"]
+        priority:
+          type: [string, "null"]
+        assignee_id:
+          type: [string, "null"]
+        labels:
+          type: [array, "null"]
+          items:
+            type: string
+    IssueTransition:
+      type: object
+      required: [id, name, to_status]
+      properties:
+        id:
+          type: string
+        name:
+          type: string
+        to_status:
+          $ref: "#/components/schemas/IssueStatus"
+    IssueComment:
+      type: object
+      required: [id, issue_key, author, body_markdown, created_at]
+      properties:
+        id:
+          type: string
+        issue_key:
+          type: string
+        author:
+          $ref: "#/components/schemas/UserSummary"
+        body_markdown:
+          type: string
+        created_at:
+          type: string
+        updated_at:
+          type: string
+    SpaceSummary:
+      type: object
+      required: [id, key, name, space_type, web_url, pinned]
+      properties:
+        id:
+          type: string
+        key:
+          type: string
+        name:
+          type: string
+        space_type:
+          type: string
+        homepage_id:
+          type: [string, "null"]
+        description:
+          type: [string, "null"]
+        web_url:
+          type: string
+        pinned:
+          type: boolean
+    PageSummary:
+      type: object
+      required: [id, space_id, space_key, title, status, version_number, updated_at, web_url]
+      properties:
+        id:
+          type: string
+        space_id:
+          type: string
+        space_key:
+          type: string
+        parent_id:
+          type: [string, "null"]
+        title:
+          type: string
+        status:
+          type: string
+        version_number:
+          type: integer
+        author_name:
+          type: [string, "null"]
+        updated_at:
+          type: string
+        position:
+          type: integer
+        has_children:
+          type: boolean
+        web_url:
+          type: string
+    PageDetail:
+      type: object
+      required: [summary, body_markdown]
+      properties:
+        summary:
+          $ref: "#/components/schemas/PageSummary"
+        ancestors:
+          type: array
+          items:
+            type: object
+        labels:
+          type: array
+          items:
+            type: string
+        body_raw:
+          type: string
+        body_representation:
+          type: string
+        body_markdown:
+          type: string
+        toc:
+          type: array
+          items:
+            type: object
+        attachments:
+          type: array
+          items:
+            type: object
+        comments:
+          type: array
+          items:
+            $ref: "#/components/schemas/ConfluenceComment"
+        linked_issue_keys:
+          type: array
+          items:
+            type: string
+    OutgoingPage:
+      type: object
+      required: [space_id_or_key, title]
+      properties:
+        space_id_or_key:
+          type: string
+        parent_id:
+          type: [string, "null"]
+        title:
+          type: string
+        body_markdown:
+          type: string
+    PageUpdate:
+      type: object
+      properties:
+        title:
+          type: [string, "null"]
+        body_markdown:
+          type: [string, "null"]
+        prev_version:
+          type: integer
+          default: 0
+        version_message:
+          type: [string, "null"]
+    ConfluenceComment:
+      type: object
+      required: [id, page_id, author_name, body_markdown, created_at]
+      properties:
+        id:
+          type: string
+        page_id:
+          type: string
+        author_name:
+          type: string
+        body_markdown:
+          type: string
+        created_at:
+          type: string
+    UnifiedSearchHit:
+      type: object
+      required: [kind, id_or_key, container, title, snippet, status_or_version, updated_at, web_url]
+      properties:
+        kind:
+          type: string
+          enum: [jira_issue, confluence_page]
+        id_or_key:
+          type: string
+        container:
+          type: string
+        title:
+          type: string
+        snippet:
+          type: string
+        status_or_version:
+          type: string
+        updated_at:
+          type: string
+        web_url:
+          type: string
+    CacheCounts:
+      type: object
+      required: [projects, boards, issues, spaces, pages]
+      properties:
+        projects:
+          type: integer
+        boards:
+          type: integer
+        issues:
+          type: integer
+        spaces:
+          type: integer
+        pages:
+          type: integer
