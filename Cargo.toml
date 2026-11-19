@@ -56,3 +56,8 @@ keyring = { version = "3", features = ["apple-native"] }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 keyring = { version = "3", features = ["async-secret-service", "async-io", "crypto-rust"] }
+
+[profile.release]
+lto = "fat"
+codegen-units = 1
+strip = "symbols"
