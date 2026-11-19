@@ -12,6 +12,7 @@ pub mod hitmap;
 pub mod issue_view;
 pub mod keymap;
 pub mod my_work_view;
+pub mod notification;
 pub mod overlays;
 pub mod search_view;
 pub mod text_edit;

@@ -14,7 +14,7 @@ use crate::{
     atlassian::AtlassianClient,
     auth::{AuthManager, StoredCredentials},
     config::{self, AppConfig, DeploymentKind, Persona, DEFAULT_SERVE_PORT},
-    img_preview,
+    daemon, img_preview,
     models::{
         AttachmentItem, BoardSummary, IssueDetail, IssueSummary, IssueUpdate, OutgoingIssue,
         OutgoingPage, PageDetail, PageUpdate, SprintSummary, StatusCategory,
@@ -24,7 +24,7 @@ use crate::{
     sync, tui, updater,
 };
 
-const DELETE_JSON_REQUIRES_YES: &str = "--json 모드에서 삭제하려면 --yes 를 함께 지정해야 합니다.";
+const DELETE_JSON_REQUIRES_YES: &str = "Deleting in --json mode requires passing --yes.";
 
 #[derive(ValueEnum, Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DeploymentArg {
@@ -46,8 +46,8 @@ impl From<DeploymentArg> for DeploymentKind {
 #[command(
     name = "jira",
     version,
-    about = "Atlassian Jira & Confluence 네이티브 터미널 클라이언트",
-    long_about = "Atlassian Cloud 및 Data Center(Jira · Agile · Confluence)를 지원하는 네이티브 터미널 클라이언트입니다.\n인자 없이 실행하면 로그인 상태를 확인한 뒤 TUI를 엽니다."
+    about = "Native terminal client for Atlassian Jira & Confluence",
+    long_about = "Native terminal client for Atlassian Cloud and Data Center (Jira · Agile · Confluence).\nRun without arguments to check login status and launch the TUI."
 )]
 pub struct Cli {
     #[command(subcommand)]
@@ -58,8 +58,8 @@ pub struct Cli {
 #[command(
     name = "confluence",
     version,
-    about = "Atlassian Confluence & Jira 네이티브 터미널 클라이언트",
-    long_about = "Atlassian Cloud 및 Data Center(Confluence · Jira)를 지원하는 네이티브 터미널 클라이언트입니다.\n인자 없이 실행하면 Confluence 스페이스/페이지 트리 TUI를 엽니다."
+    about = "Native terminal client for Atlassian Confluence & Jira",
+    long_about = "Native terminal client for Atlassian Cloud and Data Center (Confluence · Jira).\nRun without arguments to open the Confluence Space & Page Tree TUI."
 )]
 pub struct ConfluenceCli {
     #[command(subcommand)]
@@ -67,8 +67,34 @@ pub struct ConfluenceCli {
 }
 
 #[derive(Subcommand, Debug)]
+pub enum DaemonCommand {
+    /// Start the background sync daemon
+    Start {
+        #[arg(long)]
+        json: bool,
+    },
+    /// Stop the running background sync daemon
+    Stop {
+        #[arg(long)]
+        json: bool,
+    },
+    /// Show background sync daemon status
+    Status {
+        #[arg(long)]
+        json: bool,
+    },
+    /// Restart the background sync daemon
+    Restart {
+        #[arg(long)]
+        json: bool,
+    },
+    /// Run the background sync daemon in the foreground
+    Run,
+}
+
+#[derive(Subcommand, Debug)]
 pub enum Command {
-    /// Atlassian Cloud(API Token) 또는 Data Center(PAT/Basic)에 로그인합니다
+    /// Log in to Atlassian Cloud (API Token) or Data Center (PAT/Basic)
     #[command(visible_alias = "in")]
     Login {
         #[arg(long)]
@@ -86,32 +112,32 @@ pub enum Command {
         #[arg(long)]
         json: bool,
     },
-    /// 저장된 자격 증명을 삭제합니다
+    /// Remove stored credentials
     #[command(visible_alias = "out")]
     Logout {
         #[arg(long)]
         json: bool,
     },
-    /// 현재 로그인한 Atlassian 사용자 프로필을 확인합니다
+    /// Show the currently authenticated Atlassian user profile
     Whoami {
         #[arg(long)]
         json: bool,
     },
-    /// 설정/DB/키링 경로, 배포 환경 및 선택적 API 연결을 진단합니다
+    /// Diagnose config, SQLite cache, keyring paths, deployment mode, and optional API probe
     Doctor {
         #[arg(long)]
         probe: bool,
         #[arg(long)]
         json: bool,
     },
-    /// Jira 프로젝트 목록을 표시합니다
+    /// List Jira projects
     Projects {
         #[arg(long)]
         refresh: bool,
         #[arg(long)]
         json: bool,
     },
-    /// Jira Agile 보드 목록을 표시합니다
+    /// List Jira Agile boards
     Boards {
         #[arg(long)]
         project: Option<String>,
@@ -120,13 +146,13 @@ pub enum Command {
         #[arg(long)]
         json: bool,
     },
-    /// 특정 보드의 스프린트 목록을 표시합니다
+    /// List sprints for a Jira Agile board
     Sprints {
         board_id: i64,
         #[arg(long)]
         json: bool,
     },
-    /// 보드의 칸반 컬럼별 이슈 보드를 터미널에 렌더링합니다
+    /// Render a Kanban board by columns in the terminal
     Board {
         board_id: Option<i64>,
         #[arg(long)]
@@ -134,7 +160,7 @@ pub enum Command {
         #[arg(long)]
         json: bool,
     },
-    /// Jira 이슈 목록을 조회합니다
+    /// List Jira issues
     #[command(visible_alias = "ls")]
     Issues {
         #[arg(long)]
@@ -152,7 +178,7 @@ pub enum Command {
         #[arg(long)]
         json: bool,
     },
-    /// Jira 이슈 상세(설명·연결된 Confluence·서브태스크·댓글)를 표시합니다
+    /// View Jira issue details (description, linked Confluence pages, subtasks, comments)
     #[command(visible_aliases = ["read", "cat"])]
     View {
         key: String,
@@ -163,7 +189,7 @@ pub enum Command {
         #[arg(long)]
         json: bool,
     },
-    /// 새 Jira 이슈를 생성합니다
+    /// Create a new Jira issue
     #[command(visible_alias = "new")]
     Create {
         #[arg(long)]
@@ -187,7 +213,7 @@ pub enum Command {
         #[arg(long)]
         json: bool,
     },
-    /// 기존 Jira 이슈 필드를 수정합니다
+    /// Edit fields of an existing Jira issue
     Edit {
         key: String,
         #[arg(long)]
@@ -205,7 +231,7 @@ pub enum Command {
         #[arg(long)]
         json: bool,
     },
-    /// Jira 이슈의 워크플로우 상태를 전환하거나 전환 목록을 조회합니다
+    /// Transition a Jira issue workflow status or list available transitions
     #[command(visible_alias = "move")]
     Transition {
         key: String,
@@ -217,7 +243,7 @@ pub enum Command {
         #[arg(long)]
         json: bool,
     },
-    /// Jira 이슈 담당자를 지정하거나 해제합니다 (`--to me` 지원)
+    /// Assign or unassign a Jira issue (supports `--to me`)
     Assign {
         key: String,
         #[arg(long)]
@@ -227,21 +253,21 @@ pub enum Command {
         #[arg(long)]
         json: bool,
     },
-    /// Jira 이슈에 Markdown 댓글을 작성합니다
+    /// Add a Markdown comment to a Jira issue
     Comment {
         key: String,
         body: String,
         #[arg(long)]
         json: bool,
     },
-    /// Jira 이슈에 로컬 파일을 첨부합니다
+    /// Upload a local file attachment to a Jira issue
     Attach {
         key: String,
         file: PathBuf,
         #[arg(long)]
         json: bool,
     },
-    /// Jira 이슈의 첨부파일을 다운로드합니다
+    /// Download attachments from a Jira issue
     #[command(visible_alias = "dl")]
     Download {
         key: String,
@@ -252,7 +278,7 @@ pub enum Command {
         #[arg(long)]
         json: bool,
     },
-    /// Jira 이슈를 삭제합니다
+    /// Delete a Jira issue
     Delete {
         key: String,
         #[arg(long)]
@@ -260,7 +286,7 @@ pub enum Command {
         #[arg(long)]
         json: bool,
     },
-    /// 로컬 SQLite 캐시 또는 원격 JQL로 Jira 이슈를 검색합니다
+    /// Search Jira issues in local SQLite cache or via remote JQL
     Search {
         query: String,
         #[arg(long)]
@@ -272,15 +298,15 @@ pub enum Command {
         #[arg(long)]
         json: bool,
     },
-    /// Jira 이슈 웹 URL을 기본 브라우저로 엽니다
+    /// Open a Jira issue web URL in the default browser
     Open { key: String },
-    /// Confluence 명령 네임스페이스 (`jira wiki <subcmd>`)
+    /// Confluence command namespace (`jira wiki <subcmd>`)
     #[command(visible_alias = "conf")]
     Wiki {
         #[command(subcommand)]
         command: WikiCommand,
     },
-    /// Jira 이슈 또는 Confluence 페이지의 이미지 첨부를 터미널에 미리보기합니다
+    /// Preview image attachments of a Jira issue or Confluence page in the terminal
     Preview {
         target_id_or_key: String,
         #[arg(long = "attachment-id")]
@@ -290,7 +316,7 @@ pub enum Command {
         #[arg(long)]
         rows: Option<u16>,
     },
-    /// 로컬 이미지 파일을 터미널에 미리보기 렌더링합니다
+    /// Preview a local image file in the terminal
     #[command(name = "preview-file")]
     PreviewFile {
         path: PathBuf,
@@ -299,12 +325,17 @@ pub enum Command {
         #[arg(long)]
         rows: Option<u16>,
     },
-    /// Jira와 Confluence 워크스페이스를 로컬 SQLite 캐시에 동기화합니다
+    /// Sync Jira and Confluence workspace metadata into the local SQLite cache
     Sync {
         #[arg(long)]
         json: bool,
     },
-    /// GitHub Releases에서 최신 버전을 확인하거나 자가 업데이트합니다
+    /// Manage the background sync daemon
+    Daemon {
+        #[command(subcommand)]
+        action: DaemonCommand,
+    },
+    /// Check GitHub Releases for updates or self-update the binary
     Update {
         #[arg(long)]
         check: bool,
@@ -315,9 +346,9 @@ pub enum Command {
         #[arg(long)]
         json: bool,
     },
-    /// 터미널 UI(TUI)를 실행합니다
+    /// Launch the interactive terminal UI (TUI)
     Tui,
-    /// 에이전트용 로컬 HTTP JSON API 서버를 실행합니다
+    /// Run the local HTTP JSON API server for AI agents
     #[command(visible_alias = "api")]
     Serve {
         #[arg(long, default_value = "127.0.0.1")]
@@ -327,14 +358,14 @@ pub enum Command {
         #[arg(long)]
         token: Option<String>,
     },
-    /// 에이전트용 stdio MCP(JSON-RPC 2.0) 서버를 실행합니다
+    /// Run the stdio MCP (JSON-RPC 2.0) server for AI agents
     #[command(visible_alias = "mcp-server")]
     Mcp,
 }
 
 #[derive(Subcommand, Debug)]
 pub enum ConfluenceCommand {
-    /// Atlassian Cloud(API Token) 또는 Data Center(PAT/Basic)에 로그인합니다
+    /// Log in to Atlassian Cloud (API Token) or Data Center (PAT/Basic)
     #[command(visible_alias = "in")]
     Login {
         #[arg(long)]
@@ -352,25 +383,25 @@ pub enum ConfluenceCommand {
         #[arg(long)]
         json: bool,
     },
-    /// 저장된 자격 증명을 삭제합니다
+    /// Remove stored credentials
     #[command(visible_alias = "out")]
     Logout {
         #[arg(long)]
         json: bool,
     },
-    /// 현재 로그인한 Atlassian 사용자 프로필을 확인합니다
+    /// Show the currently authenticated Atlassian user profile
     Whoami {
         #[arg(long)]
         json: bool,
     },
-    /// 설정/DB/키링 경로, 배포 환경 및 선택적 API 연결을 진단합니다
+    /// Diagnose config, SQLite cache, keyring paths, deployment mode, and optional API probe
     Doctor {
         #[arg(long)]
         probe: bool,
         #[arg(long)]
         json: bool,
     },
-    /// Confluence 스페이스 목록을 표시합니다
+    /// List Confluence spaces
     Spaces {
         #[arg(long)]
         refresh: bool,
@@ -379,7 +410,7 @@ pub enum ConfluenceCommand {
         #[arg(long)]
         json: bool,
     },
-    /// 스페이스의 루트 페이지 또는 특정 페이지의 하위 페이지를 표시합니다
+    /// List root pages in a space or child pages under a parent page
     #[command(visible_alias = "tree")]
     Pages {
         space: Option<String>,
@@ -392,7 +423,7 @@ pub enum ConfluenceCommand {
         #[arg(long)]
         json: bool,
     },
-    /// Confluence 페이지 본문과 메타데이터를 읽습니다
+    /// Read Confluence page body and metadata
     #[command(visible_aliases = ["read", "cat"])]
     View {
         page_id: String,
@@ -403,7 +434,7 @@ pub enum ConfluenceCommand {
         #[arg(long)]
         json: bool,
     },
-    /// 새 Confluence 페이지를 생성합니다
+    /// Create a new Confluence page
     #[command(visible_alias = "new")]
     Create {
         #[arg(long)]
@@ -419,7 +450,7 @@ pub enum ConfluenceCommand {
         #[arg(long)]
         json: bool,
     },
-    /// Confluence 페이지를 수정합니다 (version_number 자동 조회)
+    /// Edit a Confluence page (auto-fetches version_number)
     Edit {
         page_id: String,
         #[arg(long)]
@@ -433,21 +464,21 @@ pub enum ConfluenceCommand {
         #[arg(long)]
         json: bool,
     },
-    /// Confluence 페이지에 Markdown 댓글을 작성합니다
+    /// Add a Markdown comment to a Confluence page
     Comment {
         page_id: String,
         body: String,
         #[arg(long)]
         json: bool,
     },
-    /// Confluence 페이지에 로컬 파일을 첨부합니다
+    /// Upload a local file attachment to a Confluence page
     Attach {
         page_id: String,
         file: PathBuf,
         #[arg(long)]
         json: bool,
     },
-    /// Confluence 페이지의 첨부파일을 다운로드합니다
+    /// Download attachments from a Confluence page
     #[command(visible_alias = "dl")]
     Download {
         page_id: String,
@@ -458,7 +489,7 @@ pub enum ConfluenceCommand {
         #[arg(long)]
         json: bool,
     },
-    /// Confluence 페이지를 삭제합니다
+    /// Delete a Confluence page
     Delete {
         page_id: String,
         #[arg(long)]
@@ -466,7 +497,7 @@ pub enum ConfluenceCommand {
         #[arg(long)]
         json: bool,
     },
-    /// 로컬 SQLite 캐시 또는 원격 CQL로 Confluence 페이지를 검색합니다
+    /// Search Confluence pages in local SQLite cache or via remote CQL
     Search {
         query: String,
         #[arg(long)]
@@ -478,14 +509,14 @@ pub enum ConfluenceCommand {
         #[arg(long)]
         json: bool,
     },
-    /// Confluence 페이지 웹 URL을 기본 브라우저로 엽니다
+    /// Open a Confluence page web URL in the default browser
     Open { page_id: String },
-    /// Jira 명령 네임스페이스 (`confluence jira <subcmd>`)
+    /// Jira command namespace (`confluence jira <subcmd>`)
     Jira {
         #[command(subcommand)]
         command: JiraSubcommand,
     },
-    /// Confluence 페이지 또는 Jira 이슈의 이미지 첨부를 터미널에 미리보기합니다
+    /// Preview image attachments of a Confluence page or Jira issue in the terminal
     Preview {
         target_id_or_key: String,
         #[arg(long = "attachment-id")]
@@ -495,7 +526,7 @@ pub enum ConfluenceCommand {
         #[arg(long)]
         rows: Option<u16>,
     },
-    /// 로컬 이미지 파일을 터미널에 미리보기 렌더링합니다
+    /// Preview a local image file in the terminal
     #[command(name = "preview-file")]
     PreviewFile {
         path: PathBuf,
@@ -504,12 +535,17 @@ pub enum ConfluenceCommand {
         #[arg(long)]
         rows: Option<u16>,
     },
-    /// Jira와 Confluence 워크스페이스를 로컬 SQLite 캐시에 동기화합니다
+    /// Sync Jira and Confluence workspace metadata into the local SQLite cache
     Sync {
         #[arg(long)]
         json: bool,
     },
-    /// GitHub Releases에서 최신 버전을 확인하거나 자가 업데이트합니다
+    /// Manage the background sync daemon
+    Daemon {
+        #[command(subcommand)]
+        action: DaemonCommand,
+    },
+    /// Check GitHub Releases for updates or self-update the binary
     Update {
         #[arg(long)]
         check: bool,
@@ -520,9 +556,9 @@ pub enum ConfluenceCommand {
         #[arg(long)]
         json: bool,
     },
-    /// 터미널 UI(TUI)를 실행합니다
+    /// Launch the interactive terminal UI (TUI)
     Tui,
-    /// 에이전트용 로컬 HTTP JSON API 서버를 실행합니다
+    /// Run the local HTTP JSON API server for AI agents
     #[command(visible_alias = "api")]
     Serve {
         #[arg(long, default_value = "127.0.0.1")]
@@ -532,14 +568,14 @@ pub enum ConfluenceCommand {
         #[arg(long)]
         token: Option<String>,
     },
-    /// 에이전트용 stdio MCP(JSON-RPC 2.0) 서버를 실행합니다
+    /// Run the stdio MCP (JSON-RPC 2.0) server for AI agents
     #[command(visible_alias = "mcp-server")]
     Mcp,
 }
 
 #[derive(Subcommand, Debug)]
 pub enum WikiCommand {
-    /// Confluence 스페이스 목록을 표시합니다
+    /// List Confluence spaces
     Spaces {
         #[arg(long)]
         refresh: bool,
@@ -548,7 +584,7 @@ pub enum WikiCommand {
         #[arg(long)]
         json: bool,
     },
-    /// 스페이스의 루트 페이지 또는 특정 페이지의 하위 페이지를 표시합니다
+    /// List root pages in a space or child pages under a parent page
     #[command(visible_alias = "tree")]
     Pages {
         space: Option<String>,
@@ -561,7 +597,7 @@ pub enum WikiCommand {
         #[arg(long)]
         json: bool,
     },
-    /// Confluence 페이지를 읽습니다
+    /// Read a Confluence page
     #[command(visible_aliases = ["read", "cat"])]
     View {
         page_id: String,
@@ -572,7 +608,7 @@ pub enum WikiCommand {
         #[arg(long)]
         json: bool,
     },
-    /// 새 Confluence 페이지를 생성합니다
+    /// Create a new Confluence page
     #[command(visible_alias = "new")]
     Create {
         #[arg(long)]
@@ -588,7 +624,7 @@ pub enum WikiCommand {
         #[arg(long)]
         json: bool,
     },
-    /// Confluence 페이지를 수정합니다
+    /// Edit a Confluence page
     Edit {
         page_id: String,
         #[arg(long)]
@@ -602,21 +638,21 @@ pub enum WikiCommand {
         #[arg(long)]
         json: bool,
     },
-    /// Confluence 페이지에 댓글을 작성합니다
+    /// Add a comment to a Confluence page
     Comment {
         page_id: String,
         body: String,
         #[arg(long)]
         json: bool,
     },
-    /// Confluence 페이지에 파일을 첨부합니다
+    /// Attach a file to a Confluence page
     Attach {
         page_id: String,
         file: PathBuf,
         #[arg(long)]
         json: bool,
     },
-    /// Confluence 페이지의 첨부파일을 다운로드합니다
+    /// Download attachments from a Confluence page
     #[command(visible_alias = "dl")]
     Download {
         page_id: String,
@@ -627,7 +663,7 @@ pub enum WikiCommand {
         #[arg(long)]
         json: bool,
     },
-    /// Confluence 페이지를 삭제합니다
+    /// Delete a Confluence page
     Delete {
         page_id: String,
         #[arg(long)]
@@ -635,7 +671,7 @@ pub enum WikiCommand {
         #[arg(long)]
         json: bool,
     },
-    /// Confluence 페이지를 검색합니다
+    /// Search Confluence pages
     Search {
         query: String,
         #[arg(long)]
@@ -647,20 +683,20 @@ pub enum WikiCommand {
         #[arg(long)]
         json: bool,
     },
-    /// Confluence 페이지 웹 URL을 엽니다
+    /// Open a Confluence page web URL
     Open { page_id: String },
 }
 
 #[derive(Subcommand, Debug)]
 pub enum JiraSubcommand {
-    /// Jira 프로젝트 목록을 표시합니다
+    /// List Jira projects
     Projects {
         #[arg(long)]
         refresh: bool,
         #[arg(long)]
         json: bool,
     },
-    /// Jira Agile 보드 목록을 표시합니다
+    /// List Jira Agile boards
     Boards {
         #[arg(long)]
         project: Option<String>,
@@ -669,13 +705,13 @@ pub enum JiraSubcommand {
         #[arg(long)]
         json: bool,
     },
-    /// 보드의 스프린트 목록을 표시합니다
+    /// List sprints for a board
     Sprints {
         board_id: i64,
         #[arg(long)]
         json: bool,
     },
-    /// 보드의 칸반 컬럼별 이슈 보드를 표시합니다
+    /// Render a Kanban board by columns
     Board {
         board_id: Option<i64>,
         #[arg(long)]
@@ -683,7 +719,7 @@ pub enum JiraSubcommand {
         #[arg(long)]
         json: bool,
     },
-    /// Jira 이슈 목록을 표시합니다
+    /// List Jira issues
     #[command(visible_alias = "ls")]
     Issues {
         #[arg(long)]
@@ -701,7 +737,7 @@ pub enum JiraSubcommand {
         #[arg(long)]
         json: bool,
     },
-    /// Jira 이슈 상세를 표시합니다
+    /// View Jira issue details
     #[command(visible_aliases = ["read", "cat"])]
     View {
         key: String,
@@ -712,7 +748,7 @@ pub enum JiraSubcommand {
         #[arg(long)]
         json: bool,
     },
-    /// 새 Jira 이슈를 생성합니다
+    /// Create a new Jira issue
     #[command(visible_alias = "new")]
     Create {
         #[arg(long)]
@@ -736,7 +772,7 @@ pub enum JiraSubcommand {
         #[arg(long)]
         json: bool,
     },
-    /// Jira 이슈를 수정합니다
+    /// Edit a Jira issue
     Edit {
         key: String,
         #[arg(long)]
@@ -754,7 +790,7 @@ pub enum JiraSubcommand {
         #[arg(long)]
         json: bool,
     },
-    /// Jira 이슈 상태를 전환합니다
+    /// Transition a Jira issue status
     #[command(visible_alias = "move")]
     Transition {
         key: String,
@@ -766,7 +802,7 @@ pub enum JiraSubcommand {
         #[arg(long)]
         json: bool,
     },
-    /// Jira 이슈 담당자를 지정하거나 해제합니다
+    /// Assign or unassign a Jira issue
     Assign {
         key: String,
         #[arg(long)]
@@ -776,21 +812,21 @@ pub enum JiraSubcommand {
         #[arg(long)]
         json: bool,
     },
-    /// Jira 이슈에 댓글을 작성합니다
+    /// Add a comment to a Jira issue
     Comment {
         key: String,
         body: String,
         #[arg(long)]
         json: bool,
     },
-    /// Jira 이슈에 파일을 첨부합니다
+    /// Attach a file to a Jira issue
     Attach {
         key: String,
         file: PathBuf,
         #[arg(long)]
         json: bool,
     },
-    /// Jira 이슈 첨부파일을 다운로드합니다
+    /// Download attachments from a Jira issue
     #[command(visible_alias = "dl")]
     Download {
         key: String,
@@ -801,7 +837,7 @@ pub enum JiraSubcommand {
         #[arg(long)]
         json: bool,
     },
-    /// Jira 이슈를 삭제합니다
+    /// Delete a Jira issue
     Delete {
         key: String,
         #[arg(long)]
@@ -809,7 +845,7 @@ pub enum JiraSubcommand {
         #[arg(long)]
         json: bool,
     },
-    /// Jira 이슈를 검색합니다
+    /// Search Jira issues
     Search {
         query: String,
         #[arg(long)]
@@ -821,8 +857,18 @@ pub enum JiraSubcommand {
         #[arg(long)]
         json: bool,
     },
-    /// Jira 이슈 웹 URL을 엽니다
+    /// Open a Jira issue web URL
     Open { key: String },
+}
+
+fn parse_cli_with_stack<T: Parser + Send + 'static>() -> T {
+    std::thread::Builder::new()
+        .name("atlassian-cli-parse".to_string())
+        .stack_size(8 * 1024 * 1024)
+        .spawn(T::parse)
+        .ok()
+        .and_then(|handle| handle.join().ok())
+        .unwrap_or_else(T::parse)
 }
 
 pub async fn run() -> Result<()> {
@@ -830,11 +876,11 @@ pub async fn run() -> Result<()> {
     let persona = Persona::detect();
     match persona {
         Persona::Jira => {
-            let cli = Cli::parse();
+            let cli: Cli = parse_cli_with_stack();
             Box::pin(dispatch_jira_cli(&mut cfg, persona, cli.command)).await
         }
         Persona::Confluence => {
-            let cli = ConfluenceCli::parse();
+            let cli: ConfluenceCli = parse_cli_with_stack();
             Box::pin(dispatch_confluence_cli(&mut cfg, persona, cli.command)).await
         }
     }
@@ -1037,6 +1083,7 @@ async fn dispatch_jira_cli(
         }
         Some(Command::PreviewFile { path, cols, rows }) => cmd_preview_file(&path, cols, rows),
         Some(Command::Sync { json }) => Box::pin(cmd_sync(cfg, json)).await,
+        Some(Command::Daemon { action }) => Box::pin(cmd_daemon(cfg, action)).await,
         Some(Command::Update {
             check,
             force,
@@ -1220,6 +1267,7 @@ async fn dispatch_confluence_cli(
             cmd_preview_file(&path, cols, rows)
         }
         Some(ConfluenceCommand::Sync { json }) => Box::pin(cmd_sync(cfg, json)).await,
+        Some(ConfluenceCommand::Daemon { action }) => Box::pin(cmd_daemon(cfg, action)).await,
         Some(ConfluenceCommand::Update {
             check,
             force,
@@ -2949,13 +2997,91 @@ async fn cmd_sync(cfg: &AppConfig, json_out: bool) -> Result<()> {
             }))?
         );
     } else {
-        println!("동기화 완료: {summary}");
+        println!("Sync complete: {summary}");
         println!(
-            "캐시 현황: projects={}, boards={}, issues={}, spaces={}, pages={}",
+            "Cache counts: projects={}, boards={}, issues={}, spaces={}, pages={}",
             counts.projects, counts.boards, counts.issues, counts.spaces, counts.pages
         );
     }
     Ok(())
+}
+
+async fn cmd_daemon(cfg: &AppConfig, action: DaemonCommand) -> Result<()> {
+    match action {
+        DaemonCommand::Start { json } => {
+            let st = daemon::start(cfg).await?;
+            if json {
+                println!("{}", serde_json::to_string_pretty(&st)?);
+            } else {
+                println!(
+                    "Atlassian sync daemon started (pid={}, transport={}, endpoint={}).",
+                    st.pid.map_or_else(|| "-".to_string(), |p| p.to_string()),
+                    st.transport.as_deref().unwrap_or("-"),
+                    st.endpoint.as_deref().unwrap_or("-"),
+                );
+            }
+            Ok(())
+        }
+        DaemonCommand::Stop { json } => {
+            let stopped = daemon::stop(cfg).await?;
+            if json {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&json!({ "stopped": stopped }))?
+                );
+            } else if stopped {
+                println!("Atlassian sync daemon stopped.");
+            } else {
+                println!("Atlassian sync daemon is not running.");
+            }
+            Ok(())
+        }
+        DaemonCommand::Status { json } => {
+            let st = daemon::status(cfg).await?;
+            if json {
+                println!("{}", serde_json::to_string_pretty(&st)?);
+            } else if st.running {
+                println!(
+                    "Atlassian sync daemon is running (pid={}, version={}, transport={}, endpoint={})",
+                    st.pid.map_or_else(|| "-".to_string(), |p| p.to_string()),
+                    st.version.as_deref().unwrap_or("-"),
+                    st.transport.as_deref().unwrap_or("-"),
+                    st.endpoint.as_deref().unwrap_or("-"),
+                );
+                println!(
+                    "Profile: {} · Uptime: {}s · Attached clients: {} · Syncing: {}",
+                    st.profile.as_deref().unwrap_or("-"),
+                    st.uptime_secs.unwrap_or(0),
+                    st.attached_clients,
+                    if st.sync_busy { "yes" } else { "no" },
+                );
+                if let Some(last) = st.last_sync_at.as_deref() {
+                    println!("Last sync: {last} ({})", st.sync_summary);
+                }
+                if let Some(err) = st.last_error.as_deref() {
+                    println!("Last error: {err}");
+                }
+            } else {
+                println!("Atlassian sync daemon is not running.");
+            }
+            Ok(())
+        }
+        DaemonCommand::Restart { json } => {
+            let st = daemon::restart(cfg).await?;
+            if json {
+                println!("{}", serde_json::to_string_pretty(&st)?);
+            } else {
+                println!(
+                    "Atlassian sync daemon restarted (pid={}, transport={}, endpoint={}).",
+                    st.pid.map_or_else(|| "-".to_string(), |p| p.to_string()),
+                    st.transport.as_deref().unwrap_or("-"),
+                    st.endpoint.as_deref().unwrap_or("-"),
+                );
+            }
+            Ok(())
+        }
+        DaemonCommand::Run => daemon::run_daemon_foreground(cfg.clone()).await,
+    }
 }
 
 async fn cmd_update(
@@ -2971,15 +3097,15 @@ async fn cmd_update(
         println!("{}", serde_json::to_string_pretty(&result)?);
     } else {
         println!(
-            "현재 버전: {} · 최신 버전: {}",
+            "Current version: {} · Latest version: {}",
             result.current_version, result.latest_version
         );
         if result.updated {
-            println!("업데이트 적용 완료: {}", result.binary_path);
+            println!("Update applied: {}", result.binary_path);
         } else if result.update_available {
-            println!("새 버전이 있습니다: {}", result.release_url);
+            println!("New version available: {}", result.release_url);
         } else {
-            println!("이미 최신 버전입니다.");
+            println!("Already up to date.");
         }
     }
     Ok(())
@@ -2996,21 +3122,21 @@ pub(crate) fn delete_gate(yes: bool, json: bool, answer: Option<&str>) -> Result
     if json {
         bail!("{DELETE_JSON_REQUIRES_YES}");
     }
-    let answer = answer.context("확인 입력을 받지 못했습니다. 삭제하지 않았습니다.")?;
+    let answer = answer.context("No confirmation received; item was not deleted.")?;
     let trimmed = answer.trim();
     if !trimmed.eq_ignore_ascii_case("y") && !trimmed.eq_ignore_ascii_case("yes") {
-        bail!("취소했습니다. 삭제하지 않았습니다.");
+        bail!("Cancelled; item was not deleted.");
     }
     Ok(())
 }
 
 fn read_body_arg(body: Option<&str>, body_file: Option<&Path>) -> Result<Option<String>> {
     match (body, body_file) {
-        (Some(_), Some(_)) => bail!("`--body` 와 `--body-file` 은 동시에 사용할 수 없습니다."),
+        (Some(_), Some(_)) => bail!("`--body` and `--body-file` cannot be used together."),
         (Some(b), None) => Ok(Some(b.to_string())),
         (None, Some(path)) => {
             let content = std::fs::read_to_string(path)
-                .with_context(|| format!("본문 파일 읽기 실패: {}", path.display()))?;
+                .with_context(|| format!("Failed to read body file: {}", path.display()))?;
             Ok(Some(content))
         }
         (None, None) => Ok(None),
@@ -3459,6 +3585,58 @@ mod tests {
         }
         let cli = Cli::try_parse_from(["jira", "mcp-server"]).unwrap();
         assert!(matches!(cli.command.unwrap(), Command::Mcp));
+
+        // Daemon subcommands for both Jira & Confluence personas
+        let cli = Cli::try_parse_from(["jira", "daemon", "start", "--json"]).unwrap();
+        assert!(matches!(
+            cli.command.unwrap(),
+            Command::Daemon {
+                action: DaemonCommand::Start { json: true }
+            }
+        ));
+        let cli = Cli::try_parse_from(["jira", "daemon", "stop"]).unwrap();
+        assert!(matches!(
+            cli.command.unwrap(),
+            Command::Daemon {
+                action: DaemonCommand::Stop { json: false }
+            }
+        ));
+        let cli = Cli::try_parse_from(["jira", "daemon", "status", "--json"]).unwrap();
+        assert!(matches!(
+            cli.command.unwrap(),
+            Command::Daemon {
+                action: DaemonCommand::Status { json: true }
+            }
+        ));
+        let cli = Cli::try_parse_from(["jira", "daemon", "restart"]).unwrap();
+        assert!(matches!(
+            cli.command.unwrap(),
+            Command::Daemon {
+                action: DaemonCommand::Restart { json: false }
+            }
+        ));
+        let cli = Cli::try_parse_from(["jira", "daemon", "run"]).unwrap();
+        assert!(matches!(
+            cli.command.unwrap(),
+            Command::Daemon {
+                action: DaemonCommand::Run
+            }
+        ));
+
+        let conf = ConfluenceCli::try_parse_from(["confluence", "daemon", "status", "--json"]).unwrap();
+        assert!(matches!(
+            conf.command.unwrap(),
+            ConfluenceCommand::Daemon {
+                action: DaemonCommand::Status { json: true }
+            }
+        ));
+        let conf = ConfluenceCli::try_parse_from(["confluence", "daemon", "run"]).unwrap();
+        assert!(matches!(
+            conf.command.unwrap(),
+            ConfluenceCommand::Daemon {
+                action: DaemonCommand::Run
+            }
+        ));
 
         // Confluence CLI commands
         let conf = ConfluenceCli::try_parse_from([

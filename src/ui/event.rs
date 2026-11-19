@@ -33,6 +33,10 @@ pub fn mouse_to_action(mouse: MouseEvent, hitmap: &HitMap) -> Option<Action> {
                 col: mouse.column,
             })
         }
+        MouseEventKind::Down(MouseButton::Right) => Some(Action::MouseRightClick {
+            row: mouse.row,
+            col: mouse.column,
+        }),
         MouseEventKind::ScrollUp => Some(Action::ScrollUp),
         MouseEventKind::ScrollDown => Some(Action::ScrollDown),
         _ => None,

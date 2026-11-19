@@ -12,19 +12,23 @@ use crate::{
     adf,
     atlassian::AtlassianClient,
     auth::AuthManager,
-    config::{AppConfig, Persona},
-    img_preview::{self, RenderedTerminalImage},
+    config::{
+        AppConfig, DensityMode, DraftStore, ImageProtocolPreference as ConfigImageProtocol, Persona,
+    },
+    img_preview::{self, RenderedTerminalImage, TerminalGraphicsCaps},
     models::{
-        AttachmentItem, BoardColumn, BoardSummary, CoreEvent, CrossRefTarget, DownloadedFile,
-        IssueDetail, IssueSummary, IssueTransition, IssueUpdate, OutgoingIssue, OutgoingPage,
-        PageDetail, PageSummary, PageUpdate, ProjectSummary, SavedFilter, SpaceSummary,
-        SprintSummary, StatusCategory, UnifiedSearchHit, UpdateCheckResult, UserSummary,
+        AttachmentItem, BoardColumn, BoardSummary, ConfluenceComment, CoreEvent, CrossRefTarget,
+        DownloadedFile, IssueComment, IssueDetail, IssueStatus, IssueSummary, IssueTransition,
+        IssueUpdate, OutgoingIssue, OutgoingPage, PageDetail, PageSummary, PageUpdate,
+        ProjectSummary, SavedFilter, SpaceSummary, SprintSummary, StatusCategory, UnifiedSearchHit,
+        UpdateCheckResult, UserSummary,
     },
     storage::{CacheCounts, Storage},
     sync::{self, SyncController},
     ui::{
         hitmap::HitMap,
         keymap::Keymap,
+        notification,
         overlays::{
             assignee::AssigneeOverlay,
             comment::{CommentOverlay, CommentTarget},
@@ -42,13 +46,25 @@ use crate::{
 };
 
 pub const TAB_LABELS: [&str; 6] = [
-    "1:보드",
-    "2:이슈/JQL",
-    "3:내 작업",
-    "4:위키/트리",
-    "5:통합검색",
-    "6:프로젝트/동기화",
+    "1:Board",
+    "2:Issues",
+    "3:My Work",
+    "4:Wiki",
+    "5:Search",
+    "6:Directory",
 ];
+
+pub fn config_protocol_to_img_pref(
+    pref: ConfigImageProtocol,
+) -> img_preview::ImageProtocolPreference {
+    match pref {
+        ConfigImageProtocol::Auto => img_preview::ImageProtocolPreference::Auto,
+        ConfigImageProtocol::Kitty => img_preview::ImageProtocolPreference::Kitty,
+        ConfigImageProtocol::ITerm2 => img_preview::ImageProtocolPreference::Iterm2,
+        ConfigImageProtocol::Sixel => img_preview::ImageProtocolPreference::Sixel,
+        ConfigImageProtocol::Halfblock => img_preview::ImageProtocolPreference::Halfblock,
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum WorkspaceTab {
@@ -218,8 +234,19 @@ pub enum UiMsg {
     },
     IssueTransitioned {
         key: String,
-        to_status: crate::models::IssueStatus,
+        to_status: IssueStatus,
         toast: String,
+    },
+    IssueTransitionFailed {
+        key: String,
+        previous_status: Option<IssueStatus>,
+        error: String,
+    },
+    IssueAssignFailed {
+        key: String,
+        previous_assignee: Option<Option<UserSummary>>,
+        task_label: String,
+        error: String,
     },
     IssueActionFailed(String),
     TransitionsLoaded {
@@ -233,6 +260,8 @@ pub enum UiMsg {
     CommentAdded {
         issue_key: Option<String>,
         page_id: Option<String>,
+        optimistic_id: Option<String>,
+        task_label: String,
         result: Result<(), String>,
     },
     SpacesLoaded(Result<Vec<SpaceSummary>, String>),
@@ -278,6 +307,9 @@ pub struct UiState {
     pub active_tab: WorkspaceTab,
     pub focus: PaneFocus,
     pub theme: Theme,
+    pub density: DensityMode,
+    pub notify: bool,
+    pub graphics_caps: TerminalGraphicsCaps,
     pub keymap: Keymap,
     pub hitmap: HitMap,
     pub toasts: ToastQueue,
@@ -300,10 +332,15 @@ pub struct UiState {
 impl UiState {
     pub fn from_config_with_persona(config: &AppConfig, persona: Persona) -> Self {
         let active_tab = WorkspaceTab::from_persona(persona);
+        let graphics_caps =
+            img_preview::detect_graphics_caps(config_protocol_to_img_pref(config.image_protocol));
         Self {
             active_tab,
             focus: PaneFocus::Main,
-            theme: Theme::default(),
+            theme: Theme::detect(config.theme),
+            density: config.density,
+            notify: config.notify,
+            graphics_caps,
             keymap: Keymap,
             hitmap: HitMap::new(),
             toasts: ToastQueue::new(),
@@ -400,8 +437,15 @@ pub struct AppState {
     /// Cross-App navigation stack (`Jira <-> Confluence`).
     pub nav_history: Vec<CrossRefTarget>,
 
-    /// Decoded Half-Block image cache (`"{att_id}:{cols}x{rows}"` -> `RenderedTerminalImage`).
+    /// Decoded image cache (`"{att_id}:{cols}x{rows}[:{protocol}]"` -> `RenderedTerminalImage`).
     pub image_cache: HashMap<String, RenderedTerminalImage>,
+
+    /// Persistent unsent drafts (`drafts.json`) for comments, issues, and Confluence pages.
+    pub drafts: DraftStore,
+
+    /// Optional file path overrides for isolated persistence in tests.
+    pub config_path_override: Option<PathBuf>,
+    pub drafts_path_override: Option<PathBuf>,
 }
 
 impl AppState {
@@ -415,6 +459,11 @@ impl AppState {
         ui_tx: mpsc::UnboundedSender<UiMsg>,
     ) -> Self {
         let saved_filters = builtin_filters();
+        let drafts = if cfg!(test) && std::env::var_os("ATLASSIAN_CONFIG_DIR").is_none() {
+            DraftStore::default()
+        } else {
+            DraftStore::load()
+        };
         Self {
             config,
             persona,
@@ -444,6 +493,58 @@ impl AppState {
             cache_counts: CacheCounts::default(),
             nav_history: Vec::new(),
             image_cache: HashMap::new(),
+            drafts,
+            config_path_override: None,
+            drafts_path_override: None,
+        }
+    }
+
+    pub fn save_config(&self) -> anyhow::Result<()> {
+        if let Some(ref path) = self.config_path_override {
+            return self.config.save_to(path);
+        }
+        if cfg!(test) && std::env::var_os("ATLASSIAN_CONFIG_DIR").is_none() {
+            return Ok(());
+        }
+        self.config.save()
+    }
+
+    pub fn save_drafts(&self) -> anyhow::Result<()> {
+        if let Some(ref path) = self.drafts_path_override {
+            return self.drafts.save_to(path);
+        }
+        if cfg!(test) && std::env::var_os("ATLASSIAN_CONFIG_DIR").is_none() {
+            return Ok(());
+        }
+        self.drafts.save()
+    }
+
+    pub fn sync_ui_from_config(&self, ui: &mut UiState) {
+        ui.theme = Theme::detect(self.config.theme);
+        ui.density = self.config.density;
+        ui.show_nav_rail = self.config.show_nav_rail;
+        ui.inline_images = self.config.inline_images;
+        ui.notify = self.config.notify;
+        ui.graphics_caps = img_preview::detect_graphics_caps(config_protocol_to_img_pref(
+            self.config.image_protocol,
+        ));
+    }
+
+    fn notify_desktop(&self, summary: &str, body: &str) {
+        if self.config.notify && !cfg!(test) {
+            notification::show(summary, &notification::truncate(body, notification::MAX_BODY_CHARS));
+        }
+    }
+
+    fn notify_desktop_issue(&self, issue_key: &str, summary: &str) {
+        if !cfg!(test) {
+            notification::notify_issue(self.config.notify, false, false, issue_key, summary);
+        }
+    }
+
+    fn notify_desktop_page(&self, space_key: &str, title: &str) {
+        if !cfg!(test) {
+            notification::notify_page(self.config.notify, false, false, space_key, title);
         }
     }
 
@@ -454,7 +555,7 @@ impl AppState {
     pub fn site_display(&self) -> String {
         let raw = self.config.site_url.trim();
         if raw.is_empty() {
-            "미설정".to_string()
+            "Not configured".to_string()
         } else {
             raw.trim_start_matches("https://")
                 .trim_start_matches("http://")
@@ -522,10 +623,10 @@ impl AppState {
             return;
         }
         if !self.auth.is_logged_in() || self.config.site_url.trim().is_empty() {
-            ui.info("오프라인 캐시 모드 (`jira login`으로 연결하세요)");
+            ui.info("Offline cache mode (run `jira login` to connect)");
             return;
         }
-        ui.tasks.begin("초기 동기화");
+        ui.tasks.begin("Initial sync");
         let client = self.client.clone();
         let storage = self.storage.clone();
         let tx = self.ui_tx.clone();
@@ -797,7 +898,7 @@ impl AppState {
         if tokio::runtime::Handle::try_current().is_err() {
             return;
         }
-        ui.tasks.begin(format!("보드 #{board_id}"));
+        ui.tasks.begin(format!("Board #{board_id}"));
         let client = self.client.clone();
         let storage = self.storage.clone();
         let tx = self.ui_tx.clone();
@@ -916,13 +1017,15 @@ impl AppState {
         key: &str,
         tr: IssueTransition,
     ) {
-        // Optimistic local column update so Kanban card moves right away!
+        // Capture previous status for clean rollback on API error.
+        let prev_status = self.current_issue_status(key);
+        // 0ms optimistic local column update so Kanban card moves right away!
         self.apply_local_status_update(key, &tr.to_status);
         if tokio::runtime::Handle::try_current().is_err() {
-            ui.success(format!("{key} → {} 전환됨", tr.to_status.name));
+            ui.success(format!("{key} → {}", tr.to_status.name));
             return;
         }
-        ui.tasks.begin(format!("{key} 전환"));
+        ui.tasks.begin(format!("Transition {key}"));
         let client = self.client.clone();
         let storage = self.storage.clone();
         let tx = self.ui_tx.clone();
@@ -933,7 +1036,7 @@ impl AppState {
                     let _ = tx.send(UiMsg::IssueTransitioned {
                         key: key_owned.clone(),
                         to_status: tr.to_status.clone(),
-                        toast: format!("{key_owned} → {} 전환 완료", tr.to_status.name),
+                        toast: format!("{key_owned} → {}", tr.to_status.name),
                     });
                     if let Ok(detail) = client.get_issue(&key_owned).await {
                         let _ = storage.upsert_issue_detail(&detail);
@@ -944,13 +1047,47 @@ impl AppState {
                     }
                 }
                 Err(e) => {
-                    let _ = tx.send(UiMsg::IssueActionFailed(format!("상태 전환 실패: {e}")));
+                    let _ = tx.send(UiMsg::IssueTransitionFailed {
+                        key: key_owned,
+                        previous_status: prev_status,
+                        error: format!("Transition failed: {e}"),
+                    });
                 }
             }
         });
     }
 
-    fn apply_local_status_update(&mut self, key: &str, to_status: &crate::models::IssueStatus) {
+    fn current_issue_status(&self, key: &str) -> Option<IssueStatus> {
+        self.active_issue
+            .as_ref()
+            .filter(|d| d.summary.key == key)
+            .map(|d| d.summary.status.clone())
+            .or_else(|| self.board_issues.iter().find(|i| i.key == key).map(|i| i.status.clone()))
+            .or_else(|| self.issues.iter().find(|i| i.key == key).map(|i| i.status.clone()))
+            .or_else(|| self.my_issues.iter().find(|i| i.key == key).map(|i| i.status.clone()))
+    }
+
+    fn current_issue_assignee(&self, key: &str) -> Option<Option<UserSummary>> {
+        self.active_issue
+            .as_ref()
+            .filter(|d| d.summary.key == key)
+            .map(|d| d.summary.assignee.clone())
+            .or_else(|| {
+                self.board_issues
+                    .iter()
+                    .find(|i| i.key == key)
+                    .map(|i| i.assignee.clone())
+            })
+            .or_else(|| self.issues.iter().find(|i| i.key == key).map(|i| i.assignee.clone()))
+            .or_else(|| {
+                self.my_issues
+                    .iter()
+                    .find(|i| i.key == key)
+                    .map(|i| i.assignee.clone())
+            })
+    }
+
+    fn apply_local_status_update(&mut self, key: &str, to_status: &IssueStatus) {
         for it in &mut self.board_issues {
             if it.key == key {
                 it.status = to_status.clone();
@@ -973,31 +1110,72 @@ impl AppState {
         }
     }
 
-    pub fn request_assign_to_me(&mut self, ui: &mut UiState, key: &str) {
-        let Some(me) = self.me.clone().or_else(|| self.client.cached_me()) else {
-            ui.error("현재 사용자 정보가 아직 로드되지 않았습니다");
-            return;
-        };
+    fn apply_local_assignee_update(&mut self, key: &str, assignee: Option<UserSummary>) {
         for it in &mut self.board_issues {
             if it.key == key {
-                it.assignee = Some(me.clone());
+                it.assignee = assignee.clone();
             }
         }
         for it in &mut self.issues {
             if it.key == key {
-                it.assignee = Some(me.clone());
+                it.assignee = assignee.clone();
+            }
+        }
+        for it in &mut self.my_issues {
+            if it.key == key {
+                it.assignee = assignee.clone();
             }
         }
         if let Some(detail) = &mut self.active_issue {
             if detail.summary.key == key {
-                detail.summary.assignee = Some(me.clone());
+                detail.summary.assignee = assignee;
             }
         }
+    }
+
+    fn bump_local_comment_count(&mut self, key: &str, delta: isize) {
+        let apply = |count: &mut usize| {
+            if delta >= 0 {
+                *count = count.saturating_add(delta as usize);
+            } else {
+                *count = count.saturating_sub((-delta) as usize);
+            }
+        };
+        for it in &mut self.board_issues {
+            if it.key == key {
+                apply(&mut it.comment_count);
+            }
+        }
+        for it in &mut self.issues {
+            if it.key == key {
+                apply(&mut it.comment_count);
+            }
+        }
+        for it in &mut self.my_issues {
+            if it.key == key {
+                apply(&mut it.comment_count);
+            }
+        }
+        if let Some(detail) = &mut self.active_issue {
+            if detail.summary.key == key {
+                apply(&mut detail.summary.comment_count);
+            }
+        }
+    }
+
+    pub fn request_assign_to_me(&mut self, ui: &mut UiState, key: &str) {
+        let Some(me) = self.me.clone().or_else(|| self.client.cached_me()) else {
+            ui.error("Current user profile has not been loaded yet");
+            return;
+        };
+        let prev_assignee = self.current_issue_assignee(key);
+        self.apply_local_assignee_update(key, Some(me.clone()));
         if tokio::runtime::Handle::try_current().is_err() {
-            ui.success(format!("{key} 내게 할당됨"));
+            ui.success(format!("Assigned {key} to you"));
             return;
         }
-        ui.tasks.begin(format!("{key} 내게 할당"));
+        let task_label = format!("Assign {key} to me");
+        ui.tasks.begin(&task_label);
         let client = self.client.clone();
         let storage = self.storage.clone();
         let tx = self.ui_tx.clone();
@@ -1009,15 +1187,25 @@ impl AppState {
                         let _ = storage.upsert_issue_detail(&detail);
                         let _ = tx.send(UiMsg::IssueMutated {
                             detail,
-                            toast: format!("{key_owned} 내게 할당 완료"),
+                            toast: format!("Assigned {key_owned} to you"),
                         });
                     }
                     Err(e) => {
-                        let _ = tx.send(UiMsg::IssueActionFailed(e.to_string()));
+                        let _ = tx.send(UiMsg::IssueAssignFailed {
+                            key: key_owned,
+                            previous_assignee: None,
+                            task_label,
+                            error: format!("Assigned issue, but failed to reload detail: {e}"),
+                        });
                     }
                 },
                 Err(e) => {
-                    let _ = tx.send(UiMsg::IssueActionFailed(format!("내게 할당 실패: {e}")));
+                    let _ = tx.send(UiMsg::IssueAssignFailed {
+                        key: key_owned,
+                        previous_assignee: prev_assignee,
+                        task_label,
+                        error: format!("Failed to assign to me: {e}"),
+                    });
                 }
             }
         });
@@ -1045,19 +1233,23 @@ impl AppState {
         });
     }
 
-    pub fn request_assign_user(&self, ui: &mut UiState, key: &str, user: Option<UserSummary>) {
+    pub fn request_assign_user(&mut self, ui: &mut UiState, key: &str, user: Option<UserSummary>) {
+        let prev_assignee = self.current_issue_assignee(key);
+        let label = user
+            .as_ref()
+            .map(|u| u.display_name.clone())
+            .unwrap_or_else(|| "Unassigned".to_string());
+        self.apply_local_assignee_update(key, user.clone());
         if tokio::runtime::Handle::try_current().is_err() {
+            ui.success(format!("{key} assignee → {label}"));
             return;
         }
-        ui.tasks.begin(format!("{key} 담당자 지정"));
+        let task_label = format!("Assign {key}");
+        ui.tasks.begin(&task_label);
         let client = self.client.clone();
         let storage = self.storage.clone();
         let tx = self.ui_tx.clone();
         let key_owned = key.to_string();
-        let label = user
-            .as_ref()
-            .map(|u| u.display_name.clone())
-            .unwrap_or_else(|| "미할당".to_string());
         tokio::spawn(async move {
             let id_ref = user.as_ref().map(|u| u.id.as_str());
             match client.assign_issue(&key_owned, id_ref).await {
@@ -1066,15 +1258,25 @@ impl AppState {
                         let _ = storage.upsert_issue_detail(&detail);
                         let _ = tx.send(UiMsg::IssueMutated {
                             detail,
-                            toast: format!("{key_owned} 담당자 → {label}"),
+                            toast: format!("{key_owned} assignee → {label}"),
                         });
                     }
                     Err(e) => {
-                        let _ = tx.send(UiMsg::IssueActionFailed(e.to_string()));
+                        let _ = tx.send(UiMsg::IssueAssignFailed {
+                            key: key_owned,
+                            previous_assignee: None,
+                            task_label,
+                            error: format!("Updated assignee, but failed to reload detail: {e}"),
+                        });
                     }
                 },
                 Err(e) => {
-                    let _ = tx.send(UiMsg::IssueActionFailed(format!("담당자 지정 실패: {e}")));
+                    let _ = tx.send(UiMsg::IssueAssignFailed {
+                        key: key_owned,
+                        previous_assignee: prev_assignee,
+                        task_label,
+                        error: format!("Failed to update assignee: {e}"),
+                    });
                 }
             }
         });
@@ -1088,7 +1290,7 @@ impl AppState {
         let storage = self.storage.clone();
         let tx = self.ui_tx.clone();
         if let Some(key) = form.edit_key.clone() {
-            ui.tasks.begin(format!("{key} 수정"));
+            ui.tasks.begin(format!("Update {key}"));
             let patch = IssueUpdate {
                 summary: Some(form.summary.text.trim().to_string()),
                 description_markdown: Some(form.description.text.clone()),
@@ -1103,16 +1305,18 @@ impl AppState {
                         let _ = storage.upsert_issue_detail(&detail);
                         let _ = tx.send(UiMsg::IssueMutated {
                             detail,
-                            toast: format!("{key} 수정 완료"),
+                            toast: format!("Updated {key}"),
                         });
                     }
                     Err(e) => {
-                        let _ = tx.send(UiMsg::IssueActionFailed(format!("이슈 수정 실패: {e}")));
+                        let _ = tx.send(UiMsg::IssueActionFailed(format!(
+                            "Failed to update issue: {e}"
+                        )));
                     }
                 }
             });
         } else {
-            ui.tasks.begin("이슈 생성");
+            ui.tasks.begin("Create issue");
             let req = OutgoingIssue {
                 project_key: form.project.text.trim().to_ascii_uppercase(),
                 issue_type: form.issue_type.text.trim().to_string(),
@@ -1131,53 +1335,117 @@ impl AppState {
                         let _ = storage.upsert_issue_detail(&detail);
                         let _ = tx.send(UiMsg::IssueMutated {
                             detail,
-                            toast: format!("{k} 생성 완료"),
+                            toast: format!("Created {k}"),
                         });
                     }
                     Err(e) => {
-                        let _ = tx.send(UiMsg::IssueActionFailed(format!("이슈 생성 실패: {e}")));
+                        let _ = tx.send(UiMsg::IssueActionFailed(format!(
+                            "Failed to create issue: {e}"
+                        )));
                     }
                 }
             });
         }
     }
 
-    pub fn request_submit_comment(&self, ui: &mut UiState, overlay: &CommentOverlay) {
+    pub fn request_submit_comment(&mut self, ui: &mut UiState, overlay: &CommentOverlay) {
+        self.request_add_comment(ui, overlay.target.clone(), overlay.body.text.clone());
+    }
+
+    pub fn request_add_comment(
+        &mut self,
+        ui: &mut UiState,
+        target: CommentTarget,
+        body: String,
+    ) {
+        let optimistic_id = format!("optimistic:{}", uuid::Uuid::new_v4());
+        let now = chrono::Utc::now().to_rfc3339();
+        let author = self
+            .me
+            .clone()
+            .or_else(|| self.client.cached_me())
+            .unwrap_or_else(|| UserSummary {
+                id: "me".to_string(),
+                display_name: "You".to_string(),
+                ..Default::default()
+            });
+        let blocks = adf::parse_markdown(&body);
+
+        match &target {
+            CommentTarget::Issue(key) => {
+                if let Some(detail) = &mut self.active_issue {
+                    if detail.summary.key == *key {
+                        detail.comments.push(IssueComment {
+                            id: optimistic_id.clone(),
+                            issue_key: key.clone(),
+                            author: author.clone(),
+                            body_raw: body.clone(),
+                            body_markdown: body.clone(),
+                            blocks: blocks.clone(),
+                            created_at: now.clone(),
+                            updated_at: now.clone(),
+                        });
+                    }
+                }
+                self.bump_local_comment_count(key, 1);
+            }
+            CommentTarget::Page { page_id, .. } => {
+                if let Some(page) = &mut self.active_page {
+                    if page.summary.id == *page_id {
+                        page.comments.push(ConfluenceComment {
+                            id: optimistic_id.clone(),
+                            page_id: page_id.clone(),
+                            author_name: author.display_name.clone(),
+                            body_raw: body.clone(),
+                            body_markdown: body.clone(),
+                            blocks: blocks.clone(),
+                            created_at: now.clone(),
+                        });
+                    }
+                }
+            }
+        }
+
         if tokio::runtime::Handle::try_current().is_err() {
+            ui.success("Comment posted");
             return;
         }
+
         let client = self.client.clone();
         let tx = self.ui_tx.clone();
-        let body = overlay.body.text.clone();
-        match &overlay.target {
+        match target {
             CommentTarget::Issue(key) => {
-                ui.tasks.begin(format!("{key} 댓글"));
-                let k = key.clone();
+                let task_label = format!("Comment on {key}");
+                ui.tasks.begin(&task_label);
                 tokio::spawn(async move {
                     let res = client
-                        .add_issue_comment(&k, &body)
+                        .add_issue_comment(&key, &body)
                         .await
                         .map(|_| ())
                         .map_err(|e| e.to_string());
                     let _ = tx.send(UiMsg::CommentAdded {
-                        issue_key: Some(k),
+                        issue_key: Some(key),
                         page_id: None,
+                        optimistic_id: Some(optimistic_id),
+                        task_label,
                         result: res,
                     });
                 });
             }
             CommentTarget::Page { page_id, title } => {
-                ui.tasks.begin(format!("{title} 댓글"));
-                let pid = page_id.clone();
+                let task_label = format!("Comment on {title}");
+                ui.tasks.begin(&task_label);
                 tokio::spawn(async move {
                     let res = client
-                        .add_page_comment(&pid, &body)
+                        .add_page_comment(&page_id, &body)
                         .await
                         .map(|_| ())
                         .map_err(|e| e.to_string());
                     let _ = tx.send(UiMsg::CommentAdded {
                         issue_key: None,
-                        page_id: Some(pid),
+                        page_id: Some(page_id),
+                        optimistic_id: Some(optimistic_id),
+                        task_label,
                         result: res,
                     });
                 });
@@ -1195,7 +1463,7 @@ impl AppState {
         if tokio::runtime::Handle::try_current().is_err() {
             return;
         }
-        ui.tasks.begin(format!("스페이스 {space_key}"));
+        ui.tasks.begin(format!("Space {space_key}"));
         let client = self.client.clone();
         let storage = self.storage.clone();
         let tx = self.ui_tx.clone();
@@ -1237,7 +1505,7 @@ impl AppState {
         if !page.has_children || tokio::runtime::Handle::try_current().is_err() {
             return;
         }
-        ui.tasks.begin(format!("하위 페이지: {}", page.title));
+        ui.tasks.begin(format!("Child pages: {}", page.title));
         let client = self.client.clone();
         let storage = self.storage.clone();
         let tx = self.ui_tx.clone();
@@ -1300,7 +1568,7 @@ impl AppState {
         let storage = self.storage.clone();
         let tx = self.ui_tx.clone();
         if let Some(pid) = form.edit_page_id.clone() {
-            ui.tasks.begin("페이지 수정");
+            ui.tasks.begin("Update page");
             let patch = PageUpdate {
                 title: form.title.text.trim().to_string(),
                 body_markdown: form.body.text.clone(),
@@ -1313,16 +1581,18 @@ impl AppState {
                         let _ = storage.upsert_page_detail(&detail);
                         let _ = tx.send(UiMsg::PageMutated {
                             detail,
-                            toast: "Confluence 페이지 저장 완료".to_string(),
+                            toast: "Confluence page saved".to_string(),
                         });
                     }
                     Err(e) => {
-                        let _ = tx.send(UiMsg::PageActionFailed(format!("페이지 수정 실패: {e}")));
+                        let _ = tx.send(UiMsg::PageActionFailed(format!(
+                            "Failed to update page: {e}"
+                        )));
                     }
                 }
             });
         } else {
-            ui.tasks.begin("페이지 생성");
+            ui.tasks.begin("Create page");
             let req = OutgoingPage {
                 space_id_or_key: form.space_key.clone(),
                 parent_id: form.parent_id.clone(),
@@ -1335,11 +1605,13 @@ impl AppState {
                         let _ = storage.upsert_page_detail(&detail);
                         let _ = tx.send(UiMsg::PageMutated {
                             detail,
-                            toast: "새 Confluence 페이지 생성 완료".to_string(),
+                            toast: "Created Confluence page".to_string(),
                         });
                     }
                     Err(e) => {
-                        let _ = tx.send(UiMsg::PageActionFailed(format!("페이지 생성 실패: {e}")));
+                        let _ = tx.send(UiMsg::PageActionFailed(format!(
+                            "Failed to create page: {e}"
+                        )));
                     }
                 }
             });
@@ -1350,7 +1622,7 @@ impl AppState {
         if tokio::runtime::Handle::try_current().is_err() {
             return;
         }
-        ui.tasks.begin("내 작업 불러오기");
+        ui.tasks.begin("Loading My Work");
         let client = self.client.clone();
         let storage = self.storage.clone();
         let tx = self.ui_tx.clone();
@@ -1384,7 +1656,7 @@ impl AppState {
         if q.is_empty() || tokio::runtime::Handle::try_current().is_err() {
             return;
         }
-        ui.tasks.begin(format!("원격 검색: {q}"));
+        ui.tasks.begin(format!("Remote search: {q}"));
         let client = self.client.clone();
         let tx = self.ui_tx.clone();
         tokio::spawn(async move {
@@ -1453,7 +1725,7 @@ impl AppState {
             return;
         }
         let path = PathBuf::from(overlay.path.text.trim());
-        ui.tasks.begin("첨부파일 업로드");
+        ui.tasks.begin("Upload attachment");
         let client = self.client.clone();
         let tx = self.ui_tx.clone();
         match &overlay.target {
@@ -1493,7 +1765,7 @@ impl AppState {
             return;
         }
         let dest = self.config.resolved_download_dir();
-        ui.tasks.begin(format!("다운로드: {}", att.filename));
+        ui.tasks.begin(format!("Download: {}", att.filename));
         let client = self.client.clone();
         let tx = self.ui_tx.clone();
         tokio::spawn(async move {
@@ -1509,11 +1781,15 @@ impl AppState {
         let Some(Overlay::ImagePreview(ov)) = ui.overlays.last() else {
             return;
         };
+        if ov.protocol.is_pixel() {
+            // Pixel protocols (Kitty / iTerm2 / Sixel) are decoded and synchronized by `tui.rs`.
+            return;
+        }
         let Some(att) = ov.current().cloned() else {
             return;
         };
         let (cols, rows) = ov.target_dimensions(ui.term_width, ui.term_height);
-        let cache_key = Self::image_cache_key(&att.id, cols, rows);
+        let cache_key = img_preview::preview_cache_key(&att.id, cols, rows, ov.protocol);
         if self.image_cache.contains_key(&cache_key)
             || tokio::runtime::Handle::try_current().is_err()
         {
@@ -1521,10 +1797,17 @@ impl AppState {
         }
         let client = self.client.clone();
         let tx = self.ui_tx.clone();
+        let caps = ov.graphics_caps();
+        let bg_rgb = match ui.theme.card_bg {
+            ratatui::style::Color::Rgb(r, g, b) => (r, g, b),
+            _ => img_preview::DEFAULT_PREVIEW_BG_RGB,
+        };
         tokio::spawn(async move {
             let res = match client.fetch_attachment_bytes(&att).await {
-                Ok(bytes) => img_preview::render_halfblocks(&bytes, cols, rows)
-                    .map_err(|e| e.to_string()),
+                Ok(bytes) => {
+                    img_preview::decode_and_render_for_protocol(&bytes, cols, rows, bg_rgb, caps)
+                        .map_err(|e| e.to_string())
+                }
                 Err(e) => Err(e.to_string()),
             };
             let _ = tx.send(UiMsg::ImageLoaded {
@@ -1538,7 +1821,7 @@ impl AppState {
         if tokio::runtime::Handle::try_current().is_err() {
             return;
         }
-        ui.tasks.begin("업데이트 확인");
+        ui.tasks.begin("Check for updates");
         let repo = self.config.github_repo.clone();
         let tx = self.ui_tx.clone();
         tokio::spawn(async move {
@@ -1564,7 +1847,7 @@ impl AppState {
                 if let Ok(counts) = self.storage.cache_counts() {
                     self.cache_counts = counts;
                 }
-                ui.tasks.finish("동기화", None);
+                ui.tasks.finish("Sync", None);
                 ui.success(summary);
             }
             CoreEvent::ProjectsUpdated(projects) => {
@@ -1596,8 +1879,9 @@ impl AppState {
             }
             CoreEvent::SyncError(err) => {
                 self.syncing = false;
-                ui.tasks.finish("동기화", Some(err.clone()));
-                ui.error(format!("동기화 오류: {err}"));
+                ui.tasks.finish("Sync", Some(err.clone()));
+                ui.error(format!("Sync error: {err}"));
+                self.notify_desktop("Atlassian Sync Error", &err);
             }
         }
     }
@@ -1608,22 +1892,22 @@ impl AppState {
                 self.me = Some(me);
             }
             UiMsg::MeLoaded(Err(err)) => {
-                ui.error(format!("사용자 확인 실패: {err}"));
+                ui.error(format!("Failed to verify user profile: {err}"));
             }
-            UiMsg::BootstrapFinished(res) => {
-                match res {
-                    Ok(summary) => {
-                        self.sync_summary = summary.clone();
-                        ui.tasks.finish("초기 동기화", None);
-                        self.load_cached_initial();
-                        ui.success(summary);
-                    }
-                    Err(err) => {
-                        ui.tasks.finish("초기 동기화", Some(err.clone()));
-                        ui.error(format!("초기 동기화 실패: {err}"));
-                    }
+            UiMsg::BootstrapFinished(res) => match res {
+                Ok(summary) => {
+                    self.sync_summary = summary.clone();
+                    ui.tasks.finish("Initial sync", None);
+                    self.load_cached_initial();
+                    ui.success(&summary);
+                    self.notify_desktop("Atlassian Sync Complete", &summary);
                 }
-            }
+                Err(err) => {
+                    ui.tasks.finish("Initial sync", Some(err.clone()));
+                    ui.error(format!("Initial sync failed: {err}"));
+                    self.notify_desktop("Atlassian Sync Failed", &err);
+                }
+            },
             UiMsg::BoardsLoaded(Ok(boards)) => {
                 self.boards = boards;
             }
@@ -1634,7 +1918,7 @@ impl AppState {
                 sprints,
                 issues,
             } => {
-                ui.tasks.finish(&format!("보드 #{board_id}"), None);
+                ui.tasks.finish(&format!("Board #{board_id}"), None);
                 if let Some(b) = self.boards.iter_mut().find(|b| b.id == board_id) {
                     if !columns.is_empty() {
                         b.columns = columns;
@@ -1646,7 +1930,7 @@ impl AppState {
                 ui.board_ui.selected_row = 0;
             }
             UiMsg::BoardLoadFailed(err) => {
-                ui.error(format!("보드 로드 실패: {err}"));
+                ui.error(format!("Failed to load board: {err}"));
             }
             UiMsg::IssuesLoaded { issues, label } => {
                 ui.tasks.finish(&format!("JQL: {label}"), None);
@@ -1657,7 +1941,7 @@ impl AppState {
                 }
             }
             UiMsg::IssuesLoadFailed(err) => {
-                ui.error(format!("JQL 검색 실패: {err}"));
+                ui.error(format!("JQL search failed: {err}"));
             }
             UiMsg::SavedFiltersLoaded(filters) => {
                 let mut combined = builtin_filters();
@@ -1672,10 +1956,15 @@ impl AppState {
                 Ok(d) => {
                     self.active_issue = Some(d);
                 }
-                Err(err) => ui.error(format!("이슈 상세 로드 실패: {err}")),
+                Err(err) => ui.error(format!("Failed to load issue detail: {err}")),
             },
             UiMsg::IssueMutated { detail, toast } => {
                 let key = detail.summary.key.clone();
+                let summary = detail.summary.summary.clone();
+                ui.tasks.finish(&format!("Assign {key} to me"), None);
+                ui.tasks.finish(&format!("Assign {key}"), None);
+                ui.tasks.finish(&format!("Update {key}"), None);
+                ui.tasks.finish("Create issue", None);
                 if let Some(it) = self.issues.iter_mut().find(|i| i.key == key) {
                     *it = detail.summary.clone();
                 } else {
@@ -1684,20 +1973,52 @@ impl AppState {
                 if let Some(it) = self.board_issues.iter_mut().find(|i| i.key == key) {
                     *it = detail.summary.clone();
                 }
+                if let Some(it) = self.my_issues.iter_mut().find(|i| i.key == key) {
+                    *it = detail.summary.clone();
+                }
                 self.active_issue = Some(detail);
-                ui.success(toast);
+                ui.success(&toast);
+                self.notify_desktop_issue(&key, &summary);
             }
             UiMsg::IssueTransitioned {
                 key,
                 to_status,
                 toast,
             } => {
-                ui.tasks.finish(&format!("{key} 전환"), None);
+                ui.tasks.finish(&format!("Transition {key}"), None);
                 self.apply_local_status_update(&key, &to_status);
-                ui.success(toast);
+                ui.success(&toast);
+                self.notify_desktop_issue(&key, &format!("Transitioned to {}", to_status.name));
+            }
+            UiMsg::IssueTransitionFailed {
+                key,
+                previous_status,
+                error,
+            } => {
+                ui.tasks
+                    .finish(&format!("Transition {key}"), Some(error.clone()));
+                if let Some(prev) = previous_status {
+                    self.apply_local_status_update(&key, &prev);
+                }
+                ui.error(&error);
+                self.notify_desktop("Atlassian Jira Error", &error);
+            }
+            UiMsg::IssueAssignFailed {
+                key,
+                previous_assignee,
+                task_label,
+                error,
+            } => {
+                ui.tasks.finish(&task_label, Some(error.clone()));
+                if let Some(prev) = previous_assignee {
+                    self.apply_local_assignee_update(&key, prev);
+                }
+                ui.error(&error);
+                self.notify_desktop("Atlassian Jira Error", &error);
             }
             UiMsg::IssueActionFailed(err) => {
-                ui.error(err);
+                ui.error(&err);
+                self.notify_desktop("Atlassian Jira Error", &err);
             }
             UiMsg::TransitionsLoaded {
                 issue_key,
@@ -1725,28 +2046,67 @@ impl AppState {
             UiMsg::CommentAdded {
                 issue_key,
                 page_id,
+                optimistic_id,
+                task_label,
                 result,
             } => match result {
                 Ok(()) => {
-                    ui.success("댓글이 등록되었습니다");
+                    ui.tasks.finish(&task_label, None);
+                    ui.success("Comment posted");
                     if let Some(k) = issue_key {
+                        self.notify_desktop_issue(&k, "Comment posted");
                         self.request_issue_detail(ui, &k);
                     }
                     if let Some(pid) = page_id {
+                        let space = self
+                            .active_page
+                            .as_ref()
+                            .filter(|p| p.summary.id == pid)
+                            .map(|p| p.summary.space_key.clone())
+                            .unwrap_or_default();
+                        let title = self
+                            .active_page
+                            .as_ref()
+                            .filter(|p| p.summary.id == pid)
+                            .map(|p| p.summary.title.clone())
+                            .unwrap_or_else(|| format!("Page #{pid}"));
+                        self.notify_desktop_page(&space, &format!("Comment posted on {title}"));
                         self.request_page_detail(ui, &pid);
                     }
                 }
-                Err(e) => ui.error(format!("댓글 등록 실패: {e}")),
+                Err(e) => {
+                    let msg = format!("Failed to post comment: {e}");
+                    ui.tasks.finish(&task_label, Some(msg.clone()));
+                    if let Some(ref opt_id) = optimistic_id {
+                        if let Some(ref k) = issue_key {
+                            if let Some(detail) = &mut self.active_issue {
+                                if detail.summary.key == *k {
+                                    detail.comments.retain(|c| c.id != *opt_id);
+                                }
+                            }
+                            self.bump_local_comment_count(k, -1);
+                        }
+                        if let Some(ref pid) = page_id {
+                            if let Some(page) = &mut self.active_page {
+                                if page.summary.id == *pid {
+                                    page.comments.retain(|c| c.id != *opt_id);
+                                }
+                            }
+                        }
+                    }
+                    ui.error(&msg);
+                    self.notify_desktop("Atlassian Comment Error", &msg);
+                }
             },
             UiMsg::SpacesLoaded(Ok(spaces)) => self.spaces = spaces,
             UiMsg::SpacesLoaded(Err(e)) => ui.error(e),
             UiMsg::RootPagesLoaded { space_key, pages } => {
-                ui.tasks.finish(&format!("스페이스 {space_key}"), None);
+                ui.tasks.finish(&format!("Space {space_key}"), None);
                 match pages {
                     Ok(list) => {
                         self.root_pages_by_space.insert(space_key, list);
                     }
-                    Err(e) => ui.error(format!("루트 페이지 로드 실패: {e}")),
+                    Err(e) => ui.error(format!("Failed to load root pages: {e}")),
                 }
             }
             UiMsg::ChildPagesLoaded {
@@ -1756,14 +2116,17 @@ impl AppState {
                 Ok(list) => {
                     self.page_children_map.insert(parent_id, list);
                 }
-                Err(e) => ui.error(format!("하위 페이지 로드 실패: {e}")),
+                Err(e) => ui.error(format!("Failed to load child pages: {e}")),
             },
             UiMsg::PageDetailLoaded { page_id: _, detail } => match detail {
                 Ok(d) => self.active_page = Some(d),
-                Err(e) => ui.error(format!("페이지 로드 실패: {e}")),
+                Err(e) => ui.error(format!("Failed to load page: {e}")),
             },
             UiMsg::PageMutated { detail, toast } => {
+                ui.tasks.finish("Update page", None);
+                ui.tasks.finish("Create page", None);
                 let sk = detail.summary.space_key.clone();
+                let title = detail.summary.title.clone();
                 if let Some(pid) = &detail.summary.parent_id {
                     self.page_children_map
                         .entry(pid.clone())
@@ -1775,7 +2138,7 @@ impl AppState {
                         .push(detail.summary.clone());
                     self.expanded_pages.insert(pid.clone());
                 } else {
-                    let roots = self.root_pages_by_space.entry(sk).or_default();
+                    let roots = self.root_pages_by_space.entry(sk.clone()).or_default();
                     if let Some(existing) = roots.iter_mut().find(|p| p.id == detail.summary.id) {
                         *existing = detail.summary.clone();
                     } else {
@@ -1783,23 +2146,27 @@ impl AppState {
                     }
                 }
                 self.active_page = Some(detail);
-                ui.success(toast);
+                ui.success(&toast);
+                self.notify_desktop_page(&sk, &title);
             }
-            UiMsg::PageActionFailed(err) => ui.error(err),
+            UiMsg::PageActionFailed(err) => {
+                ui.error(&err);
+                self.notify_desktop("Atlassian Confluence Error", &err);
+            }
             UiMsg::MyWorkLoaded { issues, pages } => {
-                ui.tasks.finish("내 작업 불러오기", None);
+                ui.tasks.finish("Loading My Work", None);
                 self.my_issues = issues;
                 self.my_pages = pages;
             }
             UiMsg::RemoteSearchLoaded { query, hits } => {
-                ui.tasks.finish(&format!("원격 검색: {query}"), None);
+                ui.tasks.finish(&format!("Remote search: {query}"), None);
                 match hits {
                     Ok(list) => {
                         self.search_hits = list;
                         ui.search_ui.is_remote = true;
                         ui.search_ui.selected_hit = 0;
                     }
-                    Err(e) => ui.error(format!("원격 검색 실패: {e}")),
+                    Err(e) => ui.error(format!("Remote search failed: {e}")),
                 }
             }
             UiMsg::ImageLoaded {
@@ -1816,8 +2183,15 @@ impl AppState {
                 }
             },
             UiMsg::AttachmentDownloaded(res) => match res {
-                Ok(file) => ui.success(format!("저장됨: {}", file.path.display())),
-                Err(e) => ui.error(format!("다운로드 실패: {e}")),
+                Ok(file) => {
+                    ui.tasks.finish(&format!("Download: {}", file.filename), None);
+                    ui.success(format!("Saved: {}", file.path.display()));
+                    self.notify_desktop("Atlassian Download", &format!("Saved {}", file.filename));
+                }
+                Err(e) => {
+                    ui.error(format!("Download failed: {e}"));
+                    self.notify_desktop("Atlassian Download Failed", &e);
+                }
             },
             UiMsg::AttachmentUploaded {
                 issue_key,
@@ -1825,7 +2199,9 @@ impl AppState {
                 result,
             } => match result {
                 Ok(_) => {
-                    ui.success("첨부파일 업로드 완료");
+                    ui.tasks.finish("Upload attachment", None);
+                    ui.success("Attachment uploaded");
+                    self.notify_desktop("Atlassian Upload", "Attachment uploaded");
                     if let Some(k) = issue_key {
                         self.request_issue_detail(ui, &k);
                     }
@@ -1833,23 +2209,32 @@ impl AppState {
                         self.request_page_detail(ui, &pid);
                     }
                 }
-                Err(e) => ui.error(format!("업로드 실패: {e}")),
+                Err(e) => {
+                    ui.tasks.finish("Upload attachment", Some(e.clone()));
+                    ui.error(format!("Upload failed: {e}"));
+                    self.notify_desktop("Atlassian Upload Failed", &e);
+                }
             },
             UiMsg::UpdateChecked(res) => {
-                ui.tasks.finish("업데이트 확인", None);
+                ui.tasks.finish("Check for updates", None);
                 match res {
                     Ok(info) => {
                         if info.update_available {
-                            ui.info(format!(
-                                "새 버전 {} 사용 가능 (현재 {})",
+                            let msg = format!(
+                                "New version {} available (current {})",
                                 info.latest_version, info.current_version
-                            ));
+                            );
+                            ui.info(&msg);
+                            self.notify_desktop("Atlassian Update Available", &msg);
                         } else {
-                            ui.success(format!("최신 버전입니다 ({})", info.current_version));
+                            ui.success(format!("Already up to date ({})", info.current_version));
                         }
                         ui.directory_ui.last_update = Some(info);
                     }
-                    Err(e) => ui.error(format!("업데이트 확인 실패: {e}")),
+                    Err(e) => {
+                        ui.error(format!("Update check failed: {e}"));
+                        self.notify_desktop("Atlassian Update Check Failed", &e);
+                    }
                 }
             }
         }
@@ -1860,25 +2245,25 @@ pub fn builtin_filters() -> Vec<SavedFilter> {
     vec![
         SavedFilter {
             id: "builtin:my-open".to_string(),
-            name: "내게 할당된 미해결".to_string(),
+            name: "My Open Issues".to_string(),
             jql: AtlassianClient::my_open_issues_jql().to_string(),
             builtin: true,
         },
         SavedFilter {
             id: "builtin:reported".to_string(),
-            name: "내가 보고한 이슈".to_string(),
+            name: "Reported by Me".to_string(),
             jql: "reporter = currentUser() ORDER BY updated DESC".to_string(),
             builtin: true,
         },
         SavedFilter {
             id: "builtin:recent".to_string(),
-            name: "최근 업데이트".to_string(),
+            name: "Recently Updated".to_string(),
             jql: "ORDER BY updated DESC".to_string(),
             builtin: true,
         },
         SavedFilter {
             id: "builtin:all-open".to_string(),
-            name: "미해결 전체".to_string(),
+            name: "All Open Issues".to_string(),
             jql: "statusCategory != Done ORDER BY updated DESC".to_string(),
             builtin: true,
         },
@@ -2080,14 +2465,14 @@ mod tests {
     fn confluence_tree_flattens_and_expands_children() {
         let root = PageSummary {
             id: "100".into(),
-            title: "아키텍처".into(),
+            title: "Architecture".into(),
             has_children: true,
             ..Default::default()
         };
         let child = PageSummary {
             id: "101".into(),
             parent_id: Some("100".into()),
-            title: "TUI 설계".into(),
+            title: "TUI Design".into(),
             has_children: false,
             ..Default::default()
         };
@@ -2106,7 +2491,7 @@ mod tests {
         assert_eq!(open[0].depth, 0);
         assert!(open[0].expanded);
         assert_eq!(open[1].depth, 1);
-        assert_eq!(open[1].page.title, "TUI 설계");
+        assert_eq!(open[1].page.title, "TUI Design");
     }
 
     #[tokio::test]
@@ -2139,7 +2524,7 @@ mod tests {
             &mut ui,
             CrossRefTarget::ConfluencePage {
                 page_id: "555".into(),
-                title: Some("설계 문서".into()),
+                title: Some("Design Doc".into()),
             },
         );
         assert_eq!(ui.active_tab, WorkspaceTab::Confluence);
@@ -2153,5 +2538,150 @@ mod tests {
         assert_eq!(ui.active_tab, WorkspaceTab::Issues);
         assert!(app.nav_history.is_empty());
         assert!(!app.pop_nav_history(&mut ui));
+    }
+
+    #[test]
+    fn ui_state_initializes_all_preferences_from_app_config() {
+        let cfg = AppConfig {
+            theme: crate::config::ThemePreset::Light,
+            density: DensityMode::Compact,
+            inline_images: false,
+            show_nav_rail: false,
+            notify: false,
+            image_protocol: ConfigImageProtocol::Sixel,
+            ..Default::default()
+        };
+        let ui = UiState::from_config_with_persona(&cfg, Persona::Jira);
+        assert_eq!(ui.density, DensityMode::Compact);
+        assert!(!ui.inline_images);
+        assert!(!ui.show_nav_rail);
+        assert!(!ui.notify);
+        assert_eq!(
+            ui.graphics_caps.protocol,
+            img_preview::TerminalImageProtocol::Sixel
+        );
+        assert_eq!(ui.theme.bg_sidebar, Theme::daylight_light().bg_sidebar);
+    }
+
+    #[tokio::test]
+    async fn optimistic_transition_assign_and_comment_rollback_on_failure() {
+        let cfg = AppConfig::default();
+        let auth = AuthManager::new("test");
+        let client = AtlassianClient::new(cfg.clone(), auth.clone()).unwrap();
+        let storage = Storage::open_in_memory().unwrap();
+        let (core_tx, _) = mpsc::unbounded_channel();
+        let sync_ctrl =
+            sync::spawn_sync_engine(cfg.clone(), client.clone(), storage.clone(), core_tx);
+        let (ui_tx, _ui_rx) = mpsc::unbounded_channel();
+
+        let mut app = AppState::new_with_persona(
+            cfg.clone(),
+            Persona::Jira,
+            auth,
+            client,
+            storage,
+            sync_ctrl,
+            ui_tx,
+        );
+        let mut ui = UiState::from_config_with_persona(&cfg, Persona::Jira);
+
+        let initial_status = IssueStatus {
+            id: "1".into(),
+            name: "To Do".into(),
+            category: StatusCategory::Todo,
+        };
+        let issue = IssueSummary {
+            key: "ATL-99".into(),
+            summary: "Optimistic rollback test".into(),
+            status: initial_status.clone(),
+            ..Default::default()
+        };
+        app.board_issues.push(issue.clone());
+        app.issues.push(issue.clone());
+        app.active_issue = Some(IssueDetail {
+            summary: issue,
+            ..Default::default()
+        });
+        app.me = Some(UserSummary {
+            id: "u1".into(),
+            display_name: "Alice".into(),
+            ..Default::default()
+        });
+
+        // 1. Optimistic transition -> rollback on failure
+        app.request_transition_issue(
+            &mut ui,
+            "ATL-99",
+            IssueTransition {
+                id: "31".into(),
+                name: "Done".into(),
+                to_status: IssueStatus {
+                    id: "3".into(),
+                    name: "Done".into(),
+                    category: StatusCategory::Done,
+                },
+            },
+        );
+        assert_eq!(
+            app.active_issue.as_ref().unwrap().summary.status.name,
+            "Done"
+        );
+        app.handle_ui_msg(
+            &mut ui,
+            UiMsg::IssueTransitionFailed {
+                key: "ATL-99".into(),
+                previous_status: Some(initial_status),
+                error: "HTTP 500".into(),
+            },
+        );
+        assert_eq!(
+            app.active_issue.as_ref().unwrap().summary.status.name,
+            "To Do"
+        );
+
+        // 2. Optimistic assign to me -> rollback on failure
+        app.request_assign_to_me(&mut ui, "ATL-99");
+        assert_eq!(
+            app.active_issue
+                .as_ref()
+                .unwrap()
+                .summary
+                .assignee
+                .as_ref()
+                .map(|u| u.display_name.as_str()),
+            Some("Alice")
+        );
+        app.handle_ui_msg(
+            &mut ui,
+            UiMsg::IssueAssignFailed {
+                key: "ATL-99".into(),
+                previous_assignee: Some(None),
+                task_label: "Assign ATL-99 to me".into(),
+                error: "HTTP 403".into(),
+            },
+        );
+        assert!(app.active_issue.as_ref().unwrap().summary.assignee.is_none());
+
+        // 3. Optimistic comment -> rollback on failure
+        app.request_add_comment(
+            &mut ui,
+            CommentTarget::Issue("ATL-99".into()),
+            "Testing optimistic comment".into(),
+        );
+        assert_eq!(app.active_issue.as_ref().unwrap().comments.len(), 1);
+        assert_eq!(app.active_issue.as_ref().unwrap().summary.comment_count, 1);
+        let opt_id = app.active_issue.as_ref().unwrap().comments[0].id.clone();
+        app.handle_ui_msg(
+            &mut ui,
+            UiMsg::CommentAdded {
+                issue_key: Some("ATL-99".into()),
+                page_id: None,
+                optimistic_id: Some(opt_id),
+                task_label: "Comment on ATL-99".into(),
+                result: Err("network error".into()),
+            },
+        );
+        assert!(app.active_issue.as_ref().unwrap().comments.is_empty());
+        assert_eq!(app.active_issue.as_ref().unwrap().summary.comment_count, 0);
     }
 }

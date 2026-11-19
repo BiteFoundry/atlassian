@@ -145,6 +145,28 @@ impl SettingsOverlay {
         self
     }
 
+    pub fn from_config(app: &AppState, ui: &UiState) -> Self {
+        let mut ov = Self::new();
+        ov.sync_from_caps(app, ui.graphics_caps);
+        ov
+    }
+
+    pub fn sync_from_caps(
+        &mut self,
+        app: &AppState,
+        graphics_caps: img_preview::TerminalGraphicsCaps,
+    ) {
+        let proto = match app.config.image_protocol {
+            config::ImageProtocolPreference::Auto => {
+                format!("Auto ({})", graphics_caps.protocol.label())
+            }
+            explicit => explicit.label().to_string(),
+        };
+        self.image_protocol_label = Some(proto);
+        self.density_label = app.config.density.label().to_string();
+        self.theme_label = app.config.theme.label().to_string();
+    }
+
     pub fn select(&mut self, index: usize) {
         if index < SETTINGS_COUNT {
             self.selected = index;
@@ -286,7 +308,9 @@ impl SettingsOverlay {
                     _ => OverlayOutcome::Handled,
                 }
             }
-            Action::CloseOverlay | Action::Input('q') => OverlayOutcome::Close,
+            Action::CloseOverlay | Action::OpenSettings | Action::Input('q') => {
+                OverlayOutcome::Close
+            }
             _ => OverlayOutcome::Handled,
         }
     }
@@ -389,6 +413,7 @@ fn protocol_label(protocol: TerminalGraphicsProtocol) -> &'static str {
     match protocol {
         TerminalGraphicsProtocol::Kitty => "Kitty",
         TerminalGraphicsProtocol::ITerm2 => "iTerm2",
+        TerminalGraphicsProtocol::Sixel => "Sixel",
         TerminalGraphicsProtocol::HalfBlocks => "Half-Blocks (24-bit)",
     }
 }

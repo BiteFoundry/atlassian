@@ -48,9 +48,16 @@ pub enum Action {
     CheckUpdate,
     ToggleInlineImages,
     ToggleNavRail,
+    ToggleNotify,
+    ToggleDensity,
+    CycleTheme,
+    CycleImageProtocol,
 
     // Overlays
     OpenCommandPalette,
+    OpenSettings,
+    OpenContextMenu,
+    OpenAttachments,
     OpenHelp,
     CloseOverlay,
     ConfirmYes,
@@ -68,6 +75,7 @@ pub enum Action {
     CursorEnd,
     InsertNewline,
     Paste(String),
+    PasteClipboard,
     Submit,
     ExternalEditor,
     NextField,
@@ -75,6 +83,7 @@ pub enum Action {
 
     // Mouse
     MouseClick { row: u16, col: u16 },
+    MouseRightClick { row: u16, col: u16 },
     LoadPreviewImage,
     DownloadPreviewImage,
 }
@@ -115,12 +124,28 @@ impl Keymap {
             return Some(Action::OpenCommandPalette);
         }
 
+        if ctrl && key.code == KeyCode::Char(',') {
+            return Some(Action::OpenSettings);
+        }
+
+        if ctrl && matches!(key.code, KeyCode::Char('b') | KeyCode::Char('B')) && !has_overlay {
+            return Some(Action::ToggleNavRail);
+        }
+
+        if alt && matches!(key.code, KeyCode::Char('m') | KeyCode::Char('M')) && !has_overlay {
+            return Some(Action::OpenContextMenu);
+        }
+
         if ctrl && matches!(key.code, KeyCode::Char('r') | KeyCode::Char('R')) && !has_overlay {
             return Some(Action::RemoteSearch);
         }
 
         if ctrl && matches!(key.code, KeyCode::Char('e') | KeyCode::Char('E')) && accepts_text {
             return Some(Action::ExternalEditor);
+        }
+
+        if ctrl && matches!(key.code, KeyCode::Char('v') | KeyCode::Char('V')) && accepts_text {
+            return Some(Action::PasteClipboard);
         }
 
         if (ctrl && matches!(key.code, KeyCode::Char('s') | KeyCode::Char('S')))
@@ -227,6 +252,7 @@ impl Keymap {
             KeyCode::Char('m') => Some(Action::OpenTransition),
             KeyCode::Char('i') => Some(Action::AssignToMe),
             KeyCode::Char('a') => Some(Action::OpenAssignee),
+            KeyCode::Char('A') => Some(Action::OpenAttachments),
             KeyCode::Char('c') => Some(Action::OpenComment),
             KeyCode::Char('e') => Some(Action::EditItem),
             KeyCode::Char('n') => Some(Action::NewItem),
@@ -241,6 +267,7 @@ impl Keymap {
             KeyCode::Char('p') => Some(Action::TogglePin),
             KeyCode::Char('r') => Some(Action::SyncAll),
             KeyCode::Char('U') => Some(Action::CheckUpdate),
+            KeyCode::Char('.') => Some(Action::OpenContextMenu),
             KeyCode::Char(':') => Some(Action::OpenCommandPalette),
             KeyCode::Char('?') => Some(Action::OpenHelp),
             KeyCode::Char('q') => Some(Action::Quit),
@@ -288,6 +315,32 @@ mod tests {
             km.resolve(ctrl(KeyCode::Char('4')), WorkspaceTab::Board, PaneFocus::Main, false, false),
             Some(Action::SwitchTab(3))
         );
+        assert_eq!(
+            km.resolve(ctrl(KeyCode::Char(',')), WorkspaceTab::Board, PaneFocus::Main, false, false),
+            Some(Action::OpenSettings)
+        );
+        assert_eq!(
+            km.resolve(ctrl(KeyCode::Char('b')), WorkspaceTab::Board, PaneFocus::Main, false, false),
+            Some(Action::ToggleNavRail)
+        );
+        assert_eq!(
+            km.resolve(key(KeyCode::Char('.')), WorkspaceTab::Board, PaneFocus::Main, false, false),
+            Some(Action::OpenContextMenu)
+        );
+        assert_eq!(
+            km.resolve(
+                KeyEvent::new(KeyCode::Char('m'), KeyModifiers::ALT),
+                WorkspaceTab::Board,
+                PaneFocus::Main,
+                false,
+                false
+            ),
+            Some(Action::OpenContextMenu)
+        );
+        assert_eq!(
+            km.resolve(key(KeyCode::Char('A')), WorkspaceTab::Issues, PaneFocus::Main, false, false),
+            Some(Action::OpenAttachments)
+        );
     }
 
     #[test]
@@ -304,6 +357,10 @@ mod tests {
         assert_eq!(
             km.resolve(ctrl(KeyCode::Char('e')), WorkspaceTab::Issues, PaneFocus::Main, true, true),
             Some(Action::ExternalEditor)
+        );
+        assert_eq!(
+            km.resolve(ctrl(KeyCode::Char('v')), WorkspaceTab::Issues, PaneFocus::Main, true, true),
+            Some(Action::PasteClipboard)
         );
     }
 }

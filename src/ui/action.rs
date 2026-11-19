@@ -1,6 +1,7 @@
 //! Action dispatcher for keyboard, mouse, overlays, and workspace tabs.
 
 use crate::{
+    config::{self, ImageProtocolPreference as ConfigImageProtocol},
     models::{CrossRefTarget, SearchHitKind},
     sync::SyncCommand,
     ui::{
@@ -8,12 +9,16 @@ use crate::{
         hitmap::HitTarget,
         keymap::Action,
         overlays::{
+            self,
+            attachments::{AttachmentCommand, AttachmentsOverlay},
             comment::{CommentOverlay, CommentTarget},
+            context_menu::{ContextMenuAction, ContextMenuOverlay},
             cross_link::CrossLinkOverlay,
             image_preview::ImagePreviewOverlay,
             issue_form::IssueFormOverlay,
             page_form::PageFormOverlay,
             path_input::{PathInputOverlay, UploadTarget},
+            settings::{SettingsCommand, SettingsOverlay},
             Overlay, OverlayOutcome,
         },
     },
@@ -29,35 +34,45 @@ pub fn dispatch(action: Action, app: &mut AppState, ui: &mut UiState) -> bool {
 
     // Handle active overlay first (except mouse clicks outside/on items).
     if !ui.overlays.is_empty() {
-        if let Action::MouseClick { row, col } = action {
-            if let Some(HitTarget::OverlayItem(idx)) = ui.hitmap.hit(row, col) {
-                return handle_overlay_item_click(idx, app, ui);
-            }
-            return false;
-        }
-
-        let outcome = ui.overlays.last_mut().map(|o| o.handle(&action));
-        if let Some(out) = outcome {
-            match out {
-                OverlayOutcome::Handled => return false,
-                OverlayOutcome::Close => {
+        match action {
+            Action::MouseClick { row, col } => {
+                if let Some(HitTarget::OverlayItem(idx)) = ui.hitmap.hit(row, col) {
+                    return handle_overlay_item_click(idx, app, ui);
+                }
+                if matches!(ui.overlays.last(), Some(Overlay::ContextMenu(_))) {
                     ui.pop_overlay();
-                    return false;
                 }
-                OverlayOutcome::Dispatch(sub) => {
-                    return handle_overlay_dispatch(sub, app, ui);
-                }
-                OverlayOutcome::CloseAndDispatch(sub) => {
-                    ui.pop_overlay();
-                    return dispatch(sub, app, ui);
-                }
+                return false;
             }
+            Action::MouseRightClick { row, col } => {
+                if matches!(ui.overlays.last(), Some(Overlay::ContextMenu(_))) {
+                    ui.pop_overlay();
+                    return handle_mouse_right_click(row, col, app, ui);
+                }
+                return false;
+            }
+            Action::PasteClipboard => {
+                if let Some(top) = ui.overlays.last_mut() {
+                    if top.paste_from_clipboard() {
+                        if let Overlay::Assignee(ov) = top {
+                            let key = ov.project_or_issue_key.clone();
+                            let query = ov.query.text.clone();
+                            app.request_assignable_users(&key, &query);
+                        }
+                    }
+                }
+                return false;
+            }
+            other => return dispatch_active_overlay(other, app, ui),
         }
     }
 
     // Mouse click dispatch outside overlays.
     if let Action::MouseClick { row, col } = action {
         return handle_mouse_click(row, col, app, ui);
+    }
+    if let Action::MouseRightClick { row, col } = action {
+        return handle_mouse_right_click(row, col, app, ui);
     }
 
     // Inline text bar input (JQL / Local Filter / Unified Search).
@@ -75,6 +90,16 @@ pub fn dispatch(action: Action, app: &mut AppState, ui: &mut UiState) -> bool {
                 crate::ui::overlays::command_palette::CommandPalette::new(),
             ));
         }
+        Action::OpenSettings => {
+            ui.push_overlay(Overlay::Settings(SettingsOverlay::from_config(app, ui)));
+        }
+        Action::OpenContextMenu => {
+            let anchor = (ui.term_width / 3, ui.term_height / 3);
+            open_context_menu_at(anchor, app, ui);
+        }
+        Action::OpenAttachments => {
+            open_attachments(app, ui, None);
+        }
         Action::OpenHelp => {
             ui.push_overlay(Overlay::Help);
         }
@@ -84,25 +109,33 @@ pub fn dispatch(action: Action, app: &mut AppState, ui: &mut UiState) -> bool {
             if ui.active_tab == WorkspaceTab::MyWork {
                 app.request_my_work_refresh(ui);
             }
-            ui.info("전체 동기화를 요청했습니다");
+            ui.info("Requested full workspace sync");
         }
         Action::CheckUpdate => {
             app.request_check_update(ui);
-            ui.info("GitHub 릴리스 업데이트 확인 중…");
+            ui.info("Checking GitHub releases for updates…");
+        }
+        Action::ToggleNotify => {
+            apply_settings_command(SettingsCommand::ToggleNotifications, app, ui);
+        }
+        Action::ToggleDensity => {
+            apply_settings_command(SettingsCommand::ToggleViewDensity, app, ui);
+        }
+        Action::CycleTheme => {
+            apply_settings_command(SettingsCommand::CycleColorTheme, app, ui);
+        }
+        Action::CycleImageProtocol => {
+            apply_settings_command(SettingsCommand::CycleImageProtocol, app, ui);
         }
         Action::ToggleInlineImages => {
-            ui.inline_images = !ui.inline_images;
-            ui.info(format!(
-                "인라인 이미지 썸네일: {}",
-                if ui.inline_images { "ON" } else { "OFF" }
-            ));
+            apply_settings_command(SettingsCommand::ToggleInlineImages, app, ui);
         }
         Action::ToggleNavRail => {
-            ui.show_nav_rail = !ui.show_nav_rail;
+            apply_settings_command(SettingsCommand::ToggleLeftSidebar, app, ui);
         }
         Action::PopNavHistory => {
             if !app.pop_nav_history(ui) {
-                ui.info("이전 탐색 히스토리가 없습니다");
+                ui.info("No previous navigation history");
             }
         }
         Action::OpenCrossLinks => {
@@ -118,7 +151,7 @@ pub fn dispatch(action: Action, app: &mut AppState, ui: &mut UiState) -> bool {
             if let Some(key) = app.selected_issue_key(ui) {
                 app.request_assign_to_me(ui, &key);
             } else {
-                ui.info("선택된 Jira 이슈가 없습니다");
+                ui.info("No Jira issue selected");
             }
         }
         Action::OpenAssignee => {
@@ -130,7 +163,7 @@ pub fn dispatch(action: Action, app: &mut AppState, ui: &mut UiState) -> bool {
                     .unwrap_or("");
                 app.request_open_assignee_picker(ui, &key, proj);
             } else {
-                ui.info("선택된 Jira 이슈가 없습니다");
+                ui.info("No Jira issue selected");
             }
         }
         Action::OpenComment => open_comment(app, ui),
@@ -276,6 +309,16 @@ fn handle_inline_text_action(action: Action, app: &mut AppState, ui: &mut UiStat
         return false;
     }
 
+    if action == Action::PasteClipboard {
+        if let Some(text) = overlays::read_clipboard_text() {
+            let cleaned = overlays::sanitize_single_line(&text);
+            if !cleaned.is_empty() {
+                return handle_inline_text_action(Action::Paste(cleaned), app, ui);
+            }
+        }
+        return false;
+    }
+
     if ui.issue_ui.local_filter_active {
         let buf = &mut ui.issue_ui.local_filter;
         match action {
@@ -312,7 +355,7 @@ fn handle_inline_text_action(action: Action, app: &mut AppState, ui: &mut UiStat
                 Action::Submit => {
                     let jql = buf.text.trim().to_string();
                     if !jql.is_empty() {
-                        app.request_jql_search(ui, jql, "사용자 JQL".to_string());
+                        app.request_jql_search(ui, jql, "Custom JQL".to_string());
                     }
                     ui.focus = PaneFocus::Main;
                 }
@@ -369,6 +412,209 @@ fn handle_inline_text_action(action: Action, app: &mut AppState, ui: &mut UiStat
     false
 }
 
+fn dispatch_active_overlay(action: Action, app: &mut AppState, ui: &mut UiState) -> bool {
+    let outcome = ui.overlays.last_mut().map(|o| o.handle(&action));
+
+    // Intercept SettingsOverlay pending commands so config.toml and live UiState stay in sync.
+    if let Some(Overlay::Settings(ov)) = ui.overlays.last_mut() {
+        if let Some(cmd) = ov.pending_command.take() {
+            if cmd == SettingsCommand::OpenKeyboardShortcuts {
+                ui.pop_overlay();
+                ui.push_overlay(Overlay::Help);
+            } else {
+                apply_settings_command(cmd, app, ui);
+            }
+            return false;
+        }
+    }
+
+    // Intercept AttachmentsOverlay pending commands before popping so selected index/URL is preserved.
+    if let Some(Overlay::Attachments(ov)) = ui.overlays.last_mut() {
+        if let Some(cmd) = ov.pending_command.take() {
+            match cmd {
+                AttachmentCommand::PreviewImage(idx) => {
+                    let owner = ov.owner_label.clone();
+                    let items = ov.items.clone();
+                    ui.pop_overlay();
+                    open_image_preview_with(app, ui, owner, &items, Some(idx));
+                }
+                AttachmentCommand::Download(idx) => {
+                    if let Some(att) = ov.items.get(idx).cloned() {
+                        app.request_download_attachment(ui, att);
+                    }
+                }
+                AttachmentCommand::Upload => {
+                    ui.pop_overlay();
+                    open_upload_attachment(app, ui);
+                }
+                AttachmentCommand::OpenUrl(url) => {
+                    if let Err(err) = open::that(&url) {
+                        ui.error(format!("Failed to open browser: {err}"));
+                    }
+                }
+            }
+            return false;
+        }
+    }
+
+    if let Some(out) = outcome {
+        match out {
+            OverlayOutcome::Handled => return false,
+            OverlayOutcome::Close => {
+                close_top_overlay_and_save_draft(app, ui);
+                return false;
+            }
+            OverlayOutcome::Dispatch(sub) => {
+                return handle_overlay_dispatch(sub, app, ui);
+            }
+            OverlayOutcome::CloseAndDispatch(sub) => {
+                close_top_overlay_and_save_draft(app, ui);
+                return dispatch(sub, app, ui);
+            }
+        }
+    }
+    false
+}
+
+fn close_top_overlay_and_save_draft(app: &mut AppState, ui: &mut UiState) {
+    let Some(top) = ui.overlays.pop() else {
+        return;
+    };
+    match top {
+        Overlay::Comment(ov) => {
+            let key = ov.draft_key();
+            if ov.has_unsent_content() {
+                app.drafts.set(key, ov.draft_text());
+                let _ = app.save_drafts();
+                ui.info("Saved comment draft");
+            } else if app.drafts.remove(&key).is_some() {
+                let _ = app.save_drafts();
+            }
+        }
+        Overlay::IssueForm(ov) => {
+            let key = ov.draft_key();
+            if ov.has_unsent_content() {
+                app.drafts.set(key, ov.to_draft_json());
+                let _ = app.save_drafts();
+                ui.info("Saved issue draft");
+            } else if app.drafts.remove(&key).is_some() {
+                let _ = app.save_drafts();
+            }
+        }
+        Overlay::PageForm(ov) => {
+            let key = ov.draft_key();
+            if ov.has_unsent_content() {
+                app.drafts.set(key, ov.to_draft_json());
+                let _ = app.save_drafts();
+                ui.info("Saved page draft");
+            } else if app.drafts.remove(&key).is_some() {
+                let _ = app.save_drafts();
+            }
+        }
+        _ => {}
+    }
+}
+
+fn clear_draft_key(app: &mut AppState, key: &str) {
+    if app.drafts.remove(key).is_some() {
+        let _ = app.save_drafts();
+    }
+}
+
+fn sync_open_settings_overlay(app: &AppState, ui: &mut UiState) {
+    let caps = ui.graphics_caps;
+    for overlay in &mut ui.overlays {
+        if let Overlay::Settings(ov) = overlay {
+            ov.sync_from_caps(app, caps);
+        }
+    }
+}
+
+pub fn apply_settings_command(cmd: SettingsCommand, app: &mut AppState, ui: &mut UiState) {
+    let mut mutated = false;
+    match cmd {
+        SettingsCommand::ToggleNotifications => {
+            app.config.notify = !app.config.notify;
+            app.sync_ui_from_config(ui);
+            mutated = true;
+            ui.info(format!(
+                "Desktop notifications: {}",
+                if app.config.notify { "On" } else { "Off" }
+            ));
+        }
+        SettingsCommand::ToggleLeftSidebar => {
+            app.config.show_nav_rail = !app.config.show_nav_rail;
+            app.sync_ui_from_config(ui);
+            mutated = true;
+            ui.info(format!(
+                "Left sidebar: {}",
+                if ui.show_nav_rail { "Shown" } else { "Hidden" }
+            ));
+        }
+        SettingsCommand::ToggleInlineImages => {
+            app.config.inline_images = !app.config.inline_images;
+            app.sync_ui_from_config(ui);
+            mutated = true;
+            ui.info(format!(
+                "Inline image previews: {}",
+                if ui.inline_images { "On" } else { "Off" }
+            ));
+        }
+        SettingsCommand::CycleImageProtocol => {
+            app.config.image_protocol = app.config.image_protocol.next();
+            app.sync_ui_from_config(ui);
+            mutated = true;
+            let detail = match app.config.image_protocol {
+                ConfigImageProtocol::Auto => {
+                    format!("Auto ({})", ui.graphics_caps.protocol.label())
+                }
+                explicit => explicit.label().to_string(),
+            };
+            ui.info(format!("Image protocol: {detail}"));
+        }
+        SettingsCommand::ToggleViewDensity => {
+            app.config.density = app.config.density.toggle();
+            app.sync_ui_from_config(ui);
+            mutated = true;
+            ui.info(format!("View density: {}", app.config.density.label()));
+        }
+        SettingsCommand::CycleColorTheme => {
+            app.config.theme = app.config.theme.next();
+            app.sync_ui_from_config(ui);
+            mutated = true;
+            ui.info(format!("Color theme: {}", app.config.theme.label()));
+        }
+        SettingsCommand::ShowDownloadFolder => {
+            ui.info(format!(
+                "Download folder: {}",
+                app.config.resolved_download_dir().display()
+            ));
+        }
+        SettingsCommand::OpenKeyboardShortcuts => {
+            ui.push_overlay(Overlay::Help);
+        }
+        SettingsCommand::ShowSiteUrl => {
+            ui.info(format!("Site URL: {}", app.site_display()));
+        }
+        SettingsCommand::ShowDeploymentKind => {
+            ui.info(format!("Deployment: {}", app.config.deployment.as_str()));
+        }
+        SettingsCommand::ShowConfigFilePath => {
+            ui.info(format!(
+                "Config file: {}",
+                config::config_file_path().display()
+            ));
+        }
+    }
+
+    if mutated {
+        if let Err(err) = app.save_config() {
+            ui.error(format!("Failed to save config.toml: {err}"));
+        }
+        sync_open_settings_overlay(app, ui);
+    }
+}
+
 fn handle_overlay_dispatch(action: Action, app: &mut AppState, ui: &mut UiState) -> bool {
     match action {
         Action::ExternalEditor => {
@@ -400,7 +646,9 @@ fn handle_overlay_dispatch(action: Action, app: &mut AppState, ui: &mut UiState)
             if let Some(Overlay::ImagePreview(ov)) = ui.overlays.last() {
                 if let Some(att) = ov.current() {
                     if !att.content_url.is_empty() {
-                        let _ = open::that(&att.content_url);
+                        if let Err(err) = open::that(&att.content_url) {
+                            ui.error(format!("Failed to open browser: {err}"));
+                        }
                     }
                 }
             }
@@ -421,12 +669,18 @@ fn handle_overlay_dispatch(action: Action, app: &mut AppState, ui: &mut UiState)
                     }
                 }
                 Overlay::IssueForm(ov) => {
+                    let draft_key = ov.draft_key();
+                    clear_draft_key(app, &draft_key);
                     app.request_submit_issue_form(ui, &ov);
                 }
                 Overlay::PageForm(ov) => {
+                    let draft_key = ov.draft_key();
+                    clear_draft_key(app, &draft_key);
                     app.request_submit_page_form(ui, &ov);
                 }
                 Overlay::Comment(ov) => {
+                    let draft_key = ov.draft_key();
+                    clear_draft_key(app, &draft_key);
                     app.request_submit_comment(ui, &ov);
                 }
                 Overlay::CrossLink(ov) => {
@@ -436,6 +690,31 @@ fn handle_overlay_dispatch(action: Action, app: &mut AppState, ui: &mut UiState)
                 }
                 Overlay::PathInput(ov) => {
                     app.request_upload_attachment(ui, &ov);
+                }
+                Overlay::ContextMenu(ov) => {
+                    if let Some(cmd) = ov.selected_command().cloned() {
+                        match cmd {
+                            ContextMenuAction::Action(act) => return dispatch(act, app, ui),
+                            ContextMenuAction::OpenAttachments => {
+                                open_attachments(app, ui, None);
+                            }
+                            ContextMenuAction::OpenSettings => {
+                                ui.push_overlay(Overlay::Settings(SettingsOverlay::from_config(
+                                    app, ui,
+                                )));
+                            }
+                            ContextMenuAction::CopyText { label, value } => {
+                                if value.trim().is_empty() {
+                                    ui.info(format!("{label} is empty"));
+                                } else {
+                                    match overlays::copy_to_clipboard(&value) {
+                                        Ok(()) => ui.success(format!("Copied {label}: {value}")),
+                                        Err(err) => ui.error(err),
+                                    }
+                                }
+                            }
+                        }
+                    }
                 }
                 _ => {}
             }
@@ -447,15 +726,67 @@ fn handle_overlay_dispatch(action: Action, app: &mut AppState, ui: &mut UiState)
 
 fn handle_overlay_item_click(idx: usize, app: &mut AppState, ui: &mut UiState) -> bool {
     if let Some(top) = ui.overlays.last_mut() {
-        match top {
-            Overlay::Transition(ov) => ov.selected = idx,
-            Overlay::Assignee(ov) => ov.selected = idx,
-            Overlay::CrossLink(ov) => ov.selected = idx,
-            Overlay::CommandPalette(ov) => ov.selected = idx,
-            _ => return false,
+        top.select(idx);
+    }
+    dispatch_active_overlay(Action::Activate, app, ui)
+}
+
+fn handle_mouse_right_click(row: u16, col: u16, app: &mut AppState, ui: &mut UiState) -> bool {
+    if let Some(target) = ui.hitmap.hit(row, col) {
+        match target {
+            HitTarget::KanbanCard { col: c, row: r } => {
+                ui.focus = PaneFocus::Main;
+                ui.board_ui.selected_col = c;
+                ui.board_ui.selected_row = r;
+                if let Some(issue) = app.selected_board_issue(ui) {
+                    app.request_issue_detail(ui, &issue.key);
+                }
+            }
+            HitTarget::IssueRow(idx) => {
+                ui.focus = PaneFocus::Nav;
+                ui.issue_ui.nav_section = 1;
+                ui.issue_ui.selected_issue = idx;
+                let list = app.filtered_issues(ui);
+                if let Some(it) = list.get(idx) {
+                    app.request_issue_detail(ui, &it.key);
+                }
+            }
+            HitTarget::MyWorkIssue(idx) => {
+                ui.my_work_ui.active_column = 0;
+                ui.my_work_ui.selected_issue = idx;
+            }
+            HitTarget::MyWorkPage(idx) => {
+                ui.my_work_ui.active_column = 1;
+                ui.my_work_ui.selected_page = idx;
+            }
+            HitTarget::TreeRow(idx) => {
+                ui.focus = PaneFocus::Nav;
+                ui.confluence_ui.nav_section = 1;
+                ui.confluence_ui.selected_tree_row = idx;
+                let tree = app.current_confluence_tree(ui);
+                if let Some(row_item) = tree.get(idx) {
+                    let page_id = row_item.page.id.clone();
+                    app.request_page_detail(ui, &page_id);
+                }
+            }
+            _ => {}
         }
     }
-    handle_overlay_dispatch(Action::Submit, app, ui)
+    open_context_menu_at((col, row), app, ui);
+    false
+}
+
+fn open_context_menu_at(anchor: (u16, u16), app: &AppState, ui: &mut UiState) {
+    let menu = ContextMenuOverlay::for_active_context(anchor, app, ui);
+    ui.push_overlay(Overlay::ContextMenu(menu));
+}
+
+fn open_attachments(app: &AppState, ui: &mut UiState, preferred_idx: Option<usize>) {
+    let mut ov = AttachmentsOverlay::from_app(app, ui);
+    if let Some(idx) = preferred_idx {
+        ov.select(idx);
+    }
+    ui.push_overlay(Overlay::Attachments(ov));
 }
 
 fn handle_mouse_click(row: u16, col: u16, app: &mut AppState, ui: &mut UiState) -> bool {
@@ -588,7 +919,8 @@ fn handle_mouse_click(row: u16, col: u16, app: &mut AppState, ui: &mut UiState) 
         HitTarget::NavPane => {
             ui.focus = PaneFocus::Nav;
         }
-        HitTarget::Button(_) | HitTarget::Attachment(_) | HitTarget::OverlayItem(_) => {}
+        HitTarget::Attachment(idx) => open_attachments(app, ui, Some(idx)),
+        HitTarget::Button(_) | HitTarget::OverlayItem(_) => {}
     }
     false
 }
@@ -871,26 +1203,38 @@ fn open_transition(app: &AppState, ui: &mut UiState) {
     if let Some(key) = app.selected_issue_key(ui) {
         app.request_open_transitions(ui, &key);
     } else {
-        ui.info("상태를 전환할 Jira 이슈를 먼저 선택하세요");
+        ui.info("Select a Jira issue to transition first");
     }
 }
 
 fn open_comment(app: &AppState, ui: &mut UiState) {
     if ui.active_tab == WorkspaceTab::Confluence {
         if let Some(page) = &app.active_page {
-            ui.push_overlay(Overlay::Comment(CommentOverlay::new(CommentTarget::Page {
+            let target = CommentTarget::Page {
                 page_id: page.summary.id.clone(),
                 title: page.summary.title.clone(),
-            })));
+            };
+            let overlay = if let Some(saved) = app.drafts.get(&target.draft_key()) {
+                ui.info("Restored saved comment draft");
+                CommentOverlay::with_draft(target, saved)
+            } else {
+                CommentOverlay::new(target)
+            };
+            ui.push_overlay(Overlay::Comment(overlay));
             return;
         }
     }
     if let Some(key) = app.selected_issue_key(ui) {
-        ui.push_overlay(Overlay::Comment(CommentOverlay::new(CommentTarget::Issue(
-            key,
-        ))));
+        let target = CommentTarget::Issue(key);
+        let overlay = if let Some(saved) = app.drafts.get(&target.draft_key()) {
+            ui.info("Restored saved comment draft");
+            CommentOverlay::with_draft(target, saved)
+        } else {
+            CommentOverlay::new(target)
+        };
+        ui.push_overlay(Overlay::Comment(overlay));
     } else {
-        ui.info("댓글을 작성할 이슈 또는 페이지를 먼저 선택하세요");
+        ui.info("Select an issue or page to comment on first");
     }
 }
 
@@ -902,14 +1246,17 @@ fn open_new_item(app: &AppState, ui: &mut UiState) {
             .or_else(|| app.config.default_space_key.clone())
             .unwrap_or_default();
         if space_key.is_empty() {
-            ui.info("Confluence 스페이스를 먼저 선택하세요");
+            ui.info("Select a Confluence space first");
             return;
         }
         let parent_id = app.active_page.as_ref().map(|p| p.summary.id.clone());
-        ui.push_overlay(Overlay::PageForm(PageFormOverlay::new_page(
-            space_key,
-            parent_id,
-        )));
+        let mut form = PageFormOverlay::new_page(space_key, parent_id);
+        if let Some(saved) = app.drafts.get(&form.draft_key()) {
+            if form.apply_draft_raw(saved) {
+                ui.info("Restored saved page draft");
+            }
+        }
+        ui.push_overlay(Overlay::PageForm(form));
     } else {
         let default_proj = app
             .active_board(ui)
@@ -917,23 +1264,39 @@ fn open_new_item(app: &AppState, ui: &mut UiState) {
             .or_else(|| app.config.default_project.clone())
             .or_else(|| app.projects.first().map(|p| p.key.clone()))
             .unwrap_or_default();
-        ui.push_overlay(Overlay::IssueForm(IssueFormOverlay::new_issue(
-            &default_proj,
-        )));
+        let mut form = IssueFormOverlay::new_issue(&default_proj);
+        if let Some(saved) = app.drafts.get(&form.draft_key()) {
+            if form.apply_draft_raw(saved) {
+                ui.info("Restored saved issue draft");
+            }
+        }
+        ui.push_overlay(Overlay::IssueForm(form));
     }
 }
 
 fn open_edit_item(app: &AppState, ui: &mut UiState) {
     if ui.active_tab == WorkspaceTab::Confluence {
         if let Some(page) = &app.active_page {
-            ui.push_overlay(Overlay::PageForm(PageFormOverlay::edit_page(page)));
+            let mut form = PageFormOverlay::edit_page(page);
+            if let Some(saved) = app.drafts.get(&form.draft_key()) {
+                if form.apply_draft_raw(saved) {
+                    ui.info("Restored saved page edit draft");
+                }
+            }
+            ui.push_overlay(Overlay::PageForm(form));
         } else {
-            ui.info("편집할 Confluence 페이지를 먼저 선택하세요");
+            ui.info("Select a Confluence page to edit first");
         }
     } else if let Some(issue) = &app.active_issue {
-        ui.push_overlay(Overlay::IssueForm(IssueFormOverlay::edit_issue(issue)));
+        let mut form = IssueFormOverlay::edit_issue(issue);
+        if let Some(saved) = app.drafts.get(&form.draft_key()) {
+            if form.apply_draft_raw(saved) {
+                ui.info("Restored saved issue edit draft");
+            }
+        }
+        ui.push_overlay(Overlay::IssueForm(form));
     } else {
-        ui.info("편집할 Jira 이슈를 먼저 선택하세요");
+        ui.info("Select a Jira issue to edit first");
     }
 }
 
@@ -951,7 +1314,7 @@ fn open_upload_attachment(app: &AppState, ui: &mut UiState) {
             UploadTarget::Issue(key),
         )));
     } else {
-        ui.info("파일을 첨부할 이슈 또는 페이지를 먼저 선택하세요");
+        ui.info("Select an issue or page to attach a file first");
     }
 }
 
@@ -960,17 +1323,32 @@ fn download_first_attachment(app: &AppState, ui: &mut UiState) {
     if let Some(first) = atts.first().cloned() {
         app.request_download_attachment(ui, first);
     } else {
-        ui.info("다운로드할 첨부파일이 없습니다");
+        ui.info("No attachments to download");
     }
 }
 
 fn open_image_preview(app: &AppState, ui: &mut UiState) {
     let (label, atts) = app.current_attachments(ui);
-    if let Some(ov) = ImagePreviewOverlay::from_attachments(label, &atts, None) {
+    open_image_preview_with(app, ui, label, &atts, None);
+}
+
+fn open_image_preview_with(
+    app: &AppState,
+    ui: &mut UiState,
+    label: String,
+    atts: &[crate::models::AttachmentItem],
+    preferred_idx: Option<usize>,
+) {
+    if let Some(mut ov) = ImagePreviewOverlay::from_attachments(label, atts, preferred_idx) {
+        ov.apply_graphics_caps(ui.graphics_caps);
+        if app.config.image_protocol != ConfigImageProtocol::Auto {
+            ov.protocol = ui.graphics_caps.protocol;
+            ov.protocol_overridden = true;
+        }
         ui.push_overlay(Overlay::ImagePreview(ov));
         app.request_load_preview_image(ui);
     } else {
-        ui.info("미리볼 이미지 첨부파일이 없습니다");
+        ui.info("No image attachments to preview");
     }
 }
 
@@ -982,10 +1360,10 @@ fn open_in_browser(app: &AppState, ui: &mut UiState) {
     };
     if let Some(u) = url.filter(|s| !s.trim().is_empty()) {
         if let Err(err) = open::that(&u) {
-            ui.error(format!("브라우저 열기 실패: {err}"));
+            ui.error(format!("Failed to open browser: {err}"));
         }
     } else {
-        ui.info("열 수 있는 웹 URL이 없습니다");
+        ui.info("No web URL available to open");
     }
 }
 
@@ -998,7 +1376,7 @@ fn toggle_pin(app: &mut AppState, ui: &mut UiState) {
                 ui.info(format!(
                     "{} {}",
                     p.key,
-                    if p.pinned { "고정됨" } else { "고정 해제" }
+                    if p.pinned { "pinned" } else { "unpinned" }
                 ));
             }
         } else if let Some(s) = app.spaces.get_mut(ui.directory_ui.selected_space) {
@@ -1007,7 +1385,7 @@ fn toggle_pin(app: &mut AppState, ui: &mut UiState) {
             ui.info(format!(
                 "{} {}",
                 s.key,
-                if s.pinned { "고정됨" } else { "고정 해제" }
+                if s.pinned { "pinned" } else { "unpinned" }
             ));
         }
     }
@@ -1029,5 +1407,251 @@ fn apply_scroll(cur: u16, delta: i32) -> u16 {
         cur.saturating_sub((-delta) as u16)
     } else {
         cur.saturating_add(delta as u16)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{
+        atlassian::AtlassianClient,
+        auth::AuthManager,
+        config::{AppConfig, DensityMode, DraftStore, Persona, ThemePreset},
+        models::{AttachmentItem, IssueDetail, IssueSummary, PageDetail, PageSummary, SpaceSummary},
+        storage::Storage,
+        sync,
+    };
+    use tokio::sync::mpsc;
+
+    fn test_app_and_ui() -> (AppState, UiState, tempfile::TempDir) {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = AppConfig {
+            site_url: "https://acme.atlassian.net".into(),
+            default_project: Some("ATL".into()),
+            ..Default::default()
+        };
+        let auth = AuthManager::new("test");
+        let client = AtlassianClient::new(cfg.clone(), auth.clone()).unwrap();
+        let storage = Storage::open_in_memory().unwrap();
+        let (core_tx, _) = mpsc::unbounded_channel();
+        let sync_ctrl =
+            sync::spawn_sync_engine(cfg.clone(), client.clone(), storage.clone(), core_tx);
+        let (ui_tx, _) = mpsc::unbounded_channel();
+
+        let mut app = AppState::new_with_persona(
+            cfg.clone(),
+            Persona::Jira,
+            auth,
+            client,
+            storage,
+            sync_ctrl,
+            ui_tx,
+        );
+        app.config_path_override = Some(dir.path().join("config.toml"));
+        app.drafts_path_override = Some(dir.path().join("drafts.json"));
+
+        let mut issue = IssueSummary {
+            key: "ATL-42".into(),
+            project_key: "ATL".into(),
+            summary: "Integrate overlays".into(),
+            web_url: "https://acme.atlassian.net/browse/ATL-42".into(),
+            ..Default::default()
+        };
+        issue.status.name = "To Do".into();
+        app.board_issues.push(issue.clone());
+        app.issues.push(issue.clone());
+        app.active_issue = Some(IssueDetail {
+            summary: issue,
+            attachments: vec![
+                AttachmentItem {
+                    id: "att-img".into(),
+                    filename: "arch.png".into(),
+                    mime_type: "image/png".into(),
+                    size: 1024,
+                    author_name: Some("Alice".into()),
+                    created_at: String::new(),
+                    content_url: "https://acme.atlassian.net/att/1".into(),
+                    thumbnail_url: None,
+                },
+                AttachmentItem {
+                    id: "att-pdf".into(),
+                    filename: "spec.pdf".into(),
+                    mime_type: "application/pdf".into(),
+                    size: 4096,
+                    author_name: Some("Bob".into()),
+                    created_at: String::new(),
+                    content_url: "https://acme.atlassian.net/att/2".into(),
+                    thumbnail_url: None,
+                },
+            ],
+            ..Default::default()
+        });
+        app.spaces.push(SpaceSummary {
+            id: "s1".into(),
+            key: "ENG".into(),
+            name: "Engineering".into(),
+            ..Default::default()
+        });
+        app.active_page = Some(PageDetail {
+            summary: PageSummary {
+                id: "900".into(),
+                space_key: "ENG".into(),
+                title: "Design Doc".into(),
+                version_number: 2,
+                web_url: "https://acme.atlassian.net/wiki/pages/900".into(),
+                ..Default::default()
+            },
+            body_markdown: "# Intro".into(),
+            ..Default::default()
+        });
+
+        let ui = UiState::from_config_with_persona(&cfg, Persona::Jira);
+        (app, ui, dir)
+    }
+
+    #[tokio::test]
+    async fn settings_overlay_mutates_live_ui_and_persists_config_toml() {
+        let (mut app, mut ui, dir) = test_app_and_ui();
+        dispatch(Action::OpenSettings, &mut app, &mut ui);
+        assert!(matches!(ui.overlays.last(), Some(Overlay::Settings(_))));
+
+        // Toggle notifications (row 0)
+        dispatch(Action::Activate, &mut app, &mut ui);
+        assert!(!app.config.notify);
+        assert!(!ui.notify);
+
+        // Toggle left sidebar (row 1)
+        dispatch(Action::MoveDown, &mut app, &mut ui);
+        dispatch(Action::Activate, &mut app, &mut ui);
+        assert!(!app.config.show_nav_rail);
+        assert!(!ui.show_nav_rail);
+
+        // Toggle inline images (row 2)
+        dispatch(Action::MoveDown, &mut app, &mut ui);
+        dispatch(Action::Activate, &mut app, &mut ui);
+        assert!(!app.config.inline_images);
+        assert!(!ui.inline_images);
+
+        // Cycle image protocol (row 3: Auto -> Kitty)
+        dispatch(Action::MoveDown, &mut app, &mut ui);
+        dispatch(Action::Activate, &mut app, &mut ui);
+        assert_eq!(app.config.image_protocol, ConfigImageProtocol::Kitty);
+        assert_eq!(
+            ui.graphics_caps.protocol,
+            crate::img_preview::TerminalImageProtocol::Kitty
+        );
+
+        // Toggle view density (row 4: Cozy -> Compact)
+        dispatch(Action::MoveDown, &mut app, &mut ui);
+        dispatch(Action::Activate, &mut app, &mut ui);
+        assert_eq!(app.config.density, DensityMode::Compact);
+        assert_eq!(ui.density, DensityMode::Compact);
+
+        // Cycle color theme (row 5: Auto -> Dark -> Light)
+        dispatch(Action::MoveDown, &mut app, &mut ui);
+        dispatch(Action::Activate, &mut app, &mut ui);
+        assert_eq!(app.config.theme, ThemePreset::Dark);
+        dispatch(Action::Activate, &mut app, &mut ui);
+        assert_eq!(app.config.theme, ThemePreset::Light);
+
+        // Verify persisted config.toml round-trips all changes
+        let saved = AppConfig::load_from(&dir.path().join("config.toml")).unwrap();
+        assert!(!saved.notify);
+        assert!(!saved.show_nav_rail);
+        assert!(!saved.inline_images);
+        assert_eq!(saved.image_protocol, ConfigImageProtocol::Kitty);
+        assert_eq!(saved.density, DensityMode::Compact);
+        assert_eq!(saved.theme, ThemePreset::Light);
+
+        // Open keyboard shortcuts from Settings (row 7) closes Settings and opens Help
+        dispatch(Action::MoveDown, &mut app, &mut ui); // Download folder (6)
+        dispatch(Action::Activate, &mut app, &mut ui);
+        dispatch(Action::MoveDown, &mut app, &mut ui); // Keyboard shortcuts (7)
+        dispatch(Action::Activate, &mut app, &mut ui);
+        assert!(matches!(ui.overlays.last(), Some(Overlay::Help)));
+    }
+
+    #[tokio::test]
+    async fn context_menu_and_attachments_overlays_dispatch_cleanly() {
+        let (mut app, mut ui, _dir) = test_app_and_ui();
+
+        // Open context menu via `.`
+        dispatch(Action::OpenContextMenu, &mut app, &mut ui);
+        assert!(matches!(ui.overlays.last(), Some(Overlay::ContextMenu(_))));
+
+        // Select "Attachments" item (index 4 in JiraIssue menu) and activate
+        if let Some(Overlay::ContextMenu(ov)) = ui.overlays.last_mut() {
+            ov.select(4);
+        }
+        dispatch(Action::Activate, &mut app, &mut ui);
+        assert!(matches!(ui.overlays.last(), Some(Overlay::Attachments(_))));
+
+        // Activate row 0 (arch.png) -> closes Attachments and opens ImagePreview
+        dispatch(Action::Activate, &mut app, &mut ui);
+        assert!(matches!(ui.overlays.last(), Some(Overlay::ImagePreview(_))));
+        dispatch(Action::CloseOverlay, &mut app, &mut ui);
+        assert!(!ui.has_overlay());
+
+        // Open attachments directly with `A`, press `u` -> opens PathInputOverlay
+        dispatch(Action::OpenAttachments, &mut app, &mut ui);
+        assert!(matches!(ui.overlays.last(), Some(Overlay::Attachments(_))));
+        dispatch(Action::Input('u'), &mut app, &mut ui);
+        assert!(matches!(ui.overlays.last(), Some(Overlay::PathInput(_))));
+        dispatch(Action::CloseOverlay, &mut app, &mut ui);
+    }
+
+    #[tokio::test]
+    async fn drafts_persist_on_close_restore_on_reopen_and_clear_on_submit() {
+        let (mut app, mut ui, dir) = test_app_and_ui();
+
+        // Comment draft lifecycle
+        dispatch(Action::OpenComment, &mut app, &mut ui);
+        dispatch(Action::Paste("WIP comment draft".into()), &mut app, &mut ui);
+        dispatch(Action::CloseOverlay, &mut app, &mut ui);
+        assert!(!ui.has_overlay());
+        let saved = DraftStore::load_from(&dir.path().join("drafts.json")).unwrap();
+        assert_eq!(
+            saved.get("comment:issue:ATL-42"),
+            Some("WIP comment draft")
+        );
+
+        // Reopen restores draft
+        dispatch(Action::OpenComment, &mut app, &mut ui);
+        match ui.overlays.last() {
+            Some(Overlay::Comment(ov)) => assert_eq!(ov.draft_text(), "WIP comment draft"),
+            other => panic!("expected Comment overlay, got {other:?}"),
+        }
+        // Submit clears draft
+        dispatch(Action::Submit, &mut app, &mut ui);
+        assert!(app.drafts.get("comment:issue:ATL-42").is_none());
+
+        // Issue form draft lifecycle
+        dispatch(Action::NewItem, &mut app, &mut ui);
+        dispatch(Action::Paste("Draft issue title".into()), &mut app, &mut ui);
+        dispatch(Action::CloseOverlay, &mut app, &mut ui);
+        assert!(app.drafts.get("issue:new:ATL").is_some());
+
+        dispatch(Action::NewItem, &mut app, &mut ui);
+        match ui.overlays.last() {
+            Some(Overlay::IssueForm(ov)) => assert_eq!(ov.summary.text, "Draft issue title"),
+            other => panic!("expected IssueForm overlay, got {other:?}"),
+        }
+        dispatch(Action::Submit, &mut app, &mut ui);
+        assert!(app.drafts.get("issue:new:ATL").is_none());
+
+        // Confluence page form draft lifecycle
+        ui.active_tab = WorkspaceTab::Confluence;
+        dispatch(Action::NewItem, &mut app, &mut ui);
+        dispatch(Action::Paste("Draft wiki title".into()), &mut app, &mut ui);
+        dispatch(Action::CloseOverlay, &mut app, &mut ui);
+        assert!(app.drafts.get("page:new:ENG:900").is_some());
+
+        dispatch(Action::NewItem, &mut app, &mut ui);
+        match ui.overlays.last() {
+            Some(Overlay::PageForm(ov)) => assert_eq!(ov.title.text, "Draft wiki title"),
+            other => panic!("expected PageForm overlay, got {other:?}"),
+        }
+        dispatch(Action::Submit, &mut app, &mut ui);
+        assert!(app.drafts.get("page:new:ENG:900").is_none());
     }
 }
