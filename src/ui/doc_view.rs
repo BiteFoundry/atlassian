@@ -92,9 +92,30 @@ pub fn render_blocks(
     image_cache: Option<&HashMap<String, RenderedTerminalImage>>,
     inline_images: bool,
 ) -> Vec<Line<'static>> {
+    render_blocks_with_options(blocks, width, theme, image_cache, inline_images, false)
+}
+
+/// Renders a slice of `DocBlock`s into styled ratatui `Line`s with optional inline `(href)` URL display.
+pub fn render_blocks_with_options(
+    blocks: &[DocBlock],
+    width: u16,
+    theme: &Theme,
+    image_cache: Option<&HashMap<String, RenderedTerminalImage>>,
+    inline_images: bool,
+    show_hrefs: bool,
+) -> Vec<Line<'static>> {
     let w = (width as usize).max(16);
     let mut out = Vec::new();
-    render_block_list(blocks, w, theme, image_cache, inline_images, &[], &mut out);
+    render_block_list(
+        blocks,
+        w,
+        theme,
+        image_cache,
+        inline_images,
+        show_hrefs,
+        &[],
+        &mut out,
+    );
     // Trim trailing blank lines for tidy layout.
     while out
         .last()
@@ -107,11 +128,27 @@ pub fn render_blocks(
 
 /// Renders a slice of `InlineNode`s into styled `Span`s.
 pub fn inline_nodes_to_spans(nodes: &[InlineNode], theme: &Theme) -> Vec<Span<'static>> {
+    inline_nodes_to_spans_with_hrefs(nodes, theme, false)
+}
+
+/// Renders a slice of `InlineNode`s into styled `Span`s, optionally appending ` (https://...)` next to link labels.
+pub fn inline_nodes_to_spans_with_hrefs(
+    nodes: &[InlineNode],
+    theme: &Theme,
+    show_hrefs: bool,
+) -> Vec<Span<'static>> {
     let mut spans = Vec::new();
     for node in nodes {
         match node {
             InlineNode::Text { text, style } => {
                 spans.push(Span::styled(text.clone(), map_inline_style(style, theme)));
+                if show_hrefs {
+                    if let Some(url) = style.link_url.as_deref().map(str::trim).filter(|u| !u.is_empty()) {
+                        if text.trim() != url {
+                            spans.push(Span::styled(format!(" ({url})"), theme.muted_style()));
+                        }
+                    }
+                }
             }
             InlineNode::Mention { display, .. } => {
                 let label = if display.starts_with('@') {
@@ -166,10 +203,25 @@ pub fn inline_nodes_to_spans(nodes: &[InlineNode], theme: &Theme) -> Vec<Span<'s
 }
 
 pub fn inline_nodes_plain_text(nodes: &[InlineNode]) -> String {
+    inline_nodes_plain_text_with_hrefs(nodes, false)
+}
+
+fn inline_nodes_plain_text_with_hrefs(nodes: &[InlineNode], show_hrefs: bool) -> String {
     let mut out = String::new();
     for node in nodes {
         match node {
-            InlineNode::Text { text, .. } => out.push_str(text),
+            InlineNode::Text { text, style } => {
+                out.push_str(text);
+                if show_hrefs {
+                    if let Some(url) = style.link_url.as_deref().map(str::trim).filter(|u| !u.is_empty()) {
+                        if text.trim() != url {
+                            out.push_str(" (");
+                            out.push_str(url);
+                            out.push(')');
+                        }
+                    }
+                }
+            }
             InlineNode::Mention { display, .. } => {
                 if !display.starts_with('@') {
                     out.push('@');
@@ -234,12 +286,14 @@ fn map_inline_style(style: &InlineStyle, theme: &Theme) -> Style {
     st
 }
 
+#[allow(clippy::too_many_arguments)]
 fn render_block_list(
     blocks: &[DocBlock],
     width: usize,
     theme: &Theme,
     image_cache: Option<&HashMap<String, RenderedTerminalImage>>,
     inline_images: bool,
+    show_hrefs: bool,
     prefix: &[Span<'static>],
     out: &mut Vec<Line<'static>>,
 ) {
@@ -249,7 +303,7 @@ fn render_block_list(
     for (idx, block) in blocks.iter().enumerate() {
         match block {
             DocBlock::Paragraph { spans } => {
-                let styled = inline_nodes_to_spans(spans, theme);
+                let styled = inline_nodes_to_spans_with_hrefs(spans, theme, show_hrefs);
                 let wrapped = wrap_spans_with_prefix(&styled, inner_w, prefix, prefix);
                 if wrapped.is_empty() {
                     out.push(Line::from(prefix.to_vec()));
@@ -263,7 +317,7 @@ fn render_block_list(
             DocBlock::Heading { level, spans } => {
                 let (pfx_str, style) = heading_style(*level, theme);
                 let mut h_spans = vec![Span::styled(pfx_str.to_string(), style)];
-                for mut sp in inline_nodes_to_spans(spans, theme) {
+                for mut sp in inline_nodes_to_spans_with_hrefs(spans, theme, show_hrefs) {
                     sp.style = sp.style.patch(style);
                     h_spans.push(sp);
                 }
@@ -294,6 +348,7 @@ fn render_block_list(
                         theme,
                         image_cache,
                         inline_images,
+                        show_hrefs,
                         prefix,
                         out,
                     );
@@ -316,6 +371,7 @@ fn render_block_list(
                         theme,
                         image_cache,
                         inline_images,
+                        show_hrefs,
                         prefix,
                         out,
                     );
@@ -344,7 +400,7 @@ fn render_block_list(
                     first_pfx.push(Span::styled(icon, icon_style));
                     let mut cont_pfx = prefix.to_vec();
                     cont_pfx.push(Span::raw("  "));
-                    let mut spans = inline_nodes_to_spans(content, theme);
+                    let mut spans = inline_nodes_to_spans_with_hrefs(content, theme, show_hrefs);
                     if *checked {
                         for sp in &mut spans {
                             sp.style = theme
@@ -372,7 +428,16 @@ fn render_block_list(
             DocBlock::Blockquote { blocks: inner } => {
                 let mut bq_pfx = prefix.to_vec();
                 bq_pfx.push(Span::styled("│ ", theme.subtle_style()));
-                render_block_list(inner, width, theme, image_cache, inline_images, &bq_pfx, out);
+                render_block_list(
+                    inner,
+                    width,
+                    theme,
+                    image_cache,
+                    inline_images,
+                    show_hrefs,
+                    &bq_pfx,
+                    out,
+                );
                 if idx + 1 < blocks.len() {
                     out.push(Line::from(prefix.to_vec()));
                 }
@@ -406,6 +471,7 @@ fn render_block_list(
                     theme,
                     image_cache,
                     inline_images,
+                    show_hrefs,
                     &panel_pfx,
                     out,
                 );
@@ -429,6 +495,7 @@ fn render_block_list(
                     theme,
                     image_cache,
                     inline_images,
+                    show_hrefs,
                     &exp_pfx,
                     out,
                 );
@@ -437,7 +504,7 @@ fn render_block_list(
                 }
             }
             DocBlock::Table { headers, rows } => {
-                render_table(headers, rows, inner_w, theme, prefix, out);
+                render_table(headers, rows, inner_w, theme, show_hrefs, prefix, out);
                 if idx + 1 < blocks.len() {
                     out.push(Line::from(prefix.to_vec()));
                 }
@@ -503,6 +570,7 @@ fn render_list_item(
     theme: &Theme,
     image_cache: Option<&HashMap<String, RenderedTerminalImage>>,
     inline_images: bool,
+    show_hrefs: bool,
     prefix: &[Span<'static>],
     out: &mut Vec<Line<'static>>,
 ) {
@@ -514,6 +582,7 @@ fn render_list_item(
         theme,
         image_cache,
         inline_images,
+        show_hrefs,
         &[],
         &mut sub_out,
     );
@@ -644,6 +713,7 @@ fn render_table(
     rows: &[Vec<Vec<InlineNode>>],
     inner_w: usize,
     theme: &Theme,
+    show_hrefs: bool,
     prefix: &[Span<'static>],
     out: &mut Vec<Line<'static>>,
 ) {
@@ -656,12 +726,12 @@ fn render_table(
 
     let mut col_widths = vec![4usize; col_count];
     for (c, cell) in headers.iter().enumerate() {
-        let txt = inline_nodes_plain_text(cell);
+        let txt = inline_nodes_plain_text_with_hrefs(cell, show_hrefs);
         col_widths[c] = col_widths[c].max(txt.width());
     }
     for row in rows {
         for (c, cell) in row.iter().enumerate() {
-            let txt = inline_nodes_plain_text(cell);
+            let txt = inline_nodes_plain_text_with_hrefs(cell, show_hrefs);
             col_widths[c] = col_widths[c].max(txt.width());
         }
     }
@@ -706,7 +776,7 @@ fn render_table(
         for (c, w) in col_widths.iter().enumerate() {
             let txt = headers
                 .get(c)
-                .map(|n| inline_nodes_plain_text(n))
+                .map(|n| inline_nodes_plain_text_with_hrefs(n, show_hrefs))
                 .unwrap_or_default();
             let cell = pad_right_width(&truncate_width(&txt, *w), *w);
             line_spans.push(Span::styled(format!(" {cell} "), theme.accent_style()));
@@ -722,7 +792,7 @@ fn render_table(
         for (c, w) in col_widths.iter().enumerate() {
             let txt = row
                 .get(c)
-                .map(|n| inline_nodes_plain_text(n))
+                .map(|n| inline_nodes_plain_text_with_hrefs(n, show_hrefs))
                 .unwrap_or_default();
             let cell = pad_right_width(&truncate_width(&txt, *w), *w);
             line_spans.push(Span::raw(format!(" {cell} ")));
@@ -898,5 +968,38 @@ mod tests {
         let wrapped = wrap_plain_text(s, 6);
         assert!(wrapped.iter().all(|l| l.width() <= 6));
         assert_eq!(wrapped.concat(), s);
+    }
+
+    #[test]
+    fn show_hrefs_appends_url_next_to_link_labels() {
+        let theme = Theme::default();
+        let blocks = vec![DocBlock::Paragraph {
+            spans: vec![
+                InlineNode::Text {
+                    text: "Read ".into(),
+                    style: InlineStyle::default(),
+                },
+                InlineNode::Text {
+                    text: "RFC-42".into(),
+                    style: InlineStyle {
+                        link_url: Some("https://acme.dev/rfc-42".into()),
+                        ..Default::default()
+                    },
+                },
+            ],
+        }];
+
+        let hidden = lines_to_strings(&render_blocks_with_options(
+            &blocks, 100, &theme, None, false, false,
+        ))
+        .join("\n");
+        assert!(hidden.contains("RFC-42"));
+        assert!(!hidden.contains("https://acme.dev/rfc-42"));
+
+        let shown = lines_to_strings(&render_blocks_with_options(
+            &blocks, 100, &theme, None, false, true,
+        ))
+        .join("\n");
+        assert!(shown.contains("RFC-42 (https://acme.dev/rfc-42)"));
     }
 }

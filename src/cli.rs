@@ -3509,9 +3509,19 @@ async fn cmd_issue_download(
     let downloaded = client.download_attachment(attachment, &dest_dir).await?;
 
     if json_out {
+        let abs_path = crate::mcp::normalize_abs_path(&downloaded.path);
+        let is_image = img_preview::is_image_attachment(&downloaded.mime_type, &downloaded.filename);
         println!(
             "{}",
-            serde_json::to_string_pretty(&json!({ "ok": true, "file": downloaded }))?
+            serde_json::to_string_pretty(&json!({
+                "ok": true,
+                "path": abs_path,
+                "file_name": downloaded.filename,
+                "mime_type": downloaded.mime_type,
+                "size_bytes": downloaded.size,
+                "is_image": is_image,
+                "file": downloaded,
+            }))?
         );
     } else {
         println!(
@@ -3884,9 +3894,19 @@ async fn cmd_page_download(
     let downloaded = client.download_attachment(attachment, &dest_dir).await?;
 
     if json_out {
+        let abs_path = crate::mcp::normalize_abs_path(&downloaded.path);
+        let is_image = img_preview::is_image_attachment(&downloaded.mime_type, &downloaded.filename);
         println!(
             "{}",
-            serde_json::to_string_pretty(&json!({ "ok": true, "file": downloaded }))?
+            serde_json::to_string_pretty(&json!({
+                "ok": true,
+                "path": abs_path,
+                "file_name": downloaded.filename,
+                "mime_type": downloaded.mime_type,
+                "size_bytes": downloaded.size,
+                "is_image": is_image,
+                "file": downloaded,
+            }))?
         );
     } else {
         println!(

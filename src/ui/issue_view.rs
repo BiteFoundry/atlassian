@@ -13,7 +13,9 @@ use crate::{
     models::{DocBlock, InlineNode, InlineStyle, IssueDetail, StatusCategory},
     ui::{
         app::{AppState, PaneFocus, UiState},
-        doc_view::{pad_right_width, render_blocks, truncate_width, wrap_plain_text},
+        doc_view::{
+            pad_right_width, render_blocks_with_options, truncate_width, wrap_plain_text,
+        },
         draw_horizontal_hairline, fill_surface,
         hitmap::{ButtonId, HitMap, HitTarget},
     },
@@ -721,12 +723,13 @@ pub fn build_issue_inspector_lines(
             theme.muted_style(),
         )));
     } else {
-        for mut l in render_blocks(
+        for mut l in render_blocks_with_options(
             &desc_blocks,
             w.saturating_sub(2) as u16,
             theme,
             Some(&app.image_cache),
             ui.inline_images,
+            ui.show_hrefs,
         ) {
             l.spans.insert(0, Span::raw("  "));
             lines.push(l);
@@ -861,7 +864,14 @@ pub fn build_issue_inspector_lines(
                     }],
                 }]
             };
-            for mut l in render_blocks(&c_blocks, w.saturating_sub(4) as u16, theme, None, false) {
+            for mut l in render_blocks_with_options(
+                &c_blocks,
+                w.saturating_sub(4) as u16,
+                theme,
+                None,
+                false,
+                ui.show_hrefs,
+            ) {
                 l.spans.insert(0, Span::raw("    "));
                 lines.push(l);
             }

@@ -330,6 +330,7 @@ pub struct UiState {
     pub show_nav_rail: bool,
     pub auto_detail_drawer: bool,
     pub inline_images: bool,
+    pub show_hrefs: bool,
     pub editor_request: Option<(ExternalEditorTarget, String)>,
     pub board_ui: BoardUiState,
     pub issue_ui: IssueUiState,
@@ -365,6 +366,7 @@ impl UiState {
             show_nav_rail: config.show_nav_rail,
             auto_detail_drawer: config.auto_detail_drawer,
             inline_images: config.inline_images,
+            show_hrefs: false,
             editor_request: None,
             board_ui: BoardUiState {
                 drawer_open: config.auto_detail_drawer,
@@ -2423,31 +2425,42 @@ impl AppState {
         });
     }
 
+    pub fn active_upload_target(&self, ui: &UiState) -> Option<UploadTarget> {
+        if ui.active_tab == WorkspaceTab::Confluence {
+            if let Some(page) = &self.active_page {
+                return Some(UploadTarget::Page(page.summary.id.clone()));
+            }
+        }
+        self.selected_issue_key(ui).map(UploadTarget::Issue)
+    }
+
     pub fn request_upload_attachment(&self, ui: &mut UiState, overlay: &PathInputOverlay) {
+        let path = PathBuf::from(overlay.path.text.trim());
+        self.request_upload_file(ui, overlay.target.clone(), path);
+    }
+
+    pub fn request_upload_file(&self, ui: &mut UiState, target: UploadTarget, path: PathBuf) {
         if tokio::runtime::Handle::try_current().is_err() {
             return;
         }
-        let path = PathBuf::from(overlay.path.text.trim());
         ui.tasks.begin("Upload attachment");
         let client = self.client.clone();
         let tx = self.ui_tx.clone();
-        match &overlay.target {
+        match target {
             UploadTarget::Issue(key) => {
-                let k = key.clone();
                 tokio::spawn(async move {
                     let res = client
-                        .upload_issue_attachment(&k, &path)
+                        .upload_issue_attachment(&key, &path)
                         .await
                         .map_err(|e| e.to_string());
                     let _ = tx.send(UiMsg::AttachmentUploaded {
-                        issue_key: Some(k),
+                        issue_key: Some(key),
                         page_id: None,
                         result: res,
                     });
                 });
             }
-            UploadTarget::Page(pid) => {
-                let id = pid.clone();
+            UploadTarget::Page(id) => {
                 tokio::spawn(async move {
                     let res = client
                         .upload_page_attachment(&id, &path)

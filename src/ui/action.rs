@@ -13,8 +13,10 @@ use crate::{
             comment::{CommentOverlay, CommentTarget},
             context_menu::{ContextMenuAction, ContextMenuOverlay},
             cross_link::CrossLinkOverlay,
+            file_picker::FilePickerOverlay,
             image_preview::ImagePreviewOverlay,
             issue_form::IssueFormOverlay,
+            links::{LinkCommand, LinksOverlay},
             page_form::PageFormOverlay,
             path_input::{PathInputOverlay, UploadTarget},
             settings::{SettingsCommand, SettingsOverlay},
@@ -52,6 +54,30 @@ pub fn dispatch(action: Action, app: &mut AppState, ui: &mut UiState) -> bool {
                 return false;
             }
             Action::PasteClipboard => {
+                let image_target = match ui.overlays.last() {
+                    Some(Overlay::Comment(ov)) => Some(match &ov.target {
+                        CommentTarget::Issue(key) => UploadTarget::Issue(key.clone()),
+                        CommentTarget::Page { page_id, .. } => UploadTarget::Page(page_id.clone()),
+                    }),
+                    Some(Overlay::IssueForm(ov)) => ov
+                        .edit_key
+                        .clone()
+                        .map(UploadTarget::Issue)
+                        .or_else(|| app.active_upload_target(ui)),
+                    Some(Overlay::PageForm(ov)) => ov
+                        .edit_page_id
+                        .clone()
+                        .map(UploadTarget::Page)
+                        .or_else(|| app.active_upload_target(ui)),
+                    _ => None,
+                };
+                if matches!(
+                    ui.overlays.last(),
+                    Some(Overlay::Comment(_) | Overlay::IssueForm(_) | Overlay::PageForm(_))
+                ) && try_paste_clipboard_image(image_target, app, ui)
+                {
+                    return false;
+                }
                 if let Some(top) = ui.overlays.last_mut() {
                     if top.paste_from_clipboard() {
                         if let Overlay::Assignee(ov) = top {
@@ -146,6 +172,24 @@ pub fn dispatch(action: Action, app: &mut AppState, ui: &mut UiState) -> bool {
         Action::OpenCrossLinks => {
             let (label, targets) = app.collect_cross_links(ui.active_tab);
             ui.push_overlay(Overlay::CrossLink(CrossLinkOverlay::new(label, targets)));
+        }
+        Action::OpenLinks => {
+            ui.push_overlay(Overlay::Links(LinksOverlay::from_app(app, ui)));
+        }
+        Action::ToggleHrefDisplay => {
+            ui.show_hrefs = !ui.show_hrefs;
+            ui.info(if ui.show_hrefs {
+                "Showing inline link URLs (href: On)"
+            } else {
+                "Hiding inline link URLs (href: Off)"
+            });
+        }
+        Action::OpenFilePicker => open_file_picker(app, ui),
+        Action::PasteClipboard => {
+            let target = app.active_upload_target(ui);
+            if !try_paste_clipboard_image(target, app, ui) {
+                ui.info("No image in clipboard to attach");
+            }
         }
         Action::FocusNextPane => cycle_focus(ui, true),
         Action::FocusPrevPane => cycle_focus(ui, false),
@@ -445,6 +489,27 @@ fn dispatch_active_overlay(action: Action, app: &mut AppState, ui: &mut UiState)
         }
     }
 
+    // Intercept LinksOverlay pending commands (open in browser / copy URL).
+    if let Some(Overlay::Links(ov)) = ui.overlays.last_mut() {
+        if let Some(cmd) = ov.take_pending_command() {
+            if matches!(outcome, Some(OverlayOutcome::Close)) {
+                ui.pop_overlay();
+            }
+            match cmd {
+                LinkCommand::Open(url) => {
+                    if let Err(err) = open::that(&url) {
+                        ui.error(format!("Failed to open browser: {err}"));
+                    }
+                }
+                LinkCommand::Copy(url) => match overlays::copy_to_clipboard(&url) {
+                    Ok(()) => ui.success(format!("Copied URL: {url}")),
+                    Err(err) => ui.error(err),
+                },
+            }
+            return false;
+        }
+    }
+
     // Intercept AttachmentsOverlay pending commands before popping so selected index/URL is preserved.
     if let Some(Overlay::Attachments(ov)) = ui.overlays.last_mut() {
         if let Some(cmd) = ov.pending_command.take() {
@@ -707,6 +772,17 @@ fn handle_overlay_dispatch(action: Action, app: &mut AppState, ui: &mut UiState)
                 }
                 Overlay::PathInput(ov) => {
                     app.request_upload_attachment(ui, &ov);
+                }
+                Overlay::FilePicker(ov) => {
+                    if let Some(path) = ov.selected_file {
+                        let fname = path
+                            .file_name()
+                            .and_then(|s| s.to_str())
+                            .unwrap_or("file")
+                            .to_string();
+                        app.request_upload_file(ui, ov.target, path);
+                        ui.info(format!("Uploading {fname}…"));
+                    }
                 }
                 Overlay::ContextMenu(ov) => {
                     if let Some(cmd) = ov.selected_command().cloned() {
@@ -1328,20 +1404,57 @@ fn open_edit_item(app: &AppState, ui: &mut UiState) {
 }
 
 fn open_upload_attachment(app: &AppState, ui: &mut UiState) {
-    if ui.active_tab == WorkspaceTab::Confluence {
-        if let Some(page) = &app.active_page {
-            ui.push_overlay(Overlay::PathInput(PathInputOverlay::new(
-                UploadTarget::Page(page.summary.id.clone()),
-            )));
-            return;
-        }
-    }
-    if let Some(key) = app.selected_issue_key(ui) {
-        ui.push_overlay(Overlay::PathInput(PathInputOverlay::new(
-            UploadTarget::Issue(key),
-        )));
+    if let Some(target) = app.active_upload_target(ui) {
+        ui.push_overlay(Overlay::PathInput(PathInputOverlay::new(target)));
     } else {
         ui.info("Select an issue or page to attach a file first");
+    }
+}
+
+fn open_file_picker(app: &AppState, ui: &mut UiState) {
+    if let Some(target) = app.active_upload_target(ui) {
+        ui.push_overlay(Overlay::FilePicker(FilePickerOverlay::new(target)));
+    } else {
+        ui.info("Select an issue or page to attach a file first");
+    }
+}
+
+fn try_paste_clipboard_image(
+    target: Option<UploadTarget>,
+    app: &AppState,
+    ui: &mut UiState,
+) -> bool {
+    let Some(res) = overlays::read_clipboard_image_to_temp() else {
+        return false;
+    };
+    match res {
+        Ok(path) => {
+            let fname = path
+                .file_name()
+                .and_then(|s| s.to_str())
+                .unwrap_or("pasted.png")
+                .to_string();
+            if let Some(upload_target) = target {
+                let target_label = match &upload_target {
+                    UploadTarget::Issue(k) => format!("Issue {k}"),
+                    UploadTarget::Page(id) => format!("Page #{id}"),
+                };
+                app.request_upload_file(ui, upload_target, path);
+                ui.info(format!(
+                    "Pasted clipboard image ({fname}) — uploading to {target_label}…"
+                ));
+            } else {
+                ui.info(format!(
+                    "Saved clipboard image to {} (select an issue or page to attach)",
+                    path.display()
+                ));
+            }
+            true
+        }
+        Err(err) => {
+            ui.error(format!("Clipboard image paste failed: {err}"));
+            true
+        }
     }
 }
 
@@ -1680,5 +1793,39 @@ mod tests {
         }
         dispatch(Action::Submit, &mut app, &mut ui);
         assert!(app.drafts.get("page:new:ENG:900").is_none());
+    }
+
+    #[tokio::test]
+    async fn links_overlay_href_toggle_and_file_picker_dispatch_cleanly() {
+        let (mut app, mut ui, _dir) = test_app_and_ui();
+
+        // Toggle inline href display with toast feedback
+        assert!(!ui.show_hrefs);
+        dispatch(Action::ToggleHrefDisplay, &mut app, &mut ui);
+        assert!(ui.show_hrefs);
+        assert!(!ui.toasts.is_empty());
+        dispatch(Action::ToggleHrefDisplay, &mut app, &mut ui);
+        assert!(!ui.show_hrefs);
+
+        // Open Link Extractor (`u`) and verify extracted URLs from active issue
+        dispatch(Action::OpenLinks, &mut app, &mut ui);
+        match ui.overlays.last() {
+            Some(Overlay::Links(ov)) => {
+                assert_eq!(ov.source_label, "ATL-42");
+                assert!(ov
+                    .items
+                    .iter()
+                    .any(|l| l.url == "https://acme.atlassian.net/browse/ATL-42"));
+            }
+            other => panic!("expected Links overlay, got {other:?}"),
+        }
+        dispatch(Action::CloseOverlay, &mut app, &mut ui);
+        assert!(!ui.has_overlay());
+
+        // Open File Picker (`Ctrl+F`) for active issue
+        dispatch(Action::OpenFilePicker, &mut app, &mut ui);
+        assert!(matches!(ui.overlays.last(), Some(Overlay::FilePicker(_))));
+        dispatch(Action::CloseOverlay, &mut app, &mut ui);
+        assert!(!ui.has_overlay());
     }
 }

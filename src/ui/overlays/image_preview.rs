@@ -50,6 +50,8 @@ pub struct ImagePreviewOverlay {
     pub protocol_overridden: bool,
     /// Probed terminal cell pixel dimensions `(cell_w, cell_h)` used for aspect-preserving pixel scaling.
     pub cell_px: (u16, u16),
+    /// Whether `cell_px` came from an exact terminal/env measurement rather than a fallback estimate.
+    pub cell_px_exact: bool,
     /// Currently painted pixel graphic `(cache_key, rect, protocol)` synchronized by `tui.rs`.
     pub active_pixel_graphic: Option<(String, Rect, TerminalImageProtocol)>,
     pub error: Option<String>,
@@ -84,6 +86,7 @@ impl ImagePreviewOverlay {
             protocol: caps.protocol,
             protocol_overridden: false,
             cell_px: caps.cell_px,
+            cell_px_exact: caps.cell_px_exact,
             active_pixel_graphic: None,
             error: None,
         })
@@ -97,6 +100,7 @@ impl ImagePreviewOverlay {
     /// Applies startup-probed graphics capabilities if the user has not manually cycled protocol yet.
     pub fn apply_graphics_caps(&mut self, caps: TerminalGraphicsCaps) {
         self.cell_px = caps.cell_px;
+        self.cell_px_exact = caps.cell_px_exact;
         if !self.protocol_overridden {
             self.protocol = caps.protocol;
         }
@@ -107,7 +111,7 @@ impl ImagePreviewOverlay {
         TerminalGraphicsCaps {
             protocol: self.protocol,
             cell_px: self.cell_px,
-            cell_px_exact: true,
+            cell_px_exact: self.cell_px_exact,
         }
     }
 

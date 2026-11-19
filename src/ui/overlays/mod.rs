@@ -7,13 +7,20 @@ pub mod comment;
 pub mod confirm;
 pub mod context_menu;
 pub mod cross_link;
+pub mod file_picker;
 pub mod image_preview;
 pub mod issue_form;
+pub mod links;
 pub mod page_form;
 pub mod path_input;
 pub mod settings;
 pub mod site_switcher;
 pub mod transition;
+
+use std::{
+    path::{Path, PathBuf},
+    time::{SystemTime, UNIX_EPOCH},
+};
 
 use ratatui::{
     layout::{Constraint, Direction, Layout, Rect},
@@ -32,8 +39,9 @@ use crate::ui::{
         assignee::AssigneeOverlay, attachments::AttachmentsOverlay,
         command_palette::CommandPalette, comment::CommentOverlay, confirm::ConfirmDialog,
         context_menu::ContextMenuOverlay, cross_link::CrossLinkOverlay,
-        image_preview::ImagePreviewOverlay, issue_form::IssueFormOverlay,
-        page_form::PageFormOverlay, path_input::PathInputOverlay, settings::SettingsOverlay,
+        file_picker::FilePickerOverlay, image_preview::ImagePreviewOverlay,
+        issue_form::IssueFormOverlay, links::LinksOverlay, page_form::PageFormOverlay,
+        path_input::PathInputOverlay, settings::SettingsOverlay,
         site_switcher::SiteSwitcherOverlay, transition::TransitionOverlay,
     },
     theme::Theme,
@@ -47,8 +55,10 @@ pub enum OverlayKind {
     PageForm,
     Comment,
     CrossLink,
+    Links,
     ImagePreview,
     PathInput,
+    FilePicker,
     CommandPalette,
     SiteSwitcher,
     Settings,
@@ -74,8 +84,10 @@ pub enum Overlay {
     PageForm(PageFormOverlay),
     Comment(CommentOverlay),
     CrossLink(CrossLinkOverlay),
+    Links(LinksOverlay),
     ImagePreview(ImagePreviewOverlay),
     PathInput(PathInputOverlay),
+    FilePicker(FilePickerOverlay),
     CommandPalette(CommandPalette),
     SiteSwitcher(SiteSwitcherOverlay),
     Settings(SettingsOverlay),
@@ -94,8 +106,10 @@ impl Overlay {
             Overlay::PageForm(_) => OverlayKind::PageForm,
             Overlay::Comment(_) => OverlayKind::Comment,
             Overlay::CrossLink(_) => OverlayKind::CrossLink,
+            Overlay::Links(_) => OverlayKind::Links,
             Overlay::ImagePreview(_) => OverlayKind::ImagePreview,
             Overlay::PathInput(_) => OverlayKind::PathInput,
+            Overlay::FilePicker(_) => OverlayKind::FilePicker,
             Overlay::CommandPalette(_) => OverlayKind::CommandPalette,
             Overlay::SiteSwitcher(_) => OverlayKind::SiteSwitcher,
             Overlay::Settings(_) => OverlayKind::Settings,
@@ -142,6 +156,7 @@ impl Overlay {
                 | Overlay::PageForm(_)
                 | Overlay::Comment(_)
                 | Overlay::PathInput(_)
+                | Overlay::FilePicker(_)
                 | Overlay::CommandPalette(_)
                 | Overlay::SiteSwitcher(_)
         )
@@ -165,6 +180,7 @@ impl Overlay {
             Overlay::PageForm(o) => o.paste_from_clipboard(),
             Overlay::Comment(o) => o.paste_from_clipboard(),
             Overlay::PathInput(o) => o.paste_from_clipboard(),
+            Overlay::FilePicker(o) => o.paste_from_clipboard(),
             Overlay::CommandPalette(o) => o.paste_from_clipboard(),
             Overlay::SiteSwitcher(o) => o.paste_from_clipboard(),
             _ => false,
@@ -177,6 +193,8 @@ impl Overlay {
             Overlay::Transition(o) => o.select(index),
             Overlay::Assignee(o) => o.select(index),
             Overlay::CrossLink(o) => o.select(index),
+            Overlay::Links(o) => o.select(index),
+            Overlay::FilePicker(o) => o.select(index),
             Overlay::CommandPalette(o) => o.select(index),
             Overlay::SiteSwitcher(o) => o.select(index),
             Overlay::Settings(o) => o.select(index),
@@ -200,8 +218,10 @@ impl Overlay {
             Overlay::PageForm(o) => o.handle(action),
             Overlay::Comment(o) => o.handle(action),
             Overlay::CrossLink(o) => o.handle(action),
+            Overlay::Links(o) => o.handle(action),
             Overlay::ImagePreview(o) => o.handle(action),
             Overlay::PathInput(o) => o.handle(action),
+            Overlay::FilePicker(o) => o.handle(action),
             Overlay::CommandPalette(o) => o.handle(action),
             Overlay::SiteSwitcher(o) => o.handle(action),
             Overlay::Settings(o) => o.handle(action),
@@ -232,8 +252,10 @@ impl Overlay {
             Overlay::PageForm(o) => o.draw(frame, area, app, ui, hitmap),
             Overlay::Comment(o) => o.draw(frame, area, app, ui, hitmap),
             Overlay::CrossLink(o) => o.draw(frame, area, app, ui, hitmap),
+            Overlay::Links(o) => o.draw(frame, area, app, ui, hitmap),
             Overlay::ImagePreview(o) => o.draw(frame, area, app, ui, hitmap),
             Overlay::PathInput(o) => o.draw(frame, area, app, ui, hitmap),
+            Overlay::FilePicker(o) => o.draw(frame, area, app, ui, hitmap),
             Overlay::CommandPalette(o) => o.draw(frame, area, app, ui, hitmap),
             Overlay::SiteSwitcher(o) => o.draw(frame, area, app, ui, hitmap),
             Overlay::Settings(o) => o.draw(frame, area, app, ui, hitmap),
@@ -285,6 +307,55 @@ pub fn read_clipboard_text() -> Option<String> {
     }
 }
 
+/// Encodes raw RGBA pixels into a PNG file at `<dir>/atlassian-pasted-<unix-ms>.png`.
+pub fn encode_rgba_to_temp_png(
+    width: usize,
+    height: usize,
+    rgba: &[u8],
+    dir: &Path,
+) -> Result<PathBuf, String> {
+    if width == 0 || height == 0 {
+        return Err("Clipboard image has 0x0 dimensions".to_string());
+    }
+    let expected = width
+        .checked_mul(height)
+        .and_then(|n| n.checked_mul(4))
+        .ok_or_else(|| "Clipboard image dimensions overflowed".to_string())?;
+    if rgba.len() < expected {
+        return Err(format!(
+            "Clipboard image buffer too short ({} < {expected})",
+            rgba.len()
+        ));
+    }
+    let img = image::RgbaImage::from_raw(width as u32, height as u32, rgba[..expected].to_vec())
+        .ok_or_else(|| "Failed to build RGBA image buffer".to_string())?;
+    let unix_ms = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis())
+        .unwrap_or(0);
+    let path = dir.join(format!("atlassian-pasted-{unix_ms}.png"));
+    image::DynamicImage::ImageRgba8(img)
+        .save_with_format(&path, image::ImageFormat::Png)
+        .map_err(|e| format!("Failed to encode pasted PNG: {e}"))?;
+    Ok(path)
+}
+
+/// Checks if the OS clipboard holds an image (`arboard::Clipboard::get_image()`), and if so
+/// saves it as `<temp_dir>/atlassian-pasted-<unix-ms>.png`. Returns `None` if clipboard has no image.
+pub fn read_clipboard_image_to_temp() -> Option<Result<PathBuf, String>> {
+    let mut clipboard = arboard::Clipboard::new().ok()?;
+    let img = clipboard.get_image().ok()?;
+    if img.width == 0 || img.height == 0 || img.bytes.is_empty() {
+        return None;
+    }
+    Some(encode_rgba_to_temp_png(
+        img.width,
+        img.height,
+        img.bytes.as_ref(),
+        &std::env::temp_dir(),
+    ))
+}
+
 /// Copies plain text to the OS clipboard (used by context menu Copy key / Copy URL).
 pub fn copy_to_clipboard(text: &str) -> Result<(), String> {
     let mut clipboard = arboard::Clipboard::new().map_err(|e| format!("Clipboard unavailable: {e}"))?;
@@ -329,8 +400,8 @@ const HELP_SECTIONS: [(&str, &[(&str, &str)]); 4] = [
         &[
             ("Space / → / ←", "Expand (lazy-load) or collapse page tree node"),
             ("t / e / n / c", "Toggle TOC / Edit page / New child page / Comment"),
-            ("A / v", "Browse attachments / Preview raster images"),
-            ("u / d / o", "Upload attachment / Download / Open in browser"),
+            ("A / v / h", "Attachments / Preview images / Toggle inline hrefs"),
+            ("u / Ctrl+F / d / o", "Link extractor / File picker / Download / Browser"),
             ("p", "Pin or unpin project / space in Directory"),
         ],
     ),
@@ -339,7 +410,7 @@ const HELP_SECTIONS: [(&str, &[(&str, &str)]); 4] = [
         &[
             ("Tab / Shift+Tab", "Move between form fields"),
             ("Shift+Enter", "Insert newline in description / comment body"),
-            ("Ctrl+V", "Paste text from clipboard"),
+            ("Ctrl+V", "Paste text or attach clipboard image"),
             ("Ctrl+E", "Open active Markdown body in external $EDITOR"),
             ("Ctrl+S / Enter", "Confirm and submit form"),
             ("Esc / q", "Cancel modal / Quit Atlassian TUI"),
@@ -495,5 +566,21 @@ mod tests {
     #[test]
     fn sanitize_single_line_strips_newlines() {
         assert_eq!(sanitize_single_line("  foo\r\nbar\nbaz  "), "foo bar baz");
+    }
+
+    #[test]
+    fn encode_rgba_to_temp_png_creates_valid_png_with_expected_prefix() {
+        let dir = tempfile::tempdir().unwrap();
+        let rgba = vec![255u8, 0, 128, 255, 0, 255, 64, 255, 32, 64, 96, 255, 10, 20, 30, 255];
+        let path = encode_rgba_to_temp_png(2, 2, &rgba, dir.path()).unwrap();
+        let fname = path.file_name().unwrap().to_str().unwrap();
+        assert!(fname.starts_with("atlassian-pasted-"));
+        assert!(fname.ends_with(".png"));
+        let decoded = image::open(&path).unwrap();
+        assert_eq!(decoded.width(), 2);
+        assert_eq!(decoded.height(), 2);
+
+        assert!(encode_rgba_to_temp_png(0, 2, &rgba, dir.path()).is_err());
+        assert!(encode_rgba_to_temp_png(2, 2, &[0u8; 4], dir.path()).is_err());
     }
 }

@@ -34,9 +34,12 @@ pub enum Action {
     NewItem,
     EditItem,
     UploadAttachment,
+    OpenFilePicker,
     DownloadAttachment,
     OpenImagePreview,
     OpenCrossLinks,
+    OpenLinks,
+    ToggleHrefDisplay,
     PopNavHistory,
     OpenInBrowser,
     FocusJql,
@@ -146,8 +149,14 @@ impl Keymap {
             return Some(Action::ExternalEditor);
         }
 
-        if ctrl && matches!(key.code, KeyCode::Char('v') | KeyCode::Char('V')) && accepts_text {
+        if ctrl && matches!(key.code, KeyCode::Char('v') | KeyCode::Char('V'))
+            && (accepts_text || !has_overlay)
+        {
             return Some(Action::PasteClipboard);
+        }
+
+        if ctrl && matches!(key.code, KeyCode::Char('f') | KeyCode::Char('F')) && !has_overlay {
+            return Some(Action::OpenFilePicker);
         }
 
         if ctrl && matches!(key.code, KeyCode::Char('s') | KeyCode::Char('S')) {
@@ -221,8 +230,22 @@ impl Keymap {
             KeyCode::BackTab => Some(Action::FocusPrevPane),
             KeyCode::Up | KeyCode::Char('k') => Some(Action::MoveUp),
             KeyCode::Down | KeyCode::Char('j') => Some(Action::MoveDown),
-            KeyCode::Left | KeyCode::Char('h') => {
+            KeyCode::Left => {
                 if tab == WorkspaceTab::Confluence && focus == PaneFocus::Nav {
+                    Some(Action::CollapseNode)
+                } else {
+                    Some(Action::MoveLeft)
+                }
+            }
+            KeyCode::Char('h') => {
+                if matches!(
+                    (tab, focus),
+                    (WorkspaceTab::Confluence, PaneFocus::Main)
+                        | (WorkspaceTab::Issues, PaneFocus::Main | PaneFocus::Detail)
+                        | (WorkspaceTab::Board, PaneFocus::Detail)
+                ) {
+                    Some(Action::ToggleHrefDisplay)
+                } else if tab == WorkspaceTab::Confluence && focus == PaneFocus::Nav {
                     Some(Action::CollapseNode)
                 } else {
                     Some(Action::MoveLeft)
@@ -261,7 +284,7 @@ impl Keymap {
             KeyCode::Char('c') => Some(Action::OpenComment),
             KeyCode::Char('e') => Some(Action::EditItem),
             KeyCode::Char('n') => Some(Action::NewItem),
-            KeyCode::Char('u') => Some(Action::UploadAttachment),
+            KeyCode::Char('u') => Some(Action::OpenLinks),
             KeyCode::Char('d') => Some(Action::DownloadAttachment),
             KeyCode::Char('v') => Some(Action::OpenImagePreview),
             KeyCode::Char('g') => Some(Action::OpenCrossLinks),
@@ -353,6 +376,38 @@ mod tests {
         assert_eq!(
             km.resolve(key(KeyCode::Char('A')), WorkspaceTab::Issues, PaneFocus::Main, false, false),
             Some(Action::OpenAttachments)
+        );
+        assert_eq!(
+            km.resolve(key(KeyCode::Char('u')), WorkspaceTab::Issues, PaneFocus::Main, false, false),
+            Some(Action::OpenLinks)
+        );
+        assert_eq!(
+            km.resolve(ctrl(KeyCode::Char('f')), WorkspaceTab::Issues, PaneFocus::Main, false, false),
+            Some(Action::OpenFilePicker)
+        );
+        assert_eq!(
+            km.resolve(ctrl(KeyCode::Char('v')), WorkspaceTab::Issues, PaneFocus::Main, false, false),
+            Some(Action::PasteClipboard)
+        );
+        assert_eq!(
+            km.resolve(key(KeyCode::Char('h')), WorkspaceTab::Confluence, PaneFocus::Main, false, false),
+            Some(Action::ToggleHrefDisplay)
+        );
+        assert_eq!(
+            km.resolve(key(KeyCode::Char('h')), WorkspaceTab::Issues, PaneFocus::Main, false, false),
+            Some(Action::ToggleHrefDisplay)
+        );
+        assert_eq!(
+            km.resolve(key(KeyCode::Char('h')), WorkspaceTab::Board, PaneFocus::Detail, false, false),
+            Some(Action::ToggleHrefDisplay)
+        );
+        assert_eq!(
+            km.resolve(key(KeyCode::Char('h')), WorkspaceTab::Board, PaneFocus::Main, false, false),
+            Some(Action::MoveLeft)
+        );
+        assert_eq!(
+            km.resolve(key(KeyCode::Char('h')), WorkspaceTab::Confluence, PaneFocus::Nav, false, false),
+            Some(Action::CollapseNode)
         );
     }
 

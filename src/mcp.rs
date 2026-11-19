@@ -7,7 +7,10 @@
 //! `stderr`. Notifications (`notifications/*` or requests without `id`) emit no
 //! response.
 
-use std::{io::Write, path::Path};
+use std::{
+    io::Write,
+    path::{Path, PathBuf},
+};
 
 use anyhow::Result;
 use serde_json::{json, Value};
@@ -16,6 +19,7 @@ use tokio::io::{AsyncBufReadExt, BufReader};
 use crate::{
     atlassian::{AtlassianClient, SiteClientPool},
     config::AppConfig,
+    img_preview,
     models::{FederatedSearchHit, IssueUpdate, OutgoingIssue, OutgoingPage, PageUpdate},
     serve::{clamp_limit, escape_jql_str, issue_to_hit, looks_like_query_expr, page_to_hit},
     storage::{Storage, DEFAULT_SITE_ID},
@@ -975,6 +979,56 @@ async fn call_tool(
             }))
         }
 
+        "download_attachment" => {
+            let issue_key = args.optional_str("issue_key")?;
+            let page_id = args.optional_str("page_id")?;
+            let attachment_id = args.optional_str("attachment_id")?;
+            let dest_dir_opt = args.optional_str("dest_dir")?;
+
+            let (_target_site, target_client) =
+                resolve_mcp_client(config, client, site_arg.as_deref())?;
+
+            let (owner_label, attachments) = if let Some(key) = issue_key {
+                let detail = target_client.get_issue(&key).await.map_err(format_error)?;
+                (format!("issue {key}"), detail.attachments)
+            } else if let Some(pid) = page_id {
+                let detail = target_client.get_page(&pid).await.map_err(format_error)?;
+                (format!("page {pid}"), detail.attachments)
+            } else {
+                return Err("either issue_key or page_id is required".to_string());
+            };
+
+            let selected = if let Some(aid) = attachment_id.as_deref() {
+                attachments
+                    .iter()
+                    .find(|a| a.id == aid || a.filename.eq_ignore_ascii_case(aid))
+            } else {
+                attachments.first()
+            }
+            .ok_or_else(|| format!("attachment not found on {owner_label}"))?;
+
+            let dest_dir = dest_dir_opt
+                .map(PathBuf::from)
+                .unwrap_or_else(|| config.resolved_download_dir());
+            let downloaded = target_client
+                .download_attachment(selected, &dest_dir)
+                .await
+                .map_err(format_error)?;
+
+            let abs_path = normalize_abs_path(&downloaded.path);
+            let is_image =
+                img_preview::is_image_attachment(&downloaded.mime_type, &downloaded.filename);
+
+            Ok(json!({
+                "ok": true,
+                "path": abs_path,
+                "file_name": downloaded.filename,
+                "mime_type": downloaded.mime_type,
+                "size_bytes": downloaded.size,
+                "is_image": is_image,
+            }))
+        }
+
         _ => Err(format!("unknown tool: {name}")),
     }
 }
@@ -1159,6 +1213,19 @@ pub(crate) fn validate_tool_args(name: &str, arguments: &Value) -> Result<(), St
             }
             Ok(())
         }
+        "download_attachment" => {
+            let issue_key = args.optional_str("issue_key")?;
+            let page_id = args.optional_str("page_id")?;
+            let _ = args.optional_str("attachment_id")?;
+            let _ = args.optional_str("dest_dir")?;
+            match (issue_key, page_id) {
+                (None, None) => Err("either issue_key or page_id is required".to_string()),
+                (Some(_), Some(_)) => {
+                    Err("specify either issue_key or page_id, not both".to_string())
+                }
+                _ => Ok(()),
+            }
+        }
         _ => Err(format!("unknown tool: {name}")),
     }
 }
@@ -1247,6 +1314,20 @@ fn tool_result(outcome: Result<Value, String>) -> Value {
 
 fn format_error(err: anyhow::Error) -> String {
     format!("{err:#}")
+}
+
+pub(crate) fn normalize_abs_path(path: &Path) -> String {
+    let abs = std::fs::canonicalize(path).unwrap_or_else(|_| {
+        if path.is_absolute() {
+            path.to_path_buf()
+        } else {
+            std::env::current_dir()
+                .map(|cwd| cwd.join(path))
+                .unwrap_or_else(|_| path.to_path_buf())
+        }
+    });
+    let raw = abs.to_string_lossy();
+    raw.strip_prefix(r"\\?\").unwrap_or(&raw).to_string()
 }
 
 fn validate_range(field: &str, value: usize, min: usize, max: usize) -> Result<usize, String> {
@@ -1433,7 +1514,7 @@ fn initialize_result(message: &Value) -> Value {
 }
 
 // ---------------------------------------------------------------------------
-// Tool catalog (27 tools: 15 Jira + 9 Confluence + 3 Unified / Multi-Site)
+// Tool catalog (28 tools: 15 Jira + 9 Confluence + 4 Unified / Multi-Site & Media)
 // ---------------------------------------------------------------------------
 
 fn tool_catalog() -> Vec<Value> {
@@ -1800,6 +1881,20 @@ fn tool_catalog() -> Vec<Value> {
                 "additionalProperties": false
             }
         }),
+        json!({
+            "name": "download_attachment",
+            "description": "Download an attachment from a Jira issue or Confluence page to disk and return its absolute path, metadata, and image flag for direct multimodal agent inspection.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "issue_key": { "type": "string", "minLength": 1, "description": "Jira issue key (e.g. ENG-42). Provide either issue_key or page_id." },
+                    "page_id": { "type": "string", "minLength": 1, "description": "Confluence page ID. Provide either issue_key or page_id." },
+                    "attachment_id": { "type": "string", "minLength": 1, "description": "Optional attachment ID or filename to download (defaults to first attachment)." },
+                    "dest_dir": { "type": "string", "minLength": 1, "description": "Optional destination directory (defaults to configured download_dir)." }
+                },
+                "additionalProperties": false
+            }
+        }),
     ];
 
     // Add optional `site` selector to every tool except `list_sites`.
@@ -1923,7 +2018,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn tools_list_has_exact_27_tools() {
+    async fn tools_list_has_exact_28_tools() {
         let (cfg, client, storage) = test_ctx();
         let line = json!({
             "jsonrpc": "2.0",
@@ -1935,11 +2030,113 @@ mod tests {
             .await
             .unwrap();
         let tools = resp["result"]["tools"].as_array().unwrap();
-        assert_eq!(tools.len(), 27, "expected exactly 27 MCP tools");
+        assert_eq!(tools.len(), 28, "expected exactly 28 MCP tools");
         assert!(
             tools.iter().any(|t| t["name"] == "list_sites"),
             "expected list_sites in MCP tool catalog"
         );
+        assert!(
+            tools.iter().any(|t| t["name"] == "download_attachment"),
+            "expected download_attachment in MCP tool catalog"
+        );
+    }
+
+    #[tokio::test]
+    async fn download_attachment_tool_downloads_image_and_returns_structured_metadata() {
+        use axum::{routing::get, Json, Router};
+        use tokio::net::TcpListener;
+
+        let png_bytes = b"\x89PNG\r\n\x1a\nMOCKPNG".to_vec();
+        let png_clone = png_bytes.clone();
+        let app = Router::new()
+            .route(
+                "/rest/api/3/issue/ENG-42",
+                get(|| async {
+                    Json(json!({
+                        "id": "10042",
+                        "key": "ENG-42",
+                        "fields": {
+                            "summary": "Screenshot issue",
+                            "status": { "id": "1", "name": "To Do", "statusCategory": { "key": "new" } },
+                            "issuetype": { "id": "1", "name": "Task", "subtask": false },
+                            "project": { "key": "ENG" },
+                            "attachment": [{
+                                "id": "att-77",
+                                "filename": "architecture.png",
+                                "mimeType": "image/png",
+                                "size": 15,
+                                "created": "2026-11-19T00:00:00Z",
+                                "content": "/rest/api/3/attachment/content/att-77"
+                            }]
+                        }
+                    }))
+                }),
+            )
+            .route(
+                "/rest/api/3/attachment/content/att-77",
+                get(move || {
+                    let data = png_clone.clone();
+                    async move { data }
+                }),
+            );
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        let base_url = format!("http://{addr}");
+
+        let cfg = AppConfig {
+            site_url: base_url.clone(),
+            deployment: DeploymentKind::Cloud,
+            ..AppConfig::default()
+        };
+        let auth = AuthManager::with_credentials(
+            "test",
+            crate::auth::StoredCredentials::BearerPat {
+                site_url: base_url.clone(),
+                token: "tok".into(),
+                deployment: DeploymentKind::Cloud,
+            },
+        );
+        let client =
+            AtlassianClient::with_base_urls(&base_url, "", DeploymentKind::Cloud, auth).unwrap();
+        let storage = Storage::open_in_memory().unwrap();
+        let dest = tempfile::tempdir().unwrap();
+
+        // Missing both issue_key and page_id fails validation
+        assert!(validate_tool_args("download_attachment", &json!({})).is_err());
+
+        let call = json!({
+            "jsonrpc": "2.0",
+            "id": 77,
+            "method": "tools/call",
+            "params": {
+                "name": "download_attachment",
+                "arguments": {
+                    "issue_key": "ENG-42",
+                    "attachment_id": "att-77",
+                    "dest_dir": dest.path().to_string_lossy()
+                }
+            }
+        })
+        .to_string();
+
+        let resp = handle_rpc_line(&cfg, &client, &storage, &call)
+            .await
+            .unwrap();
+        assert_eq!(resp["result"]["isError"], false, "{resp}");
+        let payload: Value =
+            serde_json::from_str(resp["result"]["content"][0]["text"].as_str().unwrap()).unwrap();
+        assert_eq!(payload["ok"], true);
+        assert_eq!(payload["file_name"], "architecture.png");
+        assert_eq!(payload["mime_type"], "image/png");
+        assert_eq!(payload["size_bytes"], png_bytes.len() as u64);
+        assert_eq!(payload["is_image"], true);
+        let dl_path = PathBuf::from(payload["path"].as_str().unwrap());
+        assert!(dl_path.is_absolute());
+        assert_eq!(std::fs::read(&dl_path).unwrap(), png_bytes);
     }
 
     #[tokio::test]

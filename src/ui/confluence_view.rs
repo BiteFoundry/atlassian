@@ -13,7 +13,7 @@ use crate::{
     models::{DocBlock, InlineNode, InlineStyle, PageDetail},
     ui::{
         app::{AppState, PaneFocus, UiState},
-        doc_view::{render_blocks, truncate_width},
+        doc_view::{render_blocks_with_options, truncate_width},
         draw_horizontal_hairline, fill_surface,
         hitmap::{ButtonId, HitMap, HitTarget},
     },
@@ -474,12 +474,13 @@ fn build_wiki_reader_lines(
             theme.muted_style(),
         )));
     } else {
-        for mut l in render_blocks(
+        for mut l in render_blocks_with_options(
             &body_blocks,
             w.saturating_sub(2) as u16,
             theme,
             Some(&app.image_cache),
             ui.inline_images,
+            ui.show_hrefs,
         ) {
             l.spans.insert(0, Span::raw(" "));
             lines.push(l);
@@ -555,7 +556,14 @@ fn build_wiki_reader_lines(
                     }],
                 }]
             };
-            for mut l in render_blocks(&c_blocks, w.saturating_sub(4) as u16, theme, None, false) {
+            for mut l in render_blocks_with_options(
+                &c_blocks,
+                w.saturating_sub(4) as u16,
+                theme,
+                None,
+                false,
+                ui.show_hrefs,
+            ) {
                 l.spans.insert(0, Span::raw("    "));
                 lines.push(l);
             }

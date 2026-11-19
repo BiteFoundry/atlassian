@@ -579,8 +579,10 @@ pub async fn run_with_persona(
     let (mut guard, mut terminal) = TerminalGuard::enter()?;
     install_panic_hook(guard.keyboard_enhanced);
 
-    // Probe terminal graphics protocol and cell pixel dimensions once on TUI startup.
-    let graphics_caps = img_preview::detect_graphics_caps_auto();
+    // Actively probe terminal graphics protocol and cell pixel dimensions once on TUI startup in raw mode.
+    let img_pref = ui::app::config_protocol_to_img_pref(app.config.image_protocol);
+    let graphics_caps = img_preview::probe_terminal_graphics_caps(img_pref);
+    ui.graphics_caps = graphics_caps;
     let mut pixel_rt = PixelPreviewRuntime::new(graphics_caps);
 
     let mut events = EventStream::new();
