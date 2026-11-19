@@ -33,7 +33,9 @@ use unicode_width::UnicodeWidthStr;
 use self::{
     app::{AppState, PaneFocus, UiState, WorkspaceTab},
     doc_view::truncate_width,
-    hitmap::HitTarget,
+    hitmap::{ButtonId, HitTarget},
+    my_work_view::MyWorkScope,
+    search_view::SearchScope,
     toast::ToastKind,
 };
 
@@ -136,6 +138,7 @@ pub fn draw(frame: &mut Frame, app: &AppState, ui: &mut UiState) -> Option<(u16,
     ui.term_width = area.width;
     ui.term_height = area.height;
     ui.hitmap.clear();
+    ui.site_group_keys.clear();
 
     if area.width < 12 || area.height < 5 {
         return None;
@@ -242,16 +245,36 @@ pub fn draw(frame: &mut Frame, app: &AppState, ui: &mut UiState) -> Option<(u16,
             issue_view::draw(frame, nav_rect, main_rect, app, ui);
         }
         WorkspaceTab::MyWork => {
-            my_work_view::draw(frame, main_rect, app, ui);
+            let active_label = app.active_scope_label();
+            let scope = MyWorkScope {
+                active_site_label: active_label.as_deref(),
+                issue_site_labels: &app.my_issue_site_labels,
+                page_site_labels: &app.my_page_site_labels,
+            };
+            my_work_view::draw_with_scope(frame, main_rect, app, ui, &scope);
         }
         WorkspaceTab::Confluence => {
             confluence_view::draw(frame, nav_rect, main_rect, drawer_rect, app, ui);
         }
         WorkspaceTab::Search => {
-            search_view::draw(frame, main_rect, app, ui);
+            let active_label = app.active_scope_label();
+            let scope = SearchScope {
+                active_site_label: active_label.as_deref(),
+                hit_site_labels: &app.search_hit_site_labels,
+            };
+            search_view::draw_with_scope(frame, main_rect, app, ui, &scope);
         }
         WorkspaceTab::Directory => {
-            directory_view::draw(frame, main_rect, app, ui);
+            let connected_sites = app.build_connected_site_rows();
+            let active_label = app.active_scope_label();
+            directory_view::draw_with_sites(
+                frame,
+                main_rect,
+                app,
+                ui,
+                &connected_sites,
+                active_label.as_deref(),
+            );
         }
     }
 
@@ -307,16 +330,28 @@ fn draw_persona_header(frame: &mut Frame, area: Rect, app: &AppState, ui: &mut U
     x += badge.content.width() as u16;
     spans.push(badge);
 
-    let site = format!(" {} ", site_display_english(app));
-    x += site.width() as u16;
-    spans.push(Span::styled(
-        site,
-        if theme.no_color {
-            Style::default().add_modifier(Modifier::DIM)
-        } else {
-            Style::default().bg(theme.bg_header).fg(theme.fg_muted)
-        },
-    ));
+    // Clickable active site pill (opens SiteSwitcherOverlay on click or Ctrl+S).
+    spans.push(Span::styled(" ", bar_style));
+    x += 1;
+    let site_pill_label = truncate_width(&app.header_site_pill_label(), 22);
+    let site_pill_text = format!(" {site_pill_label} ▾ ");
+    let site_pill_w = site_pill_text.width() as u16;
+    let site_pill_style = if theme.no_color {
+        Style::default().add_modifier(Modifier::BOLD)
+    } else {
+        Style::default()
+            .bg(theme.chip_bg)
+            .fg(theme.chip_fg)
+            .add_modifier(Modifier::BOLD)
+    };
+    if x + site_pill_w <= area.x + area.width {
+        ui.hitmap
+            .add_line(x, area.y, site_pill_w, HitTarget::Button(ButtonId::SiteSwitcher));
+    }
+    x += site_pill_w;
+    spans.push(Span::styled(site_pill_text, site_pill_style));
+    spans.push(Span::styled(" ", bar_style));
+    x += 1;
 
     for (idx, label) in WORKSPACE_TAB_LABELS.iter().enumerate() {
         let active = ui.active_tab.index() == idx;
@@ -819,5 +854,190 @@ mod tests {
         )
         .unwrap();
         assert_eq!(act_v, Action::OpenImagePreview);
+    }
+
+    #[tokio::test]
+    async fn multi_site_header_pill_switcher_federated_views_and_collapsible_groups() {
+        use crate::{
+            config::{DeploymentKind, SiteProfile},
+            models::{BoardSummary, SiteScope},
+            ui::overlays::OverlayKind,
+        };
+
+        let mut cfg = AppConfig::default();
+        cfg.upsert_site(SiteProfile {
+            id: "acme-cloud".into(),
+            name: "Acme Cloud".into(),
+            site_url: "https://acme.atlassian.net".into(),
+            confluence_url: String::new(),
+            deployment: DeploymentKind::Cloud,
+            cloud_id: Some("cid-acme".into()),
+            account_id: "cloud-oauth".into(),
+            enabled: true,
+            scopes: vec![],
+        });
+        cfg.upsert_site(SiteProfile {
+            id: "corp-dc".into(),
+            name: "Corp DC".into(),
+            site_url: "https://jira.corp.internal".into(),
+            confluence_url: String::new(),
+            deployment: DeploymentKind::DataCenter,
+            cloud_id: None,
+            account_id: "corp-dc".into(),
+            enabled: true,
+            scopes: vec![],
+        });
+
+        let auth = AuthManager::new("test");
+        let client = AtlassianClient::new(cfg.clone(), auth.clone()).unwrap();
+        let storage = Storage::open_in_memory().unwrap();
+        storage
+            .upsert_boards_for_site(
+                "acme-cloud",
+                &[BoardSummary {
+                    id: 1,
+                    name: "Acme Board".into(),
+                    board_type: "scrum".into(),
+                    ..Default::default()
+                }],
+            )
+            .unwrap();
+        storage
+            .upsert_boards_for_site(
+                "corp-dc",
+                &[BoardSummary {
+                    id: 2,
+                    name: "Corp Board".into(),
+                    board_type: "kanban".into(),
+                    ..Default::default()
+                }],
+            )
+            .unwrap();
+        storage
+            .upsert_issues_for_site(
+                "acme-cloud",
+                &[IssueSummary {
+                    id: "1".into(),
+                    key: "ENG-1".into(),
+                    project_key: "ENG".into(),
+                    summary: "Acme federated ticket".into(),
+                    status: IssueStatus {
+                        id: "1".into(),
+                        name: "In Progress".into(),
+                        category: StatusCategory::InProgress,
+                    },
+                    issue_type: IssueType {
+                        id: "10".into(),
+                        name: "Task".into(),
+                        subtask: false,
+                        epic: false,
+                    },
+                    updated_at: "2026-11-19T12:00:00Z".into(),
+                    ..Default::default()
+                }],
+            )
+            .unwrap();
+        storage
+            .upsert_issues_for_site(
+                "corp-dc",
+                &[IssueSummary {
+                    id: "2".into(),
+                    key: "ENG-1".into(),
+                    project_key: "ENG".into(),
+                    summary: "Corp federated ticket".into(),
+                    status: IssueStatus {
+                        id: "1".into(),
+                        name: "To Do".into(),
+                        category: StatusCategory::Todo,
+                    },
+                    issue_type: IssueType {
+                        id: "10".into(),
+                        name: "Task".into(),
+                        subtask: false,
+                        epic: false,
+                    },
+                    updated_at: "2026-11-19T13:00:00Z".into(),
+                    ..Default::default()
+                }],
+            )
+            .unwrap();
+        storage
+            .upsert_spaces_for_site(
+                "acme-cloud",
+                &[SpaceSummary {
+                    id: "sp1".into(),
+                    key: "DOCS".into(),
+                    name: "Acme Docs".into(),
+                    space_type: "global".into(),
+                    ..Default::default()
+                }],
+            )
+            .unwrap();
+        storage
+            .upsert_spaces_for_site(
+                "corp-dc",
+                &[SpaceSummary {
+                    id: "sp2".into(),
+                    key: "DOCS".into(),
+                    name: "Corp Docs".into(),
+                    space_type: "global".into(),
+                    ..Default::default()
+                }],
+            )
+            .unwrap();
+
+        let (core_tx, _) = mpsc::unbounded_channel();
+        let sync_ctrl =
+            sync::spawn_sync_engine(cfg.clone(), client.clone(), storage.clone(), core_tx);
+        let (ui_tx, _) = mpsc::unbounded_channel();
+        let mut app = AppState::new_with_persona(
+            cfg.clone(),
+            Persona::Jira,
+            auth,
+            client,
+            storage,
+            sync_ctrl,
+            ui_tx,
+        );
+        app.load_cached_initial();
+        let mut ui = UiState::from_config_with_persona(&cfg, Persona::Jira);
+
+        // 1. Top header shows clickable All Sites pill and Board nav shows collapsible site groups
+        let board_screen = render_buffer_text(&app, &mut ui, 130, 36);
+        assert!(board_screen.contains("All Sites (2)"), "expected All Sites pill:\n{board_screen}");
+        assert!(board_screen.contains("▾ Acme Cloud"), "expected Acme site group:\n{board_screen}");
+        assert!(board_screen.contains("▾ Corp DC"), "expected Corp site group:\n{board_screen}");
+
+        // Collapse first site group header via collapsed_site_groups
+        assert!(!ui.site_group_keys.is_empty());
+        let first_key = ui.site_group_keys[0].clone();
+        ui.collapsed_site_groups.insert(first_key);
+        let collapsed_screen = render_buffer_text(&app, &mut ui, 130, 36);
+        assert!(collapsed_screen.contains("▸ Acme Cloud"), "expected collapsed chevron:\n{collapsed_screen}");
+
+        // 2. My Work shows federated [site] pills & All Sites scope
+        action::dispatch(Action::SwitchTab(WorkspaceTab::MyWork.index()), &mut app, &mut ui);
+        let my_work_screen = render_buffer_text(&app, &mut ui, 130, 36);
+        assert!(
+            my_work_screen.contains("[Acme Cloud]") || my_work_screen.contains("[Corp DC]"),
+            "expected site pills:\n{my_work_screen}"
+        );
+
+        // 3. Directory shows Connected Sites & Accounts
+        action::dispatch(Action::SwitchTab(WorkspaceTab::Directory.index()), &mut app, &mut ui);
+        let dir_screen = render_buffer_text(&app, &mut ui, 130, 36);
+        assert!(dir_screen.contains("Connected Sites & Accounts"), "expected Connected Sites table:\n{dir_screen}");
+        assert!(dir_screen.contains("Acme Cloud"), "expected Acme Cloud row:\n{dir_screen}");
+        assert!(dir_screen.contains("Corp DC"), "expected Corp DC row:\n{dir_screen}");
+
+        // 4. Open Site Switcher via Ctrl+S, select Acme Cloud, verify SiteScope & header pill update
+        action::dispatch(Action::OpenSiteSwitcher, &mut app, &mut ui);
+        assert_eq!(ui.overlays.last().map(|o| o.kind()), Some(OverlayKind::SiteSwitcher));
+        action::dispatch(Action::MoveDown, &mut app, &mut ui);
+        action::dispatch(Action::Activate, &mut app, &mut ui);
+        assert!(!ui.has_overlay());
+        assert_eq!(app.site_scope, SiteScope::Only("acme-cloud".into()));
+        let scoped_screen = render_buffer_text(&app, &mut ui, 130, 36);
+        assert!(scoped_screen.contains(" Acme Cloud ▾ "), "expected active site pill:\n{scoped_screen}");
     }
 }

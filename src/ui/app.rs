@@ -10,22 +10,27 @@ use tokio::sync::mpsc;
 
 use crate::{
     adf,
-    atlassian::AtlassianClient,
-    auth::AuthManager,
+    atlassian::{AtlassianClient, SiteClientPool},
+    auth::{
+        fetch_accessible_resources, run_oauth_loopback_login, AuthManager, OAuthLoopbackOptions,
+        StoredCredentials, DEFAULT_OAUTH_API_BASE, DEFAULT_OAUTH_AUTH_BASE,
+    },
     config::{
-        AppConfig, DensityMode, DraftStore, ImageProtocolPreference as ConfigImageProtocol, Persona,
+        AppConfig, DensityMode, DeploymentKind, DraftStore,
+        ImageProtocolPreference as ConfigImageProtocol, Persona, SiteProfile,
     },
     img_preview::{self, RenderedTerminalImage, TerminalGraphicsCaps},
     models::{
         AttachmentItem, BoardColumn, BoardSummary, ConfluenceComment, CoreEvent, CrossRefTarget,
         DownloadedFile, IssueComment, IssueDetail, IssueStatus, IssueSummary, IssueTransition,
         IssueUpdate, OutgoingIssue, OutgoingPage, PageDetail, PageSummary, PageUpdate,
-        ProjectSummary, SavedFilter, SpaceSummary, SprintSummary, StatusCategory, UnifiedSearchHit,
-        UpdateCheckResult, UserSummary,
+        ProjectSummary, SavedFilter, SiteScope, SpaceSummary, SprintSummary, StatusCategory,
+        UnifiedSearchHit, UpdateCheckResult, UserSummary,
     },
-    storage::{CacheCounts, Storage},
-    sync::{self, SyncController},
+    storage::{CacheCounts, SiteRecord, Storage, DEFAULT_SITE_ID},
+    sync::{self, MultiSiteSyncOutcome, SiteSyncTarget, SyncController},
     ui::{
+        directory_view::ConnectedSiteRow,
         hitmap::HitMap,
         keymap::Keymap,
         notification,
@@ -35,6 +40,7 @@ use crate::{
             issue_form::IssueFormOverlay,
             page_form::PageFormOverlay,
             path_input::{PathInputOverlay, UploadTarget},
+            site_switcher::{SiteSwitcherCommand, SiteSwitcherEntry},
             transition::TransitionOverlay,
             Overlay,
         },
@@ -284,12 +290,16 @@ pub enum UiMsg {
     PageActionFailed(String),
     MyWorkLoaded {
         issues: Vec<IssueSummary>,
+        issue_site_labels: Vec<Option<String>>,
         pages: Vec<PageSummary>,
+        page_site_labels: Vec<Option<String>>,
     },
     RemoteSearchLoaded {
         query: String,
-        hits: Result<Vec<UnifiedSearchHit>, String>,
+        hits: Result<(Vec<UnifiedSearchHit>, Vec<String>, Vec<Option<String>>), String>,
     },
+    CloudSitesDiscovered(Result<Vec<SiteProfile>, String>),
+    MultiSiteSyncFinished(MultiSiteSyncOutcome),
     ImageLoaded {
         cache_key: String,
         rendered: Result<RenderedTerminalImage, String>,
@@ -327,6 +337,10 @@ pub struct UiState {
     pub confluence_ui: ConfluenceUiState,
     pub search_ui: SearchUiState,
     pub directory_ui: DirectoryUiState,
+    /// Collapsed sidebar site group keys (`"{tab}:{site_id}"`) in multi-site All Sites mode.
+    pub collapsed_site_groups: HashSet<String>,
+    /// Per-frame mapping from `HitTarget::SiteGroupHeader(idx)` to group collapse key.
+    pub site_group_keys: Vec<String>,
 }
 
 impl UiState {
@@ -364,6 +378,8 @@ impl UiState {
             },
             search_ui: SearchUiState::default(),
             directory_ui: DirectoryUiState::default(),
+            collapsed_site_groups: HashSet::new(),
+            site_group_keys: Vec::new(),
         }
     }
 
@@ -405,6 +421,8 @@ pub struct AppState {
     pub persona: Persona,
     pub auth: AuthManager,
     pub client: AtlassianClient,
+    pub site_pool: SiteClientPool,
+    pub site_scope: SiteScope,
     pub storage: Storage,
     pub sync_ctrl: SyncController,
     pub ui_tx: mpsc::UnboundedSender<UiMsg>,
@@ -415,23 +433,30 @@ pub struct AppState {
 
     pub projects: Vec<ProjectSummary>,
     pub boards: Vec<BoardSummary>,
+    pub board_site_ids: Vec<String>,
     pub sprints: Vec<SprintSummary>,
     pub board_issues: Vec<IssueSummary>,
 
     pub saved_filters: Vec<SavedFilter>,
     pub issues: Vec<IssueSummary>,
+    pub issue_site_ids: Vec<String>,
     pub active_issue: Option<IssueDetail>,
 
     pub spaces: Vec<SpaceSummary>,
+    pub space_site_ids: Vec<String>,
     pub root_pages_by_space: HashMap<String, Vec<PageSummary>>,
     pub page_children_map: HashMap<String, Vec<PageSummary>>,
     pub expanded_pages: HashSet<String>,
     pub active_page: Option<PageDetail>,
 
     pub my_issues: Vec<IssueSummary>,
+    pub my_issue_site_labels: Vec<Option<String>>,
     pub my_pages: Vec<PageSummary>,
+    pub my_page_site_labels: Vec<Option<String>>,
 
     pub search_hits: Vec<UnifiedSearchHit>,
+    pub search_hit_site_ids: Vec<String>,
+    pub search_hit_site_labels: Vec<Option<String>>,
     pub cache_counts: CacheCounts,
 
     /// Cross-App navigation stack (`Jira <-> Confluence`).
@@ -464,11 +489,18 @@ impl AppState {
         } else {
             DraftStore::load()
         };
+        let site_scope = SiteScope::from_optional(config.active_site.as_deref());
+        let site_pool = SiteClientPool::from_config(&config).unwrap_or_else(|_| {
+            SiteClientPool::new(Vec::new(), |_| auth.clone(), None, None)
+                .expect("empty site pool initialization")
+        });
         Self {
             config,
             persona,
             auth,
             client,
+            site_pool,
+            site_scope,
             storage,
             sync_ctrl,
             ui_tx,
@@ -477,19 +509,26 @@ impl AppState {
             sync_summary: String::new(),
             projects: Vec::new(),
             boards: Vec::new(),
+            board_site_ids: Vec::new(),
             sprints: Vec::new(),
             board_issues: Vec::new(),
             saved_filters,
             issues: Vec::new(),
+            issue_site_ids: Vec::new(),
             active_issue: None,
             spaces: Vec::new(),
+            space_site_ids: Vec::new(),
             root_pages_by_space: HashMap::new(),
             page_children_map: HashMap::new(),
             expanded_pages: HashSet::new(),
             active_page: None,
             my_issues: Vec::new(),
+            my_issue_site_labels: Vec::new(),
             my_pages: Vec::new(),
+            my_page_site_labels: Vec::new(),
             search_hits: Vec::new(),
+            search_hit_site_ids: Vec::new(),
+            search_hit_site_labels: Vec::new(),
             cache_counts: CacheCounts::default(),
             nav_history: Vec::new(),
             image_cache: HashMap::new(),
@@ -553,6 +592,16 @@ impl AppState {
     }
 
     pub fn site_display(&self) -> String {
+        if let Some(label) = self.active_scope_label() {
+            return label;
+        }
+        let enabled = self.config.enabled_sites();
+        if enabled.len() > 1 {
+            return format!("All Sites ({})", enabled.len());
+        }
+        if let Some(first) = enabled.first() {
+            return first.display_name().to_string();
+        }
         let raw = self.config.site_url.trim();
         if raw.is_empty() {
             "Not configured".to_string()
@@ -564,56 +613,579 @@ impl AppState {
         }
     }
 
-    pub fn load_cached_initial(&mut self) {
-        if let Ok(projs) = self.storage.list_projects() {
-            self.projects = projs;
+    /// Rebuilds the shared `SiteClientPool` from `self.config` and updates `self.client`
+    /// when a specific site scope is active.
+    pub fn rebuild_site_pool(&mut self) {
+        if let Ok(pool) = SiteClientPool::from_config(&self.config) {
+            self.site_pool = pool;
         }
-        if let Ok(boards) = self.storage.list_boards(None) {
-            self.boards = boards;
-            if let Some(first_board) = self.boards.first() {
-                let bid = first_board.id;
-                if let Ok(sprints) = self.storage.list_sprints(bid) {
-                    self.sprints = sprints;
+        if let SiteScope::Only(ref id) = self.site_scope {
+            if let Ok(scoped_client) = self.site_pool.client_for(id) {
+                self.client = scoped_client;
+            }
+        } else if let Some(def) = self.config.default_site_profile() {
+            if let Ok(def_client) = self.site_pool.client_for(&def.id) {
+                self.client = def_client;
+            }
+        }
+    }
+
+    /// Resolves a human-friendly site label for `site_id` (site `name` or fallback `site_id`).
+    pub fn site_display_label(&self, site_id: &str) -> String {
+        if let Some(site) = self.config.find_effective_site(site_id) {
+            return site.display_name().to_string();
+        }
+        site_id.to_string()
+    }
+
+    /// Returns `None` in `All Sites` federated mode, or `Some(display_name)` when scoped to 1 site.
+    pub fn active_scope_label(&self) -> Option<String> {
+        self.site_scope
+            .site_id()
+            .map(|id| self.site_display_label(id))
+    }
+
+    /// Label rendered inside the clickable top-header site switcher pill.
+    pub fn header_site_pill_label(&self) -> String {
+        match &self.site_scope {
+            SiteScope::All => {
+                let enabled = self.config.enabled_sites();
+                if enabled.len() > 1 {
+                    format!("All Sites ({})", enabled.len())
+                } else if self.config.sites.is_empty() && !self.config.site_url.trim().is_empty() {
+                    self.config
+                        .site_url
+                        .trim()
+                        .trim_start_matches("https://")
+                        .trim_start_matches("http://")
+                        .trim_end_matches('/')
+                        .to_string()
+                } else {
+                    "All Sites".to_string()
                 }
-                if let Ok(bi) = self.storage.list_board_issues(bid, None, 150) {
-                    self.board_issues = bi;
+            }
+            SiteScope::Only(id) => self.site_display_label(id),
+        }
+    }
+
+    /// True when in `All Sites` mode and multiple enabled sites exist (or multiple distinct sites are loaded).
+    pub fn is_multi_site_all_mode(&self) -> bool {
+        if !self.site_scope.is_all() {
+            return false;
+        }
+        if self.config.enabled_sites().len() > 1 {
+            return true;
+        }
+        let distinct_boards: HashSet<&str> = self.board_site_ids.iter().map(String::as_str).collect();
+        let distinct_issues: HashSet<&str> = self.issue_site_ids.iter().map(String::as_str).collect();
+        let distinct_spaces: HashSet<&str> = self.space_site_ids.iter().map(String::as_str).collect();
+        distinct_boards.len() > 1 || distinct_issues.len() > 1 || distinct_spaces.len() > 1
+    }
+
+    fn site_is_enabled_in_config(&self, site_id: &str) -> bool {
+        if self.config.sites.is_empty() {
+            return true;
+        }
+        match self.config.find_site(site_id) {
+            Some(s) => s.enabled,
+            None => true,
+        }
+    }
+
+    fn site_auth_label(&self, site: &SiteProfile) -> String {
+        let mgr = self.auth.with_account(&site.account_id);
+        let creds = mgr.load_credentials().ok().flatten().or_else(|| {
+            if site.account_id == self.auth.account_id() {
+                self.auth.load_credentials().ok().flatten()
+            } else {
+                None
+            }
+        });
+        match creds {
+            Some(StoredCredentials::CloudOAuth { .. }) => "Cloud OAuth".to_string(),
+            Some(StoredCredentials::CloudAccountToken { .. }) => "Cloud Token".to_string(),
+            Some(StoredCredentials::ApiToken { deployment, .. }) => match deployment {
+                DeploymentKind::Cloud => "Cloud Token".to_string(),
+                DeploymentKind::DataCenter => "DC Basic".to_string(),
+            },
+            Some(StoredCredentials::BearerPat { deployment, .. }) => match deployment {
+                DeploymentKind::Cloud => "Cloud Bearer".to_string(),
+                DeploymentKind::DataCenter => "DC PAT".to_string(),
+            },
+            None => {
+                if site.is_oauth_cloud() {
+                    "Cloud OAuth".to_string()
+                } else {
+                    "Offline".to_string()
                 }
             }
         }
-        if let Ok(mut filters) = self.storage.list_saved_filters() {
-            if !filters.is_empty() {
-                let mut combined = builtin_filters();
-                for f in filters.drain(..) {
-                    if !combined.iter().any(|b| b.id == f.id) {
-                        combined.push(f);
+    }
+
+    /// Builds `SiteSwitcherOverlay` rows from all effective configured sites and SQLite cache counts.
+    pub fn build_site_switcher_entries(&self) -> Vec<SiteSwitcherEntry> {
+        let sites = self.config.effective_sites();
+        let mut entries = Vec::with_capacity(sites.len());
+        for site in sites {
+            let counts = self
+                .storage
+                .cache_counts_for_site(&site.id)
+                .unwrap_or_default();
+            let deployment_label = match site.deployment {
+                DeploymentKind::Cloud => "Cloud".to_string(),
+                DeploymentKind::DataCenter => "Data Center".to_string(),
+            };
+            let auth_label = self.site_auth_label(&site);
+            let is_active = self
+                .site_scope
+                .site_id()
+                .is_some_and(|id| id.eq_ignore_ascii_case(&site.id));
+            entries.push(SiteSwitcherEntry {
+                site_id: site.id.clone(),
+                name: site.display_name().to_string(),
+                site_url: site.site_url.clone(),
+                deployment_label,
+                auth_label,
+                enabled: site.enabled,
+                is_active,
+                issue_count: counts.issues,
+                page_count: counts.pages,
+            });
+        }
+        entries
+    }
+
+    /// Builds **Connected Sites & Accounts** rows for the Directory tab.
+    pub fn build_connected_site_rows(&self) -> Vec<ConnectedSiteRow> {
+        let sites = self.config.effective_sites();
+        let mut rows = Vec::with_capacity(sites.len());
+        for site in sites {
+            let db_rec = self.storage.get_site(&site.id).ok().flatten();
+            let deployment_label = match site.deployment {
+                DeploymentKind::Cloud => "Cloud".to_string(),
+                DeploymentKind::DataCenter => "Data Center".to_string(),
+            };
+            let auth_label = self.site_auth_label(&site);
+            let is_active = match &self.site_scope {
+                SiteScope::All => site.enabled,
+                SiteScope::Only(id) => id.eq_ignore_ascii_case(&site.id),
+            };
+            let sync_status = if !site.enabled {
+                "Disabled".to_string()
+            } else if self.syncing {
+                "Syncing…".to_string()
+            } else if let Some(ref rec) = db_rec {
+                if let Some(ref err) = rec.last_error {
+                    format!("Error: {}", err.chars().take(24).collect::<String>())
+                } else if let Some(ref ts) = rec.last_synced_at {
+                    format!("Synced {}", ts.chars().take(16).collect::<String>())
+                } else {
+                    "Idle".to_string()
+                }
+            } else if auth_label == "Offline" {
+                "Offline".to_string()
+            } else {
+                "Ready".to_string()
+            };
+            rows.push(ConnectedSiteRow {
+                site_id: site.id.clone(),
+                name: site.display_name().to_string(),
+                site_url: site.site_url.clone(),
+                deployment_label,
+                auth_label,
+                enabled: site.enabled,
+                is_active,
+                sync_status,
+            });
+        }
+        rows
+    }
+
+    /// Applies a `SiteSwitcherCommand` emitted by `SiteSwitcherOverlay`, persisting
+    /// `active_site` / `enabled` to `config.toml` and refreshing federated views.
+    pub fn apply_site_switcher_command(&mut self, cmd: SiteSwitcherCommand, ui: &mut UiState) {
+        match cmd {
+            SiteSwitcherCommand::SelectAllSites => {
+                self.site_scope = SiteScope::All;
+                self.config.active_site = None;
+                self.rebuild_site_pool();
+                if let Err(err) = self.save_config() {
+                    ui.error(format!("Failed to save config.toml: {err}"));
+                }
+                self.load_cached_initial();
+                self.refresh_local_search(&ui.search_ui.query.text);
+                ui.board_ui.selected_board = 0;
+                ui.issue_ui.selected_issue = 0;
+                ui.confluence_ui.selected_space = 0;
+                ui.success("Scope: All Sites (Federated)");
+            }
+            SiteSwitcherCommand::SelectSite(site_id) => {
+                let label = self.site_display_label(&site_id);
+                self.site_scope = SiteScope::Only(site_id.clone());
+                self.config.active_site = Some(site_id);
+                self.rebuild_site_pool();
+                if let Err(err) = self.save_config() {
+                    ui.error(format!("Failed to save config.toml: {err}"));
+                }
+                self.load_cached_initial();
+                self.refresh_local_search(&ui.search_ui.query.text);
+                ui.board_ui.selected_board = 0;
+                ui.issue_ui.selected_issue = 0;
+                ui.confluence_ui.selected_space = 0;
+                ui.success(format!("Active site: {label}"));
+            }
+            SiteSwitcherCommand::ToggleSiteEnabled(site_id) => {
+                if self.config.sites.is_empty() {
+                    self.config.sites = self.config.effective_sites();
+                }
+                let mut now_enabled = None;
+                let mut label = site_id.clone();
+                for site in &mut self.config.sites {
+                    if site.id.eq_ignore_ascii_case(&site_id) {
+                        site.enabled = !site.enabled;
+                        now_enabled = Some(site.enabled);
+                        label = site.display_name().to_string();
+                        let _ = self.storage.upsert_site(&SiteRecord {
+                            site_id: site.id.clone(),
+                            name: site.display_name().to_string(),
+                            site_url: site.site_url.clone(),
+                            deployment: site.deployment.as_str().to_string(),
+                            enabled: site.enabled,
+                            last_synced_at: None,
+                            last_error: None,
+                        });
+                        break;
                     }
                 }
-                self.saved_filters = combined;
+                self.rebuild_site_pool();
+                if let Err(err) = self.save_config() {
+                    ui.error(format!("Failed to save config.toml: {err}"));
+                }
+                self.load_cached_initial();
+                self.refresh_local_search(&ui.search_ui.query.text);
+                if let Some(enabled) = now_enabled {
+                    ui.info(format!(
+                        "{}: {}",
+                        label,
+                        if enabled { "Enabled" } else { "Disabled" }
+                    ));
+                }
+            }
+            SiteSwitcherCommand::DiscoverCloudSites => {
+                self.request_discover_cloud_sites(ui);
+            }
+            SiteSwitcherCommand::SyncAllSites => {
+                self.request_multi_site_sync(ui);
             }
         }
-        if let Ok(issues) = self.storage.list_issues(None, 200) {
-            self.issues = issues.clone();
-            self.my_issues = issues.iter().take(20).cloned().collect();
-            if let Some(first) = issues.first() {
-                if let Ok(Some(detail)) = self.storage.get_issue_detail(&first.key) {
-                    self.active_issue = Some(detail);
+    }
+
+    /// Triggers Cloud OAuth 2.0 (3LO) `accessible-resources` site discovery in the background.
+    pub fn request_discover_cloud_sites(&self, ui: &mut UiState) {
+        if tokio::runtime::Handle::try_current().is_err() {
+            ui.info("Run `jira login --oauth` or `jira sites discover` to discover Cloud sites");
+            return;
+        }
+        // Check if any configured account already holds Cloud OAuth credentials.
+        let mut oauth_account: Option<AuthManager> = None;
+        if let Ok(Some(StoredCredentials::CloudOAuth { .. })) = self.auth.load_credentials() {
+            oauth_account = Some(self.auth.clone());
+        }
+        if oauth_account.is_none() {
+            for (site, client) in self.site_pool.all_clients() {
+                if let Ok(Some(StoredCredentials::CloudOAuth { .. })) =
+                    client.auth().load_credentials()
+                {
+                    oauth_account = Some(client.auth().clone());
+                    let _ = site;
+                    break;
                 }
             }
         }
-        if let Ok(spaces) = self.storage.list_spaces() {
-            self.spaces = spaces;
-            if let Some(first_space) = self.spaces.first() {
-                if let Ok(roots) = self.storage.list_space_root_pages(&first_space.key) {
-                    self.root_pages_by_space
-                        .insert(first_space.key.clone(), roots);
+
+        if let Some(auth_mgr) = oauth_account {
+            ui.tasks.begin("Discover Cloud sites");
+            let http = self.site_pool.http_client().clone();
+            let tx = self.ui_tx.clone();
+            let account_id = auth_mgr.account_id().to_string();
+            tokio::spawn(async move {
+                let res = async {
+                    let fresh = auth_mgr
+                        .ensure_fresh_credentials(&http, DEFAULT_OAUTH_AUTH_BASE)
+                        .await?;
+                    let token = fresh
+                        .oauth_access_token()
+                        .ok_or_else(|| anyhow::anyhow!("OAuth access token missing"))?;
+                    let resources =
+                        fetch_accessible_resources(&http, DEFAULT_OAUTH_API_BASE, token).await?;
+                    let profiles = resources
+                        .into_iter()
+                        .map(|r| r.to_site_profile(account_id.clone()))
+                        .collect::<Vec<_>>();
+                    Ok::<Vec<SiteProfile>, anyhow::Error>(profiles)
+                }
+                .await
+                .map_err(|e| format!("{e:#}"));
+                let _ = tx.send(UiMsg::CloudSitesDiscovered(res));
+            });
+            return;
+        }
+
+        if let Some(client_id) = self.config.effective_oauth_client_id() {
+            ui.tasks.begin("Discover Cloud sites");
+            let http = self.site_pool.http_client().clone();
+            let tx = self.ui_tx.clone();
+            let auth_mgr = self.auth.clone();
+            let client_secret = self.config.effective_oauth_client_secret();
+            tokio::spawn(async move {
+                let opts = OAuthLoopbackOptions {
+                    client_id,
+                    client_secret,
+                    ..Default::default()
+                };
+                let res = async {
+                    let (creds, resources) = run_oauth_loopback_login(&http, &opts).await?;
+                    auth_mgr.save_credentials(&creds)?;
+                    let account_id = auth_mgr.account_id().to_string();
+                    let profiles = resources
+                        .into_iter()
+                        .map(|r| r.to_site_profile(account_id.clone()))
+                        .collect::<Vec<_>>();
+                    Ok::<Vec<SiteProfile>, anyhow::Error>(profiles)
+                }
+                .await
+                .map_err(|e| format!("{e:#}"));
+                let _ = tx.send(UiMsg::CloudSitesDiscovered(res));
+            });
+            return;
+        }
+
+        ui.info(
+            "No OAuth session found. Run `jira login --oauth --client-id <ID>` to discover Cloud sites.",
+        );
+    }
+
+    /// Triggers parallel multi-site sync across all enabled sites (or falls back to single-site sync).
+    pub fn request_multi_site_sync(&mut self, ui: &mut UiState) {
+        self.syncing = true;
+        let enabled = self.site_pool.enabled_clients();
+        if enabled.len() > 1 && tokio::runtime::Handle::try_current().is_ok() {
+            ui.tasks.begin("Sync all sites");
+            let targets: Vec<SiteSyncTarget> = enabled
+                .into_iter()
+                .map(|(site, client)| SiteSyncTarget {
+                    site_id: site.id.clone(),
+                    site_name: site.display_name().to_string(),
+                    client,
+                })
+                .collect();
+            let storage = self.storage.clone();
+            let tx = self.ui_tx.clone();
+            tokio::spawn(async move {
+                let mut breakers = sync::CircuitBreakerMap::new();
+                let outcome = sync::run_multi_site_sync(
+                    &targets,
+                    &storage,
+                    &mut breakers,
+                    sync::DEFAULT_MULTI_SITE_CONCURRENCY,
+                    None,
+                )
+                .await;
+                let _ = tx.send(UiMsg::MultiSiteSyncFinished(outcome));
+            });
+            ui.info("Syncing all enabled sites in parallel…");
+        } else {
+            let _ = self.sync_ctrl.request(sync::SyncCommand::RefreshAll);
+            ui.info("Requested full workspace sync");
+        }
+    }
+
+    pub fn load_cached_initial(&mut self) {
+        let show_pills = self.site_scope.is_all();
+        match self.site_scope.site_id().map(str::to_string) {
+            Some(ref site_id) => {
+                if let Ok(projs) = self.storage.list_projects_for_site(site_id) {
+                    self.projects = projs;
+                }
+                if let Ok(boards) = self.storage.list_boards_for_site(site_id, None) {
+                    self.board_site_ids = vec![site_id.clone(); boards.len()];
+                    self.boards = boards;
+                    if let Some(first_board) = self.boards.first() {
+                        let bid = first_board.id;
+                        if let Ok(sprints) = self.storage.list_sprints_for_site(site_id, bid) {
+                            self.sprints = sprints;
+                        }
+                        if let Ok(bi) =
+                            self.storage
+                                .list_board_issues_for_site(site_id, bid, None, 150)
+                        {
+                            self.board_issues = bi;
+                        }
+                    } else {
+                        self.sprints.clear();
+                        self.board_issues.clear();
+                    }
+                }
+                if let Ok(mut filters) = self.storage.list_saved_filters_for_site(site_id) {
+                    let mut combined = builtin_filters();
+                    for f in filters.drain(..) {
+                        if !combined.iter().any(|b| b.id == f.id) {
+                            combined.push(f);
+                        }
+                    }
+                    self.saved_filters = combined;
+                }
+                if let Ok(issues) = self.storage.list_issues_for_site(site_id, None, 200) {
+                    self.issue_site_ids = vec![site_id.clone(); issues.len()];
+                    self.issues = issues.clone();
+                    self.my_issues = issues.iter().take(20).cloned().collect();
+                    self.my_issue_site_labels = vec![None; self.my_issues.len()];
+                    if let Some(first) = issues.first() {
+                        if let Ok(Some(detail)) =
+                            self.storage.get_issue_detail_for_site(site_id, &first.key)
+                        {
+                            self.active_issue = Some(detail);
+                        }
+                    }
+                }
+                if let Ok(spaces) = self.storage.list_spaces_for_site(site_id) {
+                    self.space_site_ids = vec![site_id.clone(); spaces.len()];
+                    self.spaces = spaces;
+                    if let Some(first_space) = self.spaces.first() {
+                        if let Ok(roots) = self
+                            .storage
+                            .list_space_root_pages_for_site(site_id, &first_space.key)
+                        {
+                            self.root_pages_by_space
+                                .insert(first_space.key.clone(), roots);
+                        }
+                    }
+                }
+                if let Ok(pages) = self.storage.list_recent_pages_for_site(site_id, 30) {
+                    self.my_pages = pages;
+                    self.my_page_site_labels = vec![None; self.my_pages.len()];
+                }
+                if let Ok(counts) = self.storage.cache_counts_for_site(site_id) {
+                    self.cache_counts = counts;
                 }
             }
-        }
-        if let Ok(pages) = self.storage.list_recent_pages(30) {
-            self.my_pages = pages;
-        }
-        if let Ok(counts) = self.storage.cache_counts() {
-            self.cache_counts = counts;
+            None => {
+                if let Ok(projs) = self.storage.list_projects_all_sites() {
+                    self.projects = projs
+                        .into_iter()
+                        .filter(|(sid, _)| self.site_is_enabled_in_config(sid))
+                        .map(|(_, p)| p)
+                        .collect();
+                }
+                if let Ok(boards) = self.storage.list_boards_all_sites(None) {
+                    let filtered: Vec<(String, BoardSummary)> = boards
+                        .into_iter()
+                        .filter(|(sid, _)| self.site_is_enabled_in_config(sid))
+                        .collect();
+                    self.board_site_ids = filtered.iter().map(|(s, _)| s.clone()).collect();
+                    self.boards = filtered.into_iter().map(|(_, b)| b).collect();
+                    if let (Some(first_board), Some(first_sid)) =
+                        (self.boards.first(), self.board_site_ids.first())
+                    {
+                        let bid = first_board.id;
+                        if let Ok(sprints) = self.storage.list_sprints_for_site(first_sid, bid) {
+                            self.sprints = sprints;
+                        }
+                        if let Ok(bi) = self
+                            .storage
+                            .list_board_issues_for_site(first_sid, bid, None, 150)
+                        {
+                            self.board_issues = bi;
+                        }
+                    }
+                }
+                if let Ok(mut filters) = self.storage.list_saved_filters() {
+                    if !filters.is_empty() {
+                        let mut combined = builtin_filters();
+                        for f in filters.drain(..) {
+                            if !combined.iter().any(|b| b.id == f.id) {
+                                combined.push(f);
+                            }
+                        }
+                        self.saved_filters = combined;
+                    }
+                }
+                if let Ok(issues_all) = self.storage.list_issues_all_sites(None, 200) {
+                    let filtered: Vec<(String, IssueSummary)> = issues_all
+                        .into_iter()
+                        .filter(|(sid, _)| self.site_is_enabled_in_config(sid))
+                        .collect();
+                    let has_multi = self.config.enabled_sites().len() > 1
+                        || filtered.iter().any(|(s, _)| s != DEFAULT_SITE_ID);
+                    self.issue_site_ids = filtered.iter().map(|(s, _)| s.clone()).collect();
+                    self.issues = filtered.iter().map(|(_, i)| i.clone()).collect();
+
+                    let my_work_pairs = self
+                        .storage
+                        .list_my_work_all_sites(40)
+                        .ok()
+                        .map(|rows| {
+                            rows.into_iter()
+                                .filter(|(sid, _)| self.site_is_enabled_in_config(sid))
+                                .collect::<Vec<_>>()
+                        })
+                        .filter(|v| !v.is_empty())
+                        .unwrap_or_else(|| filtered.iter().take(20).cloned().collect());
+                    self.my_issue_site_labels = my_work_pairs
+                        .iter()
+                        .map(|(sid, _)| {
+                            (show_pills && has_multi).then(|| self.site_display_label(sid))
+                        })
+                        .collect();
+                    self.my_issues = my_work_pairs.into_iter().map(|(_, i)| i).collect();
+
+                    if let Some((first_sid, first)) = filtered.first() {
+                        if let Ok(Some(detail)) = self
+                            .storage
+                            .get_issue_detail_for_site(first_sid, &first.key)
+                        {
+                            self.active_issue = Some(detail);
+                        }
+                    }
+                }
+                if let Ok(spaces_all) = self.storage.list_spaces_all_sites() {
+                    let filtered: Vec<(String, SpaceSummary)> = spaces_all
+                        .into_iter()
+                        .filter(|(sid, _)| self.site_is_enabled_in_config(sid))
+                        .collect();
+                    self.space_site_ids = filtered.iter().map(|(s, _)| s.clone()).collect();
+                    self.spaces = filtered.into_iter().map(|(_, s)| s).collect();
+                    if let (Some(first_space), Some(first_sid)) =
+                        (self.spaces.first(), self.space_site_ids.first())
+                    {
+                        if let Ok(roots) = self
+                            .storage
+                            .list_space_root_pages_for_site(first_sid, &first_space.key)
+                        {
+                            self.root_pages_by_space
+                                .insert(first_space.key.clone(), roots);
+                        }
+                    }
+                }
+                if let Ok(pages_all) = self.storage.list_recent_pages_all_sites(30) {
+                    let filtered: Vec<(String, PageSummary)> = pages_all
+                        .into_iter()
+                        .filter(|(sid, _)| self.site_is_enabled_in_config(sid))
+                        .collect();
+                    let has_multi = self.config.enabled_sites().len() > 1
+                        || filtered.iter().any(|(s, _)| s != DEFAULT_SITE_ID);
+                    self.my_page_site_labels = filtered
+                        .iter()
+                        .map(|(sid, _)| {
+                            (show_pills && has_multi).then(|| self.site_display_label(sid))
+                        })
+                        .collect();
+                    self.my_pages = filtered.into_iter().map(|(_, p)| p).collect();
+                }
+                if let Ok(counts) = self.storage.cache_counts() {
+                    self.cache_counts = counts;
+                }
+            }
         }
         self.refresh_local_search("");
     }
@@ -667,14 +1239,25 @@ impl AppState {
     }
 
     pub fn filtered_issues(&self, ui: &UiState) -> Vec<IssueSummary> {
+        self.filtered_issues_with_sites(ui)
+            .into_iter()
+            .map(|(_, issue)| issue)
+            .collect()
+    }
+
+    pub fn filtered_issues_with_sites(&self, ui: &UiState) -> Vec<(String, IssueSummary)> {
         let q = ui.issue_ui.local_filter.text.trim().to_ascii_lowercase();
-        if q.is_empty() {
-            return self.issues.clone();
-        }
+        let fallback_site = self
+            .site_scope
+            .site_id()
+            .unwrap_or(DEFAULT_SITE_ID)
+            .to_string();
         self.issues
             .iter()
-            .filter(|it| {
-                it.key.to_ascii_lowercase().contains(&q)
+            .enumerate()
+            .filter(|(_, it)| {
+                q.is_empty()
+                    || it.key.to_ascii_lowercase().contains(&q)
                     || it.summary.to_ascii_lowercase().contains(&q)
                     || it.status.name.to_ascii_lowercase().contains(&q)
                     || it
@@ -682,7 +1265,14 @@ impl AppState {
                         .as_ref()
                         .is_some_and(|a| a.display_name.to_ascii_lowercase().contains(&q))
             })
-            .cloned()
+            .map(|(idx, it)| {
+                let sid = self
+                    .issue_site_ids
+                    .get(idx)
+                    .cloned()
+                    .unwrap_or_else(|| fallback_site.clone());
+                (sid, it.clone())
+            })
             .collect()
     }
 
@@ -885,8 +1475,25 @@ impl AppState {
     }
 
     pub fn refresh_local_search(&mut self, query: &str) {
-        if let Ok(hits) = self.storage.search_unified(query, 50) {
-            self.search_hits = hits;
+        if let Ok(scoped_hits) =
+            self.storage
+                .unified_search_scoped(query, self.site_scope.site_id(), 50)
+        {
+            let filtered: Vec<(String, UnifiedSearchHit)> = scoped_hits
+                .into_iter()
+                .filter(|(sid, _)| {
+                    !self.site_scope.is_all() || self.site_is_enabled_in_config(sid)
+                })
+                .collect();
+            let show_pills = self.site_scope.is_all()
+                && (self.config.enabled_sites().len() > 1
+                    || filtered.iter().any(|(s, _)| s != DEFAULT_SITE_ID));
+            self.search_hit_site_ids = filtered.iter().map(|(s, _)| s.clone()).collect();
+            self.search_hit_site_labels = filtered
+                .iter()
+                .map(|(s, _)| show_pills.then(|| self.site_display_label(s)))
+                .collect();
+            self.search_hits = filtered.into_iter().map(|(_, h)| h).collect();
         }
     }
 
@@ -1623,31 +2230,79 @@ impl AppState {
             return;
         }
         ui.tasks.begin("Loading My Work");
-        let client = self.client.clone();
+        let clients: Vec<(String, String, AtlassianClient)> = match &self.site_scope {
+            SiteScope::Only(id) => {
+                let c = self
+                    .site_pool
+                    .client_for(id)
+                    .unwrap_or_else(|_| self.client.clone());
+                vec![(id.clone(), self.site_display_label(id), c)]
+            }
+            SiteScope::All => {
+                let enabled = self.site_pool.enabled_clients();
+                if enabled.is_empty() {
+                    vec![(
+                        self.client.site_id().to_string(),
+                        self.site_display_label(self.client.site_id()),
+                        self.client.clone(),
+                    )]
+                } else {
+                    enabled
+                        .into_iter()
+                        .map(|(s, c)| (s.id.clone(), s.display_name().to_string(), c))
+                        .collect()
+                }
+            }
+        };
+        let show_pills = self.site_scope.is_all() && clients.len() > 1;
         let storage = self.storage.clone();
         let tx = self.ui_tx.clone();
         tokio::spawn(async move {
-            let issues = match client
-                .search_issues_jql(AtlassianClient::my_open_issues_jql(), 40, None, None)
-                .await
-            {
-                Ok(p) => {
-                    let _ = storage.upsert_issues(&p.issues);
-                    p.issues
+            let mut all_issues: Vec<(Option<String>, IssueSummary)> = Vec::new();
+            let mut all_pages: Vec<(Option<String>, PageSummary)> = Vec::new();
+            for (site_id, site_label, client) in clients {
+                let pill = show_pills.then_some(site_label);
+                let issues = match client
+                    .search_issues_jql(AtlassianClient::my_open_issues_jql(), 40, None, None)
+                    .await
+                {
+                    Ok(p) => {
+                        let _ = storage.upsert_issues_for_site(&site_id, &p.issues);
+                        p.issues
+                    }
+                    Err(_) => storage
+                        .list_issues_for_site(&site_id, None, 25)
+                        .unwrap_or_default(),
+                };
+                for issue in issues {
+                    all_issues.push((pill.clone(), issue));
                 }
-                Err(_) => storage.list_issues(None, 25).unwrap_or_default(),
-            };
-            let pages = match client
-                .search_confluence_cql("type = page ORDER BY lastmodified DESC", 25)
-                .await
-            {
-                Ok(ps) => {
-                    let _ = storage.upsert_pages(&ps);
-                    ps
+                let pages = match client
+                    .search_confluence_cql("type = page ORDER BY lastmodified DESC", 25)
+                    .await
+                {
+                    Ok(ps) => {
+                        let _ = storage.upsert_pages_for_site(&site_id, &ps);
+                        ps
+                    }
+                    Err(_) => storage
+                        .list_recent_pages_for_site(&site_id, 25)
+                        .unwrap_or_default(),
+                };
+                for page in pages {
+                    all_pages.push((pill.clone(), page));
                 }
-                Err(_) => storage.list_recent_pages(25).unwrap_or_default(),
-            };
-            let _ = tx.send(UiMsg::MyWorkLoaded { issues, pages });
+            }
+            all_issues.sort_by(|a, b| b.1.updated_at.cmp(&a.1.updated_at));
+            all_pages.sort_by(|a, b| b.1.updated_at.cmp(&a.1.updated_at));
+            let (issue_site_labels, issues): (Vec<_>, Vec<_>) = all_issues.into_iter().unzip();
+            let (page_site_labels, pages): (Vec<_>, Vec<_>) = all_pages.into_iter().unzip();
+            let _ = tx.send(UiMsg::MyWorkLoaded {
+                issues,
+                issue_site_labels,
+                pages,
+                page_site_labels,
+            });
         });
     }
 
@@ -1657,64 +2312,112 @@ impl AppState {
             return;
         }
         ui.tasks.begin(format!("Remote search: {q}"));
-        let client = self.client.clone();
+        let clients: Vec<(String, String, AtlassianClient)> = match &self.site_scope {
+            SiteScope::Only(id) => {
+                let c = self
+                    .site_pool
+                    .client_for(id)
+                    .unwrap_or_else(|_| self.client.clone());
+                vec![(id.clone(), self.site_display_label(id), c)]
+            }
+            SiteScope::All => {
+                let enabled = self.site_pool.enabled_clients();
+                if enabled.is_empty() {
+                    vec![(
+                        self.client.site_id().to_string(),
+                        self.site_display_label(self.client.site_id()),
+                        self.client.clone(),
+                    )]
+                } else {
+                    enabled
+                        .into_iter()
+                        .map(|(s, c)| (s.id.clone(), s.display_name().to_string(), c))
+                        .collect()
+                }
+            }
+        };
+        let show_pills = self.site_scope.is_all() && clients.len() > 1;
         let tx = self.ui_tx.clone();
         tokio::spawn(async move {
             let escaped = q.replace('"', "\\\"");
             let jql = format!("text ~ \"{escaped}\" ORDER BY updated DESC");
             let cql = format!("text ~ \"{escaped}\" AND type = page");
-            let (j_res, c_res) = tokio::join!(
-                client.search_issues_jql(&jql, 25, None, None),
-                client.search_confluence_cql(&cql, 25),
-            );
-            let mut hits = Vec::new();
+            let mut combined: Vec<(String, Option<String>, UnifiedSearchHit)> = Vec::new();
             let mut err_msg = None;
-            match j_res {
-                Ok(page) => {
-                    for it in page.issues {
-                        hits.push(UnifiedSearchHit {
-                            kind: crate::models::SearchHitKind::JiraIssue,
-                            id_or_key: it.key,
-                            container: it.project_key,
-                            title: it.summary,
-                            snippet: it.status.name.clone(),
-                            status_or_version: it.status.name,
-                            updated_at: it.updated_at,
-                            web_url: it.web_url,
-                        });
+            for (site_id, site_label, client) in clients {
+                let pill = show_pills.then_some(site_label);
+                let (j_res, c_res) = tokio::join!(
+                    client.search_issues_jql(&jql, 25, None, None),
+                    client.search_confluence_cql(&cql, 25),
+                );
+                match j_res {
+                    Ok(page) => {
+                        for it in page.issues {
+                            combined.push((
+                                site_id.clone(),
+                                pill.clone(),
+                                UnifiedSearchHit {
+                                    kind: crate::models::SearchHitKind::JiraIssue,
+                                    id_or_key: it.key,
+                                    container: it.project_key,
+                                    title: it.summary,
+                                    snippet: it.status.name.clone(),
+                                    status_or_version: it.status.name,
+                                    updated_at: it.updated_at,
+                                    web_url: it.web_url,
+                                },
+                            ));
+                        }
+                    }
+                    Err(e) => {
+                        if err_msg.is_none() {
+                            err_msg = Some(e.to_string());
+                        }
                     }
                 }
-                Err(e) => err_msg = Some(e.to_string()),
+                match c_res {
+                    Ok(pages) => {
+                        for pg in pages {
+                            combined.push((
+                                site_id.clone(),
+                                pill.clone(),
+                                UnifiedSearchHit {
+                                    kind: crate::models::SearchHitKind::ConfluencePage,
+                                    id_or_key: pg.id,
+                                    container: pg.space_key,
+                                    title: pg.title,
+                                    snippet: format!("v{}", pg.version_number),
+                                    status_or_version: format!("v{}", pg.version_number),
+                                    updated_at: pg.updated_at,
+                                    web_url: pg.web_url,
+                                },
+                            ));
+                        }
+                    }
+                    Err(e) => {
+                        if err_msg.is_none() {
+                            err_msg = Some(e.to_string());
+                        }
+                    }
+                }
             }
-            match c_res {
-                Ok(pages) => {
-                    for pg in pages {
-                        hits.push(UnifiedSearchHit {
-                            kind: crate::models::SearchHitKind::ConfluencePage,
-                            id_or_key: pg.id,
-                            container: pg.space_key,
-                            title: pg.title,
-                            snippet: format!("v{}", pg.version_number),
-                            status_or_version: format!("v{}", pg.version_number),
-                            updated_at: pg.updated_at,
-                            web_url: pg.web_url,
-                        });
-                    }
-                }
-                Err(e) => {
-                    if err_msg.is_none() {
-                        err_msg = Some(e.to_string());
-                    }
-                }
-            }
-            let res = if hits.is_empty() {
+            combined.sort_by(|a, b| b.2.updated_at.cmp(&a.2.updated_at));
+            let res = if combined.is_empty() {
                 if let Some(err) = err_msg {
                     Err(err)
                 } else {
-                    Ok(hits)
+                    Ok((Vec::new(), Vec::new(), Vec::new()))
                 }
             } else {
-                Ok(hits)
+                let mut hits = Vec::with_capacity(combined.len());
+                let mut site_ids = Vec::with_capacity(combined.len());
+                let mut labels = Vec::with_capacity(combined.len());
+                for (sid, lbl, hit) in combined {
+                    site_ids.push(sid);
+                    labels.push(lbl);
+                    hits.push(hit);
+                }
+                Ok((hits, site_ids, labels))
             };
             let _ = tx.send(UiMsg::RemoteSearchLoaded { query: q, hits: res });
         });
@@ -2153,21 +2856,64 @@ impl AppState {
                 ui.error(&err);
                 self.notify_desktop("Atlassian Confluence Error", &err);
             }
-            UiMsg::MyWorkLoaded { issues, pages } => {
+            UiMsg::MyWorkLoaded {
+                issues,
+                issue_site_labels,
+                pages,
+                page_site_labels,
+            } => {
                 ui.tasks.finish("Loading My Work", None);
                 self.my_issues = issues;
+                self.my_issue_site_labels = issue_site_labels;
                 self.my_pages = pages;
+                self.my_page_site_labels = page_site_labels;
             }
             UiMsg::RemoteSearchLoaded { query, hits } => {
                 ui.tasks.finish(&format!("Remote search: {query}"), None);
                 match hits {
-                    Ok(list) => {
+                    Ok((list, site_ids, labels)) => {
                         self.search_hits = list;
+                        self.search_hit_site_ids = site_ids;
+                        self.search_hit_site_labels = labels;
                         ui.search_ui.is_remote = true;
                         ui.search_ui.selected_hit = 0;
                     }
                     Err(e) => ui.error(format!("Remote search failed: {e}")),
                 }
+            }
+            UiMsg::CloudSitesDiscovered(res) => {
+                ui.tasks.finish("Discover Cloud sites", None);
+                match res {
+                    Ok(profiles) => {
+                        let count = profiles.len();
+                        for profile in profiles {
+                            let _ = self.storage.upsert_site(&SiteRecord {
+                                site_id: profile.id.clone(),
+                                name: profile.display_name().to_string(),
+                                site_url: profile.site_url.clone(),
+                                deployment: profile.deployment.as_str().to_string(),
+                                enabled: profile.enabled,
+                                last_synced_at: None,
+                                last_error: None,
+                            });
+                            self.config.upsert_site(profile);
+                        }
+                        self.rebuild_site_pool();
+                        let _ = self.save_config();
+                        self.load_cached_initial();
+                        ui.success(format!("Discovered {count} Cloud site(s)"));
+                    }
+                    Err(e) => {
+                        ui.error(format!("Cloud site discovery failed: {e}"));
+                    }
+                }
+            }
+            UiMsg::MultiSiteSyncFinished(outcome) => {
+                self.syncing = false;
+                self.sync_summary = outcome.summary.clone();
+                ui.tasks.finish("Sync all sites", None);
+                self.load_cached_initial();
+                ui.success(outcome.summary);
             }
             UiMsg::ImageLoaded {
                 cache_key,

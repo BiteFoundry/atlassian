@@ -3,10 +3,9 @@
 use crate::{
     config::{self, ImageProtocolPreference as ConfigImageProtocol},
     models::{CrossRefTarget, SearchHitKind},
-    sync::SyncCommand,
     ui::{
         app::{AppState, PaneFocus, UiState, WorkspaceTab},
-        hitmap::HitTarget,
+        hitmap::{ButtonId, HitTarget},
         keymap::Action,
         overlays::{
             self,
@@ -19,6 +18,7 @@ use crate::{
             page_form::PageFormOverlay,
             path_input::{PathInputOverlay, UploadTarget},
             settings::{SettingsCommand, SettingsOverlay},
+            site_switcher::SiteSwitcherOverlay,
             Overlay, OverlayOutcome,
         },
     },
@@ -90,6 +90,13 @@ pub fn dispatch(action: Action, app: &mut AppState, ui: &mut UiState) -> bool {
                 crate::ui::overlays::command_palette::CommandPalette::new(),
             ));
         }
+        Action::OpenSiteSwitcher => {
+            let entries = app.build_site_switcher_entries();
+            ui.push_overlay(Overlay::SiteSwitcher(SiteSwitcherOverlay::new(entries)));
+        }
+        Action::DiscoverCloudSites => {
+            app.request_discover_cloud_sites(ui);
+        }
         Action::OpenSettings => {
             ui.push_overlay(Overlay::Settings(SettingsOverlay::from_config(app, ui)));
         }
@@ -104,12 +111,10 @@ pub fn dispatch(action: Action, app: &mut AppState, ui: &mut UiState) -> bool {
             ui.push_overlay(Overlay::Help);
         }
         Action::SyncAll => {
-            app.syncing = true;
-            let _ = app.sync_ctrl.request(SyncCommand::RefreshAll);
+            app.request_multi_site_sync(ui);
             if ui.active_tab == WorkspaceTab::MyWork {
                 app.request_my_work_refresh(ui);
             }
-            ui.info("Requested full workspace sync");
         }
         Action::CheckUpdate => {
             app.request_check_update(ui);
@@ -414,6 +419,18 @@ fn handle_inline_text_action(action: Action, app: &mut AppState, ui: &mut UiStat
 
 fn dispatch_active_overlay(action: Action, app: &mut AppState, ui: &mut UiState) -> bool {
     let outcome = ui.overlays.last_mut().map(|o| o.handle(&action));
+
+    // Intercept SiteSwitcherOverlay pending commands so active_site / enabled / discover / sync
+    // are persisted and reflected across federated views.
+    if let Some(Overlay::SiteSwitcher(ov)) = ui.overlays.last_mut() {
+        if let Some(cmd) = ov.take_pending_command() {
+            if matches!(outcome, Some(OverlayOutcome::Close)) {
+                ui.pop_overlay();
+            }
+            app.apply_site_switcher_command(cmd, ui);
+            return false;
+        }
+    }
 
     // Intercept SettingsOverlay pending commands so config.toml and live UiState stay in sync.
     if let Some(Overlay::Settings(ov)) = ui.overlays.last_mut() {
@@ -920,6 +937,16 @@ fn handle_mouse_click(row: u16, col: u16, app: &mut AppState, ui: &mut UiState) 
             ui.focus = PaneFocus::Nav;
         }
         HitTarget::Attachment(idx) => open_attachments(app, ui, Some(idx)),
+        HitTarget::SiteGroupHeader(idx) => {
+            if let Some(key) = ui.site_group_keys.get(idx).cloned() {
+                if !ui.collapsed_site_groups.remove(&key) {
+                    ui.collapsed_site_groups.insert(key);
+                }
+            }
+        }
+        HitTarget::Button(ButtonId::SiteSwitcher) => {
+            return dispatch(Action::OpenSiteSwitcher, app, ui);
+        }
         HitTarget::Button(_) | HitTarget::OverlayItem(_) => {}
     }
     false

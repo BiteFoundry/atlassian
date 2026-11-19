@@ -55,6 +55,8 @@ pub enum Action {
 
     // Overlays
     OpenCommandPalette,
+    OpenSiteSwitcher,
+    DiscoverCloudSites,
     OpenSettings,
     OpenContextMenu,
     OpenAttachments,
@@ -148,12 +150,15 @@ impl Keymap {
             return Some(Action::PasteClipboard);
         }
 
-        if (ctrl && matches!(key.code, KeyCode::Char('s') | KeyCode::Char('S')))
-            || (alt && key.code == KeyCode::Enter)
-        {
+        if ctrl && matches!(key.code, KeyCode::Char('s') | KeyCode::Char('S')) {
             if accepts_text {
                 return Some(Action::Submit);
             }
+            return Some(Action::OpenSiteSwitcher);
+        }
+
+        if alt && key.code == KeyCode::Enter && accepts_text {
+            return Some(Action::Submit);
         }
 
         if key.code == KeyCode::Esc {
@@ -298,6 +303,14 @@ mod tests {
         assert_eq!(
             km.resolve(key(KeyCode::Char('m')), WorkspaceTab::Board, PaneFocus::Main, false, false),
             Some(Action::OpenTransition)
+        );
+        assert_eq!(
+            km.resolve(ctrl(KeyCode::Char('s')), WorkspaceTab::Board, PaneFocus::Main, false, false),
+            Some(Action::OpenSiteSwitcher)
+        );
+        assert_eq!(
+            km.resolve(ctrl(KeyCode::Char('s')), WorkspaceTab::Issues, PaneFocus::Main, true, true),
+            Some(Action::Submit)
         );
         assert_eq!(
             km.resolve(key(KeyCode::Char('g')), WorkspaceTab::Issues, PaneFocus::Main, false, false),

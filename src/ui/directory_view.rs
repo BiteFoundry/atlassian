@@ -76,6 +76,8 @@ pub fn default_connected_sites(app: &AppState) -> Vec<ConnectedSiteRow> {
             DeploymentKind::Cloud => "Cloud Bearer".to_string(),
             DeploymentKind::DataCenter => "DC PAT".to_string(),
         },
+        Some(StoredCredentials::CloudOAuth { .. }) => "Cloud OAuth".to_string(),
+        Some(StoredCredentials::CloudAccountToken { .. }) => "Cloud Token".to_string(),
         None => "Not signed in".to_string(),
     };
     let sync_status = if app.syncing {

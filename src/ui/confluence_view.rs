@@ -82,16 +82,114 @@ fn draw_space_and_tree(frame: &mut Frame, area: Rect, app: &AppState, ui: &mut U
         return;
     }
 
-    let space_h = (app.spaces.len() as u16 + 1).clamp(3, 7);
+    let multi_site = app.is_multi_site_all_mode();
+    let extra_group_rows = if multi_site {
+        app.config.enabled_sites().len().max(2) as u16
+    } else {
+        0
+    };
+    let space_h = (app.spaces.len() as u16 + 1 + extra_group_rows)
+        .clamp(3, (inner.height / 2).max(7).min(12));
     let rows = Layout::default()
         .direction(Direction::Vertical)
         .constraints([Constraint::Length(space_h), Constraint::Min(2)])
         .split(inner);
 
-    // Space Selector
+    // Space Selector (grouped by site with collapsible headers in multi-site All Sites mode)
     let mut s_lines = vec![Line::from(Span::styled(" SPACES", theme.muted_style()))];
     if app.spaces.is_empty() {
         s_lines.push(Line::from(Span::styled("  (no spaces)", theme.muted_style())));
+    } else if multi_site {
+        let mut cursor_y = rows[0].y + 1;
+        let max_y = rows[0].bottom();
+        let mut site_order: Vec<String> = Vec::new();
+        for site in app.config.enabled_sites() {
+            if !site_order.iter().any(|s| s.eq_ignore_ascii_case(&site.id)) {
+                site_order.push(site.id);
+            }
+        }
+        for sid in &app.space_site_ids {
+            if !site_order.iter().any(|s| s.eq_ignore_ascii_case(sid)) {
+                site_order.push(sid.clone());
+            }
+        }
+        for site_id in site_order {
+            let group_indices: Vec<usize> = app
+                .spaces
+                .iter()
+                .enumerate()
+                .filter(|(i, _)| {
+                    app.space_site_ids
+                        .get(*i)
+                        .map(|s| s.eq_ignore_ascii_case(&site_id))
+                        .unwrap_or(false)
+                })
+                .map(|(i, _)| i)
+                .collect();
+            if group_indices.is_empty() || cursor_y >= max_y {
+                continue;
+            }
+            let collapse_key = format!("wiki:{site_id}");
+            let collapsed = ui.collapsed_site_groups.contains(&collapse_key);
+            let group_idx = ui.site_group_keys.len();
+            ui.site_group_keys.push(collapse_key);
+            let chevron = if collapsed { "▸" } else { "▾" };
+            let site_label = app.site_display_label(&site_id);
+            s_lines.push(Line::from(Span::styled(
+                truncate_width(
+                    &format!(" {chevron} {site_label} ({})", group_indices.len()),
+                    rows[0].width as usize,
+                ),
+                theme.accent_style().patch(sidebar_style),
+            )));
+            ui.hitmap.add_line(
+                rows[0].x,
+                cursor_y,
+                rows[0].width,
+                HitTarget::SiteGroupHeader(group_idx),
+            );
+            cursor_y += 1;
+
+            if collapsed {
+                continue;
+            }
+            for idx in group_indices {
+                if cursor_y >= max_y {
+                    break;
+                }
+                let sp = &app.spaces[idx];
+                let is_sel = ui.confluence_ui.selected_space == idx;
+                let style = if focused && ui.confluence_ui.nav_section == 0 && is_sel {
+                    theme.nav_selection()
+                } else if is_sel {
+                    if theme.no_color {
+                        Style::default().add_modifier(Modifier::BOLD)
+                    } else {
+                        Style::default()
+                            .fg(theme.confluence_teal)
+                            .add_modifier(Modifier::BOLD)
+                    }
+                } else {
+                    sidebar_style
+                };
+                let pfx = if is_sel { "  ▸ " } else { "    " };
+                let pin = if sp.pinned { "★ " } else { "" };
+                s_lines.push(Line::from(Span::styled(
+                    truncate_width(
+                        &format!("{pfx}{pin}{} ({})", sp.name, sp.key),
+                        rows[0].width as usize,
+                    ),
+                    style,
+                )));
+                ui.hitmap.add_line(
+                    rows[0].x,
+                    cursor_y,
+                    rows[0].width,
+                    HitTarget::SpaceItem(idx),
+                );
+                cursor_y += 1;
+            }
+        }
     } else {
         for (idx, sp) in app
             .spaces

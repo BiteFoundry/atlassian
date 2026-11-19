@@ -83,6 +83,8 @@ impl CommandPalette {
             PaletteEntry { label: "Open in Browser", shortcut: "o", action: Action::OpenInBrowser },
             PaletteEntry { label: "Focus JQL Query Bar", shortcut: "J", action: Action::FocusJql },
             PaletteEntry { label: "Sync All Workspace Data", shortcut: "r", action: Action::SyncAll },
+            PaletteEntry { label: "Switch site (Ctrl+S)", shortcut: "Ctrl+S", action: Action::OpenSiteSwitcher },
+            PaletteEntry { label: "Discover Cloud sites (OAuth)", shortcut: "", action: Action::DiscoverCloudSites },
             PaletteEntry { label: "Open Settings", shortcut: "Ctrl+,", action: Action::OpenSettings },
             PaletteEntry { label: "Toggle Desktop Notifications", shortcut: "", action: Action::ToggleNotify },
             PaletteEntry { label: "Toggle View Density (Cozy / Compact)", shortcut: "", action: Action::ToggleDensity },

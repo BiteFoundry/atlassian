@@ -24,6 +24,7 @@ pub enum ButtonId {
     CheckUpdate,
     ToggleInlineImages,
     ToggleDrawer,
+    SiteSwitcher,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -60,6 +61,8 @@ pub enum HitTarget {
     Attachment(usize),
     /// Overlay list item.
     OverlayItem(usize),
+    /// Collapsible site group header in left sidebar (`index` into `UiState::site_group_keys`).
+    SiteGroupHeader(usize),
     /// Toolbar / action hint button.
     Button(ButtonId),
     /// JQL / search input bar.

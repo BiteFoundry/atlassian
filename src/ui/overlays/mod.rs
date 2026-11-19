@@ -12,6 +12,7 @@ pub mod issue_form;
 pub mod page_form;
 pub mod path_input;
 pub mod settings;
+pub mod site_switcher;
 pub mod transition;
 
 use ratatui::{
@@ -33,7 +34,7 @@ use crate::ui::{
         context_menu::ContextMenuOverlay, cross_link::CrossLinkOverlay,
         image_preview::ImagePreviewOverlay, issue_form::IssueFormOverlay,
         page_form::PageFormOverlay, path_input::PathInputOverlay, settings::SettingsOverlay,
-        transition::TransitionOverlay,
+        site_switcher::SiteSwitcherOverlay, transition::TransitionOverlay,
     },
     theme::Theme,
 };
@@ -49,6 +50,7 @@ pub enum OverlayKind {
     ImagePreview,
     PathInput,
     CommandPalette,
+    SiteSwitcher,
     Settings,
     ContextMenu,
     Attachments,
@@ -75,6 +77,7 @@ pub enum Overlay {
     ImagePreview(ImagePreviewOverlay),
     PathInput(PathInputOverlay),
     CommandPalette(CommandPalette),
+    SiteSwitcher(SiteSwitcherOverlay),
     Settings(SettingsOverlay),
     ContextMenu(ContextMenuOverlay),
     Attachments(AttachmentsOverlay),
@@ -94,6 +97,7 @@ impl Overlay {
             Overlay::ImagePreview(_) => OverlayKind::ImagePreview,
             Overlay::PathInput(_) => OverlayKind::PathInput,
             Overlay::CommandPalette(_) => OverlayKind::CommandPalette,
+            Overlay::SiteSwitcher(_) => OverlayKind::SiteSwitcher,
             Overlay::Settings(_) => OverlayKind::Settings,
             Overlay::ContextMenu(_) => OverlayKind::ContextMenu,
             Overlay::Attachments(_) => OverlayKind::Attachments,
@@ -118,6 +122,10 @@ impl Overlay {
         Overlay::CommandPalette(CommandPalette::new())
     }
 
+    pub fn site_switcher(overlay: SiteSwitcherOverlay) -> Self {
+        Overlay::SiteSwitcher(overlay)
+    }
+
     pub fn confirm(message: impl Into<String>, on_confirm: Option<Action>) -> Self {
         Overlay::Confirm(ConfirmDialog::new(message, on_confirm))
     }
@@ -135,6 +143,7 @@ impl Overlay {
                 | Overlay::Comment(_)
                 | Overlay::PathInput(_)
                 | Overlay::CommandPalette(_)
+                | Overlay::SiteSwitcher(_)
         )
     }
 
@@ -157,6 +166,7 @@ impl Overlay {
             Overlay::Comment(o) => o.paste_from_clipboard(),
             Overlay::PathInput(o) => o.paste_from_clipboard(),
             Overlay::CommandPalette(o) => o.paste_from_clipboard(),
+            Overlay::SiteSwitcher(o) => o.paste_from_clipboard(),
             _ => false,
         }
     }
@@ -168,6 +178,7 @@ impl Overlay {
             Overlay::Assignee(o) => o.select(index),
             Overlay::CrossLink(o) => o.select(index),
             Overlay::CommandPalette(o) => o.select(index),
+            Overlay::SiteSwitcher(o) => o.select(index),
             Overlay::Settings(o) => o.select(index),
             Overlay::ContextMenu(o) => o.select(index),
             Overlay::Attachments(o) => o.select(index),
@@ -192,6 +203,7 @@ impl Overlay {
             Overlay::ImagePreview(o) => o.handle(action),
             Overlay::PathInput(o) => o.handle(action),
             Overlay::CommandPalette(o) => o.handle(action),
+            Overlay::SiteSwitcher(o) => o.handle(action),
             Overlay::Settings(o) => o.handle(action),
             Overlay::ContextMenu(o) => o.handle(action),
             Overlay::Attachments(o) => o.handle(action),
@@ -223,6 +235,7 @@ impl Overlay {
             Overlay::ImagePreview(o) => o.draw(frame, area, app, ui, hitmap),
             Overlay::PathInput(o) => o.draw(frame, area, app, ui, hitmap),
             Overlay::CommandPalette(o) => o.draw(frame, area, app, ui, hitmap),
+            Overlay::SiteSwitcher(o) => o.draw(frame, area, app, ui, hitmap),
             Overlay::Settings(o) => o.draw(frame, area, app, ui, hitmap),
             Overlay::ContextMenu(o) => o.draw(frame, area, app, ui, hitmap),
             Overlay::Attachments(o) => o.draw(frame, area, app, ui, hitmap),
@@ -295,6 +308,7 @@ const HELP_SECTIONS: [(&str, &[(&str, &str)]); 4] = [
             ("1..6 / Ctrl+1..6", "Switch Board / Issues / My Work / Wiki / Search / Dir"),
             ("Tab / Shift+Tab", "Cycle focus Nav <-> Main <-> Detail drawer"),
             ("Ctrl+P / :", "Open Command Palette"),
+            ("Ctrl+S", "Switch site / All Sites federation"),
             ("Ctrl+,", "Open Settings (theme, density, protocol)"),
             ("g / Backspace", "Jump to cross-linked Jira/Confluence / nav back"),
             ("r / U / ?", "Sync all / check updates / keyboard shortcuts help"),
@@ -471,6 +485,11 @@ mod tests {
         let ctx = Overlay::context_menu(ContextMenuOverlay::for_global((0, 0)));
         assert_eq!(ctx.kind(), OverlayKind::ContextMenu);
         assert!(!ctx.accepts_text());
+
+        let switcher = Overlay::site_switcher(SiteSwitcherOverlay::new(vec![]));
+        assert_eq!(switcher.kind(), OverlayKind::SiteSwitcher);
+        assert!(switcher.accepts_text());
+        assert_eq!(switcher.draft_key(), None);
     }
 
     #[test]

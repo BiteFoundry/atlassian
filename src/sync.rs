@@ -1483,10 +1483,12 @@ async fn run_full_sync_for_site(
                 breakers.record_success_site(site_id, SyncEndpoint::JiraProjects);
                 succeeded_steps += 1;
                 project_count = projects.len();
-                if let Err(err) = storage.upsert_projects(&projects) {
+                if let Err(err) = storage.upsert_projects_for_site(site_id, &projects) {
                     record_err(err, SyncErrorKind::Transient);
                 } else if let Some(tx) = core_tx {
-                    let stored = storage.list_projects().unwrap_or(projects);
+                    let stored = storage
+                        .list_projects_for_site(site_id)
+                        .unwrap_or(projects);
                     let _ = tx.send(CoreEvent::ProjectsUpdated(stored));
                 }
             }
@@ -1512,7 +1514,7 @@ async fn run_full_sync_for_site(
                 breakers.record_success_site(site_id, SyncEndpoint::JiraAgileBoards);
                 succeeded_steps += 1;
                 board_count = boards.len();
-                if let Err(err) = storage.upsert_boards(&boards) {
+                if let Err(err) = storage.upsert_boards_for_site(site_id, &boards) {
                     record_err(err, SyncErrorKind::Transient);
                 }
                 if let Some(target_board) = select_default_board(&boards, client.config()) {
@@ -1521,10 +1523,10 @@ async fn run_full_sync_for_site(
                         if let Some(b) = boards.iter_mut().find(|b| b.id == board_id) {
                             b.columns = cols;
                         }
-                        let _ = storage.upsert_boards(&boards);
+                        let _ = storage.upsert_boards_for_site(site_id, &boards);
                     }
                     if let Ok((_, count)) =
-                        sync_board_details(client, storage, board_id, None, core_tx).await
+                        sync_board_details_for_site(site_id, client, storage, board_id, None, core_tx).await
                     {
                         issue_count += count;
                     }
@@ -1561,7 +1563,7 @@ async fn run_full_sync_for_site(
                 if fetched > issue_count {
                     issue_count = fetched;
                 }
-                if let Err(err) = storage.upsert_issues(&page.issues) {
+                if let Err(err) = storage.upsert_issues_for_site(site_id, &page.issues) {
                     record_err(err, SyncErrorKind::Transient);
                 } else if let Some(tx) = core_tx {
                     let _ = tx.send(CoreEvent::IssuesUpdated(page.issues));
@@ -1589,10 +1591,12 @@ async fn run_full_sync_for_site(
                 breakers.record_success_site(site_id, SyncEndpoint::ConfluenceSpaces);
                 succeeded_steps += 1;
                 space_count = spaces.len();
-                if let Err(err) = storage.upsert_spaces(&spaces) {
+                if let Err(err) = storage.upsert_spaces_for_site(site_id, &spaces) {
                     record_err(err, SyncErrorKind::Transient);
                 } else if let Some(tx) = core_tx {
-                    let stored = storage.list_spaces().unwrap_or_else(|_| spaces.clone());
+                    let stored = storage
+                        .list_spaces_for_site(site_id)
+                        .unwrap_or_else(|_| spaces.clone());
                     let _ = tx.send(CoreEvent::SpacesUpdated(stored));
                 }
                 if let Some(target_space) = select_default_space(&spaces, client.config()) {
@@ -1601,7 +1605,15 @@ async fn run_full_sync_for_site(
                         SyncEndpoint::ConfluencePages,
                         Instant::now(),
                     ) {
-                        match sync_space_pages(client, storage, &target_space.key, core_tx).await {
+                        match sync_space_pages_for_site(
+                            site_id,
+                            client,
+                            storage,
+                            &target_space.key,
+                            core_tx,
+                        )
+                        .await
+                        {
                             Ok(_) => {
                                 breakers.record_success_site(site_id, SyncEndpoint::ConfluencePages);
                             }
@@ -1631,6 +1643,14 @@ async fn run_full_sync_for_site(
         skipped_steps += 1;
     }
 
+    let synced_at = chrono::Utc::now().to_rfc3339();
+    let err_note = if succeeded_steps == 0 {
+        first_error.as_ref().map(|e| format!("{e:#}"))
+    } else {
+        None
+    };
+    let _ = storage.record_site_sync(site_id, &synced_at, err_note.as_deref());
+
     let summary = format_sync_summary(project_count, board_count, issue_count, space_count);
     FullSyncOutcome {
         summary,
@@ -1653,20 +1673,22 @@ async fn sync_board(
     sprint_id: Option<i64>,
     core_tx: Option<&mpsc::UnboundedSender<CoreEvent>>,
 ) -> Result<(Option<SprintSummary>, usize)> {
+    let site_id = client.site_id();
     if let Ok(cols) = client.get_board_columns(board_id).await {
-        let mut boards = storage.list_boards(None).unwrap_or_default();
+        let mut boards = storage.list_boards_for_site(site_id, None).unwrap_or_default();
         if let Some(b) = boards.iter_mut().find(|b| b.id == board_id) {
             b.columns = cols;
-            let _ = storage.upsert_boards(&boards);
+            let _ = storage.upsert_boards_for_site(site_id, &boards);
             if let Some(tx) = core_tx {
                 let _ = tx.send(CoreEvent::BoardsUpdated(boards));
             }
         }
     }
-    sync_board_details(client, storage, board_id, sprint_id, core_tx).await
+    sync_board_details_for_site(site_id, client, storage, board_id, sprint_id, core_tx).await
 }
 
-async fn sync_board_details(
+async fn sync_board_details_for_site(
+    site_id: &str,
     client: &AtlassianClient,
     storage: &Storage,
     board_id: i64,
@@ -1675,7 +1697,7 @@ async fn sync_board_details(
 ) -> Result<(Option<SprintSummary>, usize)> {
     let sprints = client.list_board_sprints(board_id).await.unwrap_or_default();
     if !sprints.is_empty() {
-        storage.upsert_sprints(&sprints)?;
+        storage.upsert_sprints_for_site(site_id, &sprints)?;
     }
 
     let active_sprint = if let Some(sid) = explicit_sprint_id {
@@ -1692,7 +1714,7 @@ async fn sync_board_details(
         .list_board_issues(board_id, target_sprint_id, 50)
         .await?;
     let count = issues.len();
-    storage.upsert_board_issues(board_id, target_sprint_id, &issues)?;
+    storage.upsert_board_issues_for_site(site_id, board_id, target_sprint_id, &issues)?;
 
     if let Some(tx) = core_tx {
         let _ = tx.send(CoreEvent::BoardIssuesUpdated {
@@ -1713,7 +1735,7 @@ async fn sync_project_issues(
     let jql = format!("project = \"{project_key}\" ORDER BY updated DESC");
     let page = client.search_issues_jql(&jql, 50, None, None).await?;
     let count = page.issues.len();
-    storage.upsert_issues(&page.issues)?;
+    storage.upsert_issues_for_site(client.site_id(), &page.issues)?;
     if let Some(tx) = core_tx {
         let _ = tx.send(CoreEvent::IssuesUpdated(page.issues));
     }
@@ -1726,9 +1748,19 @@ async fn sync_space_pages(
     space_key: &str,
     core_tx: Option<&mpsc::UnboundedSender<CoreEvent>>,
 ) -> Result<usize> {
+    sync_space_pages_for_site(client.site_id(), client, storage, space_key, core_tx).await
+}
+
+async fn sync_space_pages_for_site(
+    site_id: &str,
+    client: &AtlassianClient,
+    storage: &Storage,
+    space_key: &str,
+    core_tx: Option<&mpsc::UnboundedSender<CoreEvent>>,
+) -> Result<usize> {
     let pages = client.list_space_root_pages(space_key, 50).await?;
     let count = pages.len();
-    storage.upsert_pages(&pages)?;
+    storage.upsert_pages_for_site(site_id, &pages)?;
     if let Some(tx) = core_tx {
         let _ = tx.send(CoreEvent::SpacePagesUpdated {
             space_key: space_key.to_string(),

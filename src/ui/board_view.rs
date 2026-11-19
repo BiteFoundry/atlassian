@@ -103,19 +103,112 @@ fn draw_board_nav(frame: &mut Frame, area: Rect, app: &AppState, ui: &mut UiStat
         return;
     }
 
-    let split_h = (app.boards.len() as u16 + 2).clamp(3, (inner.height / 2).max(3));
+    let multi_site = app.is_multi_site_all_mode();
+    let extra_group_rows = if multi_site {
+        app.config.enabled_sites().len().max(2) as u16
+    } else {
+        0
+    };
+    let split_h = (app.boards.len() as u16 + 2 + extra_group_rows)
+        .clamp(3, (inner.height / 2).max(3));
     let rows = Layout::default()
         .direction(Direction::Vertical)
         .constraints([Constraint::Length(split_h), Constraint::Min(2)])
         .split(inner);
 
-    // Boards section
+    // Boards section (grouped by site with collapsible headers in multi-site All Sites mode)
     let mut b_lines = vec![Line::from(Span::styled(
         " AGILE BOARDS",
         theme.muted_style(),
     ))];
     if app.boards.is_empty() {
         b_lines.push(Line::from(Span::styled("  (no boards)", theme.muted_style())));
+    } else if multi_site {
+        let mut cursor_y = rows[0].y + 1;
+        let max_y = rows[0].bottom();
+        let mut site_order: Vec<String> = Vec::new();
+        for site in app.config.enabled_sites() {
+            if !site_order.iter().any(|s| s.eq_ignore_ascii_case(&site.id)) {
+                site_order.push(site.id);
+            }
+        }
+        for sid in &app.board_site_ids {
+            if !site_order.iter().any(|s| s.eq_ignore_ascii_case(sid)) {
+                site_order.push(sid.clone());
+            }
+        }
+        for site_id in site_order {
+            let group_indices: Vec<usize> = app
+                .boards
+                .iter()
+                .enumerate()
+                .filter(|(i, _)| {
+                    app.board_site_ids
+                        .get(*i)
+                        .map(|s| s.eq_ignore_ascii_case(&site_id))
+                        .unwrap_or(false)
+                })
+                .map(|(i, _)| i)
+                .collect();
+            if group_indices.is_empty() || cursor_y >= max_y {
+                continue;
+            }
+            let collapse_key = format!("board:{site_id}");
+            let collapsed = ui.collapsed_site_groups.contains(&collapse_key);
+            let group_idx = ui.site_group_keys.len();
+            ui.site_group_keys.push(collapse_key);
+            let chevron = if collapsed { "▸" } else { "▾" };
+            let site_label = app.site_display_label(&site_id);
+            b_lines.push(Line::from(Span::styled(
+                truncate_width(
+                    &format!(" {chevron} {site_label} ({})", group_indices.len()),
+                    rows[0].width as usize,
+                ),
+                theme.accent_style().patch(sidebar_style),
+            )));
+            ui.hitmap.add_line(
+                rows[0].x,
+                cursor_y,
+                rows[0].width,
+                HitTarget::SiteGroupHeader(group_idx),
+            );
+            cursor_y += 1;
+
+            if collapsed {
+                continue;
+            }
+            for idx in group_indices {
+                if cursor_y >= max_y {
+                    break;
+                }
+                let b = &app.boards[idx];
+                let is_sel = ui.board_ui.selected_board == idx;
+                let style = if focused && ui.board_ui.nav_section == 0 && is_sel {
+                    theme.nav_selection()
+                } else if is_sel {
+                    theme.accent_style()
+                } else {
+                    sidebar_style
+                };
+                let pfx = if is_sel { "  ▸ " } else { "    " };
+                let tag = if b.board_type.eq_ignore_ascii_case("scrum") {
+                    "S"
+                } else {
+                    "K"
+                };
+                b_lines.push(Line::from(Span::styled(
+                    truncate_width(&format!("{pfx}[{tag}] {}", b.name), rows[0].width as usize),
+                    style,
+                )));
+                ui.hitmap.add_line(
+                    rows[0].x,
+                    cursor_y,
+                    rows[0].width,
+                    HitTarget::BoardItem(idx),
+                );
+                cursor_y += 1;
+            }
+        }
     } else {
         for (idx, b) in app
             .boards

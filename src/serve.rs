@@ -17,14 +17,14 @@ use tokio::{net::TcpListener, sync::mpsc};
 use tower_http::cors::CorsLayer;
 
 use crate::{
-    atlassian::AtlassianClient,
+    atlassian::{AtlassianClient, SiteClientPool},
     config::AppConfig,
     models::{
-        IssueSummary, IssueUpdate, OutgoingIssue, OutgoingPage, PageSummary, PageUpdate,
-        SearchHitKind, UnifiedSearchHit,
+        FederatedSearchHit, IssueSummary, IssueUpdate, OutgoingIssue, OutgoingPage, PageSummary,
+        PageUpdate, SearchHitKind, UnifiedSearchHit,
     },
-    storage::Storage,
-    sync::{self, SyncCommand},
+    storage::{Storage, DEFAULT_SITE_ID},
+    sync::{self, SiteSyncTarget, SyncCommand},
 };
 
 #[derive(Debug, Clone)]
@@ -48,6 +48,7 @@ impl Default for ServeOptions {
 pub struct AppState {
     pub config: AppConfig,
     pub client: AtlassianClient,
+    pub site_pool: SiteClientPool,
     pub storage: Storage,
     pub token: Option<String>,
 }
@@ -98,9 +99,17 @@ pub struct HealthResponse {
 }
 
 #[derive(Debug, Default, Deserialize)]
+pub struct SiteQuery {
+    #[serde(default)]
+    pub site: Option<String>,
+}
+
+#[derive(Debug, Default, Deserialize)]
 pub struct RefreshQuery {
     #[serde(default)]
     pub refresh: bool,
+    #[serde(default)]
+    pub site: Option<String>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -109,12 +118,16 @@ pub struct BoardsQuery {
     pub project: Option<String>,
     #[serde(default)]
     pub refresh: bool,
+    #[serde(default)]
+    pub site: Option<String>,
 }
 
 #[derive(Debug, Default, Deserialize)]
 pub struct SprintsQuery {
     #[serde(default)]
     pub offline: bool,
+    #[serde(default)]
+    pub site: Option<String>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -125,6 +138,8 @@ pub struct BoardIssuesQuery {
     pub limit: Option<usize>,
     #[serde(default)]
     pub offline: bool,
+    #[serde(default)]
+    pub site: Option<String>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -139,12 +154,16 @@ pub struct IssuesQuery {
     pub page_token: Option<String>,
     #[serde(default)]
     pub offline: bool,
+    #[serde(default)]
+    pub site: Option<String>,
 }
 
 #[derive(Debug, Default, Deserialize)]
 pub struct OfflineQuery {
     #[serde(default)]
     pub offline: bool,
+    #[serde(default)]
+    pub site: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -193,6 +212,8 @@ pub struct SpacesQuery {
     pub refresh: bool,
     #[serde(default)]
     pub limit: Option<usize>,
+    #[serde(default)]
+    pub site: Option<String>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -201,6 +222,8 @@ pub struct SpacePagesQuery {
     pub limit: Option<usize>,
     #[serde(default)]
     pub offline: bool,
+    #[serde(default)]
+    pub site: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -234,6 +257,8 @@ pub struct SearchQuery {
     pub remote: bool,
     #[serde(default)]
     pub limit: Option<usize>,
+    #[serde(default)]
+    pub site: Option<String>,
 }
 
 /// Build the `axum::Router` for the unified Jira & Confluence HTTP JSON API.
@@ -243,15 +268,23 @@ pub fn build_router(
     storage: Storage,
     token: Option<String>,
 ) -> Router {
+    let site_pool = SiteClientPool::from_config(&config).unwrap_or_else(|_| {
+        let auth = client.auth().clone();
+        SiteClientPool::new(Vec::new(), move |_| auth.clone(), None, None)
+            .expect("empty site pool initialization")
+    });
     let state = Arc::new(AppState {
         config,
         client,
+        site_pool,
         storage,
         token,
     });
 
     Router::new()
         .route("/health", get(health))
+        .route("/api/v1/sites", get(list_sites))
+        .route("/sites", get(list_sites))
         .route("/myself", get(get_myself))
         .route("/projects", get(list_projects))
         .route("/boards", get(list_boards))
@@ -357,22 +390,123 @@ async fn health(State(state): State<Arc<AppState>>) -> Json<HealthResponse> {
     })
 }
 
-async fn get_myself(State(state): State<Arc<AppState>>) -> Result<Json<Value>, ApiError> {
-    let me = state.client.get_myself().await?;
-    state.client.set_cached_me(me.clone());
-    Ok(Json(json!({ "user": me })))
+fn resolve_site_id(state: &AppState, raw_site: Option<&str>) -> Option<String> {
+    let trimmed = raw_site.map(str::trim).filter(|s| !s.is_empty())?;
+    if trimmed.eq_ignore_ascii_case("all") {
+        return None;
+    }
+    if let Some(found) = state.config.find_effective_site(trimmed) {
+        return Some(found.id);
+    }
+    Some(trimmed.to_string())
+}
+
+fn resolve_site_client(state: &AppState, raw_site: Option<&str>) -> Result<(String, AtlassianClient), ApiError> {
+    if let Some(site_id) = resolve_site_id(state, raw_site) {
+        if site_id.eq_ignore_ascii_case(state.client.site_id()) {
+            return Ok((site_id, state.client.clone()));
+        }
+        if let Ok(client) = state.site_pool.client_for(&site_id) {
+            return Ok((site_id, client));
+        }
+        if site_id.eq_ignore_ascii_case(DEFAULT_SITE_ID) {
+            return Ok((site_id, state.client.clone()));
+        }
+        return Err(ApiError::not_found(format!("site not found: '{site_id}'")));
+    }
+    Ok((state.client.site_id().to_string(), state.client.clone()))
+}
+
+fn site_name_lookup(config: &AppConfig, site_id: &str) -> Option<String> {
+    config
+        .find_effective_site(site_id)
+        .map(|s| s.display_name().to_string())
+}
+
+async fn list_sites(State(state): State<Arc<AppState>>) -> Result<Json<Value>, ApiError> {
+    let mut sites_out = Vec::new();
+    let mut seen_ids = std::collections::HashSet::new();
+
+    for site in state.config.effective_sites() {
+        seen_ids.insert(site.id.to_ascii_lowercase());
+        let counts = state
+            .storage
+            .cache_counts_for_site(&site.id)
+            .unwrap_or_default();
+        let db_rec = state.storage.get_site(&site.id).ok().flatten();
+        sites_out.push(json!({
+            "id": site.id,
+            "name": site.display_name(),
+            "site_url": site.site_url,
+            "confluence_url": site.effective_confluence_root(),
+            "deployment": site.deployment.as_str(),
+            "cloud_id": site.cloud_id,
+            "account_id": site.account_id,
+            "enabled": site.enabled,
+            "issue_count": counts.issues,
+            "page_count": counts.pages,
+            "last_synced_at": db_rec.as_ref().and_then(|r| r.last_synced_at.clone()),
+            "last_error": db_rec.as_ref().and_then(|r| r.last_error.clone()),
+        }));
+    }
+
+    if let Ok(db_sites) = state.storage.list_sites() {
+        for rec in db_sites {
+            if seen_ids.insert(rec.site_id.to_ascii_lowercase()) {
+                let counts = state
+                    .storage
+                    .cache_counts_for_site(&rec.site_id)
+                    .unwrap_or_default();
+                sites_out.push(json!({
+                    "id": rec.site_id,
+                    "name": rec.name,
+                    "site_url": rec.site_url,
+                    "confluence_url": "",
+                    "deployment": rec.deployment,
+                    "cloud_id": null,
+                    "account_id": "default",
+                    "enabled": rec.enabled,
+                    "issue_count": counts.issues,
+                    "page_count": counts.pages,
+                    "last_synced_at": rec.last_synced_at,
+                    "last_error": rec.last_error,
+                }));
+            }
+        }
+    }
+
+    Ok(Json(json!({
+        "active_site": state.config.active_site,
+        "default_site": state.config.default_site,
+        "sites": sites_out,
+    })))
+}
+
+async fn get_myself(
+    State(state): State<Arc<AppState>>,
+    Query(query): Query<SiteQuery>,
+) -> Result<Json<Value>, ApiError> {
+    let (site_id, client) = resolve_site_client(&state, query.site.as_deref())?;
+    let me = client.get_myself().await?;
+    client.set_cached_me(me.clone());
+    Ok(Json(json!({ "site_id": site_id, "user": me })))
 }
 
 async fn list_projects(
     State(state): State<Arc<AppState>>,
     Query(query): Query<RefreshQuery>,
 ) -> Result<Json<Value>, ApiError> {
-    let cached = state.storage.list_projects()?;
+    let scoped_site = resolve_site_id(&state, query.site.as_deref());
+    let cached = match scoped_site.as_deref() {
+        Some(sid) => state.storage.list_projects_for_site(sid)?,
+        None => state.storage.list_projects()?,
+    };
     let projects = if query.refresh || cached.is_empty() {
-        match state.client.list_projects().await {
+        let (target_site, client) = resolve_site_client(&state, query.site.as_deref())?;
+        match client.list_projects().await {
             Ok(fetched) => {
-                let _ = state.storage.upsert_projects(&fetched);
-                let stored = state.storage.list_projects()?;
+                let _ = state.storage.upsert_projects_for_site(&target_site, &fetched);
+                let stored = state.storage.list_projects_for_site(&target_site)?;
                 if stored.is_empty() {
                     fetched
                 } else {
@@ -384,8 +518,7 @@ async fn list_projects(
                 cached
             }
             Err(err) if !query.refresh => {
-                // Offline/unauthenticated fresh cache: return empty cached list if client is not configured
-                if state.config.site_url.trim().is_empty() {
+                if state.config.site_url.trim().is_empty() && state.config.sites.is_empty() {
                     cached
                 } else {
                     return Err(err.into());
@@ -397,7 +530,7 @@ async fn list_projects(
         cached
     };
 
-    Ok(Json(json!({ "projects": projects })))
+    Ok(Json(json!({ "site_id": scoped_site, "projects": projects })))
 }
 
 async fn list_boards(
@@ -409,14 +542,19 @@ async fn list_boards(
         .as_deref()
         .map(str::trim)
         .filter(|s| !s.is_empty());
-    let cached = state.storage.list_boards(project)?;
+    let scoped_site = resolve_site_id(&state, query.site.as_deref());
+    let cached = match scoped_site.as_deref() {
+        Some(sid) => state.storage.list_boards_for_site(sid, project)?,
+        None => state.storage.list_boards(project)?,
+    };
     let boards = if query.refresh || cached.is_empty() {
-        if !query.refresh && state.config.site_url.trim().is_empty() {
+        if !query.refresh && state.config.site_url.trim().is_empty() && state.config.sites.is_empty() {
             cached
         } else {
-            let fetched = state.client.list_boards(project).await?;
-            let _ = state.storage.upsert_boards(&fetched);
-            let stored = state.storage.list_boards(project)?;
+            let (target_site, client) = resolve_site_client(&state, query.site.as_deref())?;
+            let fetched = client.list_boards(project).await?;
+            let _ = state.storage.upsert_boards_for_site(&target_site, &fetched);
+            let stored = state.storage.list_boards_for_site(&target_site, project)?;
             if stored.is_empty() {
                 fetched
             } else {
@@ -427,7 +565,7 @@ async fn list_boards(
         cached
     };
 
-    Ok(Json(json!({ "boards": boards })))
+    Ok(Json(json!({ "site_id": scoped_site, "boards": boards })))
 }
 
 async fn list_board_sprints(
@@ -435,15 +573,20 @@ async fn list_board_sprints(
     Path(board_id): Path<i64>,
     Query(query): Query<SprintsQuery>,
 ) -> Result<Json<Value>, ApiError> {
+    let scoped_site = resolve_site_id(&state, query.site.as_deref());
     let sprints = if query.offline {
-        state.storage.list_sprints(board_id)?
+        match scoped_site.as_deref() {
+            Some(sid) => state.storage.list_sprints_for_site(sid, board_id)?,
+            None => state.storage.list_sprints(board_id)?,
+        }
     } else {
-        let fetched = state.client.list_board_sprints(board_id).await?;
-        let _ = state.storage.upsert_sprints(&fetched);
+        let (target_site, client) = resolve_site_client(&state, query.site.as_deref())?;
+        let fetched = client.list_board_sprints(board_id).await?;
+        let _ = state.storage.upsert_sprints_for_site(&target_site, &fetched);
         fetched
     };
 
-    Ok(Json(json!({ "board_id": board_id, "sprints": sprints })))
+    Ok(Json(json!({ "site_id": scoped_site, "board_id": board_id, "sprints": sprints })))
 }
 
 async fn list_board_issues(
@@ -452,20 +595,27 @@ async fn list_board_issues(
     Query(query): Query<BoardIssuesQuery>,
 ) -> Result<Json<Value>, ApiError> {
     let limit = clamp_limit(query.limit.unwrap_or(50));
+    let scoped_site = resolve_site_id(&state, query.site.as_deref());
     let issues = if query.offline {
-        state
-            .storage
-            .list_board_issues(board_id, query.sprint_id, limit)?
+        match scoped_site.as_deref() {
+            Some(sid) => state
+                .storage
+                .list_board_issues_for_site(sid, board_id, query.sprint_id, limit)?,
+            None => state
+                .storage
+                .list_board_issues(board_id, query.sprint_id, limit)?,
+        }
     } else {
-        let fetched = state
-            .client
+        let (target_site, client) = resolve_site_client(&state, query.site.as_deref())?;
+        let fetched = client
             .list_board_issues(board_id, query.sprint_id, limit)
             .await?;
-        let _ = state.storage.upsert_issues(&fetched);
+        let _ = state.storage.upsert_issues_for_site(&target_site, &fetched);
         fetched
     };
 
     Ok(Json(json!({
+        "site_id": scoped_site,
         "board_id": board_id,
         "sprint_id": query.sprint_id,
         "issues": issues,
@@ -482,11 +632,16 @@ async fn list_issues(
         .as_deref()
         .map(str::trim)
         .filter(|s| !s.is_empty());
+    let scoped_site = resolve_site_id(&state, query.site.as_deref());
 
     if query.offline {
-        let issues = state.storage.list_issues(project, limit)?;
+        let issues = match scoped_site.as_deref() {
+            Some(sid) => state.storage.list_issues_for_site(sid, project, limit)?,
+            None => state.storage.list_issues(project, limit)?,
+        };
         let total = issues.len();
         return Ok(Json(json!({
+            "site_id": scoped_site,
             "issues": issues,
             "next_page_token": null,
             "next_start_at": null,
@@ -494,6 +649,7 @@ async fn list_issues(
         })));
     }
 
+    let (target_site, client) = resolve_site_client(&state, query.site.as_deref())?;
     let jql = match query.jql.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
         Some(raw) => raw.to_string(),
         None => match project.or(state.config.default_project.as_deref()) {
@@ -504,13 +660,13 @@ async fn list_issues(
         },
     };
 
-    let page = state
-        .client
+    let page = client
         .search_issues_jql(&jql, limit, query.page_token.as_deref(), None)
         .await?;
-    let _ = state.storage.upsert_issues(&page.issues);
+    let _ = state.storage.upsert_issues_for_site(&target_site, &page.issues);
 
     Ok(Json(json!({
+        "site_id": target_site,
         "issues": page.issues,
         "next_page_token": page.next_page_token,
         "next_start_at": page.next_start_at,
@@ -563,18 +719,21 @@ async fn get_issue(
         return Err(ApiError::bad_request("issue key must not be empty"));
     }
 
+    let scoped_site = resolve_site_id(&state, query.site.as_deref());
     let detail = if query.offline {
-        state
-            .storage
-            .get_issue_detail(key)?
-            .ok_or_else(|| ApiError::not_found(format!("issue not found in cache: {key}")))?
+        match scoped_site.as_deref() {
+            Some(sid) => state.storage.get_issue_detail_for_site(sid, key)?,
+            None => state.storage.get_issue_detail(key)?,
+        }
+        .ok_or_else(|| ApiError::not_found(format!("issue not found in cache: {key}")))?
     } else {
-        let fetched = state.client.get_issue(key).await?;
-        let _ = state.storage.upsert_issue_detail(&fetched);
+        let (target_site, client) = resolve_site_client(&state, query.site.as_deref())?;
+        let fetched = client.get_issue(key).await?;
+        let _ = state.storage.upsert_issue_detail_for_site(&target_site, &fetched);
         fetched
     };
 
-    Ok(Json(json!({ "issue": detail })))
+    Ok(Json(json!({ "site_id": scoped_site, "issue": detail })))
 }
 
 async fn patch_issue(
@@ -707,14 +866,19 @@ async fn list_spaces(
     Query(query): Query<SpacesQuery>,
 ) -> Result<Json<Value>, ApiError> {
     let limit = clamp_limit(query.limit.unwrap_or(50));
-    let cached = state.storage.list_spaces()?;
+    let scoped_site = resolve_site_id(&state, query.site.as_deref());
+    let cached = match scoped_site.as_deref() {
+        Some(sid) => state.storage.list_spaces_for_site(sid)?,
+        None => state.storage.list_spaces()?,
+    };
     let mut spaces = if query.refresh || cached.is_empty() {
-        if !query.refresh && state.config.site_url.trim().is_empty() {
+        if !query.refresh && state.config.site_url.trim().is_empty() && state.config.sites.is_empty() {
             cached
         } else {
-            let fetched = state.client.list_spaces(limit).await?;
-            let _ = state.storage.upsert_spaces(&fetched);
-            let stored = state.storage.list_spaces()?;
+            let (target_site, client) = resolve_site_client(&state, query.site.as_deref())?;
+            let fetched = client.list_spaces(limit).await?;
+            let _ = state.storage.upsert_spaces_for_site(&target_site, &fetched);
+            let stored = state.storage.list_spaces_for_site(&target_site)?;
             if stored.is_empty() {
                 fetched
             } else {
@@ -725,7 +889,7 @@ async fn list_spaces(
         cached
     };
     spaces.truncate(limit);
-    Ok(Json(json!({ "spaces": spaces })))
+    Ok(Json(json!({ "site_id": scoped_site, "spaces": spaces })))
 }
 
 async fn list_space_pages(
@@ -735,15 +899,20 @@ async fn list_space_pages(
 ) -> Result<Json<Value>, ApiError> {
     let limit = clamp_limit(query.limit.unwrap_or(50));
     let space = space.trim();
+    let scoped_site = resolve_site_id(&state, query.site.as_deref());
     let mut pages = if query.offline {
-        state.storage.list_space_root_pages(space)?
+        match scoped_site.as_deref() {
+            Some(sid) => state.storage.list_space_root_pages_for_site(sid, space)?,
+            None => state.storage.list_space_root_pages(space)?,
+        }
     } else {
-        let fetched = state.client.list_space_root_pages(space, limit).await?;
-        let _ = state.storage.upsert_pages(&fetched);
+        let (target_site, client) = resolve_site_client(&state, query.site.as_deref())?;
+        let fetched = client.list_space_root_pages(space, limit).await?;
+        let _ = state.storage.upsert_pages_for_site(&target_site, &fetched);
         fetched
     };
     pages.truncate(limit);
-    Ok(Json(json!({ "space": space, "pages": pages })))
+    Ok(Json(json!({ "site_id": scoped_site, "space": space, "pages": pages })))
 }
 
 async fn get_page(
@@ -752,17 +921,20 @@ async fn get_page(
     Query(query): Query<OfflineQuery>,
 ) -> Result<Json<Value>, ApiError> {
     let id = id.trim();
+    let scoped_site = resolve_site_id(&state, query.site.as_deref());
     let detail = if query.offline {
-        state
-            .storage
-            .get_page_detail(id)?
-            .ok_or_else(|| ApiError::not_found(format!("page not found in cache: {id}")))?
+        match scoped_site.as_deref() {
+            Some(sid) => state.storage.get_page_detail_for_site(sid, id)?,
+            None => state.storage.get_page_detail(id)?,
+        }
+        .ok_or_else(|| ApiError::not_found(format!("page not found in cache: {id}")))?
     } else {
-        let fetched = state.client.get_page(id).await?;
-        let _ = state.storage.upsert_page_detail(&fetched);
+        let (target_site, client) = resolve_site_client(&state, query.site.as_deref())?;
+        let fetched = client.get_page(id).await?;
+        let _ = state.storage.upsert_page_detail_for_site(&target_site, &fetched);
         fetched
     };
-    Ok(Json(json!({ "page": detail })))
+    Ok(Json(json!({ "site_id": scoped_site, "page": detail })))
 }
 
 async fn list_child_pages(
@@ -771,14 +943,19 @@ async fn list_child_pages(
     Query(query): Query<OfflineQuery>,
 ) -> Result<Json<Value>, ApiError> {
     let id = id.trim();
+    let scoped_site = resolve_site_id(&state, query.site.as_deref());
     let pages = if query.offline {
-        state.storage.list_child_pages(id)?
+        match scoped_site.as_deref() {
+            Some(sid) => state.storage.list_child_pages_for_site(sid, id)?,
+            None => state.storage.list_child_pages(id)?,
+        }
     } else {
-        let fetched = state.client.list_child_pages(id).await?;
-        let _ = state.storage.upsert_pages(&fetched);
+        let (target_site, client) = resolve_site_client(&state, query.site.as_deref())?;
+        let fetched = client.list_child_pages(id).await?;
+        let _ = state.storage.upsert_pages_for_site(&target_site, &fetched);
         fetched
     };
-    Ok(Json(json!({ "parent_id": id, "pages": pages })))
+    Ok(Json(json!({ "site_id": scoped_site, "parent_id": id, "pages": pages })))
 }
 
 async fn create_page(
@@ -917,14 +1094,30 @@ async fn search(
         )));
     }
     let limit = clamp_limit(query.limit.unwrap_or(30));
+    let scoped_site = resolve_site_id(&state, query.site.as_deref());
 
-    let hits = if !query.remote {
-        match scope.as_str() {
-            "jira" => state.storage.search_issues(q, limit)?,
-            "confluence" => state.storage.search_pages(q, limit)?,
-            _ => state.storage.search_unified(q, limit)?,
-        }
+    let hits: Vec<FederatedSearchHit> = if !query.remote {
+        let scoped_hits = match scope.as_str() {
+            "jira" => state
+                .storage
+                .search_issues_scoped(q, scoped_site.as_deref(), limit)?,
+            "confluence" => state
+                .storage
+                .search_pages_scoped(q, scoped_site.as_deref(), limit)?,
+            _ => state
+                .storage
+                .unified_search_scoped(q, scoped_site.as_deref(), limit)?,
+        };
+        scoped_hits
+            .into_iter()
+            .map(|(sid, hit)| {
+                let sname = site_name_lookup(&state.config, &sid);
+                FederatedSearchHit::new(sid, sname, hit)
+            })
+            .collect()
     } else {
+        let (target_site, client) = resolve_site_client(&state, query.site.as_deref())?;
+        let target_name = site_name_lookup(&state.config, &target_site);
         let mut combined = Vec::new();
         if scope == "all" || scope == "jira" {
             let jql = if looks_like_query_expr(q) {
@@ -932,12 +1125,13 @@ async fn search(
             } else {
                 format!("text ~ \"{}\"", escape_jql_str(q))
             };
-            let page = state
-                .client
-                .search_issues_jql(&jql, limit, None, None)
-                .await?;
-            let _ = state.storage.upsert_issues(&page.issues);
-            combined.extend(page.issues.iter().map(issue_to_hit));
+            let page = client.search_issues_jql(&jql, limit, None, None).await?;
+            let _ = state
+                .storage
+                .upsert_issues_for_site(&target_site, &page.issues);
+            combined.extend(page.issues.iter().map(|i| {
+                FederatedSearchHit::new(target_site.clone(), target_name.clone(), issue_to_hit(i))
+            }));
         }
         if scope == "all" || scope == "confluence" {
             let cql = if looks_like_query_expr(q) {
@@ -945,9 +1139,11 @@ async fn search(
             } else {
                 format!("text ~ \"{}\"", escape_jql_str(q))
             };
-            let pages = state.client.search_confluence_cql(&cql, limit).await?;
-            let _ = state.storage.upsert_pages(&pages);
-            combined.extend(pages.iter().map(page_to_hit));
+            let pages = client.search_confluence_cql(&cql, limit).await?;
+            let _ = state.storage.upsert_pages_for_site(&target_site, &pages);
+            combined.extend(pages.iter().map(|p| {
+                FederatedSearchHit::new(target_site.clone(), target_name.clone(), page_to_hit(p))
+            }));
         }
         combined.truncate(limit);
         combined
@@ -956,13 +1152,46 @@ async fn search(
     Ok(Json(json!({
         "query": q,
         "scope": scope,
+        "site_id": scoped_site,
         "remote": query.remote,
         "hits": hits,
     })))
 }
 
-async fn sync_workspace(State(state): State<Arc<AppState>>) -> Result<Json<Value>, ApiError> {
-    let summary = sync::bootstrap_workspace(&state.client, &state.storage).await?;
+async fn sync_workspace(
+    State(state): State<Arc<AppState>>,
+    Query(query): Query<SiteQuery>,
+) -> Result<Json<Value>, ApiError> {
+    if query.site.is_none() && state.site_pool.enabled_clients().len() > 1 {
+        let targets: Vec<SiteSyncTarget> = state
+            .site_pool
+            .enabled_clients()
+            .into_iter()
+            .map(|(site, client)| SiteSyncTarget {
+                site_id: site.id.clone(),
+                site_name: site.display_name().to_string(),
+                client,
+            })
+            .collect();
+        let mut breakers = sync::CircuitBreakerMap::new();
+        let outcome = sync::run_multi_site_sync(
+            &targets,
+            &state.storage,
+            &mut breakers,
+            sync::DEFAULT_MULTI_SITE_CONCURRENCY,
+            None,
+        )
+        .await;
+        let counts = state.storage.cache_counts()?;
+        return Ok(Json(json!({
+            "ok": outcome.succeeded_sites > 0,
+            "summary": outcome.summary,
+            "sites": outcome.per_site,
+            "counts": counts,
+        })));
+    }
+    let (_site_id, client) = resolve_site_client(&state, query.site.as_deref())?;
+    let summary = sync::bootstrap_workspace(&client, &state.storage).await?;
     let counts = state.storage.cache_counts()?;
     Ok(Json(json!({
         "ok": true,

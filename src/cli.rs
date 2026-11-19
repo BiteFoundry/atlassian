@@ -11,17 +11,23 @@ use serde_json::json;
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use crate::{
-    atlassian::AtlassianClient,
-    auth::{AuthManager, StoredCredentials},
-    config::{self, AppConfig, DeploymentKind, Persona, DEFAULT_SERVE_PORT},
+    atlassian::{AtlassianClient, SiteClientPool},
+    auth::{
+        fetch_accessible_resources, run_oauth_loopback_login, AuthManager, OAuthLoopbackOptions,
+        StoredCredentials, DEFAULT_OAUTH_API_BASE, DEFAULT_OAUTH_AUTH_BASE,
+    },
+    config::{
+        self, AppConfig, DeploymentKind, Persona, SiteProfile, DEFAULT_SERVE_PORT,
+    },
     daemon, img_preview,
     models::{
         AttachmentItem, BoardSummary, IssueDetail, IssueSummary, IssueUpdate, OutgoingIssue,
         OutgoingPage, PageDetail, PageUpdate, SprintSummary, StatusCategory,
     },
     serve::{self, ServeOptions},
-    storage::Storage,
-    sync, tui, updater,
+    storage::{SiteRecord, Storage},
+    sync::{self, SiteSyncTarget},
+    tui, updater,
 };
 
 const DELETE_JSON_REQUIRES_YES: &str = "Deleting in --json mode requires passing --yes.";
@@ -50,6 +56,9 @@ impl From<DeploymentArg> for DeploymentKind {
     long_about = "Native terminal client for Atlassian Cloud and Data Center (Jira · Agile · Confluence).\nRun without arguments to check login status and launch the TUI."
 )]
 pub struct Cli {
+    /// Target Atlassian site ID, name, or URL (overrides default_site)
+    #[arg(long, global = true, env = "ATLASSIAN_SITE", value_name = "SITE")]
+    pub site: Option<String>,
     #[command(subcommand)]
     pub command: Option<Command>,
 }
@@ -62,8 +71,93 @@ pub struct Cli {
     long_about = "Native terminal client for Atlassian Cloud and Data Center (Confluence · Jira).\nRun without arguments to open the Confluence Space & Page Tree TUI."
 )]
 pub struct ConfluenceCli {
+    /// Target Atlassian site ID, name, or URL (overrides default_site)
+    #[arg(long, global = true, env = "ATLASSIAN_SITE", value_name = "SITE")]
+    pub site: Option<String>,
     #[command(subcommand)]
     pub command: Option<ConfluenceCommand>,
+}
+
+#[derive(clap::Args, Debug, Clone)]
+pub struct SiteAddArgs {
+    /// Atlassian site URL (e.g. https://acme.atlassian.net or https://jira.corp.internal)
+    pub url: String,
+    /// Optional explicit site slug ID (auto-derived from URL if omitted)
+    #[arg(long)]
+    pub id: Option<String>,
+    /// Human-readable site display name
+    #[arg(long)]
+    pub name: Option<String>,
+    /// Shared credential account ID (e.g. a saved --cloud-account)
+    #[arg(long)]
+    pub account: Option<String>,
+    /// Personal Access Token (Bearer PAT)
+    #[arg(long)]
+    pub pat: Option<String>,
+    /// Email / username for API token or Basic auth
+    #[arg(long)]
+    pub email: Option<String>,
+    /// API token or password
+    #[arg(long)]
+    pub token: Option<String>,
+    /// Optional separate Confluence base URL (Data Center)
+    #[arg(long = "confluence-url")]
+    pub confluence_url: Option<String>,
+    /// Cloud vs Data Center API dialect
+    #[arg(long, value_enum)]
+    pub deployment: Option<DeploymentArg>,
+    #[arg(long)]
+    pub json: bool,
+}
+
+#[derive(Subcommand, Debug)]
+pub enum SitesCommand {
+    /// List all registered Atlassian sites and sync/cache status
+    #[command(visible_alias = "ls")]
+    List {
+        #[arg(long)]
+        json: bool,
+    },
+    /// Register a Cloud or Data Center Atlassian site
+    Add(Box<SiteAddArgs>),
+    /// Discover all consented Atlassian Cloud sites via OAuth 2.0 (3LO) accessible-resources
+    Discover {
+        #[arg(long)]
+        account: Option<String>,
+        #[arg(long = "client-id")]
+        client_id: Option<String>,
+        #[arg(long = "client-secret")]
+        client_secret: Option<String>,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Set the default target site for single-site CLI / HTTP / MCP commands
+    Default {
+        id: String,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Enable a site for federated sync, search, and TUI views
+    Enable {
+        id: String,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Disable a site without deleting its config or cached data
+    Disable {
+        id: String,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Remove a registered site and purge its local cached data
+    #[command(visible_alias = "rm")]
+    Remove {
+        id: String,
+        #[arg(long)]
+        yes: bool,
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 #[derive(Subcommand, Debug)]
@@ -94,7 +188,7 @@ pub enum DaemonCommand {
 
 #[derive(Subcommand, Debug)]
 pub enum Command {
-    /// Log in to Atlassian Cloud (API Token) or Data Center (PAT/Basic)
+    /// Log in to Atlassian Cloud (OAuth 2.0 3LO / Shared Cloud Account / API Token) or Data Center (PAT/Basic)
     #[command(visible_alias = "in")]
     Login {
         #[arg(long)]
@@ -109,8 +203,31 @@ pub enum Command {
         pat: Option<String>,
         #[arg(long, value_enum)]
         deployment: Option<DeploymentArg>,
+        /// Sign in via Atlassian Cloud OAuth 2.0 (3LO) loopback flow and auto-discover all consented sites
+        #[arg(long)]
+        oauth: bool,
+        /// Save a shared Atlassian Cloud account API token reusable across unlimited *.atlassian.net sites
+        #[arg(long = "cloud-account")]
+        cloud_account: bool,
+        /// OAuth 2.0 (3LO) client ID (overrides ATLASSIAN_OAUTH_CLIENT_ID)
+        #[arg(long = "client-id")]
+        client_id: Option<String>,
+        /// Optional OAuth 2.0 (3LO) client secret (overrides ATLASSIAN_OAUTH_CLIENT_SECRET)
+        #[arg(long = "client-secret")]
+        client_secret: Option<String>,
+        /// Credential account ID to store/reuse credentials under
+        #[arg(long)]
+        account: Option<String>,
+        /// Human-readable site name when registering a site during login
+        #[arg(long)]
+        name: Option<String>,
         #[arg(long)]
         json: bool,
+    },
+    /// Manage connected Atlassian Cloud and Data Center sites
+    Sites {
+        #[command(subcommand)]
+        action: Box<SitesCommand>,
     },
     /// Remove stored credentials
     #[command(visible_alias = "out")]
@@ -365,7 +482,7 @@ pub enum Command {
 
 #[derive(Subcommand, Debug)]
 pub enum ConfluenceCommand {
-    /// Log in to Atlassian Cloud (API Token) or Data Center (PAT/Basic)
+    /// Log in to Atlassian Cloud (OAuth 2.0 3LO / Shared Cloud Account / API Token) or Data Center (PAT/Basic)
     #[command(visible_alias = "in")]
     Login {
         #[arg(long)]
@@ -380,8 +497,31 @@ pub enum ConfluenceCommand {
         pat: Option<String>,
         #[arg(long, value_enum)]
         deployment: Option<DeploymentArg>,
+        /// Sign in via Atlassian Cloud OAuth 2.0 (3LO) loopback flow and auto-discover all consented sites
+        #[arg(long)]
+        oauth: bool,
+        /// Save a shared Atlassian Cloud account API token reusable across unlimited *.atlassian.net sites
+        #[arg(long = "cloud-account")]
+        cloud_account: bool,
+        /// OAuth 2.0 (3LO) client ID (overrides ATLASSIAN_OAUTH_CLIENT_ID)
+        #[arg(long = "client-id")]
+        client_id: Option<String>,
+        /// Optional OAuth 2.0 (3LO) client secret (overrides ATLASSIAN_OAUTH_CLIENT_SECRET)
+        #[arg(long = "client-secret")]
+        client_secret: Option<String>,
+        /// Credential account ID to store/reuse credentials under
+        #[arg(long)]
+        account: Option<String>,
+        /// Human-readable site name when registering a site during login
+        #[arg(long)]
+        name: Option<String>,
         #[arg(long)]
         json: bool,
+    },
+    /// Manage connected Atlassian Cloud and Data Center sites
+    Sites {
+        #[command(subcommand)]
+        action: Box<SitesCommand>,
     },
     /// Remove stored credentials
     #[command(visible_alias = "out")]
@@ -877,22 +1017,68 @@ pub async fn run() -> Result<()> {
     match persona {
         Persona::Jira => {
             let cli: Cli = parse_cli_with_stack();
-            Box::pin(dispatch_jira_cli(&mut cfg, persona, cli.command)).await
+            let site_override = cli.site.clone();
+            Box::pin(dispatch_jira_cli(&mut cfg, persona, site_override, cli.command)).await
         }
         Persona::Confluence => {
             let cli: ConfluenceCli = parse_cli_with_stack();
-            Box::pin(dispatch_confluence_cli(&mut cfg, persona, cli.command)).await
+            let site_override = cli.site.clone();
+            Box::pin(dispatch_confluence_cli(
+                &mut cfg,
+                persona,
+                site_override,
+                cli.command,
+            ))
+            .await
         }
     }
+}
+
+fn apply_site_override(cfg: &AppConfig, site_override: Option<&str>) -> Result<AppConfig> {
+    let Some(raw) = site_override.map(str::trim).filter(|s| !s.is_empty()) else {
+        return Ok(cfg.clone());
+    };
+    let mut scoped = cfg.clone();
+    if raw.eq_ignore_ascii_case("all") {
+        scoped.active_site = None;
+        return Ok(scoped);
+    }
+    let Some(found) = cfg.find_effective_site(raw) else {
+        let available: Vec<String> = cfg
+            .effective_sites()
+            .into_iter()
+            .map(|s| s.id)
+            .collect();
+        if available.is_empty() {
+            bail!(
+                "Site '{raw}' not found (no sites configured). Run `jira sites add <URL>` or `jira login --oauth` first."
+            );
+        }
+        bail!(
+            "Site '{raw}' not found. Available sites: {}.",
+            available.join(", ")
+        );
+    };
+    scoped.active_site = Some(found.id.clone());
+    scoped.default_site = Some(found.id.clone());
+    scoped.site_url = found.site_url.clone();
+    scoped.confluence_url = found.confluence_url.clone();
+    scoped.deployment = found.deployment;
+    scoped.profile = found.account_id;
+    Ok(scoped)
 }
 
 async fn dispatch_jira_cli(
     cfg: &mut AppConfig,
     persona: Persona,
+    site_override: Option<String>,
     command: Option<Command>,
 ) -> Result<()> {
     match command {
-        None => Box::pin(cmd_tui(cfg, persona)).await,
+        None => {
+            let mut run_cfg = apply_site_override(cfg, site_override.as_deref())?;
+            Box::pin(cmd_tui(&mut run_cfg, persona)).await
+        }
         Some(Command::Login {
             url,
             confluence_url,
@@ -900,6 +1086,12 @@ async fn dispatch_jira_cli(
             token,
             pat,
             deployment,
+            oauth,
+            cloud_account,
+            client_id,
+            client_secret,
+            account,
+            name,
             json,
         }) => {
             Box::pin(cmd_login(
@@ -911,28 +1103,54 @@ async fn dispatch_jira_cli(
                     token,
                     pat,
                     deployment: deployment.map(Into::into),
+                    oauth,
+                    cloud_account,
+                    client_id,
+                    client_secret,
+                    account,
+                    name,
                 },
                 json,
             ))
             .await
         }
-        Some(Command::Logout { json }) => cmd_logout(cfg, json),
-        Some(Command::Whoami { json }) => Box::pin(cmd_whoami(cfg, persona, json)).await,
-        Some(Command::Doctor { probe, json }) => Box::pin(cmd_doctor(cfg, persona, probe, json)).await,
-        Some(Command::Projects { refresh, json }) => Box::pin(cmd_projects(cfg, refresh, json)).await,
+        Some(Command::Sites { action }) => Box::pin(cmd_sites(cfg, *action)).await,
+        Some(Command::Logout { json }) => {
+            let scoped = apply_site_override(cfg, site_override.as_deref())?;
+            cmd_logout(&scoped, json)
+        }
+        Some(Command::Whoami { json }) => {
+            let scoped = apply_site_override(cfg, site_override.as_deref())?;
+            Box::pin(cmd_whoami(&scoped, persona, json)).await
+        }
+        Some(Command::Doctor { probe, json }) => {
+            let scoped = apply_site_override(cfg, site_override.as_deref())?;
+            Box::pin(cmd_doctor(&scoped, persona, probe, json)).await
+        }
+        Some(Command::Projects { refresh, json }) => {
+            let scoped = apply_site_override(cfg, site_override.as_deref())?;
+            Box::pin(cmd_projects(&scoped, refresh, json)).await
+        }
         Some(Command::Boards {
             project,
             refresh,
             json,
-        }) => Box::pin(cmd_boards(cfg, project.as_deref(), refresh, json)).await,
+        }) => {
+            let scoped = apply_site_override(cfg, site_override.as_deref())?;
+            Box::pin(cmd_boards(&scoped, project.as_deref(), refresh, json)).await
+        }
         Some(Command::Sprints { board_id, json }) => {
-            Box::pin(cmd_sprints(cfg, board_id, json)).await
+            let scoped = apply_site_override(cfg, site_override.as_deref())?;
+            Box::pin(cmd_sprints(&scoped, board_id, json)).await
         }
         Some(Command::Board {
             board_id,
             sprint,
             json,
-        }) => Box::pin(cmd_board(cfg, board_id, sprint, json)).await,
+        }) => {
+            let scoped = apply_site_override(cfg, site_override.as_deref())?;
+            Box::pin(cmd_board(&scoped, board_id, sprint, json)).await
+        }
         Some(Command::Issues {
             project,
             jql,
@@ -942,8 +1160,9 @@ async fn dispatch_jira_cli(
             offline,
             json,
         }) => {
+            let scoped = apply_site_override(cfg, site_override.as_deref())?;
             Box::pin(cmd_issues(
-                cfg,
+                &scoped,
                 project.as_deref(),
                 jql.as_deref(),
                 mine,
@@ -959,7 +1178,10 @@ async fn dispatch_jira_cli(
             preview_images,
             offline,
             json,
-        }) => Box::pin(cmd_issue_view(cfg, &key, preview_images, offline, json)).await,
+        }) => {
+            let scoped = apply_site_override(cfg, site_override.as_deref())?;
+            Box::pin(cmd_issue_view(&scoped, &key, preview_images, offline, json)).await
+        }
         Some(Command::Create {
             project,
             issue_type,
@@ -972,8 +1194,9 @@ async fn dispatch_jira_cli(
             parent,
             json,
         }) => {
+            let scoped = apply_site_override(cfg, site_override.as_deref())?;
             Box::pin(cmd_issue_create(
-                cfg,
+                &scoped,
                 project.as_deref(),
                 &issue_type,
                 &summary,
@@ -997,8 +1220,9 @@ async fn dispatch_jira_cli(
             label,
             json,
         }) => {
+            let scoped = apply_site_override(cfg, site_override.as_deref())?;
             Box::pin(cmd_issue_edit(
-                cfg,
+                &scoped,
                 &key,
                 summary,
                 body.as_deref(),
@@ -1017,8 +1241,9 @@ async fn dispatch_jira_cli(
             list,
             json,
         }) => {
+            let scoped = apply_site_override(cfg, site_override.as_deref())?;
             Box::pin(cmd_issue_transition(
-                cfg,
+                &scoped,
                 &key,
                 status.as_deref(),
                 comment.as_deref(),
@@ -1032,12 +1257,17 @@ async fn dispatch_jira_cli(
             to,
             unassign,
             json,
-        }) => Box::pin(cmd_issue_assign(cfg, &key, to.as_deref(), unassign, json)).await,
+        }) => {
+            let scoped = apply_site_override(cfg, site_override.as_deref())?;
+            Box::pin(cmd_issue_assign(&scoped, &key, to.as_deref(), unassign, json)).await
+        }
         Some(Command::Comment { key, body, json }) => {
-            Box::pin(cmd_issue_comment(cfg, &key, &body, json)).await
+            let scoped = apply_site_override(cfg, site_override.as_deref())?;
+            Box::pin(cmd_issue_comment(&scoped, &key, &body, json)).await
         }
         Some(Command::Attach { key, file, json }) => {
-            Box::pin(cmd_issue_attach(cfg, &key, &file, json)).await
+            let scoped = apply_site_override(cfg, site_override.as_deref())?;
+            Box::pin(cmd_issue_attach(&scoped, &key, &file, json)).await
         }
         Some(Command::Download {
             key,
@@ -1045,8 +1275,9 @@ async fn dispatch_jira_cli(
             dir,
             json,
         }) => {
+            let scoped = apply_site_override(cfg, site_override.as_deref())?;
             Box::pin(cmd_issue_download(
-                cfg,
+                &scoped,
                 &key,
                 attachment_id.as_deref(),
                 dir.as_deref(),
@@ -1055,7 +1286,8 @@ async fn dispatch_jira_cli(
             .await
         }
         Some(Command::Delete { key, yes, json }) => {
-            Box::pin(cmd_issue_delete(cfg, &key, yes, json)).await
+            let scoped = apply_site_override(cfg, site_override.as_deref())?;
+            Box::pin(cmd_issue_delete(&scoped, &key, yes, json)).await
         }
         Some(Command::Search {
             query,
@@ -1063,17 +1295,27 @@ async fn dispatch_jira_cli(
             remote,
             limit,
             json,
-        }) => Box::pin(cmd_issue_search(cfg, &query, jql, remote, limit, json)).await,
-        Some(Command::Open { key }) => Box::pin(cmd_issue_open(cfg, &key)).await,
-        Some(Command::Wiki { command }) => Box::pin(dispatch_wiki_subcommand(cfg, command)).await,
+        }) => {
+            let scoped = apply_site_override(cfg, site_override.as_deref())?;
+            Box::pin(cmd_issue_search(&scoped, &query, jql, remote, limit, json)).await
+        }
+        Some(Command::Open { key }) => {
+            let scoped = apply_site_override(cfg, site_override.as_deref())?;
+            Box::pin(cmd_issue_open(&scoped, &key)).await
+        }
+        Some(Command::Wiki { command }) => {
+            let scoped = apply_site_override(cfg, site_override.as_deref())?;
+            Box::pin(dispatch_wiki_subcommand(&scoped, command)).await
+        }
         Some(Command::Preview {
             target_id_or_key,
             attachment_id,
             cols,
             rows,
         }) => {
+            let scoped = apply_site_override(cfg, site_override.as_deref())?;
             Box::pin(cmd_preview(
-                cfg,
+                &scoped,
                 &target_id_or_key,
                 attachment_id.as_deref(),
                 cols,
@@ -1082,7 +1324,9 @@ async fn dispatch_jira_cli(
             .await
         }
         Some(Command::PreviewFile { path, cols, rows }) => cmd_preview_file(&path, cols, rows),
-        Some(Command::Sync { json }) => Box::pin(cmd_sync(cfg, json)).await,
+        Some(Command::Sync { json }) => {
+            Box::pin(cmd_sync(cfg, site_override.as_deref(), json)).await
+        }
         Some(Command::Daemon { action }) => Box::pin(cmd_daemon(cfg, action)).await,
         Some(Command::Update {
             check,
@@ -1090,11 +1334,15 @@ async fn dispatch_jira_cli(
             repo,
             json,
         }) => Box::pin(cmd_update(cfg, check, force, repo.as_deref(), json)).await,
-        Some(Command::Tui) => Box::pin(cmd_tui(cfg, persona)).await,
+        Some(Command::Tui) => {
+            let mut run_cfg = apply_site_override(cfg, site_override.as_deref())?;
+            Box::pin(cmd_tui(&mut run_cfg, persona)).await
+        }
         Some(Command::Serve { bind, port, token }) => {
-            let (_auth, client, storage) = open_runtime(cfg, false)?;
+            let scoped = apply_site_override(cfg, site_override.as_deref())?;
+            let (_auth, client, storage) = open_runtime(&scoped, false)?;
             Box::pin(serve::run(
-                cfg.clone(),
+                scoped,
                 client,
                 storage,
                 ServeOptions { bind, port, token },
@@ -1102,8 +1350,9 @@ async fn dispatch_jira_cli(
             .await
         }
         Some(Command::Mcp) => {
-            let (_auth, client, storage) = open_runtime(cfg, false)?;
-            Box::pin(crate::mcp::run(cfg.clone(), client, storage)).await
+            let scoped = apply_site_override(cfg, site_override.as_deref())?;
+            let (_auth, client, storage) = open_runtime(&scoped, false)?;
+            Box::pin(crate::mcp::run(scoped, client, storage)).await
         }
     }
 }
@@ -1111,10 +1360,14 @@ async fn dispatch_jira_cli(
 async fn dispatch_confluence_cli(
     cfg: &mut AppConfig,
     persona: Persona,
+    site_override: Option<String>,
     command: Option<ConfluenceCommand>,
 ) -> Result<()> {
     match command {
-        None => Box::pin(cmd_tui(cfg, persona)).await,
+        None => {
+            let mut run_cfg = apply_site_override(cfg, site_override.as_deref())?;
+            Box::pin(cmd_tui(&mut run_cfg, persona)).await
+        }
         Some(ConfluenceCommand::Login {
             url,
             confluence_url,
@@ -1122,6 +1375,12 @@ async fn dispatch_confluence_cli(
             token,
             pat,
             deployment,
+            oauth,
+            cloud_account,
+            client_id,
+            client_secret,
+            account,
+            name,
             json,
         }) => {
             Box::pin(cmd_login(
@@ -1133,21 +1392,38 @@ async fn dispatch_confluence_cli(
                     token,
                     pat,
                     deployment: deployment.map(Into::into),
+                    oauth,
+                    cloud_account,
+                    client_id,
+                    client_secret,
+                    account,
+                    name,
                 },
                 json,
             ))
             .await
         }
-        Some(ConfluenceCommand::Logout { json }) => cmd_logout(cfg, json),
-        Some(ConfluenceCommand::Whoami { json }) => Box::pin(cmd_whoami(cfg, persona, json)).await,
+        Some(ConfluenceCommand::Sites { action }) => Box::pin(cmd_sites(cfg, *action)).await,
+        Some(ConfluenceCommand::Logout { json }) => {
+            let scoped = apply_site_override(cfg, site_override.as_deref())?;
+            cmd_logout(&scoped, json)
+        }
+        Some(ConfluenceCommand::Whoami { json }) => {
+            let scoped = apply_site_override(cfg, site_override.as_deref())?;
+            Box::pin(cmd_whoami(&scoped, persona, json)).await
+        }
         Some(ConfluenceCommand::Doctor { probe, json }) => {
-            Box::pin(cmd_doctor(cfg, persona, probe, json)).await
+            let scoped = apply_site_override(cfg, site_override.as_deref())?;
+            Box::pin(cmd_doctor(&scoped, persona, probe, json)).await
         }
         Some(ConfluenceCommand::Spaces {
             refresh,
             limit,
             json,
-        }) => Box::pin(cmd_spaces(cfg, refresh, limit, json)).await,
+        }) => {
+            let scoped = apply_site_override(cfg, site_override.as_deref())?;
+            Box::pin(cmd_spaces(&scoped, refresh, limit, json)).await
+        }
         Some(ConfluenceCommand::Pages {
             space,
             parent,
@@ -1155,8 +1431,9 @@ async fn dispatch_confluence_cli(
             offline,
             json,
         }) => {
+            let scoped = apply_site_override(cfg, site_override.as_deref())?;
             Box::pin(cmd_pages(
-                cfg,
+                &scoped,
                 space.as_deref(),
                 parent.as_deref(),
                 limit,
@@ -1170,7 +1447,10 @@ async fn dispatch_confluence_cli(
             preview_images,
             offline,
             json,
-        }) => Box::pin(cmd_page_view(cfg, &page_id, preview_images, offline, json)).await,
+        }) => {
+            let scoped = apply_site_override(cfg, site_override.as_deref())?;
+            Box::pin(cmd_page_view(&scoped, &page_id, preview_images, offline, json)).await
+        }
         Some(ConfluenceCommand::Create {
             space,
             parent,
@@ -1179,8 +1459,9 @@ async fn dispatch_confluence_cli(
             body_file,
             json,
         }) => {
+            let scoped = apply_site_override(cfg, site_override.as_deref())?;
             Box::pin(cmd_page_create(
-                cfg,
+                &scoped,
                 space.as_deref(),
                 parent.as_deref(),
                 &title,
@@ -1198,8 +1479,9 @@ async fn dispatch_confluence_cli(
             message,
             json,
         }) => {
+            let scoped = apply_site_override(cfg, site_override.as_deref())?;
             Box::pin(cmd_page_edit(
-                cfg,
+                &scoped,
                 &page_id,
                 title,
                 body.as_deref(),
@@ -1213,20 +1495,27 @@ async fn dispatch_confluence_cli(
             page_id,
             body,
             json,
-        }) => Box::pin(cmd_page_comment(cfg, &page_id, &body, json)).await,
+        }) => {
+            let scoped = apply_site_override(cfg, site_override.as_deref())?;
+            Box::pin(cmd_page_comment(&scoped, &page_id, &body, json)).await
+        }
         Some(ConfluenceCommand::Attach {
             page_id,
             file,
             json,
-        }) => Box::pin(cmd_page_attach(cfg, &page_id, &file, json)).await,
+        }) => {
+            let scoped = apply_site_override(cfg, site_override.as_deref())?;
+            Box::pin(cmd_page_attach(&scoped, &page_id, &file, json)).await
+        }
         Some(ConfluenceCommand::Download {
             page_id,
             attachment_id,
             dir,
             json,
         }) => {
+            let scoped = apply_site_override(cfg, site_override.as_deref())?;
             Box::pin(cmd_page_download(
-                cfg,
+                &scoped,
                 &page_id,
                 attachment_id.as_deref(),
                 dir.as_deref(),
@@ -1235,7 +1524,8 @@ async fn dispatch_confluence_cli(
             .await
         }
         Some(ConfluenceCommand::Delete { page_id, yes, json }) => {
-            Box::pin(cmd_page_delete(cfg, &page_id, yes, json)).await
+            let scoped = apply_site_override(cfg, site_override.as_deref())?;
+            Box::pin(cmd_page_delete(&scoped, &page_id, yes, json)).await
         }
         Some(ConfluenceCommand::Search {
             query,
@@ -1243,10 +1533,17 @@ async fn dispatch_confluence_cli(
             remote,
             limit,
             json,
-        }) => Box::pin(cmd_page_search(cfg, &query, cql, remote, limit, json)).await,
-        Some(ConfluenceCommand::Open { page_id }) => Box::pin(cmd_page_open(cfg, &page_id)).await,
+        }) => {
+            let scoped = apply_site_override(cfg, site_override.as_deref())?;
+            Box::pin(cmd_page_search(&scoped, &query, cql, remote, limit, json)).await
+        }
+        Some(ConfluenceCommand::Open { page_id }) => {
+            let scoped = apply_site_override(cfg, site_override.as_deref())?;
+            Box::pin(cmd_page_open(&scoped, &page_id)).await
+        }
         Some(ConfluenceCommand::Jira { command }) => {
-            Box::pin(dispatch_jira_subcommand(cfg, command)).await
+            let scoped = apply_site_override(cfg, site_override.as_deref())?;
+            Box::pin(dispatch_jira_subcommand(&scoped, command)).await
         }
         Some(ConfluenceCommand::Preview {
             target_id_or_key,
@@ -1254,8 +1551,9 @@ async fn dispatch_confluence_cli(
             cols,
             rows,
         }) => {
+            let scoped = apply_site_override(cfg, site_override.as_deref())?;
             Box::pin(cmd_preview(
-                cfg,
+                &scoped,
                 &target_id_or_key,
                 attachment_id.as_deref(),
                 cols,
@@ -1266,7 +1564,9 @@ async fn dispatch_confluence_cli(
         Some(ConfluenceCommand::PreviewFile { path, cols, rows }) => {
             cmd_preview_file(&path, cols, rows)
         }
-        Some(ConfluenceCommand::Sync { json }) => Box::pin(cmd_sync(cfg, json)).await,
+        Some(ConfluenceCommand::Sync { json }) => {
+            Box::pin(cmd_sync(cfg, site_override.as_deref(), json)).await
+        }
         Some(ConfluenceCommand::Daemon { action }) => Box::pin(cmd_daemon(cfg, action)).await,
         Some(ConfluenceCommand::Update {
             check,
@@ -1274,11 +1574,15 @@ async fn dispatch_confluence_cli(
             repo,
             json,
         }) => Box::pin(cmd_update(cfg, check, force, repo.as_deref(), json)).await,
-        Some(ConfluenceCommand::Tui) => Box::pin(cmd_tui(cfg, persona)).await,
+        Some(ConfluenceCommand::Tui) => {
+            let mut run_cfg = apply_site_override(cfg, site_override.as_deref())?;
+            Box::pin(cmd_tui(&mut run_cfg, persona)).await
+        }
         Some(ConfluenceCommand::Serve { bind, port, token }) => {
-            let (_auth, client, storage) = open_runtime(cfg, false)?;
+            let scoped = apply_site_override(cfg, site_override.as_deref())?;
+            let (_auth, client, storage) = open_runtime(&scoped, false)?;
             Box::pin(serve::run(
-                cfg.clone(),
+                scoped,
                 client,
                 storage,
                 ServeOptions { bind, port, token },
@@ -1286,8 +1590,9 @@ async fn dispatch_confluence_cli(
             .await
         }
         Some(ConfluenceCommand::Mcp) => {
-            let (_auth, client, storage) = open_runtime(cfg, false)?;
-            Box::pin(crate::mcp::run(cfg.clone(), client, storage)).await
+            let scoped = apply_site_override(cfg, site_override.as_deref())?;
+            let (_auth, client, storage) = open_runtime(&scoped, false)?;
+            Box::pin(crate::mcp::run(scoped, client, storage)).await
         }
     }
 }
@@ -1561,12 +1866,43 @@ struct LoginParams {
     token: Option<String>,
     pat: Option<String>,
     deployment: Option<DeploymentKind>,
+    oauth: bool,
+    cloud_account: bool,
+    client_id: Option<String>,
+    client_secret: Option<String>,
+    account: Option<String>,
+    name: Option<String>,
 }
 
 fn open_runtime(
     cfg: &AppConfig,
     require_login: bool,
 ) -> Result<(AuthManager, AtlassianClient, Storage)> {
+    let storage = Storage::open(&config::cache_db_path(&cfg.profile))?;
+    if let Ok(pool) = SiteClientPool::from_config(cfg) {
+        if let Some(target_site) = cfg
+            .active_site
+            .as_deref()
+            .and_then(|id| cfg.find_effective_site(id))
+            .or_else(|| cfg.default_site_profile())
+        {
+            if let Ok(client) = pool.client_for(&target_site.id) {
+                let auth = client.auth().clone();
+                if require_login && !auth.is_logged_in() {
+                    bail!(
+                        "Authentication required for site '{}' (account '{}'). Run `{} login --oauth` or `{} login --url {} --email <email>`.",
+                        target_site.id,
+                        target_site.account_id,
+                        Persona::detect().as_str(),
+                        Persona::detect().as_str(),
+                        target_site.site_url,
+                    );
+                }
+                return Ok((auth, client, storage));
+            }
+        }
+    }
+
     let auth = AuthManager::new(&cfg.profile);
     if require_login && !auth.is_logged_in() {
         bail!(
@@ -1574,17 +1910,30 @@ fn open_runtime(
             Persona::detect().as_str()
         );
     }
-    let storage = Storage::open(&config::cache_db_path(&cfg.profile))?;
     let client = AtlassianClient::new(cfg.clone(), auth.clone())?;
     Ok((auth, client, storage))
 }
 
 async fn cmd_tui(cfg: &mut AppConfig, persona: Persona) -> Result<()> {
-    let auth = AuthManager::new(&cfg.profile);
-    if !auth.is_logged_in() || cfg.site_url.trim().is_empty() {
+    let has_any_site = !cfg.effective_sites().is_empty();
+    let has_any_auth = if has_any_site {
+        SiteClientPool::from_config(cfg)
+            .ok()
+            .map(|pool| {
+                pool.enabled_clients()
+                    .iter()
+                    .any(|(_, c)| c.auth().is_logged_in())
+            })
+            .unwrap_or(false)
+            || AuthManager::new(&cfg.profile).is_logged_in()
+    } else {
+        AuthManager::new(&cfg.profile).is_logged_in()
+    };
+
+    if !has_any_auth || !has_any_site {
         let bin = persona.as_str();
         println!("저장된 Atlassian 로그인 정보가 없습니다.");
-        println!("빠른 로그인 예시: {bin} login --url https://<site>.atlassian.net --email <email>");
+        println!("빠른 로그인 예시: {bin} login --oauth  또는  {bin} login --url https://<site>.atlassian.net --email <email>");
         if !io::stdin().is_terminal() {
             bail!("비대화형 터미널입니다. 먼저 `{bin} login --url ... --email ... --token ...` 으로 로그인하세요.");
         }
@@ -1598,6 +1947,12 @@ async fn cmd_tui(cfg: &mut AppConfig, persona: Persona) -> Result<()> {
                 token: None,
                 pat: None,
                 deployment: None,
+                oauth: false,
+                cloud_account: false,
+                client_id: None,
+                client_secret: None,
+                account: None,
+                name: None,
             },
             false,
         )
@@ -1610,6 +1965,13 @@ async fn cmd_tui(cfg: &mut AppConfig, persona: Persona) -> Result<()> {
 }
 
 async fn cmd_login(cfg: &mut AppConfig, params: LoginParams, json_out: bool) -> Result<()> {
+    if params.oauth {
+        return cmd_login_oauth(cfg, params, json_out).await;
+    }
+    if params.cloud_account {
+        return cmd_login_cloud_account(cfg, params, json_out).await;
+    }
+
     let raw_url = match params.url.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
         Some(u) => u.to_string(),
         None => {
@@ -1724,12 +2086,45 @@ async fn cmd_login(cfg: &mut AppConfig, params: LoginParams, json_out: bool) -> 
         }
     };
 
+    let account_id = params
+        .account
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+        .unwrap_or_else(|| cfg.profile.clone());
+
     cfg.site_url = site_url.clone();
-    cfg.confluence_url = confluence_url;
+    cfg.confluence_url = confluence_url.clone();
     cfg.deployment = deployment;
+    if !cfg.sites.is_empty() || params.name.is_some() || params.account.is_some() {
+        let site_id = config::slugify_site_id(&site_url);
+        let display_name = params
+            .name
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string)
+            .unwrap_or_else(|| site_id.clone());
+        let profile = SiteProfile {
+            id: site_id.clone(),
+            name: display_name,
+            site_url: site_url.clone(),
+            confluence_url,
+            deployment,
+            cloud_id: None,
+            account_id: account_id.clone(),
+            enabled: true,
+            scopes: Vec::new(),
+        };
+        cfg.upsert_site(profile);
+        if cfg.default_site.is_none() {
+            cfg.default_site = Some(site_id);
+        }
+    }
     cfg.save()?;
 
-    let auth = AuthManager::new(&cfg.profile);
+    let auth = AuthManager::for_account(&account_id);
     auth.save_credentials(&creds)?;
 
     let client = AtlassianClient::new(cfg.clone(), auth)?;
@@ -1747,6 +2142,7 @@ async fn cmd_login(cfg: &mut AppConfig, params: LoginParams, json_out: bool) -> 
                 "deployment": cfg.deployment.as_str(),
                 "site_url": cfg.site_url,
                 "confluence_url": cfg.effective_confluence_root(),
+                "account_id": account_id,
                 "user": me,
             }))?
         );
@@ -1765,6 +2161,680 @@ async fn cmd_login(cfg: &mut AppConfig, params: LoginParams, json_out: bool) -> 
         );
     }
     Ok(())
+}
+
+async fn cmd_login_oauth(
+    cfg: &mut AppConfig,
+    params: LoginParams,
+    json_out: bool,
+) -> Result<()> {
+    let client_id = match params
+        .client_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+        .or_else(|| cfg.effective_oauth_client_id())
+    {
+        Some(id) => id,
+        None => {
+            if !io::stdin().is_terminal() {
+                bail!("OAuth client ID is required. Pass `--client-id <ID>` or set ATLASSIAN_OAUTH_CLIENT_ID.");
+            }
+            let entered = prompt_line("Atlassian OAuth 2.0 (3LO) Client ID: ")?;
+            if entered.trim().is_empty() {
+                bail!("OAuth client ID cannot be empty.");
+            }
+            entered.trim().to_string()
+        }
+    };
+    let client_secret = params
+        .client_secret
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+        .or_else(|| cfg.effective_oauth_client_secret());
+
+    cfg.oauth_client_id = Some(client_id.clone());
+    if let Some(ref secret) = client_secret {
+        cfg.oauth_client_secret = Some(secret.clone());
+    }
+
+    let account_id = params
+        .account
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+        .unwrap_or_else(|| "cloud-oauth".to_string());
+
+    let http = reqwest::Client::new();
+    let opts = OAuthLoopbackOptions {
+        client_id,
+        client_secret,
+        ..Default::default()
+    };
+    if !json_out {
+        println!("Opening Atlassian Cloud OAuth 2.0 (3LO) consent flow in your browser…");
+    }
+    let (creds, resources) = run_oauth_loopback_login(&http, &opts).await?;
+    let auth = AuthManager::for_account(&account_id);
+    auth.save_credentials(&creds)?;
+
+    let storage = Storage::open(&config::cache_db_path(&cfg.profile))?;
+    let mut registered = Vec::with_capacity(resources.len());
+    for res in &resources {
+        let profile = res.to_site_profile(&account_id);
+        let _ = storage.upsert_site(&SiteRecord {
+            site_id: profile.id.clone(),
+            name: profile.display_name().to_string(),
+            site_url: profile.site_url.clone(),
+            deployment: profile.deployment.as_str().to_string(),
+            enabled: profile.enabled,
+            last_synced_at: None,
+            last_error: None,
+        });
+        cfg.upsert_site(profile.clone());
+        registered.push(profile);
+    }
+
+    if let Some(first) = registered.first() {
+        if cfg.default_site.is_none() {
+            cfg.default_site = Some(first.id.clone());
+        }
+        if cfg.site_url.trim().is_empty() {
+            cfg.site_url = first.site_url.clone();
+            cfg.deployment = DeploymentKind::Cloud;
+        }
+    }
+    cfg.save()?;
+
+    if json_out {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&json!({
+                "ok": true,
+                "auth_kind": "cloud_oauth",
+                "account_id": account_id,
+                "sites_discovered": registered.len(),
+                "sites": registered,
+            }))?
+        );
+    } else {
+        println!(
+            "Cloud OAuth 2.0 sign-in complete (account='{account_id}'). Registered {} site(s):",
+            registered.len()
+        );
+        for site in &registered {
+            println!(
+                "  - {} ({}) [cloudId={}]",
+                site.id,
+                site.site_url,
+                site.cloud_id.as_deref().unwrap_or("-")
+            );
+        }
+    }
+    Ok(())
+}
+
+async fn cmd_login_cloud_account(
+    cfg: &mut AppConfig,
+    params: LoginParams,
+    json_out: bool,
+) -> Result<()> {
+    let email = match params
+        .email
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
+        Some(e) => e.to_string(),
+        None => {
+            if !io::stdin().is_terminal() {
+                bail!("Email is required for `--cloud-account`. Pass `--email <email>`.");
+            }
+            let entered = prompt_line("Atlassian Cloud Account Email: ")?;
+            if entered.trim().is_empty() {
+                bail!("Email cannot be empty.");
+            }
+            entered.trim().to_string()
+        }
+    };
+    let api_token = match params
+        .token
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
+        Some(t) => t.to_string(),
+        None => {
+            if !io::stdin().is_terminal() {
+                bail!("API token is required for `--cloud-account`. Pass `--token <TOKEN>`.");
+            }
+            let entered = rpassword::prompt_password("Atlassian Cloud API Token: ")
+                .context("Failed to read API token")?;
+            if entered.trim().is_empty() {
+                bail!("API token cannot be empty.");
+            }
+            entered.trim().to_string()
+        }
+    };
+
+    let account_id = params
+        .account
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+        .unwrap_or_else(|| "cloud-account".to_string());
+
+    let creds = StoredCredentials::CloudAccountToken {
+        email: email.clone(),
+        api_token,
+    };
+    let auth = AuthManager::for_account(&account_id);
+    auth.save_credentials(&creds)?;
+
+    let mut added_site: Option<SiteProfile> = None;
+    if let Some(raw_url) = params.url.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+        let site_url = config::normalize_base_url(raw_url);
+        let site_id = config::slugify_site_id(&site_url);
+        let name = params
+            .name
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string)
+            .unwrap_or_else(|| site_id.clone());
+        let profile = SiteProfile {
+            id: site_id.clone(),
+            name,
+            site_url: site_url.clone(),
+            confluence_url: params
+                .confluence_url
+                .as_deref()
+                .map(config::normalize_base_url)
+                .unwrap_or_default(),
+            deployment: DeploymentKind::Cloud,
+            cloud_id: None,
+            account_id: account_id.clone(),
+            enabled: true,
+            scopes: Vec::new(),
+        };
+        let storage = Storage::open(&config::cache_db_path(&cfg.profile))?;
+        let _ = storage.upsert_site(&SiteRecord {
+            site_id: profile.id.clone(),
+            name: profile.display_name().to_string(),
+            site_url: profile.site_url.clone(),
+            deployment: profile.deployment.as_str().to_string(),
+            enabled: true,
+            last_synced_at: None,
+            last_error: None,
+        });
+        cfg.upsert_site(profile.clone());
+        if cfg.default_site.is_none() {
+            cfg.default_site = Some(site_id);
+        }
+        if cfg.site_url.trim().is_empty() {
+            cfg.site_url = site_url;
+            cfg.deployment = DeploymentKind::Cloud;
+        }
+        cfg.save()?;
+        added_site = Some(profile);
+    }
+
+    if json_out {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&json!({
+                "ok": true,
+                "auth_kind": "cloud_account_token",
+                "account_id": account_id,
+                "email": email,
+                "site": added_site,
+            }))?
+        );
+    } else {
+        println!("Saved shared Cloud account token '{account_id}' ({email}).");
+        if let Some(site) = added_site {
+            println!("Registered site '{}' ({}) using account '{account_id}'.", site.id, site.site_url);
+        } else {
+            println!(
+                "Attach any Cloud site with: jira sites add https://<site>.atlassian.net --account {account_id}"
+            );
+        }
+    }
+    Ok(())
+}
+
+async fn cmd_sites(cfg: &mut AppConfig, action: SitesCommand) -> Result<()> {
+    let storage = Storage::open(&config::cache_db_path(&cfg.profile))?;
+    match action {
+        SitesCommand::List { json } => {
+            let sites = cfg.effective_sites();
+            let mut rows = Vec::with_capacity(sites.len());
+            for site in &sites {
+                let counts = storage.cache_counts_for_site(&site.id).unwrap_or_default();
+                let db_rec = storage.get_site(&site.id).ok().flatten();
+                let auth_kind = AuthManager::for_account(&site.account_id)
+                    .load_credentials()
+                    .ok()
+                    .flatten()
+                    .map(|c| c.auth_kind_label().to_string())
+                    .unwrap_or_else(|| "none".to_string());
+                let is_default = cfg
+                    .default_site
+                    .as_deref()
+                    .is_some_and(|d| d.eq_ignore_ascii_case(&site.id));
+                rows.push(json!({
+                    "id": site.id,
+                    "name": site.display_name(),
+                    "site_url": site.site_url,
+                    "confluence_url": site.effective_confluence_root(),
+                    "deployment": site.deployment.as_str(),
+                    "cloud_id": site.cloud_id,
+                    "account_id": site.account_id,
+                    "auth_kind": auth_kind,
+                    "enabled": site.enabled,
+                    "is_default": is_default,
+                    "issue_count": counts.issues,
+                    "page_count": counts.pages,
+                    "last_synced_at": db_rec.as_ref().and_then(|r| r.last_synced_at.clone()),
+                    "last_error": db_rec.as_ref().and_then(|r| r.last_error.clone()),
+                }));
+            }
+            if json {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&json!({
+                        "active_site": cfg.active_site,
+                        "default_site": cfg.default_site,
+                        "sites": rows,
+                    }))?
+                );
+            } else if sites.is_empty() {
+                println!("No Atlassian sites registered. Run `jira login --oauth` or `jira sites add <URL>`.");
+            } else {
+                println!(
+                    "{:<16} {:<18} {:<12} {:<10} {:<8} {:<8} {}",
+                    "ID", "NAME", "DEPLOYMENT", "ENABLED", "ISSUES", "PAGES", "URL"
+                );
+                for (site, row) in sites.iter().zip(rows.iter()) {
+                    let mark = if row["is_default"].as_bool().unwrap_or(false) {
+                        "*"
+                    } else {
+                        " "
+                    };
+                    println!(
+                        "{mark}{:<15} {:<18} {:<12} {:<10} {:<8} {:<8} {}",
+                        site.id,
+                        site.display_name(),
+                        site.deployment.as_str(),
+                        if site.enabled { "yes" } else { "no" },
+                        row["issue_count"].as_u64().unwrap_or(0),
+                        row["page_count"].as_u64().unwrap_or(0),
+                        site.site_url,
+                    );
+                }
+            }
+            Ok(())
+        }
+        SitesCommand::Add(args) => {
+            let site_url = config::normalize_base_url(&args.url);
+            if site_url.is_empty() {
+                bail!("Site URL cannot be empty.");
+            }
+            let deployment = args
+                .deployment
+                .map(Into::into)
+                .unwrap_or_else(|| DeploymentKind::infer_from_url(&site_url));
+            let site_id = args
+                .id
+                .as_deref()
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(str::to_string)
+                .unwrap_or_else(|| config::slugify_site_id(&site_url));
+            let name = args
+                .name
+                .as_deref()
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(str::to_string)
+                .unwrap_or_else(|| site_id.clone());
+            let has_inline_creds = args.pat.is_some() || args.token.is_some();
+            let account_id = args
+                .account
+                .as_deref()
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(str::to_string)
+                .unwrap_or_else(|| {
+                    if has_inline_creds {
+                        site_id.clone()
+                    } else {
+                        cfg.profile.clone()
+                    }
+                });
+
+            if let Some(pat) = args.pat.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+                let auth = AuthManager::for_account(&account_id);
+                auth.save_credentials(&StoredCredentials::BearerPat {
+                    site_url: site_url.clone(),
+                    token: pat.to_string(),
+                    deployment,
+                })?;
+            } else if let Some(token) =
+                args.token.as_deref().map(str::trim).filter(|s| !s.is_empty())
+            {
+                let email = args
+                    .email
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                    .ok_or_else(|| anyhow::anyhow!("`--email` is required when passing `--token`."))?;
+                let auth = AuthManager::for_account(&account_id);
+                auth.save_credentials(&StoredCredentials::ApiToken {
+                    site_url: site_url.clone(),
+                    email: email.to_string(),
+                    api_token: token.to_string(),
+                    deployment,
+                })?;
+            }
+
+            if cfg.sites.is_empty() && !cfg.site_url.trim().is_empty() {
+                cfg.sites = cfg.effective_sites();
+            }
+
+            let profile = SiteProfile {
+                id: site_id.clone(),
+                name: name.clone(),
+                site_url: site_url.clone(),
+                confluence_url: args
+                    .confluence_url
+                    .as_deref()
+                    .map(config::normalize_base_url)
+                    .unwrap_or_default(),
+                deployment,
+                cloud_id: None,
+                account_id: account_id.clone(),
+                enabled: true,
+                scopes: Vec::new(),
+            };
+            storage.upsert_site(&SiteRecord {
+                site_id: profile.id.clone(),
+                name: profile.display_name().to_string(),
+                site_url: profile.site_url.clone(),
+                deployment: profile.deployment.as_str().to_string(),
+                enabled: true,
+                last_synced_at: None,
+                last_error: None,
+            })?;
+            cfg.upsert_site(profile.clone());
+            if cfg.default_site.is_none() {
+                cfg.default_site = Some(site_id.clone());
+            }
+            if cfg.site_url.trim().is_empty() {
+                cfg.site_url = site_url.clone();
+                cfg.deployment = deployment;
+            }
+            cfg.save()?;
+
+            if args.json {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&json!({ "ok": true, "site": profile }))?
+                );
+            } else {
+                println!(
+                    "Added site '{}' ({}) [deployment={}, account={}]",
+                    profile.id,
+                    profile.site_url,
+                    profile.deployment.as_str(),
+                    profile.account_id
+                );
+            }
+            Ok(())
+        }
+        SitesCommand::Discover {
+            account,
+            client_id,
+            client_secret,
+            json,
+        } => {
+            let http = reqwest::Client::new();
+            let candidate_account = account
+                .as_deref()
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(str::to_string)
+                .or_else(|| {
+                    cfg.effective_sites()
+                        .into_iter()
+                        .find(|s| s.is_oauth_cloud())
+                        .map(|s| s.account_id)
+                })
+                .unwrap_or_else(|| "cloud-oauth".to_string());
+
+            let auth = AuthManager::for_account(&candidate_account);
+            let existing_oauth = matches!(
+                auth.load_credentials().ok().flatten(),
+                Some(StoredCredentials::CloudOAuth { .. })
+            );
+
+            let resources = if existing_oauth {
+                let fresh = auth
+                    .ensure_fresh_credentials(&http, DEFAULT_OAUTH_AUTH_BASE)
+                    .await?;
+                let token = fresh
+                    .oauth_access_token()
+                    .ok_or_else(|| anyhow::anyhow!("OAuth access token missing"))?;
+                fetch_accessible_resources(&http, DEFAULT_OAUTH_API_BASE, token).await?
+            } else {
+                let resolved_client_id = client_id
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                    .map(str::to_string)
+                    .or_else(|| cfg.effective_oauth_client_id())
+                    .ok_or_else(|| {
+                        anyhow::anyhow!(
+                            "No OAuth credentials found for account '{candidate_account}'. Run `jira login --oauth --client-id <ID>` first."
+                        )
+                    })?;
+                let resolved_secret = client_secret
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                    .map(str::to_string)
+                    .or_else(|| cfg.effective_oauth_client_secret());
+                let opts = OAuthLoopbackOptions {
+                    client_id: resolved_client_id,
+                    client_secret: resolved_secret,
+                    ..Default::default()
+                };
+                let (creds, resources) = run_oauth_loopback_login(&http, &opts).await?;
+                auth.save_credentials(&creds)?;
+                resources
+            };
+
+            let mut discovered = Vec::with_capacity(resources.len());
+            for res in &resources {
+                let profile = res.to_site_profile(&candidate_account);
+                let _ = storage.upsert_site(&SiteRecord {
+                    site_id: profile.id.clone(),
+                    name: profile.display_name().to_string(),
+                    site_url: profile.site_url.clone(),
+                    deployment: profile.deployment.as_str().to_string(),
+                    enabled: true,
+                    last_synced_at: None,
+                    last_error: None,
+                });
+                cfg.upsert_site(profile.clone());
+                discovered.push(profile);
+            }
+            if cfg.default_site.is_none() {
+                if let Some(first) = discovered.first() {
+                    cfg.default_site = Some(first.id.clone());
+                }
+            }
+            cfg.save()?;
+
+            if json {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&json!({
+                        "ok": true,
+                        "account_id": candidate_account,
+                        "discovered": discovered,
+                    }))?
+                );
+            } else {
+                println!(
+                    "Discovered {} Atlassian Cloud site(s) for account '{candidate_account}':",
+                    discovered.len()
+                );
+                for site in &discovered {
+                    println!(
+                        "  - {} ({}) [cloudId={}]",
+                        site.id,
+                        site.site_url,
+                        site.cloud_id.as_deref().unwrap_or("-")
+                    );
+                }
+            }
+            Ok(())
+        }
+        SitesCommand::Default { id, json } => {
+            if cfg.sites.is_empty() {
+                cfg.sites = cfg.effective_sites();
+            }
+            let Some(found) = cfg.find_effective_site(&id) else {
+                bail!("Site '{id}' not found.");
+            };
+            cfg.default_site = Some(found.id.clone());
+            cfg.save()?;
+            if json {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&json!({
+                        "ok": true,
+                        "default_site": found.id,
+                    }))?
+                );
+            } else {
+                println!("Default site set to '{}' ({}).", found.id, found.site_url);
+            }
+            Ok(())
+        }
+        SitesCommand::Enable { id, json } => {
+            if cfg.sites.is_empty() {
+                cfg.sites = cfg.effective_sites();
+            }
+            let Some(site) = cfg
+                .sites
+                .iter_mut()
+                .find(|s| s.id.eq_ignore_ascii_case(id.trim()))
+            else {
+                bail!("Site '{id}' not found.");
+            };
+            site.enabled = true;
+            let rec = SiteRecord {
+                site_id: site.id.clone(),
+                name: site.display_name().to_string(),
+                site_url: site.site_url.clone(),
+                deployment: site.deployment.as_str().to_string(),
+                enabled: true,
+                last_synced_at: None,
+                last_error: None,
+            };
+            let site_id = site.id.clone();
+            let _ = storage.upsert_site(&rec);
+            cfg.save()?;
+            if json {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&json!({
+                        "ok": true,
+                        "site_id": site_id,
+                        "enabled": true,
+                    }))?
+                );
+            } else {
+                println!("Enabled site '{site_id}'.");
+            }
+            Ok(())
+        }
+        SitesCommand::Disable { id, json } => {
+            if cfg.sites.is_empty() {
+                cfg.sites = cfg.effective_sites();
+            }
+            let Some(site) = cfg
+                .sites
+                .iter_mut()
+                .find(|s| s.id.eq_ignore_ascii_case(id.trim()))
+            else {
+                bail!("Site '{id}' not found.");
+            };
+            site.enabled = false;
+            let rec = SiteRecord {
+                site_id: site.id.clone(),
+                name: site.display_name().to_string(),
+                site_url: site.site_url.clone(),
+                deployment: site.deployment.as_str().to_string(),
+                enabled: false,
+                last_synced_at: None,
+                last_error: None,
+            };
+            let site_id = site.id.clone();
+            let _ = storage.upsert_site(&rec);
+            cfg.save()?;
+            if json {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&json!({
+                        "ok": true,
+                        "site_id": site_id,
+                        "enabled": false,
+                    }))?
+                );
+            } else {
+                println!("Disabled site '{site_id}'.");
+            }
+            Ok(())
+        }
+        SitesCommand::Remove { id, yes, json } => {
+            let answer = if !yes && !json {
+                Some(prompt_line(&format!(
+                    "Remove site '{id}' and delete its local cache? [y/N]: "
+                ))?)
+            } else {
+                None
+            };
+            delete_gate(yes, json, answer.as_deref())?;
+            if cfg.sites.is_empty() {
+                cfg.sites = cfg.effective_sites();
+            }
+            if !cfg.remove_site(&id) {
+                bail!("Site '{id}' not found.");
+            }
+            let _ = storage.delete_site_data(&id);
+            cfg.save()?;
+            if json {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&json!({
+                        "ok": true,
+                        "removed": id,
+                    }))?
+                );
+            } else {
+                println!("Removed site '{id}' and purged its cached data.");
+            }
+            Ok(())
+        }
+    }
 }
 
 fn cmd_logout(cfg: &AppConfig, json_out: bool) -> Result<()> {
@@ -2983,7 +4053,66 @@ fn cmd_preview_file(path: &Path, cols: Option<u16>, rows: Option<u16>) -> Result
     Ok(())
 }
 
-async fn cmd_sync(cfg: &AppConfig, json_out: bool) -> Result<()> {
+async fn cmd_sync(cfg: &AppConfig, site_filter: Option<&str>, json_out: bool) -> Result<()> {
+    let storage = Storage::open(&config::cache_db_path(&cfg.profile))?;
+    let pool = SiteClientPool::from_config(cfg)?;
+    let targets: Vec<SiteSyncTarget> = if let Some(filter) =
+        site_filter.map(str::trim).filter(|s| !s.is_empty() && !s.eq_ignore_ascii_case("all"))
+    {
+        let site = cfg
+            .find_effective_site(filter)
+            .ok_or_else(|| anyhow::anyhow!("Site '{filter}' not found."))?;
+        let client = pool.client_for(&site.id)?;
+        vec![SiteSyncTarget {
+            site_id: site.id.clone(),
+            site_name: site.display_name().to_string(),
+            client,
+        }]
+    } else {
+        pool.enabled_clients()
+            .into_iter()
+            .map(|(site, client)| SiteSyncTarget {
+                site_id: site.id.clone(),
+                site_name: site.display_name().to_string(),
+                client,
+            })
+            .collect()
+    };
+
+    if targets.len() > 1 || (!cfg.sites.is_empty() && !targets.is_empty()) {
+        let mut breakers = sync::CircuitBreakerMap::new();
+        let outcome = sync::run_multi_site_sync(
+            &targets,
+            &storage,
+            &mut breakers,
+            sync::DEFAULT_MULTI_SITE_CONCURRENCY,
+            None,
+        )
+        .await;
+        let counts = storage.cache_counts()?;
+        if json_out {
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&json!({
+                    "ok": outcome.succeeded_sites > 0,
+                    "summary": outcome.summary,
+                    "sites": outcome.per_site,
+                    "counts": counts,
+                }))?
+            );
+        } else {
+            println!("Sync complete: {}", outcome.summary);
+            for s in &outcome.per_site {
+                println!("  - {} ({}): {}", s.site_id, s.site_url, s.summary);
+            }
+            println!(
+                "Cache counts: projects={}, boards={}, issues={}, spaces={}, pages={}",
+                counts.projects, counts.boards, counts.issues, counts.spaces, counts.pages
+            );
+        }
+        return Ok(());
+    }
+
     let (_auth, client, storage) = open_runtime(cfg, true)?;
     let summary = sync::bootstrap_workspace(&client, &storage).await?;
     let counts = storage.cache_counts()?;
@@ -3691,6 +4820,140 @@ mod tests {
                     ..
                 }
             }
+        ));
+
+        // Multi-site global --site option, OAuth / Cloud Account login, and Sites subcommands
+        let cli = Cli::try_parse_from(["jira", "--site", "acme-cloud", "issues", "--mine"]).unwrap();
+        assert_eq!(cli.site.as_deref(), Some("acme-cloud"));
+        assert!(matches!(cli.command.unwrap(), Command::Issues { mine: true, .. }));
+
+        let cli = Cli::try_parse_from(["jira", "issues", "--site", "corp-dc", "--offline"]).unwrap();
+        assert_eq!(cli.site.as_deref(), Some("corp-dc"));
+
+        let cli = Cli::try_parse_from([
+            "jira",
+            "login",
+            "--oauth",
+            "--client-id",
+            "cid-123",
+            "--client-secret",
+            "sec-456",
+            "--account",
+            "work-cloud",
+            "--json",
+        ])
+        .unwrap();
+        assert!(matches!(
+            cli.command.unwrap(),
+            Command::Login {
+                oauth: true,
+                cloud_account: false,
+                client_id: Some(_),
+                client_secret: Some(_),
+                account: Some(_),
+                json: true,
+                ..
+            }
+        ));
+
+        let cli = Cli::try_parse_from([
+            "jira",
+            "login",
+            "--cloud-account",
+            "--email",
+            "dev@acme.com",
+            "--token",
+            "tok",
+            "--account",
+            "shared",
+        ])
+        .unwrap();
+        assert!(matches!(
+            cli.command.unwrap(),
+            Command::Login {
+                oauth: false,
+                cloud_account: true,
+                ..
+            }
+        ));
+
+        let cli = Cli::try_parse_from(["jira", "sites", "list", "--json"]).unwrap();
+        assert!(matches!(
+            cli.command.unwrap(),
+            Command::Sites { action } if matches!(*action, SitesCommand::List { json: true })
+        ));
+
+        let cli = Cli::try_parse_from([
+            "jira",
+            "sites",
+            "add",
+            "https://jira.corp.internal",
+            "--name",
+            "Corp DC",
+            "--pat",
+            "dc-pat",
+            "--confluence-url",
+            "https://wiki.corp.internal",
+            "--deployment",
+            "dc",
+        ])
+        .unwrap();
+        match cli.command.unwrap() {
+            Command::Sites { action } => match *action {
+                SitesCommand::Add(args) => {
+                    assert_eq!(args.url, "https://jira.corp.internal");
+                    assert_eq!(args.name.as_deref(), Some("Corp DC"));
+                    assert_eq!(args.pat.as_deref(), Some("dc-pat"));
+                    assert_eq!(args.deployment, Some(DeploymentArg::Datacenter));
+                }
+                other => panic!("unexpected sites action: {other:?}"),
+            },
+            other => panic!("unexpected: {other:?}"),
+        }
+
+        let cli = Cli::try_parse_from(["jira", "sites", "discover", "--json"]).unwrap();
+        assert!(matches!(
+            cli.command.unwrap(),
+            Command::Sites { action } if matches!(*action, SitesCommand::Discover { json: true, .. })
+        ));
+
+        let cli = Cli::try_parse_from(["jira", "sites", "default", "acme"]).unwrap();
+        assert!(matches!(
+            cli.command.unwrap(),
+            Command::Sites { action } if matches!(*action, SitesCommand::Default { .. })
+        ));
+
+        let cli = Cli::try_parse_from(["jira", "sites", "enable", "acme"]).unwrap();
+        assert!(matches!(
+            cli.command.unwrap(),
+            Command::Sites { action } if matches!(*action, SitesCommand::Enable { .. })
+        ));
+
+        let cli = Cli::try_parse_from(["jira", "sites", "disable", "acme"]).unwrap();
+        assert!(matches!(
+            cli.command.unwrap(),
+            Command::Sites { action } if matches!(*action, SitesCommand::Disable { .. })
+        ));
+
+        let cli = Cli::try_parse_from(["jira", "sites", "remove", "acme", "--yes"]).unwrap();
+        assert!(matches!(
+            cli.command.unwrap(),
+            Command::Sites { action } if matches!(*action, SitesCommand::Remove { yes: true, .. })
+        ));
+
+        let conf = ConfluenceCli::try_parse_from([
+            "confluence",
+            "--site",
+            "acme-cloud",
+            "sites",
+            "list",
+            "--json",
+        ])
+        .unwrap();
+        assert_eq!(conf.site.as_deref(), Some("acme-cloud"));
+        assert!(matches!(
+            conf.command.unwrap(),
+            ConfluenceCommand::Sites { action } if matches!(*action, SitesCommand::List { json: true })
         ));
     }
 

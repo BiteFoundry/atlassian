@@ -6,4 +6,4 @@ pub mod confluence;
 pub mod jira;
 pub mod media;
 
-pub use client::AtlassianClient;
+pub use client::{AtlassianClient, SiteClientPool};

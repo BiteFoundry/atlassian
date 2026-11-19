@@ -65,5 +65,6 @@ pub fn button_to_action(btn: ButtonId) -> Action {
         ButtonId::CheckUpdate => Action::CheckUpdate,
         ButtonId::ToggleInlineImages => Action::ToggleInlineImages,
         ButtonId::ToggleDrawer => Action::ToggleDrawerOrToc,
+        ButtonId::SiteSwitcher => Action::OpenSiteSwitcher,
     }
 }

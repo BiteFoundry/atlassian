@@ -205,18 +205,144 @@ fn draw_issue_nav(frame: &mut Frame, area: Rect, app: &AppState, ui: &mut UiStat
     frame.render_widget(Paragraph::new(f_lines).style(sidebar_style), rows[0]);
 
     // Issue list (density-aware: Cozy = 2 lines per issue, Compact = 1 line per issue)
-    let issues = app.filtered_issues(ui);
+    // In multi-site All Sites mode, renders collapsible site group headers.
+    let issues_with_sites = app.filtered_issues_with_sites(ui);
     let list_h = rows[1].height.saturating_sub(1) as usize;
     let mut i_lines = vec![Line::from(Span::styled(
-        format!(" ISSUES ({})", issues.len()),
+        format!(" ISSUES ({})", issues_with_sites.len()),
         theme.muted_style(),
     ))];
-    if issues.is_empty() {
+    if issues_with_sites.is_empty() {
         i_lines.push(Line::from(Span::styled(
             "  No issues to display",
             theme.muted_style(),
         )));
+    } else if list_h > 0 && app.is_multi_site_all_mode() {
+        let row_lines = match app.config.density {
+            DensityMode::Cozy => 2usize,
+            DensityMode::Compact => 1usize,
+        };
+        let sel = ui
+            .issue_ui
+            .selected_issue
+            .min(issues_with_sites.len().saturating_sub(1));
+        let w = rows[1].width as usize;
+        let max_y = rows[1].bottom();
+        let mut cursor_y = rows[1].y + 1;
+
+        let mut site_order: Vec<String> = Vec::new();
+        for site in app.config.enabled_sites() {
+            if !site_order.iter().any(|s| s.eq_ignore_ascii_case(&site.id)) {
+                site_order.push(site.id);
+            }
+        }
+        for (sid, _) in &issues_with_sites {
+            if !site_order.iter().any(|s| s.eq_ignore_ascii_case(sid)) {
+                site_order.push(sid.clone());
+            }
+        }
+
+        for site_id in site_order {
+            let group_indices: Vec<usize> = issues_with_sites
+                .iter()
+                .enumerate()
+                .filter(|(_, (sid, _))| sid.eq_ignore_ascii_case(&site_id))
+                .map(|(i, _)| i)
+                .collect();
+            if group_indices.is_empty() || cursor_y >= max_y {
+                continue;
+            }
+            let collapse_key = format!("issues:{site_id}");
+            let collapsed = ui.collapsed_site_groups.contains(&collapse_key);
+            let group_idx = ui.site_group_keys.len();
+            ui.site_group_keys.push(collapse_key);
+            let chevron = if collapsed { "▸" } else { "▾" };
+            let site_label = app.site_display_label(&site_id);
+            i_lines.push(Line::from(Span::styled(
+                truncate_width(
+                    &format!(" {chevron} {site_label} ({})", group_indices.len()),
+                    w,
+                ),
+                theme.accent_style().patch(sidebar_style),
+            )));
+            ui.hitmap.add_line(
+                rows[1].x,
+                cursor_y,
+                rows[1].width,
+                HitTarget::SiteGroupHeader(group_idx),
+            );
+            cursor_y += 1;
+
+            if collapsed {
+                continue;
+            }
+            for abs_idx in group_indices {
+                if cursor_y >= max_y {
+                    break;
+                }
+                let issue = &issues_with_sites[abs_idx].1;
+                let is_sel = abs_idx == sel;
+                let (icon, icon_color) = theme.issue_type_badge(&issue.issue_type);
+                let row_style = if is_sel && focused && ui.issue_ui.nav_section == 1 {
+                    theme.nav_selection()
+                } else if is_sel {
+                    theme.selection().add_modifier(Modifier::BOLD)
+                } else {
+                    sidebar_style
+                };
+                if row_lines == 2 && cursor_y + 1 < max_y {
+                    let status_txt = truncate_width(
+                        &issue.status.name,
+                        w.saturating_sub(issue.key.len() + 8),
+                    );
+                    i_lines.push(Line::from(vec![
+                        Span::styled(if is_sel { "  ▸ " } else { "    " }, row_style),
+                        Span::styled(format!("{icon} "), Style::default().fg(icon_color)),
+                        Span::styled(
+                            format!("{} ", issue.key),
+                            theme.accent_style().patch(row_style),
+                        ),
+                        Span::styled(status_txt, theme.muted_style().patch(row_style)),
+                    ]));
+                    let summary_line = truncate_width(&format!("      {}", issue.summary), w);
+                    i_lines.push(Line::from(Span::styled(summary_line, row_style)));
+                    ui.hitmap.add_line(
+                        rows[1].x,
+                        cursor_y,
+                        rows[1].width,
+                        HitTarget::IssueRow(abs_idx),
+                    );
+                    ui.hitmap.add_line(
+                        rows[1].x,
+                        cursor_y + 1,
+                        rows[1].width,
+                        HitTarget::IssueRow(abs_idx),
+                    );
+                    cursor_y += 2;
+                } else {
+                    let title_budget = w.saturating_sub(issue.key.len() + 8);
+                    let summary = truncate_width(&issue.summary, title_budget);
+                    i_lines.push(Line::from(vec![
+                        Span::styled(if is_sel { "  ▸ " } else { "    " }, row_style),
+                        Span::styled(format!("{icon} "), Style::default().fg(icon_color)),
+                        Span::styled(
+                            format!("{} ", issue.key),
+                            theme.accent_style().patch(row_style),
+                        ),
+                        Span::styled(summary, row_style),
+                    ]));
+                    ui.hitmap.add_line(
+                        rows[1].x,
+                        cursor_y,
+                        rows[1].width,
+                        HitTarget::IssueRow(abs_idx),
+                    );
+                    cursor_y += 1;
+                }
+            }
+        }
     } else if list_h > 0 {
+        let issues: Vec<_> = issues_with_sites.into_iter().map(|(_, i)| i).collect();
         let row_lines = match app.config.density {
             DensityMode::Cozy => 2usize,
             DensityMode::Compact => 1usize,

@@ -541,8 +541,27 @@ pub async fn run_with_persona(
     let (core_tx, mut core_rx) = mpsc::unbounded_channel::<CoreEvent>();
     let (ui_tx, mut ui_rx) = mpsc::unbounded_channel::<UiMsg>();
 
-    let sync_ctrl =
-        sync::spawn_sync_engine(config.clone(), client.clone(), storage.clone(), core_tx);
+    let sync_ctrl = match crate::atlassian::SiteClientPool::from_config(&config) {
+        Ok(pool) if pool.enabled_clients().len() > 1 => {
+            let targets: Vec<sync::SiteSyncTarget> = pool
+                .enabled_clients()
+                .into_iter()
+                .map(|(site, c)| sync::SiteSyncTarget {
+                    site_id: site.id.clone(),
+                    site_name: site.display_name().to_string(),
+                    client: c,
+                })
+                .collect();
+            sync::spawn_multi_site_sync_engine(
+                config.clone(),
+                targets,
+                storage.clone(),
+                sync::DEFAULT_MULTI_SITE_CONCURRENCY,
+                core_tx,
+            )
+        }
+        _ => sync::spawn_sync_engine(config.clone(), client.clone(), storage.clone(), core_tx),
+    };
 
     let mut ui = UiState::from_config_with_persona(&config, persona);
     let mut app = AppState::new_with_persona(

@@ -14,12 +14,12 @@ use serde_json::{json, Value};
 use tokio::io::{AsyncBufReadExt, BufReader};
 
 use crate::{
-    atlassian::AtlassianClient,
+    atlassian::{AtlassianClient, SiteClientPool},
     config::AppConfig,
-    models::{IssueUpdate, OutgoingIssue, OutgoingPage, PageUpdate},
+    models::{FederatedSearchHit, IssueUpdate, OutgoingIssue, OutgoingPage, PageUpdate},
     serve::{clamp_limit, escape_jql_str, issue_to_hit, looks_like_query_expr, page_to_hit},
-    storage::Storage,
-    sync,
+    storage::{Storage, DEFAULT_SITE_ID},
+    sync::{self, SiteSyncTarget},
 };
 
 const SUPPORTED_PROTOCOL_VERSIONS: &[&str] = &["2024-11-05", "2025-03-26", "2025-06-18"];
@@ -127,6 +127,42 @@ pub async fn handle_rpc_line(
     }
 }
 
+fn resolve_mcp_site_id(config: &AppConfig, raw_site: Option<&str>) -> Option<String> {
+    let trimmed = raw_site.map(str::trim).filter(|s| !s.is_empty())?;
+    if trimmed.eq_ignore_ascii_case("all") {
+        return None;
+    }
+    if let Some(found) = config.find_effective_site(trimmed) {
+        return Some(found.id);
+    }
+    Some(trimmed.to_string())
+}
+
+fn resolve_mcp_client(
+    config: &AppConfig,
+    fallback_client: &AtlassianClient,
+    raw_site: Option<&str>,
+) -> Result<(String, AtlassianClient), String> {
+    if let Some(site_id) = resolve_mcp_site_id(config, raw_site) {
+        if site_id.eq_ignore_ascii_case(fallback_client.site_id()) {
+            return Ok((site_id, fallback_client.clone()));
+        }
+        if let Ok(pool) = SiteClientPool::from_config(config) {
+            if let Ok(c) = pool.client_for(&site_id) {
+                return Ok((site_id, c));
+            }
+        }
+        if site_id.eq_ignore_ascii_case(DEFAULT_SITE_ID) {
+            return Ok((site_id, fallback_client.clone()));
+        }
+        return Err(format!("site not found: '{site_id}'"));
+    }
+    Ok((
+        fallback_client.site_id().to_string(),
+        fallback_client.clone(),
+    ))
+}
+
 async fn call_tool(
     config: &AppConfig,
     client: &AtlassianClient,
@@ -135,27 +171,95 @@ async fn call_tool(
     arguments: &Value,
 ) -> Result<Value, String> {
     let args = Args::new(arguments);
+    let site_arg = args.optional_str("site")?;
+    let scoped_site = resolve_mcp_site_id(config, site_arg.as_deref());
 
     match name {
+        // -------------------------------------------------------------------
+        // Multi-site registry (1)
+        // -------------------------------------------------------------------
+        "list_sites" => {
+            let mut sites_out = Vec::new();
+            let mut seen_ids = std::collections::HashSet::new();
+            for site in config.effective_sites() {
+                seen_ids.insert(site.id.to_ascii_lowercase());
+                let counts = storage
+                    .cache_counts_for_site(&site.id)
+                    .unwrap_or_default();
+                let db_rec = storage.get_site(&site.id).ok().flatten();
+                sites_out.push(json!({
+                    "id": site.id,
+                    "name": site.display_name(),
+                    "site_url": site.site_url,
+                    "confluence_url": site.effective_confluence_root(),
+                    "deployment": site.deployment.as_str(),
+                    "cloud_id": site.cloud_id,
+                    "account_id": site.account_id,
+                    "enabled": site.enabled,
+                    "issue_count": counts.issues,
+                    "page_count": counts.pages,
+                    "last_synced_at": db_rec.as_ref().and_then(|r| r.last_synced_at.clone()),
+                    "last_error": db_rec.as_ref().and_then(|r| r.last_error.clone()),
+                }));
+            }
+            if let Ok(db_sites) = storage.list_sites() {
+                for rec in db_sites {
+                    if seen_ids.insert(rec.site_id.to_ascii_lowercase()) {
+                        let counts = storage
+                            .cache_counts_for_site(&rec.site_id)
+                            .unwrap_or_default();
+                        sites_out.push(json!({
+                            "id": rec.site_id,
+                            "name": rec.name,
+                            "site_url": rec.site_url,
+                            "confluence_url": "",
+                            "deployment": rec.deployment,
+                            "cloud_id": null,
+                            "account_id": "default",
+                            "enabled": rec.enabled,
+                            "issue_count": counts.issues,
+                            "page_count": counts.pages,
+                            "last_synced_at": rec.last_synced_at,
+                            "last_error": rec.last_error,
+                        }));
+                    }
+                }
+            }
+            Ok(json!({
+                "active_site": config.active_site,
+                "default_site": config.default_site,
+                "sites": sites_out,
+            }))
+        }
+
         // -------------------------------------------------------------------
         // Jira (15)
         // -------------------------------------------------------------------
         "get_myself" => {
-            let me = client.get_myself().await.map_err(format_error)?;
-            client.set_cached_me(me.clone());
-            Ok(json!({ "user": me }))
+            let (site_id, target_client) =
+                resolve_mcp_client(config, client, site_arg.as_deref())?;
+            let me = target_client.get_myself().await.map_err(format_error)?;
+            target_client.set_cached_me(me.clone());
+            Ok(json!({ "site_id": site_id, "user": me }))
         }
 
         "list_projects" => {
             let refresh = args.optional_bool("refresh")?.unwrap_or(false);
-            let cached = storage.list_projects().map_err(format_error)?;
+            let cached = match scoped_site.as_deref() {
+                Some(sid) => storage.list_projects_for_site(sid).map_err(format_error)?,
+                None => storage.list_projects().map_err(format_error)?,
+            };
             let projects = if refresh || cached.is_empty() {
-                if !refresh && config.site_url.trim().is_empty() {
+                if !refresh && config.site_url.trim().is_empty() && config.sites.is_empty() {
                     cached
                 } else {
-                    let fetched = client.list_projects().await.map_err(format_error)?;
-                    let _ = storage.upsert_projects(&fetched);
-                    let stored = storage.list_projects().map_err(format_error)?;
+                    let (target_site, target_client) =
+                        resolve_mcp_client(config, client, site_arg.as_deref())?;
+                    let fetched = target_client.list_projects().await.map_err(format_error)?;
+                    let _ = storage.upsert_projects_for_site(&target_site, &fetched);
+                    let stored = storage
+                        .list_projects_for_site(&target_site)
+                        .map_err(format_error)?;
                     if stored.is_empty() {
                         fetched
                     } else {
@@ -165,26 +269,33 @@ async fn call_tool(
             } else {
                 cached
             };
-            Ok(json!({ "projects": projects }))
+            Ok(json!({ "site_id": scoped_site, "projects": projects }))
         }
 
         "list_boards" => {
             let project = args.optional_str("project")?;
             let refresh = args.optional_bool("refresh")?.unwrap_or(false);
-            let cached = storage
-                .list_boards(project.as_deref())
-                .map_err(format_error)?;
+            let cached = match scoped_site.as_deref() {
+                Some(sid) => storage
+                    .list_boards_for_site(sid, project.as_deref())
+                    .map_err(format_error)?,
+                None => storage
+                    .list_boards(project.as_deref())
+                    .map_err(format_error)?,
+            };
             let boards = if refresh || cached.is_empty() {
-                if !refresh && config.site_url.trim().is_empty() {
+                if !refresh && config.site_url.trim().is_empty() && config.sites.is_empty() {
                     cached
                 } else {
-                    let fetched = client
+                    let (target_site, target_client) =
+                        resolve_mcp_client(config, client, site_arg.as_deref())?;
+                    let fetched = target_client
                         .list_boards(project.as_deref())
                         .await
                         .map_err(format_error)?;
-                    let _ = storage.upsert_boards(&fetched);
+                    let _ = storage.upsert_boards_for_site(&target_site, &fetched);
                     let stored = storage
-                        .list_boards(project.as_deref())
+                        .list_boards_for_site(&target_site, project.as_deref())
                         .map_err(format_error)?;
                     if stored.is_empty() {
                         fetched
@@ -195,23 +306,30 @@ async fn call_tool(
             } else {
                 cached
             };
-            Ok(json!({ "boards": boards }))
+            Ok(json!({ "site_id": scoped_site, "boards": boards }))
         }
 
         "list_sprints" => {
             let board_id = args.required_i64("board_id")?;
             let offline = args.optional_bool("offline")?.unwrap_or(false);
             let sprints = if offline {
-                storage.list_sprints(board_id).map_err(format_error)?
+                match scoped_site.as_deref() {
+                    Some(sid) => storage
+                        .list_sprints_for_site(sid, board_id)
+                        .map_err(format_error)?,
+                    None => storage.list_sprints(board_id).map_err(format_error)?,
+                }
             } else {
-                let fetched = client
+                let (target_site, target_client) =
+                    resolve_mcp_client(config, client, site_arg.as_deref())?;
+                let fetched = target_client
                     .list_board_sprints(board_id)
                     .await
                     .map_err(format_error)?;
-                let _ = storage.upsert_sprints(&fetched);
+                let _ = storage.upsert_sprints_for_site(&target_site, &fetched);
                 fetched
             };
-            Ok(json!({ "board_id": board_id, "sprints": sprints }))
+            Ok(json!({ "site_id": scoped_site, "board_id": board_id, "sprints": sprints }))
         }
 
         "get_board_issues" => {
@@ -221,18 +339,26 @@ async fn call_tool(
             let offline = args.optional_bool("offline")?.unwrap_or(false);
 
             let issues = if offline {
-                storage
-                    .list_board_issues(board_id, sprint_id, limit)
-                    .map_err(format_error)?
+                match scoped_site.as_deref() {
+                    Some(sid) => storage
+                        .list_board_issues_for_site(sid, board_id, sprint_id, limit)
+                        .map_err(format_error)?,
+                    None => storage
+                        .list_board_issues(board_id, sprint_id, limit)
+                        .map_err(format_error)?,
+                }
             } else {
-                let fetched = client
+                let (target_site, target_client) =
+                    resolve_mcp_client(config, client, site_arg.as_deref())?;
+                let fetched = target_client
                     .list_board_issues(board_id, sprint_id, limit)
                     .await
                     .map_err(format_error)?;
-                let _ = storage.upsert_issues(&fetched);
+                let _ = storage.upsert_issues_for_site(&target_site, &fetched);
                 fetched
             };
             Ok(json!({
+                "site_id": scoped_site,
                 "board_id": board_id,
                 "sprint_id": sprint_id,
                 "issues": issues,
@@ -249,22 +375,41 @@ async fn call_tool(
 
             if offline {
                 if let Some(q) = query.as_deref().or(jql.as_deref()) {
-                    let hits = storage.search_issues(q, limit).map_err(format_error)?;
+                    let hits: Vec<FederatedSearchHit> = storage
+                        .search_issues_scoped(q, scoped_site.as_deref(), limit)
+                        .map_err(format_error)?
+                        .into_iter()
+                        .map(|(sid, hit)| {
+                            let sname = config
+                                .find_effective_site(&sid)
+                                .map(|s| s.display_name().to_string());
+                            FederatedSearchHit::new(sid, sname, hit)
+                        })
+                        .collect();
                     return Ok(json!({
                         "offline": true,
+                        "site_id": scoped_site,
                         "query": q,
                         "hits": hits,
                     }));
                 }
-                let issues = storage
-                    .list_issues(project.as_deref(), limit)
-                    .map_err(format_error)?;
+                let issues = match scoped_site.as_deref() {
+                    Some(sid) => storage
+                        .list_issues_for_site(sid, project.as_deref(), limit)
+                        .map_err(format_error)?,
+                    None => storage
+                        .list_issues(project.as_deref(), limit)
+                        .map_err(format_error)?,
+                };
                 return Ok(json!({
                     "offline": true,
+                    "site_id": scoped_site,
                     "issues": issues,
                 }));
             }
 
+            let (target_site, target_client) =
+                resolve_mcp_client(config, client, site_arg.as_deref())?;
             let effective_jql = if let Some(raw_jql) = jql {
                 raw_jql
             } else if let Some(q) = query {
@@ -288,13 +433,14 @@ async fn call_tool(
                 AtlassianClient::my_open_issues_jql().to_string()
             };
 
-            let page = client
+            let page = target_client
                 .search_issues_jql(&effective_jql, limit, page_token.as_deref(), None)
                 .await
                 .map_err(format_error)?;
-            let _ = storage.upsert_issues(&page.issues);
+            let _ = storage.upsert_issues_for_site(&target_site, &page.issues);
 
             Ok(json!({
+                "site_id": target_site,
                 "jql": effective_jql,
                 "issues": page.issues,
                 "next_page_token": page.next_page_token,
@@ -307,16 +453,21 @@ async fn call_tool(
             let key = args.required_str("key")?;
             let offline = args.optional_bool("offline")?.unwrap_or(false);
             let detail = if offline {
-                storage
-                    .get_issue_detail(&key)
-                    .map_err(format_error)?
-                    .ok_or_else(|| format!("issue not found in cache: {key}"))?
+                match scoped_site.as_deref() {
+                    Some(sid) => storage
+                        .get_issue_detail_for_site(sid, &key)
+                        .map_err(format_error)?,
+                    None => storage.get_issue_detail(&key).map_err(format_error)?,
+                }
+                .ok_or_else(|| format!("issue not found in cache: {key}"))?
             } else {
-                let fetched = client.get_issue(&key).await.map_err(format_error)?;
-                let _ = storage.upsert_issue_detail(&fetched);
+                let (target_site, target_client) =
+                    resolve_mcp_client(config, client, site_arg.as_deref())?;
+                let fetched = target_client.get_issue(&key).await.map_err(format_error)?;
+                let _ = storage.upsert_issue_detail_for_site(&target_site, &fetched);
                 fetched
             };
-            Ok(json!({ "issue": detail }))
+            Ok(json!({ "site_id": scoped_site, "issue": detail }))
         }
 
         "create_jira_issue" => {
@@ -445,14 +596,24 @@ async fn call_tool(
         "list_confluence_spaces" => {
             let refresh = args.optional_bool("refresh")?.unwrap_or(false);
             let limit = clamp_limit(args.optional_usize("limit")?.unwrap_or(50));
-            let cached = storage.list_spaces().map_err(format_error)?;
+            let cached = match scoped_site.as_deref() {
+                Some(sid) => storage.list_spaces_for_site(sid).map_err(format_error)?,
+                None => storage.list_spaces().map_err(format_error)?,
+            };
             let mut spaces = if refresh || cached.is_empty() {
-                if !refresh && config.site_url.trim().is_empty() {
+                if !refresh && config.site_url.trim().is_empty() && config.sites.is_empty() {
                     cached
                 } else {
-                    let fetched = client.list_spaces(limit).await.map_err(format_error)?;
-                    let _ = storage.upsert_spaces(&fetched);
-                    let stored = storage.list_spaces().map_err(format_error)?;
+                    let (target_site, target_client) =
+                        resolve_mcp_client(config, client, site_arg.as_deref())?;
+                    let fetched = target_client
+                        .list_spaces(limit)
+                        .await
+                        .map_err(format_error)?;
+                    let _ = storage.upsert_spaces_for_site(&target_site, &fetched);
+                    let stored = storage
+                        .list_spaces_for_site(&target_site)
+                        .map_err(format_error)?;
                     if stored.is_empty() {
                         fetched
                     } else {
@@ -463,7 +624,7 @@ async fn call_tool(
                 cached
             };
             spaces.truncate(limit);
-            Ok(json!({ "spaces": spaces }))
+            Ok(json!({ "site_id": scoped_site, "spaces": spaces }))
         }
 
         "list_space_pages" => {
@@ -471,51 +632,70 @@ async fn call_tool(
             let limit = clamp_limit(args.optional_usize("limit")?.unwrap_or(50));
             let offline = args.optional_bool("offline")?.unwrap_or(false);
             let mut pages = if offline {
-                storage
-                    .list_space_root_pages(&space_key)
-                    .map_err(format_error)?
+                match scoped_site.as_deref() {
+                    Some(sid) => storage
+                        .list_space_root_pages_for_site(sid, &space_key)
+                        .map_err(format_error)?,
+                    None => storage
+                        .list_space_root_pages(&space_key)
+                        .map_err(format_error)?,
+                }
             } else {
-                let fetched = client
+                let (target_site, target_client) =
+                    resolve_mcp_client(config, client, site_arg.as_deref())?;
+                let fetched = target_client
                     .list_space_root_pages(&space_key, limit)
                     .await
                     .map_err(format_error)?;
-                let _ = storage.upsert_pages(&fetched);
+                let _ = storage.upsert_pages_for_site(&target_site, &fetched);
                 fetched
             };
             pages.truncate(limit);
-            Ok(json!({ "space_key": space_key, "pages": pages }))
+            Ok(json!({ "site_id": scoped_site, "space_key": space_key, "pages": pages }))
         }
 
         "list_child_pages" => {
             let page_id = args.required_str("page_id")?;
             let offline = args.optional_bool("offline")?.unwrap_or(false);
             let pages = if offline {
-                storage.list_child_pages(&page_id).map_err(format_error)?
+                match scoped_site.as_deref() {
+                    Some(sid) => storage
+                        .list_child_pages_for_site(sid, &page_id)
+                        .map_err(format_error)?,
+                    None => storage.list_child_pages(&page_id).map_err(format_error)?,
+                }
             } else {
-                let fetched = client
+                let (target_site, target_client) =
+                    resolve_mcp_client(config, client, site_arg.as_deref())?;
+                let fetched = target_client
                     .list_child_pages(&page_id)
                     .await
                     .map_err(format_error)?;
-                let _ = storage.upsert_pages(&fetched);
+                let _ = storage.upsert_pages_for_site(&target_site, &fetched);
                 fetched
             };
-            Ok(json!({ "parent_id": page_id, "pages": pages }))
+            Ok(json!({ "site_id": scoped_site, "parent_id": page_id, "pages": pages }))
         }
 
         "get_confluence_page" => {
             let page_id = args.required_str("page_id")?;
             let offline = args.optional_bool("offline")?.unwrap_or(false);
             let detail = if offline {
-                storage
-                    .get_page_detail(&page_id)
-                    .map_err(format_error)?
-                    .ok_or_else(|| format!("page not found in cache: {page_id}"))?
+                match scoped_site.as_deref() {
+                    Some(sid) => storage
+                        .get_page_detail_for_site(sid, &page_id)
+                        .map_err(format_error)?,
+                    None => storage.get_page_detail(&page_id).map_err(format_error)?,
+                }
+                .ok_or_else(|| format!("page not found in cache: {page_id}"))?
             } else {
-                let fetched = client.get_page(&page_id).await.map_err(format_error)?;
-                let _ = storage.upsert_page_detail(&fetched);
+                let (target_site, target_client) =
+                    resolve_mcp_client(config, client, site_arg.as_deref())?;
+                let fetched = target_client.get_page(&page_id).await.map_err(format_error)?;
+                let _ = storage.upsert_page_detail_for_site(&target_site, &fetched);
                 fetched
             };
-            Ok(json!({ "page": detail }))
+            Ok(json!({ "site_id": scoped_site, "page": detail }))
         }
 
         "create_confluence_page" => {
@@ -601,6 +781,8 @@ async fn call_tool(
             let limit = clamp_limit(args.optional_usize("limit")?.unwrap_or(30));
 
             if remote || cql.is_some() {
+                let (target_site, target_client) =
+                    resolve_mcp_client(config, client, site_arg.as_deref())?;
                 let effective_cql = match cql {
                     Some(raw) => raw,
                     None => {
@@ -612,12 +794,13 @@ async fn call_tool(
                         }
                     }
                 };
-                let pages = client
+                let pages = target_client
                     .search_confluence_cql(&effective_cql, limit)
                     .await
                     .map_err(format_error)?;
-                let _ = storage.upsert_pages(&pages);
+                let _ = storage.upsert_pages_for_site(&target_site, &pages);
                 return Ok(json!({
+                    "site_id": target_site,
                     "remote": true,
                     "cql": effective_cql,
                     "pages": pages,
@@ -625,8 +808,19 @@ async fn call_tool(
             }
 
             let q = query.unwrap_or_default();
-            let hits = storage.search_pages(&q, limit).map_err(format_error)?;
+            let hits: Vec<FederatedSearchHit> = storage
+                .search_pages_scoped(&q, scoped_site.as_deref(), limit)
+                .map_err(format_error)?
+                .into_iter()
+                .map(|(sid, hit)| {
+                    let sname = config
+                        .find_effective_site(&sid)
+                        .map(|s| s.display_name().to_string());
+                    FederatedSearchHit::new(sid, sname, hit)
+                })
+                .collect();
             Ok(json!({
+                "site_id": scoped_site,
                 "remote": false,
                 "query": q,
                 "hits": hits,
@@ -635,9 +829,14 @@ async fn call_tool(
 
         "delete_confluence_page" => {
             let page_id = args.required_str("page_id")?;
-            client.delete_page(&page_id).await.map_err(format_error)?;
-            let _ = storage.delete_page(&page_id);
-            Ok(json!({ "ok": true, "page_id": page_id }))
+            let (target_site, target_client) =
+                resolve_mcp_client(config, client, site_arg.as_deref())?;
+            target_client
+                .delete_page(&page_id)
+                .await
+                .map_err(format_error)?;
+            let _ = storage.delete_page_for_site(&target_site, &page_id);
+            Ok(json!({ "ok": true, "site_id": target_site, "page_id": page_id }))
         }
 
         // -------------------------------------------------------------------
@@ -652,13 +851,33 @@ async fn call_tool(
             let remote = args.optional_bool("remote")?.unwrap_or(false);
             let limit = clamp_limit(args.optional_usize("limit")?.unwrap_or(30));
 
-            let hits = if !remote {
-                match scope.as_str() {
-                    "jira" => storage.search_issues(&query, limit).map_err(format_error)?,
-                    "confluence" => storage.search_pages(&query, limit).map_err(format_error)?,
-                    _ => storage.search_unified(&query, limit).map_err(format_error)?,
-                }
+            let hits: Vec<FederatedSearchHit> = if !remote {
+                let raw_hits = match scope.as_str() {
+                    "jira" => storage
+                        .search_issues_scoped(&query, scoped_site.as_deref(), limit)
+                        .map_err(format_error)?,
+                    "confluence" => storage
+                        .search_pages_scoped(&query, scoped_site.as_deref(), limit)
+                        .map_err(format_error)?,
+                    _ => storage
+                        .unified_search_scoped(&query, scoped_site.as_deref(), limit)
+                        .map_err(format_error)?,
+                };
+                raw_hits
+                    .into_iter()
+                    .map(|(sid, hit)| {
+                        let sname = config
+                            .find_effective_site(&sid)
+                            .map(|s| s.display_name().to_string());
+                        FederatedSearchHit::new(sid, sname, hit)
+                    })
+                    .collect()
             } else {
+                let (target_site, target_client) =
+                    resolve_mcp_client(config, client, site_arg.as_deref())?;
+                let target_name = config
+                    .find_effective_site(&target_site)
+                    .map(|s| s.display_name().to_string());
                 let mut combined = Vec::new();
                 if scope == "all" || scope == "jira" {
                     let jql = if looks_like_query_expr(&query) {
@@ -666,12 +885,18 @@ async fn call_tool(
                     } else {
                         format!("text ~ \"{}\"", escape_jql_str(&query))
                     };
-                    let page = client
+                    let page = target_client
                         .search_issues_jql(&jql, limit, None, None)
                         .await
                         .map_err(format_error)?;
-                    let _ = storage.upsert_issues(&page.issues);
-                    combined.extend(page.issues.iter().map(issue_to_hit));
+                    let _ = storage.upsert_issues_for_site(&target_site, &page.issues);
+                    combined.extend(page.issues.iter().map(|i| {
+                        FederatedSearchHit::new(
+                            target_site.clone(),
+                            target_name.clone(),
+                            issue_to_hit(i),
+                        )
+                    }));
                 }
                 if scope == "all" || scope == "confluence" {
                     let cql = if looks_like_query_expr(&query) {
@@ -679,12 +904,18 @@ async fn call_tool(
                     } else {
                         format!("text ~ \"{}\"", escape_jql_str(&query))
                     };
-                    let pages = client
+                    let pages = target_client
                         .search_confluence_cql(&cql, limit)
                         .await
                         .map_err(format_error)?;
-                    let _ = storage.upsert_pages(&pages);
-                    combined.extend(pages.iter().map(page_to_hit));
+                    let _ = storage.upsert_pages_for_site(&target_site, &pages);
+                    combined.extend(pages.iter().map(|p| {
+                        FederatedSearchHit::new(
+                            target_site.clone(),
+                            target_name.clone(),
+                            page_to_hit(p),
+                        )
+                    }));
                 }
                 combined.truncate(limit);
                 combined
@@ -693,13 +924,47 @@ async fn call_tool(
             Ok(json!({
                 "query": query,
                 "scope": scope,
+                "site_id": scoped_site,
                 "remote": remote,
                 "hits": hits,
             }))
         }
 
         "sync_workspace" => {
-            let summary = sync::bootstrap_workspace(client, storage)
+            if scoped_site.is_none() {
+                if let Ok(pool) = SiteClientPool::from_config(config) {
+                    let enabled = pool.enabled_clients();
+                    if enabled.len() > 1 {
+                        let targets: Vec<SiteSyncTarget> = enabled
+                            .into_iter()
+                            .map(|(site, c)| SiteSyncTarget {
+                                site_id: site.id.clone(),
+                                site_name: site.display_name().to_string(),
+                                client: c,
+                            })
+                            .collect();
+                        let mut breakers = sync::CircuitBreakerMap::new();
+                        let outcome = sync::run_multi_site_sync(
+                            &targets,
+                            storage,
+                            &mut breakers,
+                            sync::DEFAULT_MULTI_SITE_CONCURRENCY,
+                            None,
+                        )
+                        .await;
+                        let counts = storage.cache_counts().map_err(format_error)?;
+                        return Ok(json!({
+                            "ok": outcome.succeeded_sites > 0,
+                            "summary": outcome.summary,
+                            "sites": outcome.per_site,
+                            "counts": counts,
+                        }));
+                    }
+                }
+            }
+            let (_target_site, target_client) =
+                resolve_mcp_client(config, client, site_arg.as_deref())?;
+            let summary = sync::bootstrap_workspace(&target_client, storage)
                 .await
                 .map_err(format_error)?;
             let counts = storage.cache_counts().map_err(format_error)?;
@@ -717,9 +982,10 @@ async fn call_tool(
 /// Validates tool arguments before dispatching to Atlassian API or SQLite storage.
 pub(crate) fn validate_tool_args(name: &str, arguments: &Value) -> Result<(), String> {
     let args = Args::new(arguments);
+    let _ = args.optional_str("site")?;
 
     match name {
-        "get_myself" | "sync_workspace" => Ok(()),
+        "list_sites" | "get_myself" | "sync_workspace" => Ok(()),
         "list_projects" => {
             let _ = args.optional_bool("refresh")?;
             Ok(())
@@ -1167,11 +1433,11 @@ fn initialize_result(message: &Value) -> Value {
 }
 
 // ---------------------------------------------------------------------------
-// Tool catalog (26 tools: 15 Jira + 9 Confluence + 2 Unified)
+// Tool catalog (27 tools: 15 Jira + 9 Confluence + 3 Unified / Multi-Site)
 // ---------------------------------------------------------------------------
 
 fn tool_catalog() -> Vec<Value> {
-    vec![
+    let mut tools = vec![
         // --- Jira (15) ---
         json!({
             "name": "get_myself",
@@ -1500,7 +1766,16 @@ fn tool_catalog() -> Vec<Value> {
                 "additionalProperties": false
             }
         }),
-        // --- Unified (2) ---
+        // --- Unified & Multi-Site (3) ---
+        json!({
+            "name": "list_sites",
+            "description": "List all registered Atlassian Cloud and Data Center sites with deployment, enabled state, and SQLite cache counts.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {},
+                "additionalProperties": false
+            }
+        }),
         json!({
             "name": "search_all",
             "description": "Unified search across both Jira issues and Confluence pages (local SQLite FTS5 or remote JQL/CQL).",
@@ -1525,7 +1800,27 @@ fn tool_catalog() -> Vec<Value> {
                 "additionalProperties": false
             }
         }),
-    ]
+    ];
+
+    // Add optional `site` selector to every tool except `list_sites`.
+    for tool in &mut tools {
+        let is_list_sites = tool
+            .get("name")
+            .and_then(Value::as_str)
+            .is_some_and(|n| n == "list_sites");
+        if !is_list_sites {
+            if let Some(props) = tool.pointer_mut("/inputSchema/properties").and_then(Value::as_object_mut) {
+                props.insert(
+                    "site".to_string(),
+                    json!({
+                        "type": "string",
+                        "description": "Optional target Atlassian site ID, name, or URL."
+                    }),
+                );
+            }
+        }
+    }
+    tools
 }
 
 #[cfg(test)]
@@ -1628,7 +1923,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn tools_list_has_exact_26_tools() {
+    async fn tools_list_has_exact_27_tools() {
         let (cfg, client, storage) = test_ctx();
         let line = json!({
             "jsonrpc": "2.0",
@@ -1640,7 +1935,11 @@ mod tests {
             .await
             .unwrap();
         let tools = resp["result"]["tools"].as_array().unwrap();
-        assert_eq!(tools.len(), 26, "expected exactly 26 MCP tools");
+        assert_eq!(tools.len(), 27, "expected exactly 27 MCP tools");
+        assert!(
+            tools.iter().any(|t| t["name"] == "list_sites"),
+            "expected list_sites in MCP tool catalog"
+        );
     }
 
     #[tokio::test]

@@ -1724,7 +1724,8 @@ async fn e2e_serve_http_mcp_image_preview_and_self_updater() {
     .await
     .expect("tools/list response");
     let tools = list_resp["result"]["tools"].as_array().unwrap();
-    assert_eq!(tools.len(), 26, "expected 26 MCP tools, got {}", tools.len());
+    assert_eq!(tools.len(), 27, "expected 27 MCP tools, got {}", tools.len());
+    assert!(tools.iter().any(|t| t["name"] == "list_sites"));
 
     let get_issue_mcp = mcp::handle_rpc_line(
         &cfg,
@@ -1906,4 +1907,638 @@ async fn e2e_serve_http_mcp_image_preview_and_self_updater() {
     .expect("update apply");
     assert!(apply_res.updated);
     assert_eq!(std::fs::read(&target_exe).unwrap(), new_binary_payload);
+}
+
+#[tokio::test]
+async fn e2e_multi_site_oauth_3lo_refresh_collision_free_sync_and_federation() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use atlassian_cli::{
+        atlassian::SiteClientPool,
+        auth::{exchange_oauth_code, fetch_accessible_resources},
+        config::SiteProfile,
+        storage::SiteRecord,
+        sync::{self, CircuitBreakerMap, SiteSyncTarget},
+    };
+
+    ensure_isolated_env();
+
+    struct MockOAuthGatewayState {
+        refresh_calls: AtomicUsize,
+        acme_forced_401: AtomicUsize,
+        gateway_hits_acme: AtomicUsize,
+        gateway_hits_side: AtomicUsize,
+    }
+
+    let oauth_state = Arc::new(MockOAuthGatewayState {
+        refresh_calls: AtomicUsize::new(0),
+        acme_forced_401: AtomicUsize::new(0),
+        gateway_hits_acme: AtomicUsize::new(0),
+        gateway_hits_side: AtomicUsize::new(0),
+    });
+
+    fn check_oauth_bearer(headers: &HeaderMap, expected: &str) -> bool {
+        headers
+            .get(header::AUTHORIZATION)
+            .and_then(|v| v.to_str().ok())
+            == Some(&format!("Bearer {expected}"))
+    }
+
+    let oauth_router = Router::new()
+        .route(
+            "/oauth/token",
+            post(|State(st): State<Arc<MockOAuthGatewayState>>, Json(body): Json<Value>| async move {
+                let grant = body["grant_type"].as_str().unwrap_or_default();
+                match grant {
+                    "authorization_code" => {
+                        assert_eq!(body["code"], "code-3lo-xyz");
+                        assert_eq!(body["client_id"], "mock-client-id");
+                        (
+                            StatusCode::OK,
+                            Json(json!({
+                                "access_token": "oauth-tok-v1",
+                                "refresh_token": "oauth-ref-v1",
+                                "expires_in": 3600,
+                                "scope": "offline_access read:jira-work read:confluence-content.all"
+                            })),
+                        )
+                    }
+                    "refresh_token" => {
+                        assert_eq!(body["refresh_token"], "oauth-ref-v1");
+                        st.refresh_calls.fetch_add(1, Ordering::SeqCst);
+                        (
+                            StatusCode::OK,
+                            Json(json!({
+                                "access_token": "oauth-tok-v2",
+                                "refresh_token": "oauth-ref-v2",
+                                "expires_in": 3600,
+                                "scope": "offline_access read:jira-work read:confluence-content.all"
+                            })),
+                        )
+                    }
+                    _ => (
+                        StatusCode::BAD_REQUEST,
+                        Json(json!({ "error": "unsupported_grant_type" })),
+                    ),
+                }
+            }),
+        )
+        .route(
+            "/oauth/token/accessible-resources",
+            get(|headers: HeaderMap| async move {
+                if !check_oauth_bearer(&headers, "oauth-tok-v1")
+                    && !check_oauth_bearer(&headers, "oauth-tok-v2")
+                {
+                    return (StatusCode::UNAUTHORIZED, Json(json!({ "error": "unauthorized" })));
+                }
+                (
+                    StatusCode::OK,
+                    Json(json!([
+                        {
+                            "id": "cloud-id-acme",
+                            "url": "https://acme-cloud.atlassian.net",
+                            "name": "Acme Cloud",
+                            "scopes": ["read:jira-work", "read:confluence-content.all"]
+                        },
+                        {
+                            "id": "cloud-id-side",
+                            "url": "https://side-cloud.atlassian.net",
+                            "name": "Side Cloud",
+                            "scopes": ["read:jira-work", "read:confluence-content.all"]
+                        }
+                    ])),
+                )
+            }),
+        )
+        .route(
+            "/ex/jira/{cloud_id}/rest/api/3/project/search",
+            get(|State(st): State<Arc<MockOAuthGatewayState>>, Path(cid): Path<String>, headers: HeaderMap| async move {
+                // Force a 401 on the very first request to Acme Cloud with v1 token to verify automatic refresh!
+                if cid == "cloud-id-acme" && check_oauth_bearer(&headers, "oauth-tok-v1") {
+                    if st.acme_forced_401.fetch_add(1, Ordering::SeqCst) == 0 {
+                        return (
+                            StatusCode::UNAUTHORIZED,
+                            Json(json!({ "message": "Access token expired" })),
+                        );
+                    }
+                }
+                if !check_oauth_bearer(&headers, "oauth-tok-v1")
+                    && !check_oauth_bearer(&headers, "oauth-tok-v2")
+                {
+                    return (StatusCode::UNAUTHORIZED, Json(json!({ "message": "Unauthorized" })));
+                }
+                if cid == "cloud-id-acme" {
+                    st.gateway_hits_acme.fetch_add(1, Ordering::SeqCst);
+                    (
+                        StatusCode::OK,
+                        Json(json!({
+                            "values": [{
+                                "id": "10001",
+                                "key": "ENG",
+                                "name": "Acme Engineering",
+                                "projectTypeKey": "software"
+                            }]
+                        })),
+                    )
+                } else {
+                    st.gateway_hits_side.fetch_add(1, Ordering::SeqCst);
+                    (
+                        StatusCode::OK,
+                        Json(json!({
+                            "values": [{
+                                "id": "20001",
+                                "key": "SIDE",
+                                "name": "Side Product",
+                                "projectTypeKey": "software"
+                            }]
+                        })),
+                    )
+                }
+            }),
+        )
+        .route(
+            "/ex/jira/{cloud_id}/rest/agile/1.0/board",
+            get(|Path(cid): Path<String>, headers: HeaderMap| async move {
+                if !check_oauth_bearer(&headers, "oauth-tok-v1")
+                    && !check_oauth_bearer(&headers, "oauth-tok-v2")
+                {
+                    return (StatusCode::UNAUTHORIZED, Json(json!({ "message": "Unauthorized" })));
+                }
+                let (id, name, pkey) = if cid == "cloud-id-acme" {
+                    (1, "Acme Scrum", "ENG")
+                } else {
+                    (2, "Side Kanban", "SIDE")
+                };
+                (
+                    StatusCode::OK,
+                    Json(json!({
+                        "values": [{
+                            "id": id,
+                            "name": name,
+                            "type": "scrum",
+                            "location": { "projectKey": pkey, "projectName": name }
+                        }]
+                    })),
+                )
+            }),
+        )
+        .route(
+            "/ex/jira/{cloud_id}/rest/agile/1.0/board/{board_id}/sprint",
+            get(|Path((_cid, board_id)): Path<(String, i64)>| async move {
+                Json(json!({
+                    "values": [{
+                        "id": 10,
+                        "name": format!("Sprint 10 (B{board_id})"),
+                        "state": "active"
+                    }]
+                }))
+            }),
+        )
+        .route(
+            "/ex/jira/{cloud_id}/rest/agile/1.0/board/{board_id}/sprint/{sprint_id}/issue",
+            get(|Path((cid, _bid, _sid)): Path<(String, i64, i64)>| async move {
+                let (key, proj, summary) = if cid == "cloud-id-acme" {
+                    ("ENG-1", "ENG", "Acme Cloud Gateway Migration")
+                } else {
+                    ("SIDE-1", "SIDE", "Side Cloud Telemetry Rollout")
+                };
+                Json(json!({
+                    "issues": [{
+                        "id": format!("id-{cid}-{key}"),
+                        "key": key,
+                        "fields": {
+                            "project": { "key": proj },
+                            "summary": summary,
+                            "status": { "id": "3", "name": "In Progress", "statusCategory": { "key": "indeterminate" } },
+                            "issuetype": { "id": "10001", "name": "Task", "subtask": false },
+                            "updated": "2026-11-19T12:00:00.000+0000"
+                        }
+                    }]
+                }))
+            }),
+        )
+        .route(
+            "/ex/jira/{cloud_id}/rest/api/3/search/jql",
+            post(|Path(cid): Path<String>, headers: HeaderMap| async move {
+                if !check_oauth_bearer(&headers, "oauth-tok-v1")
+                    && !check_oauth_bearer(&headers, "oauth-tok-v2")
+                {
+                    return (StatusCode::UNAUTHORIZED, Json(json!({ "message": "Unauthorized" })));
+                }
+                let (key, proj, summary) = if cid == "cloud-id-acme" {
+                    ("ENG-1", "ENG", "Acme Cloud Gateway Migration")
+                } else {
+                    ("SIDE-1", "SIDE", "Side Cloud Telemetry Rollout")
+                };
+                (
+                    StatusCode::OK,
+                    Json(json!({
+                        "issues": [{
+                            "id": format!("id-{cid}-{key}"),
+                            "key": key,
+                            "fields": {
+                                "project": { "key": proj },
+                                "summary": summary,
+                                "status": { "id": "3", "name": "In Progress", "statusCategory": { "key": "indeterminate" } },
+                                "issuetype": { "id": "10001", "name": "Task", "subtask": false },
+                                "updated": "2026-11-19T12:00:00.000+0000"
+                            }
+                        }]
+                    })),
+                )
+            }),
+        )
+        .route(
+            "/ex/confluence/{cloud_id}/wiki/api/v2/spaces",
+            get(|Path(cid): Path<String>| async move {
+                let (id, key, name) = if cid == "cloud-id-acme" {
+                    ("sp-acme", "DOCS", "Acme Cloud Docs")
+                } else {
+                    ("sp-side", "SIDEWIKI", "Side Cloud Wiki")
+                };
+                Json(json!({
+                    "results": [{
+                        "id": id,
+                        "key": key,
+                        "name": name,
+                        "type": "global",
+                        "status": "current"
+                    }]
+                }))
+            }),
+        )
+        .route(
+            "/ex/confluence/{cloud_id}/wiki/api/v2/spaces/{space_id}/pages",
+            get(|Path((cid, space_id)): Path<(String, String)>| async move {
+                let title = if cid == "cloud-id-acme" {
+                    "Acme Cloud Gateway Runbook"
+                } else {
+                    "Side Cloud Guide"
+                };
+                Json(json!({
+                    "results": [{
+                        "id": "100",
+                        "spaceId": space_id,
+                        "title": title,
+                        "status": "current",
+                        "version": { "number": 1, "createdAt": "2026-11-19T12:00:00Z" }
+                    }]
+                }))
+            }),
+        )
+        .with_state(oauth_state.clone());
+
+    let oauth_base = spawn_server(oauth_router).await;
+
+    // Mock Data Center server (`corp-dc`) sharing the EXACT same project key `ENG` and issue key `ENG-1`!
+    let dc_router = Router::new()
+        .route(
+            "/rest/api/2/project",
+            get(|headers: HeaderMap| async move {
+                if let Err(resp) = check_bearer_auth(&headers, "dc-pat-secret") {
+                    return resp;
+                }
+                Json(json!([{
+                    "id": "90001",
+                    "key": "ENG",
+                    "name": "Corp DC Engineering",
+                    "projectTypeKey": "software"
+                }]))
+                .into_response()
+            }),
+        )
+        .route(
+            "/rest/agile/1.0/board",
+            get(|headers: HeaderMap| async move {
+                if let Err(resp) = check_bearer_auth(&headers, "dc-pat-secret") {
+                    return resp;
+                }
+                Json(json!({
+                    "values": [{
+                        "id": 1,
+                        "name": "Corp DC Board",
+                        "type": "scrum",
+                        "location": { "projectKey": "ENG", "projectName": "Corp DC Engineering" }
+                    }]
+                }))
+                .into_response()
+            }),
+        )
+        .route(
+            "/rest/agile/1.0/board/{board_id}/sprint",
+            get(|| async {
+                Json(json!({
+                    "values": [{
+                        "id": 10,
+                        "name": "Corp DC Sprint 10",
+                        "state": "active"
+                    }]
+                }))
+            }),
+        )
+        .route(
+            "/rest/agile/1.0/board/{board_id}/sprint/{sprint_id}/issue",
+            get(|| async {
+                Json(json!({
+                    "issues": [{
+                        "id": "dc-eng-1",
+                        "key": "ENG-1",
+                        "fields": {
+                            "project": { "key": "ENG" },
+                            "summary": "Corp DC Gateway Migration",
+                            "status": { "id": "1", "name": "To Do", "statusCategory": { "key": "new" } },
+                            "issuetype": { "id": "10001", "name": "Task", "subtask": false },
+                            "updated": "2026-11-19T13:00:00.000+0000"
+                        }
+                    }]
+                }))
+            }),
+        )
+        .route(
+            "/rest/api/2/search",
+            post(|headers: HeaderMap| async move {
+                if let Err(resp) = check_bearer_auth(&headers, "dc-pat-secret") {
+                    return resp;
+                }
+                Json(json!({
+                    "startAt": 0,
+                    "maxResults": 50,
+                    "total": 1,
+                    "issues": [{
+                        "id": "dc-eng-1",
+                        "key": "ENG-1",
+                        "fields": {
+                            "project": { "key": "ENG" },
+                            "summary": "Corp DC Gateway Migration",
+                            "status": { "id": "1", "name": "To Do", "statusCategory": { "key": "new" } },
+                            "issuetype": { "id": "10001", "name": "Task", "subtask": false },
+                            "updated": "2026-11-19T13:00:00.000+0000"
+                        }
+                    }]
+                }))
+                .into_response()
+            }),
+        )
+        .route(
+            "/rest/api/space",
+            get(|headers: HeaderMap| async move {
+                if let Err(resp) = check_bearer_auth(&headers, "dc-pat-secret") {
+                    return resp;
+                }
+                Json(json!({
+                    "results": [{
+                        "id": 901,
+                        "key": "DOCS",
+                        "name": "Corp DC Docs",
+                        "type": "global"
+                    }]
+                }))
+                .into_response()
+            }),
+        )
+        .route(
+            "/rest/api/content",
+            get(|headers: HeaderMap| async move {
+                if let Err(resp) = check_bearer_auth(&headers, "dc-pat-secret") {
+                    return resp;
+                }
+                Json(json!({
+                    "results": [{
+                        "id": "100",
+                        "title": "Corp DC Gateway Runbook",
+                        "status": "current",
+                        "space": { "id": 901, "key": "DOCS" },
+                        "version": { "number": 2, "when": "2026-11-19T13:00:00Z" }
+                    }]
+                }))
+                .into_response()
+            }),
+        );
+
+    let dc_base = spawn_server(dc_router).await;
+
+    // 1. OAuth 3LO token exchange + accessible-resources auto-discovery
+    let http = reqwest::Client::new();
+    let initial_oauth_creds = exchange_oauth_code(
+        &http,
+        &oauth_base,
+        "mock-client-id",
+        Some("mock-client-secret"),
+        "code-3lo-xyz",
+        "http://127.0.0.1:9999/callback",
+    )
+    .await
+    .expect("OAuth 3LO token exchange");
+    assert_eq!(initial_oauth_creds.oauth_access_token(), Some("oauth-tok-v1"));
+
+    let resources = fetch_accessible_resources(
+        &http,
+        &oauth_base,
+        initial_oauth_creds.oauth_access_token().unwrap(),
+    )
+    .await
+    .expect("fetch accessible-resources");
+    assert_eq!(resources.len(), 2);
+
+    let cred_dir = tempfile::tempdir().expect("isolated credentials dir");
+    let cred_path = cred_dir.path().join("credentials.json");
+    let oauth_auth = AuthManager::for_account("cloud-oauth").with_fallback_path(cred_path.clone());
+    oauth_auth
+        .save_credentials(&initial_oauth_creds)
+        .expect("save OAuth credentials");
+    let dc_auth = AuthManager::for_account("corp-dc-acct").with_fallback_path(cred_path.clone());
+    dc_auth
+        .save_credentials(&StoredCredentials::BearerPat {
+            site_url: dc_base.clone(),
+            token: "dc-pat-secret".to_string(),
+            deployment: DeploymentKind::DataCenter,
+        })
+        .expect("save DC PAT credentials");
+
+    let mut cfg = AppConfig::default();
+    for res in &resources {
+        cfg.upsert_site(res.to_site_profile("cloud-oauth"));
+    }
+    cfg.upsert_site(SiteProfile {
+        id: "corp-dc".to_string(),
+        name: "Corp DC".to_string(),
+        site_url: dc_base.clone(),
+        confluence_url: dc_base.clone(),
+        deployment: DeploymentKind::DataCenter,
+        cloud_id: None,
+        account_id: "corp-dc-acct".to_string(),
+        enabled: true,
+        scopes: Vec::new(),
+    });
+    cfg.default_site = Some("acme-cloud".to_string());
+
+    // 2. Build SiteClientPool with OAuth gateway + token refresh endpoints
+    let pool = SiteClientPool::from_config_with_options(
+        &cfg,
+        Some(cred_path.clone()),
+        Some(oauth_base.clone()),
+        Some(oauth_base.clone()),
+    )
+    .expect("build SiteClientPool");
+    assert_eq!(pool.enabled_clients().len(), 3);
+
+    // 3. Parallel multi-site sync into SQLite v2
+    let storage = Storage::open_in_memory().expect("in-memory SQLite v2");
+    for site in cfg.effective_sites() {
+        storage
+            .upsert_site(&SiteRecord {
+                site_id: site.id.clone(),
+                name: site.display_name().to_string(),
+                site_url: site.site_url.clone(),
+                deployment: site.deployment.as_str().to_string(),
+                enabled: site.enabled,
+                last_synced_at: None,
+                last_error: None,
+            })
+            .unwrap();
+    }
+
+    let targets: Vec<SiteSyncTarget> = pool
+        .enabled_clients()
+        .into_iter()
+        .map(|(site, client)| SiteSyncTarget {
+            site_id: site.id.clone(),
+            site_name: site.display_name().to_string(),
+            client,
+        })
+        .collect();
+
+    let mut breakers = CircuitBreakerMap::new();
+    let outcome = sync::run_multi_site_sync(&targets, &storage, &mut breakers, 4, None).await;
+    assert_eq!(outcome.total_sites, 3, "outcome: {outcome:?}");
+    assert_eq!(outcome.succeeded_sites, 3, "outcome: {outcome:?}");
+
+    // Verify OAuth 3LO gateway routing + 401 automatic refresh + rotated refresh token persistence
+    assert!(
+        oauth_state.gateway_hits_acme.load(Ordering::SeqCst) >= 1,
+        "expected OAuth gateway hits for acme-cloud"
+    );
+    assert!(
+        oauth_state.gateway_hits_side.load(Ordering::SeqCst) >= 1,
+        "expected OAuth gateway hits for side-cloud"
+    );
+    assert!(
+        oauth_state.refresh_calls.load(Ordering::SeqCst) >= 1,
+        "expected automatic 401 OAuth token refresh"
+    );
+    let refreshed_creds = oauth_auth.load_credentials().unwrap().unwrap();
+    assert_eq!(refreshed_creds.oauth_access_token(), Some("oauth-tok-v2"));
+    match refreshed_creds {
+        StoredCredentials::CloudOAuth { refresh_token, .. } => {
+            assert_eq!(refresh_token.as_deref(), Some("oauth-ref-v2"));
+        }
+        other => panic!("expected CloudOAuth credentials, got {other:?}"),
+    }
+
+    // 4. Verify zero key collision across acme-cloud and corp-dc for ENG / ENG-1
+    let acme_projects = storage.list_projects_for_site("acme-cloud").unwrap();
+    let dc_projects = storage.list_projects_for_site("corp-dc").unwrap();
+    assert_eq!(acme_projects.len(), 1);
+    assert_eq!(dc_projects.len(), 1);
+    assert_eq!(acme_projects[0].key, "ENG");
+    assert_eq!(acme_projects[0].name, "Acme Engineering");
+    assert_eq!(dc_projects[0].key, "ENG");
+    assert_eq!(dc_projects[0].name, "Corp DC Engineering");
+
+    let acme_issues = storage.list_issues_for_site("acme-cloud", None, 20).unwrap();
+    let dc_issues = storage.list_issues_for_site("corp-dc", None, 20).unwrap();
+    assert_eq!(acme_issues[0].key, "ENG-1");
+    assert_eq!(acme_issues[0].summary, "Acme Cloud Gateway Migration");
+    assert_eq!(dc_issues[0].key, "ENG-1");
+    assert_eq!(dc_issues[0].summary, "Corp DC Gateway Migration");
+
+    // 5. Verify federated unified_search_scoped returns BOTH ENG-1 hits with distinct site_ids!
+    let federated_hits = storage
+        .unified_search_scoped("Gateway Migration", None, 20)
+        .expect("federated unified_search_scoped");
+    let eng1_sites: Vec<&str> = federated_hits
+        .iter()
+        .filter(|(_, h)| h.id_or_key == "ENG-1")
+        .map(|(sid, _)| sid.as_str())
+        .collect();
+    assert_eq!(eng1_sites.len(), 2, "expected 2 distinct ENG-1 hits, got {federated_hits:?}");
+    assert!(eng1_sites.contains(&"acme-cloud"));
+    assert!(eng1_sites.contains(&"corp-dc"));
+
+    let acme_only_hits = storage
+        .unified_search_scoped("Gateway Migration", Some("acme-cloud"), 20)
+        .expect("scoped search");
+    assert_eq!(acme_only_hits.len(), 1);
+    assert_eq!(acme_only_hits[0].0, "acme-cloud");
+
+    // 6. Verify HTTP GET /api/v1/sites & ?site= scoping + MCP list_sites & site argument
+    let default_client = pool.client_for("acme-cloud").unwrap();
+    let api_router = serve::build_router(cfg.clone(), default_client.clone(), storage.clone(), None);
+    let api_base = spawn_server(api_router).await;
+
+    let sites_resp: Value = http
+        .get(format!("{api_base}/api/v1/sites"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(sites_resp["sites"].as_array().unwrap().len(), 3);
+
+    let dc_search_resp: Value = http
+        .get(format!("{api_base}/search?q=Gateway&site=corp-dc"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let dc_hits = dc_search_resp["hits"].as_array().unwrap();
+    assert!(!dc_hits.is_empty());
+    assert!(dc_hits.iter().all(|h| h["site_id"] == "corp-dc"));
+
+    let mcp_sites = mcp::handle_rpc_line(
+        &cfg,
+        &default_client,
+        &storage,
+        &json!({
+            "jsonrpc": "2.0",
+            "id": 101,
+            "method": "tools/call",
+            "params": { "name": "list_sites", "arguments": {} }
+        })
+        .to_string(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(mcp_sites["result"]["isError"], false);
+    let mcp_sites_payload: Value =
+        serde_json::from_str(mcp_sites["result"]["content"][0]["text"].as_str().unwrap()).unwrap();
+    assert_eq!(mcp_sites_payload["sites"].as_array().unwrap().len(), 3);
+
+    let mcp_scoped_search = mcp::handle_rpc_line(
+        &cfg,
+        &default_client,
+        &storage,
+        &json!({
+            "jsonrpc": "2.0",
+            "id": 102,
+            "method": "tools/call",
+            "params": {
+                "name": "search_all",
+                "arguments": { "query": "Gateway Migration", "site": "acme-cloud" }
+            }
+        })
+        .to_string(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(mcp_scoped_search["result"]["isError"], false);
+    let mcp_search_payload: Value =
+        serde_json::from_str(mcp_scoped_search["result"]["content"][0]["text"].as_str().unwrap())
+            .unwrap();
+    let mcp_hits = mcp_search_payload["hits"].as_array().unwrap();
+    assert_eq!(mcp_hits.len(), 1);
+    assert_eq!(mcp_hits[0]["site_id"], "acme-cloud");
+    assert_eq!(mcp_hits[0]["id_or_key"], "ENG-1");
 }
