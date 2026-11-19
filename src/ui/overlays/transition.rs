@@ -4,7 +4,7 @@ use ratatui::{
     layout::Rect,
     style::{Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, Borders, Clear, Paragraph},
+    widgets::{Clear, Paragraph},
     Frame,
 };
 
@@ -15,7 +15,7 @@ use crate::{
         doc_view::truncate_width,
         hitmap::{HitMap, HitTarget},
         keymap::Action,
-        overlays::{centered_rect, OverlayOutcome},
+        overlays::{centered_rect, modal_block, OverlayOutcome},
     },
 };
 
@@ -53,6 +53,12 @@ impl TransitionOverlay {
         self.error = Some(err);
     }
 
+    pub fn select(&mut self, index: usize) {
+        if index < self.transitions.len() {
+            self.selected = index;
+        }
+    }
+
     pub fn selected_transition(&self) -> Option<&IssueTransition> {
         self.transitions.get(self.selected)
     }
@@ -60,19 +66,19 @@ impl TransitionOverlay {
     pub fn handle(&mut self, action: &Action) -> OverlayOutcome {
         match action {
             Action::CloseOverlay | Action::Input('q') => OverlayOutcome::Close,
-            Action::MoveUp => {
+            Action::MoveUp | Action::CursorUp | Action::PrevField => {
                 if !self.transitions.is_empty() {
                     self.selected = self.selected.saturating_sub(1);
                 }
                 OverlayOutcome::Handled
             }
-            Action::MoveDown => {
+            Action::MoveDown | Action::CursorDown | Action::NextField => {
                 if self.selected + 1 < self.transitions.len() {
                     self.selected += 1;
                 }
                 OverlayOutcome::Handled
             }
-            Action::Activate => {
+            Action::Activate | Action::Submit => {
                 if self.selected_transition().is_some() {
                     OverlayOutcome::Dispatch(Action::Submit)
                 } else {
@@ -92,16 +98,14 @@ impl TransitionOverlay {
         hitmap: &mut HitMap,
     ) {
         let theme = &ui.theme;
-        let rect = centered_rect(area, 56.min(area.width.saturating_sub(4)).max(24), 16.min(area.height.saturating_sub(2)).max(8));
+        let rect = centered_rect(
+            area,
+            58.min(area.width.saturating_sub(4)).max(26),
+            16.min(area.height.saturating_sub(2)).max(8),
+        );
         frame.render_widget(Clear, rect);
 
-        let block = Block::default()
-            .borders(Borders::ALL)
-            .title(Line::from(Span::styled(
-                format!(" 상태 전환 — {} ", self.issue_key),
-                theme.title(true),
-            )))
-            .border_style(theme.border_style(true));
+        let block = modal_block(format!(" Transition Status — {} ", self.issue_key), theme, true);
         let inner = block.inner(rect);
         frame.render_widget(block, rect);
         if inner.width == 0 || inner.height < 2 {
@@ -112,26 +116,32 @@ impl TransitionOverlay {
         let mut lines = Vec::new();
         if self.loading {
             lines.push(Line::from(Span::styled(
-                " 전환 가능한 상태를 불러오는 중…",
+                " Loading available transitions…",
                 theme.muted_style(),
             )));
         } else if let Some(err) = &self.error {
             lines.push(Line::from(Span::styled(
-                format!(" 오류: {err}"),
+                format!(" Error: {err}"),
                 Style::default().fg(theme.error),
             )));
         } else if self.transitions.is_empty() {
             lines.push(Line::from(Span::styled(
-                " 사용 가능한 상태 전환이 없습니다.",
+                " No available transitions for this issue.",
                 theme.muted_style(),
             )));
         } else {
-            for (idx, tr) in self.transitions.iter().take(list_h).enumerate() {
+            let start = if self.selected >= list_h && list_h > 0 {
+                self.selected - list_h + 1
+            } else {
+                0
+            };
+            for (vis_idx, tr) in self.transitions.iter().skip(start).take(list_h).enumerate() {
+                let idx = start + vis_idx;
                 let is_sel = idx == self.selected;
                 let row_style = if is_sel {
                     theme.selection()
                 } else {
-                    Style::default()
+                    Style::default().fg(theme.fg)
                 };
                 let marker = if is_sel { "▸ " } else { "  " };
                 let name = truncate_width(&tr.name, inner.width.saturating_sub(22) as usize);
@@ -140,7 +150,12 @@ impl TransitionOverlay {
                     Span::styled(format!("{marker}{name}  →  "), row_style),
                     lozenge,
                 ]));
-                hitmap.add_line(inner.x, inner.y + idx as u16, inner.width, HitTarget::OverlayItem(idx));
+                hitmap.add_line(
+                    inner.x,
+                    inner.y + vis_idx as u16,
+                    inner.width,
+                    HitTarget::OverlayItem(idx),
+                );
             }
         }
 
@@ -150,10 +165,54 @@ impl TransitionOverlay {
         let footer_area = Rect::new(inner.x, inner.y + inner.height - 1, inner.width, 1);
         frame.render_widget(
             Paragraph::new(Line::from(Span::styled(
-                truncate_width(" j/k: 이동   Enter: 전환 적용   Esc: 닫기", footer_area.width as usize),
+                truncate_width(
+                    " j/k navigate · Enter confirm · Esc cancel",
+                    footer_area.width as usize,
+                ),
                 Style::default().fg(theme.muted).add_modifier(Modifier::DIM),
             ))),
             footer_area,
+        );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::models::{IssueStatus, StatusCategory};
+
+    #[test]
+    fn transition_selection_and_submit() {
+        let mut ov = TransitionOverlay::new("ENG-5");
+        assert!(ov.loading);
+        assert_eq!(ov.handle(&Action::Activate), OverlayOutcome::Handled);
+
+        ov.set_transitions(vec![
+            IssueTransition {
+                id: "11".into(),
+                name: "Start Progress".into(),
+                to_status: IssueStatus {
+                    id: "2".into(),
+                    name: "In Progress".into(),
+                    category: StatusCategory::InProgress,
+                },
+            },
+            IssueTransition {
+                id: "21".into(),
+                name: "Done".into(),
+                to_status: IssueStatus {
+                    id: "3".into(),
+                    name: "Done".into(),
+                    category: StatusCategory::Done,
+                },
+            },
+        ]);
+        assert!(!ov.loading);
+        ov.handle(&Action::MoveDown);
+        assert_eq!(ov.selected_transition().unwrap().id, "21");
+        assert_eq!(
+            ov.handle(&Action::Activate),
+            OverlayOutcome::Dispatch(Action::Submit)
         );
     }
 }

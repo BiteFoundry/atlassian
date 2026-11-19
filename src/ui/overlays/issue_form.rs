@@ -1,12 +1,13 @@
-//! Jira issue create (`n`) & edit (`e`) modal with `$EDITOR` (`Ctrl+E`) support.
+//! Jira issue create (`n`) & edit (`e`) modal with `$EDITOR` (`Ctrl+E`), `Ctrl+V` paste, and draft helpers.
 
 use ratatui::{
     layout::{Constraint, Direction, Layout, Rect},
     style::{Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, Borders, Clear, Paragraph},
+    widgets::{Block, BorderType, Borders, Clear, Paragraph},
     Frame,
 };
+use serde::{Deserialize, Serialize};
 
 use crate::{
     models::IssueDetail,
@@ -15,7 +16,9 @@ use crate::{
         doc_view::{truncate_width, wrap_plain_text},
         hitmap::HitMap,
         keymap::Action,
-        overlays::{centered_rect, OverlayOutcome},
+        overlays::{
+            centered_rect, modal_block, read_clipboard_text, sanitize_single_line, OverlayOutcome,
+        },
         text_edit::TextBuffer,
     },
 };
@@ -57,6 +60,17 @@ impl IssueFormField {
         }
         Self::ALL[prev]
     }
+}
+
+/// Serializable draft payload for persisting unsent Jira issue forms in `DraftStore`.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct IssueFormDraft {
+    pub project: String,
+    pub issue_type: String,
+    pub summary: String,
+    pub priority: String,
+    pub labels: String,
+    pub description: String,
 }
 
 #[derive(Debug, Clone)]
@@ -113,6 +127,86 @@ impl IssueFormOverlay {
         }
     }
 
+    /// Returns a stable `DraftStore` key for this create/edit issue form.
+    pub fn draft_key(&self) -> String {
+        if let Some(key) = &self.edit_key {
+            format!("issue:edit:{key}")
+        } else {
+            let proj = self.project.text.trim().to_ascii_uppercase();
+            if proj.is_empty() {
+                "issue:new".to_string()
+            } else {
+                format!("issue:new:{proj}")
+            }
+        }
+    }
+
+    pub fn to_draft(&self) -> IssueFormDraft {
+        IssueFormDraft {
+            project: self.project.text.clone(),
+            issue_type: self.issue_type.text.clone(),
+            summary: self.summary.text.clone(),
+            priority: self.priority.text.clone(),
+            labels: self.labels.text.clone(),
+            description: self.description.text.clone(),
+        }
+    }
+
+    pub fn to_draft_json(&self) -> String {
+        serde_json::to_string(&self.to_draft()).unwrap_or_else(|_| self.description.text.clone())
+    }
+
+    /// Restores a draft from JSON (produced by `to_draft_json`) or plain Markdown text.
+    pub fn apply_draft_raw(&mut self, raw: &str) -> bool {
+        if raw.trim().is_empty() {
+            return false;
+        }
+        if let Ok(draft) = serde_json::from_str::<IssueFormDraft>(raw) {
+            if self.edit_key.is_none() {
+                if !draft.project.trim().is_empty() {
+                    self.project.set_text(draft.project);
+                }
+                if !draft.issue_type.trim().is_empty() {
+                    self.issue_type.set_text(draft.issue_type);
+                }
+            }
+            self.summary.set_text(draft.summary);
+            if !draft.priority.trim().is_empty() {
+                self.priority.set_text(draft.priority);
+            }
+            self.labels.set_text(draft.labels);
+            self.description.set_text(draft.description);
+            return true;
+        }
+        self.description.set_text(raw);
+        true
+    }
+
+    pub fn has_unsent_content(&self) -> bool {
+        !self.summary.text.trim().is_empty()
+            || !self.description.text.trim().is_empty()
+            || !self.labels.text.trim().is_empty()
+    }
+
+    /// Pastes text from the system clipboard (`Ctrl+V`) into the currently focused field.
+    pub fn paste_from_clipboard(&mut self) -> bool {
+        let Some(text) = read_clipboard_text() else {
+            return false;
+        };
+        self.paste_text(&text);
+        true
+    }
+
+    fn paste_text(&mut self, text: &str) {
+        if self.field == IssueFormField::Description {
+            self.description.insert_str(text);
+        } else {
+            let cleaned = sanitize_single_line(text);
+            self.active_buffer_mut().insert_str(&cleaned);
+        }
+        self.error = None;
+    }
+
     fn active_buffer_mut(&mut self) -> &mut TextBuffer {
         match self.field {
             IssueFormField::Project => &mut self.project,
@@ -166,12 +260,12 @@ impl IssueFormOverlay {
             }
             Action::Submit => {
                 if self.edit_key.is_none() && self.project.text.trim().is_empty() {
-                    self.error = Some("프로젝트 키를 입력하세요 (예: PROJ)".to_string());
+                    self.error = Some("Please enter a project key (e.g. PROJ)".to_string());
                     self.field = IssueFormField::Project;
                     return OverlayOutcome::Handled;
                 }
                 if self.summary.text.trim().is_empty() {
-                    self.error = Some("이슈 제목(Summary)을 입력하세요".to_string());
+                    self.error = Some("Please enter an issue summary".to_string());
                     self.field = IssueFormField::Summary;
                     return OverlayOutcome::Handled;
                 }
@@ -231,7 +325,7 @@ impl IssueFormOverlay {
                 OverlayOutcome::Handled
             }
             Action::Paste(s) => {
-                self.active_buffer_mut().insert_str(s);
+                self.paste_text(s);
                 OverlayOutcome::Handled
             }
             _ => OverlayOutcome::Handled,
@@ -256,19 +350,16 @@ impl IssueFormOverlay {
         let theme = &ui.theme;
         let rect = centered_rect(
             area,
-            78.min(area.width.saturating_sub(4)).max(34),
+            80.min(area.width.saturating_sub(4)).max(34),
             24.min(area.height.saturating_sub(2)).max(14),
         );
         frame.render_widget(Clear, rect);
 
         let title = match &self.edit_key {
-            Some(k) => format!(" 이슈 수정 — {k} "),
-            None => " 새 Jira 이슈 생성 ".to_string(),
+            Some(k) => format!(" Edit Issue — {k} "),
+            None => " New Jira Issue ".to_string(),
         };
-        let block = Block::default()
-            .borders(Borders::ALL)
-            .title(Line::from(Span::styled(title, theme.title(true))))
-            .border_style(theme.border_style(true));
+        let block = modal_block(title, theme, true);
         let inner = block.inner(rect);
         frame.render_widget(block, rect);
         if inner.width == 0 || inner.height < 8 {
@@ -293,15 +384,15 @@ impl IssueFormOverlay {
             };
             let cursor = if active && !locked { "▏" } else { "" };
             Line::from(vec![
-                Span::styled(format!(" {label:<10}: "), lbl_style),
+                Span::styled(format!(" {label:<12}: "), lbl_style),
                 Span::styled(
                     val.to_string(),
                     if locked {
                         theme.muted_style()
                     } else if active {
-                        Style::default().add_modifier(Modifier::BOLD)
+                        Style::default().fg(theme.fg).add_modifier(Modifier::BOLD)
                     } else {
-                        Style::default()
+                        Style::default().fg(theme.fg)
                     },
                 ),
                 Span::styled(cursor, theme.accent_style()),
@@ -310,46 +401,86 @@ impl IssueFormOverlay {
 
         let is_edit = self.edit_key.is_some();
         let top_lines = vec![
-            field_line(IssueFormField::Project, "프로젝트", &self.project.text, is_edit),
+            field_line(IssueFormField::Project, "Project", &self.project.text, is_edit),
             field_line(
                 IssueFormField::IssueType,
-                "유형(←/→)",
+                "Type (←/→)",
                 &self.issue_type.text,
                 is_edit,
             ),
-            field_line(IssueFormField::Summary, "제목", &self.summary.text, false),
-            field_line(IssueFormField::Priority, "우선순위", &self.priority.text, false),
-            field_line(IssueFormField::Labels, "라벨(,)", &self.labels.text, false),
+            field_line(IssueFormField::Summary, "Summary", &self.summary.text, false),
+            field_line(IssueFormField::Priority, "Priority", &self.priority.text, false),
+            field_line(IssueFormField::Labels, "Labels (,)", &self.labels.text, false),
         ];
         frame.render_widget(Paragraph::new(top_lines), chunks[0]);
 
         let desc_active = self.field == IssueFormField::Description;
         let desc_block = Block::default()
             .borders(Borders::ALL)
+            .border_type(BorderType::Rounded)
+            .style(Style::default().bg(theme.card_bg).fg(theme.fg))
             .title(Line::from(Span::styled(
-                " 설명 Markdown (Ctrl+E: 외부 $EDITOR) ",
+                " Description (Markdown · Ctrl+E $EDITOR) ",
                 theme.title(desc_active),
             )))
             .border_style(theme.border_style(desc_active));
         let desc_inner = desc_block.inner(chunks[1]);
         let wrapped = wrap_plain_text(&self.description.text, desc_inner.width.max(4) as usize);
-        let desc_lines: Vec<Line<'static>> = wrapped.into_iter().map(Line::from).collect();
+        let mut desc_lines: Vec<Line<'static>> = wrapped.into_iter().map(Line::from).collect();
+        if desc_active {
+            if let Some(last) = desc_lines.last_mut() {
+                last.spans.push(Span::styled("▏", theme.accent_style()));
+            }
+        }
         frame.render_widget(Paragraph::new(desc_lines).block(desc_block), chunks[1]);
 
         let footer = if let Some(err) = &self.error {
             Line::from(Span::styled(
-                format!(" 오류: {err}"),
+                format!(" Error: {err}"),
                 Style::default().fg(theme.error),
             ))
         } else {
             Line::from(Span::styled(
                 truncate_width(
-                    " Tab: 다음필드   Ctrl+E: $EDITOR   Ctrl+S/Enter: 저장   Esc: 취소",
+                    " Tab next · Ctrl+V paste · Ctrl+E $EDITOR · Enter confirm · Esc cancel",
                     chunks[2].width as usize,
                 ),
-                theme.muted_style(),
+                Style::default().fg(theme.muted).add_modifier(Modifier::DIM),
             ))
         };
         frame.render_widget(Paragraph::new(footer), chunks[2]);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn issue_form_draft_roundtrip_and_validation() {
+        let mut form = IssueFormOverlay::new_issue("eng");
+        assert_eq!(form.draft_key(), "issue:new:ENG");
+
+        // Missing summary fails validation
+        assert_eq!(form.handle(&Action::Submit), OverlayOutcome::Handled);
+        assert!(form.error.is_some());
+
+        form.handle(&Action::Paste("Ship Settings modal\n".into()));
+        assert_eq!(form.summary.text, "Ship Settings modal");
+        assert!(form.error.is_none());
+
+        form.field = IssueFormField::Description;
+        form.handle(&Action::Paste("Line 1\nLine 2".into()));
+        assert_eq!(form.description.text, "Line 1\nLine 2");
+
+        let json = form.to_draft_json();
+        let mut restored = IssueFormOverlay::new_issue("ENG");
+        assert!(restored.apply_draft_raw(&json));
+        assert_eq!(restored.summary.text, "Ship Settings modal");
+        assert_eq!(restored.description.text, "Line 1\nLine 2");
+        assert_eq!(
+            restored.handle(&Action::Submit),
+            OverlayOutcome::Dispatch(Action::Submit)
+        );
     }
 }

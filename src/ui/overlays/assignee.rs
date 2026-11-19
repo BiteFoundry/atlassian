@@ -4,7 +4,7 @@ use ratatui::{
     layout::{Constraint, Direction, Layout, Rect},
     style::{Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, Borders, Clear, Paragraph},
+    widgets::{Clear, Paragraph},
     Frame,
 };
 
@@ -15,7 +15,9 @@ use crate::{
         doc_view::truncate_width,
         hitmap::{HitMap, HitTarget},
         keymap::Action,
-        overlays::{centered_rect, OverlayOutcome},
+        overlays::{
+            centered_rect, modal_block, read_clipboard_text, sanitize_single_line, OverlayOutcome,
+        },
         text_edit::TextBuffer,
     },
 };
@@ -26,7 +28,7 @@ pub struct AssigneeOverlay {
     pub project_or_issue_key: String,
     pub query: TextBuffer,
     pub users: Vec<UserSummary>,
-    /// Index `0` is always "미할당 (Unassigned)"; `1..` map to `users[idx - 1]`.
+    /// Index `0` is always "Unassigned"; `1..` map to `users[idx - 1]`.
     pub selected: usize,
     pub loading: bool,
     pub error: Option<String>,
@@ -62,7 +64,27 @@ impl AssigneeOverlay {
         self.error = Some(err);
     }
 
-    /// Returns `Some(None)` for Unassigned, `Some(Some(user))` for user, or `None` if invalid.
+    pub fn select(&mut self, index: usize) {
+        if index <= self.users.len() {
+            self.selected = index;
+        }
+    }
+
+    /// Pastes text from the system clipboard (`Ctrl+V`) into the search query.
+    pub fn paste_from_clipboard(&mut self) -> bool {
+        let Some(text) = read_clipboard_text() else {
+            return false;
+        };
+        let cleaned = sanitize_single_line(&text);
+        if cleaned.is_empty() {
+            return false;
+        }
+        self.query.insert_str(&cleaned);
+        self.loading = true;
+        true
+    }
+
+    /// Returns `Some(None)` for Unassigned, `Some(Some(user))` for a user, or `None` if invalid.
     pub fn selected_assignee(&self) -> Option<Option<&UserSummary>> {
         if self.selected == 0 {
             Some(None)
@@ -117,9 +139,13 @@ impl AssigneeOverlay {
                 OverlayOutcome::Dispatch(Action::RemoteSearch)
             }
             Action::Paste(s) => {
-                self.query.insert_str(s);
-                self.loading = true;
-                OverlayOutcome::Dispatch(Action::RemoteSearch)
+                let cleaned = sanitize_single_line(s);
+                if !cleaned.is_empty() {
+                    self.query.insert_str(&cleaned);
+                    self.loading = true;
+                    return OverlayOutcome::Dispatch(Action::RemoteSearch);
+                }
+                OverlayOutcome::Handled
             }
             Action::Submit | Action::Activate => OverlayOutcome::Dispatch(Action::Submit),
             _ => OverlayOutcome::Handled,
@@ -137,18 +163,12 @@ impl AssigneeOverlay {
         let theme = &ui.theme;
         let rect = centered_rect(
             area,
-            60.min(area.width.saturating_sub(4)).max(26),
+            62.min(area.width.saturating_sub(4)).max(28),
             18.min(area.height.saturating_sub(2)).max(9),
         );
         frame.render_widget(Clear, rect);
 
-        let block = Block::default()
-            .borders(Borders::ALL)
-            .title(Line::from(Span::styled(
-                format!(" 담당자 지정 — {} ", self.issue_key),
-                theme.title(true),
-            )))
-            .border_style(theme.border_style(true));
+        let block = modal_block(format!(" Assign Issue — {} ", self.issue_key), theme, true);
         let inner = block.inner(rect);
         frame.render_widget(block, rect);
         if inner.width == 0 || inner.height < 4 {
@@ -165,7 +185,7 @@ impl AssigneeOverlay {
             .split(inner);
 
         let q_line = Line::from(vec![
-            Span::styled(" 검색: ", theme.accent_style()),
+            Span::styled(" Search: ", theme.accent_style()),
             Span::raw(&self.query.text),
             Span::styled("▏", theme.accent_style()),
         ]);
@@ -183,68 +203,133 @@ impl AssigneeOverlay {
         let mut lines = Vec::new();
         let max_rows = chunks[1].height as usize;
 
-        // Row 0: Unassigned
-        let sel0 = self.selected == 0;
-        lines.push(Line::from(Span::styled(
-            format!("{}○ 미할당 (Unassigned)", if sel0 { "▸ " } else { "  " }),
-            if sel0 {
-                theme.selection()
-            } else {
-                theme.muted_style()
-            },
-        )));
-        hitmap.add_line(chunks[1].x, chunks[1].y, chunks[1].width, HitTarget::OverlayItem(0));
-
         if self.loading {
+            let sel0 = self.selected == 0;
             lines.push(Line::from(Span::styled(
-                "  사용자 검색 중…",
+                format!("{}○ Unassigned", if sel0 { "▸ " } else { "  " }),
+                if sel0 {
+                    theme.selection()
+                } else {
+                    theme.muted_style()
+                },
+            )));
+            hitmap.add_line(chunks[1].x, chunks[1].y, chunks[1].width, HitTarget::OverlayItem(0));
+            lines.push(Line::from(Span::styled(
+                "  Searching assignable users…",
                 theme.muted_style(),
             )));
         } else if let Some(err) = &self.error {
+            let sel0 = self.selected == 0;
             lines.push(Line::from(Span::styled(
-                format!("  오류: {err}"),
+                format!("{}○ Unassigned", if sel0 { "▸ " } else { "  " }),
+                if sel0 {
+                    theme.selection()
+                } else {
+                    theme.muted_style()
+                },
+            )));
+            hitmap.add_line(chunks[1].x, chunks[1].y, chunks[1].width, HitTarget::OverlayItem(0));
+            lines.push(Line::from(Span::styled(
+                format!("  Error: {err}"),
                 Style::default().fg(theme.error),
             )));
         } else {
-            for (u_idx, user) in self.users.iter().enumerate() {
-                let row_idx = u_idx + 1;
-                if row_idx >= max_rows {
-                    break;
-                }
+            let total = self.users.len() + 1;
+            let start = if self.selected >= max_rows && max_rows > 0 {
+                self.selected - max_rows + 1
+            } else {
+                0
+            };
+            for (vis_idx, row_idx) in (start..total).take(max_rows).enumerate() {
                 let is_sel = self.selected == row_idx;
-                let email = user
-                    .email
-                    .as_deref()
-                    .map(|e| format!(" <{e}>"))
-                    .unwrap_or_default();
-                let label = truncate_width(
-                    &format!("{}● {}{}", if is_sel { "▸ " } else { "  " }, user.display_name, email),
-                    chunks[1].width as usize,
-                );
-                lines.push(Line::from(Span::styled(
-                    label,
-                    if is_sel {
-                        theme.selection()
-                    } else {
-                        Style::default()
-                    },
-                )));
+                let line = if row_idx == 0 {
+                    Line::from(Span::styled(
+                        format!("{}○ Unassigned", if is_sel { "▸ " } else { "  " }),
+                        if is_sel {
+                            theme.selection()
+                        } else {
+                            theme.muted_style()
+                        },
+                    ))
+                } else {
+                    let user = &self.users[row_idx - 1];
+                    let email = user
+                        .email
+                        .as_deref()
+                        .map(|e| format!(" <{e}>"))
+                        .unwrap_or_default();
+                    let label = truncate_width(
+                        &format!(
+                            "{}● {}{}",
+                            if is_sel { "▸ " } else { "  " },
+                            user.display_name,
+                            email
+                        ),
+                        chunks[1].width as usize,
+                    );
+                    Line::from(Span::styled(
+                        label,
+                        if is_sel {
+                            theme.selection()
+                        } else {
+                            Style::default().fg(theme.fg)
+                        },
+                    ))
+                };
+                lines.push(line);
                 hitmap.add_line(
                     chunks[1].x,
-                    chunks[1].y + row_idx as u16,
+                    chunks[1].y + vis_idx as u16,
                     chunks[1].width,
                     HitTarget::OverlayItem(row_idx),
                 );
+            }
+            if self.users.is_empty() && lines.len() < max_rows {
+                lines.push(Line::from(Span::styled(
+                    "  No matching users found",
+                    theme.muted_style(),
+                )));
             }
         }
         frame.render_widget(Paragraph::new(lines), chunks[1]);
 
         frame.render_widget(
             Paragraph::new(Line::from(Span::styled(
-                truncate_width(" ↑/↓: 선택   Enter: 할당   Esc: 닫기", chunks[2].width as usize),
+                truncate_width(
+                    " ↑/↓ select · Enter confirm · Ctrl+V paste · Esc cancel",
+                    chunks[2].width as usize,
+                ),
                 Style::default().fg(theme.muted).add_modifier(Modifier::DIM),
             ))),
             chunks[2],
         );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn assignee_selection_and_paste_search() {
+        let mut ov = AssigneeOverlay::new("ENG-10", "ENG");
+        ov.set_users(vec![UserSummary {
+            id: "u1".into(),
+            display_name: "Jane Doe".into(),
+            email: Some("jane@acme.com".into()),
+            avatar_url: None,
+            active: true,
+        }]);
+        assert!(matches!(ov.selected_assignee(), Some(None)));
+
+        ov.handle(&Action::MoveDown);
+        assert_eq!(ov.selected_assignee().unwrap().unwrap().display_name, "Jane Doe");
+
+        assert_eq!(
+            ov.handle(&Action::Paste("alice\n".into())),
+            OverlayOutcome::Dispatch(Action::RemoteSearch)
+        );
+        assert_eq!(ov.query.text, "alice");
+        assert!(ov.loading);
     }
 }
