@@ -1,18 +1,20 @@
-//! Tab 3 (`Ctrl+4`): Confluence Space Selector, Expandable Page Tree, Wiki Reader & TOC Drawer.
+//! Tab 3 (`Ctrl+4`): Minimal-chrome Confluence Space Selector, Page Tree, Wiki Reader & TOC Drawer.
 
 use ratatui::{
     layout::{Constraint, Direction, Layout, Rect},
     style::{Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, Borders, Paragraph},
+    widgets::Paragraph,
     Frame,
 };
 
 use crate::{
+    config::DensityMode,
     models::{DocBlock, InlineNode, InlineStyle, PageDetail},
     ui::{
         app::{AppState, PaneFocus, UiState},
         doc_view::{render_blocks, truncate_width},
+        draw_horizontal_hairline, fill_surface,
         hitmap::{ButtonId, HitMap, HitTarget},
     },
 };
@@ -29,7 +31,9 @@ pub fn draw(
         draw_space_and_tree(frame, nav_rect, app, ui);
     }
 
-    draw_wiki_reader(frame, main_area, app, ui);
+    if main_area.width > 0 && main_area.height > 0 {
+        draw_wiki_reader(frame, main_area, app, ui);
+    }
 
     if let Some(toc_rect) = drawer_area {
         draw_toc_drawer(frame, toc_rect, app, ui);
@@ -39,14 +43,42 @@ pub fn draw(
 fn draw_space_and_tree(frame: &mut Frame, area: Rect, app: &AppState, ui: &mut UiState) {
     let theme = &ui.theme;
     let focused = ui.focus == PaneFocus::Nav;
-    let block = Block::default()
-        .borders(Borders::ALL)
-        .title(Line::from(Span::styled(" 스페이스 & 페이지 트리 ", theme.title(focused))))
-        .border_style(theme.border_style(focused));
-    let inner = block.inner(area);
-    frame.render_widget(block, area);
+    let sidebar_style = theme.surface_style(theme.bg_sidebar);
+    fill_surface(frame, area, sidebar_style);
     ui.hitmap.add(area, HitTarget::NavPane);
-    if inner.width == 0 || inner.height < 4 {
+    if area.width < 4 || area.height < 4 {
+        return;
+    }
+
+    let hdr_rect = Rect::new(area.x, area.y, area.width, 1);
+    let focus_mark = if focused { "▸" } else { " " };
+    frame.render_widget(
+        Paragraph::new(Line::from(Span::styled(
+            truncate_width(&format!("{focus_mark} Spaces & Pages"), area.width as usize),
+            theme.title(focused),
+        )))
+        .style(sidebar_style),
+        hdr_rect,
+    );
+    draw_horizontal_hairline(
+        frame,
+        area.x,
+        area.y + 1,
+        area.width,
+        if focused {
+            theme.accent_style()
+        } else {
+            theme.subtle_style()
+        },
+    );
+
+    let inner = Rect::new(
+        area.x,
+        area.y + 2,
+        area.width,
+        area.height.saturating_sub(2),
+    );
+    if inner.height < 4 {
         return;
     }
 
@@ -57,9 +89,9 @@ fn draw_space_and_tree(frame: &mut Frame, area: Rect, app: &AppState, ui: &mut U
         .split(inner);
 
     // Space Selector
-    let mut s_lines = vec![Line::from(Span::styled(" Confluence 스페이스", theme.muted_style()))];
+    let mut s_lines = vec![Line::from(Span::styled(" SPACES", theme.muted_style()))];
     if app.spaces.is_empty() {
-        s_lines.push(Line::from(Span::styled("  (스페이스 없음)", theme.muted_style())));
+        s_lines.push(Line::from(Span::styled("  (no spaces)", theme.muted_style())));
     } else {
         for (idx, sp) in app
             .spaces
@@ -69,18 +101,25 @@ fn draw_space_and_tree(frame: &mut Frame, area: Rect, app: &AppState, ui: &mut U
         {
             let is_sel = ui.confluence_ui.selected_space == idx;
             let style = if focused && ui.confluence_ui.nav_section == 0 && is_sel {
-                theme.selection()
+                theme.nav_selection()
             } else if is_sel {
-                Style::default()
-                    .fg(theme.confluence_teal)
-                    .add_modifier(Modifier::BOLD)
+                if theme.no_color {
+                    Style::default().add_modifier(Modifier::BOLD)
+                } else {
+                    Style::default()
+                        .fg(theme.confluence_teal)
+                        .add_modifier(Modifier::BOLD)
+                }
             } else {
-                Style::default()
+                sidebar_style
             };
             let pfx = if is_sel { "▸ " } else { "  " };
             let pin = if sp.pinned { "★ " } else { "" };
             s_lines.push(Line::from(Span::styled(
-                truncate_width(&format!("{pfx}{pin}{} ({})", sp.name, sp.key), rows[0].width as usize),
+                truncate_width(
+                    &format!("{pfx}{pin}{} ({})", sp.name, sp.key),
+                    rows[0].width as usize,
+                ),
                 style,
             )));
             ui.hitmap.add_line(
@@ -91,18 +130,18 @@ fn draw_space_and_tree(frame: &mut Frame, area: Rect, app: &AppState, ui: &mut U
             );
         }
     }
-    frame.render_widget(Paragraph::new(s_lines), rows[0]);
+    frame.render_widget(Paragraph::new(s_lines).style(sidebar_style), rows[0]);
 
     // Expandable Hierarchical Page Tree
     let tree = app.current_confluence_tree(ui);
     let tree_h = rows[1].height.saturating_sub(1) as usize;
     let mut t_lines = vec![Line::from(Span::styled(
-        format!(" 페이지 트리 ({}) [Space/→ 확장]", tree.len()),
+        format!(" PAGE TREE ({}) [Space]", tree.len()),
         theme.muted_style(),
     ))];
     if tree.is_empty() {
         t_lines.push(Line::from(Span::styled(
-            "  (페이지 없음 — [n] 새 페이지)",
+            "  (no pages — [n] new page)",
             theme.muted_style(),
         )));
     } else if tree_h > 0 {
@@ -111,30 +150,32 @@ fn draw_space_and_tree(frame: &mut Frame, area: Rect, app: &AppState, ui: &mut U
             .selected_tree_row
             .min(tree.len().saturating_sub(1));
         let start = if sel >= tree_h { sel - tree_h + 1 } else { 0 };
+        let indent_step = match app.config.density {
+            DensityMode::Cozy => "  ",
+            DensityMode::Compact => " ",
+        };
         for (vis_idx, row) in tree.iter().skip(start).take(tree_h).enumerate() {
             let abs_idx = start + vis_idx;
             let is_sel = abs_idx == sel;
             let style = if focused && ui.confluence_ui.nav_section == 1 && is_sel {
-                theme.selection()
+                theme.nav_selection()
             } else if is_sel {
-                Style::default()
-                    .bg(theme.card_selected_bg)
-                    .add_modifier(Modifier::BOLD)
+                theme.selection().add_modifier(Modifier::BOLD)
             } else {
-                Style::default()
+                sidebar_style
             };
-            let indent = "  ".repeat(row.depth);
+            let indent = indent_step.repeat(row.depth);
             let branch = if row.has_children {
                 if row.expanded {
-                    "▾ 📁 "
+                    "▾ "
                 } else {
-                    "▸ 📁 "
+                    "▸ "
                 }
             } else {
-                "  📄 "
+                "· "
             };
             let text = truncate_width(
-                &format!("{indent}{branch}{}", row.page.title),
+                &format!(" {indent}{branch}{}", row.page.title),
                 rows[1].width as usize,
             );
             t_lines.push(Line::from(Span::styled(text, style)));
@@ -146,24 +187,49 @@ fn draw_space_and_tree(frame: &mut Frame, area: Rect, app: &AppState, ui: &mut U
             );
         }
     }
-    frame.render_widget(Paragraph::new(t_lines), rows[1]);
+    frame.render_widget(Paragraph::new(t_lines).style(sidebar_style), rows[1]);
 }
 
 fn draw_wiki_reader(frame: &mut Frame, area: Rect, app: &AppState, ui: &mut UiState) {
     let theme = &ui.theme;
     let focused = ui.focus == PaneFocus::Main;
-    let title = match &app.active_page {
-        Some(p) => format!(" 📘 {} — Wiki Reader ", p.summary.title),
-        None => " 📘 Confluence Wiki Reader ".to_string(),
-    };
-    let block = Block::default()
-        .borders(Borders::ALL)
-        .title(Line::from(Span::styled(title, theme.title(focused))))
-        .border_style(theme.border_style(focused));
-    let inner = block.inner(area);
-    frame.render_widget(block, area);
     ui.hitmap.add(area, HitTarget::DetailPane);
 
+    if area.width < 6 || area.height < 3 {
+        return;
+    }
+
+    let title = match &app.active_page {
+        Some(p) => format!(" {} — Wiki Reader", p.summary.title),
+        None => " Confluence Wiki Reader".to_string(),
+    };
+    let hdr_rect = Rect::new(area.x, area.y, area.width, 1);
+    let focus_mark = if focused { "▸" } else { " " };
+    frame.render_widget(
+        Paragraph::new(Line::from(Span::styled(
+            truncate_width(&format!("{focus_mark}{title}"), area.width as usize),
+            theme.title(focused),
+        ))),
+        hdr_rect,
+    );
+    draw_horizontal_hairline(
+        frame,
+        area.x,
+        area.y + 1,
+        area.width,
+        if focused {
+            theme.accent_style()
+        } else {
+            theme.subtle_style()
+        },
+    );
+
+    let inner = Rect::new(
+        area.x,
+        area.y + 2,
+        area.width,
+        area.height.saturating_sub(2),
+    );
     if inner.width == 0 || inner.height == 0 {
         return;
     }
@@ -173,7 +239,7 @@ fn draw_wiki_reader(frame: &mut Frame, area: Rect, app: &AppState, ui: &mut UiSt
             Paragraph::new(vec![
                 Line::from(""),
                 Line::from(Span::styled(
-                    "  좌측 트리에서 Confluence 페이지를 선택하거나 [n]으로 새 페이지를 작성하세요.",
+                    "  Select a Confluence page from the tree or press [n] to create a new page.",
                     theme.muted_style(),
                 )),
             ]),
@@ -194,15 +260,15 @@ fn draw_wiki_reader(frame: &mut Frame, area: Rect, app: &AppState, ui: &mut UiSt
 
 fn register_wiki_action_buttons(x: u16, row: u16, width: u16, hitmap: &mut HitMap) {
     let buttons = [
-        ("[e]편집($EDITOR)", ButtonId::Edit),
-        ("[n]하위페이지생성", ButtonId::NewItem),
-        ("[c]댓글", ButtonId::Comment),
-        ("[t]목차(TOC)", ButtonId::ToggleToc),
-        ("[u]첨부업로드", ButtonId::UploadAttachment),
-        ("[d]첨부다운로드", ButtonId::DownloadAttachment),
-        ("[v]이미지", ButtonId::ImagePreview),
-        ("[g]연결이슈점프", ButtonId::CrossLinks),
-        ("[o]브라우저", ButtonId::OpenBrowser),
+        ("[e]Edit", ButtonId::Edit),
+        ("[n]Child Page", ButtonId::NewItem),
+        ("[c]Comment", ButtonId::Comment),
+        ("[t]TOC", ButtonId::ToggleToc),
+        ("[u]Upload", ButtonId::UploadAttachment),
+        ("[d]Download", ButtonId::DownloadAttachment),
+        ("[v]Image", ButtonId::ImagePreview),
+        ("[g]Links", ButtonId::CrossLinks),
+        ("[o]Open", ButtonId::OpenBrowser),
     ];
     let mut cx = x + 1;
     for (label, btn) in buttons {
@@ -222,9 +288,17 @@ fn build_wiki_reader_lines(
     ui: &UiState,
 ) -> Vec<Line<'static>> {
     let theme = &ui.theme;
+    let is_compact = app.config.density == DensityMode::Compact;
     let w = (width as usize).max(20);
     let mut lines = Vec::new();
     let s = &page.summary;
+
+    let teal_style = if theme.no_color {
+        Style::default().add_modifier(Modifier::BOLD)
+    } else {
+        Style::default().fg(theme.confluence_teal)
+    };
+    let teal_bold = teal_style.add_modifier(Modifier::BOLD);
 
     // 1. Breadcrumb: SPACE > Ancestor > Title
     let mut crumb_parts = vec![s.space_key.clone()];
@@ -234,7 +308,7 @@ fn build_wiki_reader_lines(
     crumb_parts.push(s.title.clone());
     lines.push(Line::from(Span::styled(
         truncate_width(&format!(" {}", crumb_parts.join(" > ")), w),
-        Style::default().fg(theme.confluence_teal),
+        teal_style,
     )));
 
     // 2. Title
@@ -243,8 +317,8 @@ fn build_wiki_reader_lines(
         Style::default().add_modifier(Modifier::BOLD),
     )));
 
-    // 3. Metadata: v{N} · 작성자 · 수정시각 · #labels
-    let author = s.author_name.as_deref().unwrap_or("알 수 없음");
+    // 3. Metadata: v{N} · Author · Updated · #labels
+    let author = s.author_name.as_deref().unwrap_or("Unknown");
     let labels = if page.labels.is_empty() {
         String::new()
     } else {
@@ -266,16 +340,21 @@ fn build_wiki_reader_lines(
     )));
 
     // 4. Action bar
+    let action_style = if theme.no_color {
+        Style::default().add_modifier(Modifier::DIM)
+    } else {
+        Style::default().fg(theme.accent)
+    };
     lines.push(Line::from(Span::styled(
         truncate_width(
-            " [e]편집($EDITOR) [n]하위페이지생성 [c]댓글 [t]목차(TOC) [u]첨부업로드 [d]첨부다운로드 [v]이미지 [g]연결이슈점프 [o]브라우저",
+            " [e]Edit [n]Child Page [c]Comment [t]TOC [u]Upload [d]Download [v]Image [g]Links [o]Open",
             w,
         ),
-        Style::default().fg(theme.accent),
+        action_style,
     )));
     lines.push(Line::from(Span::styled(
         "─".repeat(w.min(120)),
-        Style::default().fg(theme.border),
+        theme.subtle_style(),
     )));
 
     // 5. Wiki body
@@ -292,7 +371,10 @@ fn build_wiki_reader_lines(
         Vec::new()
     };
     if body_blocks.is_empty() {
-        lines.push(Line::from(Span::styled(" (본문 없음)", theme.muted_style())));
+        lines.push(Line::from(Span::styled(
+            " (empty page body)",
+            theme.muted_style(),
+        )));
     } else {
         for mut l in render_blocks(
             &body_blocks,
@@ -305,45 +387,64 @@ fn build_wiki_reader_lines(
             lines.push(l);
         }
     }
-    lines.push(Line::from(""));
+    if !is_compact {
+        lines.push(Line::from(""));
+    }
 
     // 6. Attachments
     if !page.attachments.is_empty() {
         lines.push(Line::from(Span::styled(
-            format!(" ▾ 첨부파일 ({}) — [d]다운로드 [v]이미지미리보기", page.attachments.len()),
-            Style::default()
-                .fg(theme.confluence_teal)
-                .add_modifier(Modifier::BOLD),
+            format!(
+                " ▾ Attachments ({}) — [d] Download · [v] Preview",
+                page.attachments.len()
+            ),
+            teal_bold,
         )));
+        let file_style = if theme.no_color {
+            Style::default().add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(theme.chip_fg)
+        };
         for att in &page.attachments {
             let kb = (att.size / 1024).max(1);
             lines.push(Line::from(vec![
-                Span::raw("  📎 "),
-                Span::styled(att.filename.clone(), Style::default().fg(theme.chip_fg)),
-                Span::styled(format!(" ({kb} KB · {})", att.mime_type), theme.muted_style()),
+                Span::raw("  • "),
+                Span::styled(att.filename.clone(), file_style),
+                Span::styled(
+                    format!(" ({kb} KB · {})", att.mime_type),
+                    theme.muted_style(),
+                ),
             ]));
         }
-        lines.push(Line::from(""));
+        if !is_compact {
+            lines.push(Line::from(""));
+        }
     }
 
     // 7. Footer comments
     lines.push(Line::from(Span::styled(
-        format!(" ▾ 페이지 댓글 ({}) — [c]댓글 작성", page.comments.len()),
-        Style::default()
-            .fg(theme.confluence_teal)
-            .add_modifier(Modifier::BOLD),
+        format!(
+            " ▾ Page Comments ({}) — [c] Add Comment",
+            page.comments.len()
+        ),
+        teal_bold,
     )));
     if page.comments.is_empty() {
-        lines.push(Line::from(Span::styled("  (댓글 없음)", theme.muted_style())));
+        lines.push(Line::from(Span::styled(
+            "  (no comments)",
+            theme.muted_style(),
+        )));
     } else {
         for c in &page.comments {
+            let author_style = if theme.no_color {
+                Style::default().add_modifier(Modifier::BOLD)
+            } else {
+                Style::default()
+                    .fg(theme.author(&c.author_name))
+                    .add_modifier(Modifier::BOLD)
+            };
             lines.push(Line::from(vec![
-                Span::styled(
-                    format!("  💬 {} ", c.author_name),
-                    Style::default()
-                        .fg(theme.mention_fg)
-                        .add_modifier(Modifier::BOLD),
-                ),
+                Span::styled(format!("  {} ", c.author_name), author_style),
                 Span::styled(c.created_at.clone(), theme.muted_style()),
             ]));
             let c_blocks = if !c.blocks.is_empty() {
@@ -360,7 +461,9 @@ fn build_wiki_reader_lines(
                 l.spans.insert(0, Span::raw("    "));
                 lines.push(l);
             }
-            lines.push(Line::from(""));
+            if !is_compact {
+                lines.push(Line::from(""));
+            }
         }
     }
 
@@ -370,12 +473,43 @@ fn build_wiki_reader_lines(
 fn draw_toc_drawer(frame: &mut Frame, area: Rect, app: &AppState, ui: &mut UiState) {
     let theme = &ui.theme;
     let focused = ui.focus == PaneFocus::Detail;
-    let block = Block::default()
-        .borders(Borders::ALL)
-        .title(Line::from(Span::styled(" 목차 (TOC) [t] ", theme.title(focused))))
-        .border_style(theme.border_style(focused));
-    let inner = block.inner(area);
-    frame.render_widget(block, area);
+    let sidebar_style = theme.surface_style(theme.bg_sidebar);
+    fill_surface(frame, area, sidebar_style);
+    if area.width < 4 || area.height < 3 {
+        return;
+    }
+
+    let hdr_rect = Rect::new(area.x, area.y, area.width, 1);
+    let focus_mark = if focused { "▸" } else { " " };
+    frame.render_widget(
+        Paragraph::new(Line::from(Span::styled(
+            truncate_width(
+                &format!("{focus_mark} Table of Contents [t]"),
+                area.width as usize,
+            ),
+            theme.title(focused),
+        )))
+        .style(sidebar_style),
+        hdr_rect,
+    );
+    draw_horizontal_hairline(
+        frame,
+        area.x,
+        area.y + 1,
+        area.width,
+        if focused {
+            theme.accent_style()
+        } else {
+            theme.subtle_style()
+        },
+    );
+
+    let inner = Rect::new(
+        area.x,
+        area.y + 2,
+        area.width,
+        area.height.saturating_sub(2),
+    );
     if inner.width == 0 || inner.height == 0 {
         return;
     }
@@ -386,7 +520,8 @@ fn draw_toc_drawer(frame: &mut Frame, area: Rect, app: &AppState, ui: &mut UiSta
     let toc: Vec<_> = page.toc.iter().filter(|t| t.level <= 4).collect();
     if toc.is_empty() {
         frame.render_widget(
-            Paragraph::new(Span::styled(" (목차 없음)", theme.muted_style())),
+            Paragraph::new(Span::styled(" (no headings)", theme.muted_style()))
+                .style(sidebar_style),
             inner,
         );
         return;
@@ -396,15 +531,15 @@ fn draw_toc_drawer(frame: &mut Frame, area: Rect, app: &AppState, ui: &mut UiSta
     for (idx, entry) in toc.iter().enumerate().take(inner.height as usize) {
         let is_sel = ui.confluence_ui.selected_toc == idx;
         let style = if focused && is_sel {
-            theme.selection()
+            theme.nav_selection()
         } else if is_sel {
             theme.accent_style()
         } else {
-            Style::default()
+            sidebar_style
         };
         let indent = "  ".repeat(entry.level.saturating_sub(1) as usize);
         lines.push(Line::from(Span::styled(
-            truncate_width(&format!("{indent}• {}", entry.text), inner.width as usize),
+            truncate_width(&format!(" {indent}• {}", entry.text), inner.width as usize),
             style,
         )));
         ui.hitmap.add_line(
@@ -414,5 +549,5 @@ fn draw_toc_drawer(frame: &mut Frame, area: Rect, app: &AppState, ui: &mut UiSta
             HitTarget::TocItem(idx),
         );
     }
-    frame.render_widget(Paragraph::new(lines), inner);
+    frame.render_widget(Paragraph::new(lines).style(sidebar_style), inner);
 }

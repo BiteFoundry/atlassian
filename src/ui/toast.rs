@@ -65,6 +65,14 @@ impl ToastQueue {
         if self.max == 0 {
             self.max = 4;
         }
+        if let Some(existing) = self
+            .toasts
+            .iter_mut()
+            .find(|t| t.kind == toast.kind && t.message == toast.message)
+        {
+            existing.created = Instant::now();
+            return;
+        }
         self.toasts.push_back(toast);
         while self.toasts.len() > self.max {
             self.toasts.pop_front();
@@ -123,8 +131,8 @@ impl TaskStatus {
     pub fn display(&self) -> String {
         match &self.state {
             TaskState::Running => format!("{}…", self.label),
-            TaskState::Done => format!("{} 완료", self.label),
-            TaskState::Failed(err) => format!("{} 실패: {err}", self.label),
+            TaskState::Done => format!("{} done", self.label),
+            TaskState::Failed(err) => format!("{} failed: {err}", self.label),
         }
     }
 
@@ -171,11 +179,54 @@ impl TaskBoard {
         self.tasks = keep;
     }
 
+    pub fn running(&self) -> impl Iterator<Item = &TaskStatus> {
+        self.tasks.iter().filter(|t| t.running())
+    }
+
     pub fn first_running(&self) -> Option<&TaskStatus> {
-        self.tasks.iter().find(|t| t.running())
+        self.running().next()
     }
 
     pub fn last(&self) -> Option<&TaskStatus> {
         self.tasks.last()
+    }
+
+    pub fn clear(&mut self) {
+        self.tasks.clear();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn toasts_deduplicate_and_expire_cleanly() {
+        let mut queue = ToastQueue::new();
+        let older = Instant::now() - Duration::from_secs(3);
+        queue.push(Toast {
+            message: "Sync failed".to_string(),
+            kind: ToastKind::Error,
+            created: older,
+            ttl: Duration::from_secs(4),
+        });
+        assert_eq!(queue.len(), 1);
+        queue.error("Sync failed");
+        assert_eq!(queue.len(), 1);
+        assert!(queue.current().unwrap().created > older);
+
+        queue.info("Sync failed");
+        assert_eq!(queue.len(), 2);
+    }
+
+    #[test]
+    fn task_board_formats_english_status() {
+        let mut board = TaskBoard::default();
+        board.begin("Sync");
+        assert_eq!(board.first_running().unwrap().display(), "Sync…");
+        board.finish("Sync", None);
+        assert_eq!(board.last().unwrap().display(), "Sync done");
+        board.finish("Sync", Some("timeout".into()));
+        assert_eq!(board.last().unwrap().display(), "Sync failed: timeout");
     }
 }

@@ -1,9 +1,9 @@
-//! Rich `DocBlock` -> styled `Vec<Line<'static>>` renderer (CJK Unicode width-aware).
+//! Rich `DocBlock` -> styled `Vec<Line<'static>>` renderer (Unicode width-aware).
 
 use std::collections::HashMap;
 
 use ratatui::{
-    style::{Color, Modifier, Style},
+    style::{Modifier, Style},
     text::{Line, Span},
 };
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
@@ -96,7 +96,10 @@ pub fn render_blocks(
     let mut out = Vec::new();
     render_block_list(blocks, w, theme, image_cache, inline_images, &[], &mut out);
     // Trim trailing blank lines for tidy layout.
-    while out.last().is_some_and(|l| l.spans.is_empty() || l.width() == 0) {
+    while out
+        .last()
+        .is_some_and(|l| l.spans.is_empty() || l.width() == 0)
+    {
         out.pop();
     }
     out
@@ -116,34 +119,40 @@ pub fn inline_nodes_to_spans(nodes: &[InlineNode], theme: &Theme) -> Vec<Span<'s
                 } else {
                     format!("@{display}")
                 };
-                spans.push(Span::styled(
-                    format!(" {label} "),
+                let style = if theme.no_color {
+                    Style::default().add_modifier(Modifier::BOLD | Modifier::UNDERLINED)
+                } else {
                     Style::default()
                         .bg(theme.mention_bg)
                         .fg(theme.mention_fg)
-                        .add_modifier(Modifier::BOLD),
-                ));
+                        .add_modifier(Modifier::BOLD)
+                };
+                spans.push(Span::styled(format!(" {label} "), style));
             }
             InlineNode::StatusLozenge { text, category } => {
                 spans.push(theme.status_lozenge_span(text, *category));
             }
             InlineNode::IssueRef { key } => {
-                spans.push(Span::styled(
-                    format!("[{key}]"),
+                let style = if theme.no_color {
+                    Style::default().add_modifier(Modifier::BOLD)
+                } else {
                     Style::default()
                         .bg(theme.chip_bg)
                         .fg(theme.chip_fg)
-                        .add_modifier(Modifier::BOLD),
-                ));
+                        .add_modifier(Modifier::BOLD)
+                };
+                spans.push(Span::styled(format!("[{key}]"), style));
             }
             InlineNode::PageRef { title, .. } => {
-                spans.push(Span::styled(
-                    format!("[📄 {title}]"),
+                let style = if theme.no_color {
+                    Style::default().add_modifier(Modifier::BOLD)
+                } else {
                     Style::default()
-                        .bg(Color::Rgb(16, 62, 74))
+                        .bg(theme.wiki_chip_bg)
                         .fg(theme.confluence_teal)
-                        .add_modifier(Modifier::BOLD),
-                ));
+                        .add_modifier(Modifier::BOLD)
+                };
+                spans.push(Span::styled(format!("[Wiki: {title}]"), style));
             }
             InlineNode::Emoji { text } => {
                 spans.push(Span::raw(text.clone()));
@@ -183,7 +192,7 @@ pub fn inline_nodes_plain_text(nodes: &[InlineNode]) -> String {
                 out.push(']');
             }
             InlineNode::PageRef { title, .. } => {
-                out.push_str("[📄 ");
+                out.push_str("[Wiki: ");
                 out.push_str(title);
                 out.push(']');
             }
@@ -195,7 +204,11 @@ pub fn inline_nodes_plain_text(nodes: &[InlineNode]) -> String {
 }
 
 fn map_inline_style(style: &InlineStyle, theme: &Theme) -> Style {
-    let mut st = Style::default();
+    let mut st = if theme.no_color {
+        Style::default()
+    } else {
+        Style::default().fg(theme.fg_primary)
+    };
     if style.bold {
         st = st.add_modifier(Modifier::BOLD);
     }
@@ -209,10 +222,14 @@ fn map_inline_style(style: &InlineStyle, theme: &Theme) -> Style {
         st = st.add_modifier(Modifier::UNDERLINED);
     }
     if style.code {
-        st = st.fg(theme.code_fg).bg(theme.code_bg);
+        st = theme.code_style();
     }
     if style.link_url.is_some() {
-        st = st.fg(theme.accent).add_modifier(Modifier::UNDERLINED);
+        st = if theme.no_color {
+            st.add_modifier(Modifier::UNDERLINED)
+        } else {
+            st.fg(theme.accent).add_modifier(Modifier::UNDERLINED)
+        };
     }
     st
 }
@@ -254,10 +271,7 @@ fn render_block_list(
                 if *level <= 2 {
                     let rule_w = inner_w.min(48);
                     let mut r_spans = prefix.to_vec();
-                    r_spans.push(Span::styled(
-                        "─".repeat(rule_w),
-                        Style::default().fg(theme.border),
-                    ));
+                    r_spans.push(Span::styled("─".repeat(rule_w), theme.subtle_style()));
                     out.push(Line::from(r_spans));
                 }
                 if idx + 1 < blocks.len() {
@@ -265,12 +279,17 @@ fn render_block_list(
                 }
             }
             DocBlock::BulletList { items } => {
+                let bullet_style = if theme.no_color {
+                    Style::default()
+                } else {
+                    Style::default().fg(theme.accent)
+                };
                 for item in items {
                     render_list_item(
                         item,
                         "• ",
                         "  ",
-                        Style::default().fg(theme.accent),
+                        bullet_style,
                         inner_w,
                         theme,
                         image_cache,
@@ -284,6 +303,7 @@ fn render_block_list(
                 }
             }
             DocBlock::OrderedList { start, items } => {
+                let num_style = theme.accent_style();
                 for (i, item) in items.iter().enumerate() {
                     let marker = format!("{}. ", start + i);
                     let cont = " ".repeat(marker.width());
@@ -291,7 +311,7 @@ fn render_block_list(
                         item,
                         &marker,
                         &cont,
-                        Style::default().fg(theme.accent).add_modifier(Modifier::BOLD),
+                        num_style,
                         inner_w,
                         theme,
                         image_cache,
@@ -307,9 +327,18 @@ fn render_block_list(
             DocBlock::TaskList { items } => {
                 for TaskItem { checked, content } in items {
                     let (icon, icon_style) = if *checked {
-                        ("☑ ", Style::default().fg(theme.success).add_modifier(Modifier::BOLD))
+                        (
+                            "☑ ",
+                            if theme.no_color {
+                                Style::default().add_modifier(Modifier::BOLD)
+                            } else {
+                                Style::default()
+                                    .fg(theme.success)
+                                    .add_modifier(Modifier::BOLD)
+                            },
+                        )
                     } else {
-                        ("☐ ", Style::default().fg(theme.muted))
+                        ("☐ ", theme.muted_style())
                     };
                     let mut first_pfx = prefix.to_vec();
                     first_pfx.push(Span::styled(icon, icon_style));
@@ -318,7 +347,9 @@ fn render_block_list(
                     let mut spans = inline_nodes_to_spans(content, theme);
                     if *checked {
                         for sp in &mut spans {
-                            sp.style = sp.style.fg(theme.muted).add_modifier(Modifier::CROSSED_OUT);
+                            sp.style = theme
+                                .muted_style()
+                                .add_modifier(Modifier::CROSSED_OUT);
                         }
                     }
                     out.extend(wrap_spans_with_prefix(
@@ -340,7 +371,7 @@ fn render_block_list(
             }
             DocBlock::Blockquote { blocks: inner } => {
                 let mut bq_pfx = prefix.to_vec();
-                bq_pfx.push(Span::styled("│ ", Style::default().fg(theme.border)));
+                bq_pfx.push(Span::styled("│ ", theme.subtle_style()));
                 render_block_list(inner, width, theme, image_cache, inline_images, &bq_pfx, out);
                 if idx + 1 < blocks.len() {
                     out.push(Line::from(prefix.to_vec()));
@@ -352,22 +383,32 @@ fn render_block_list(
                 blocks: inner,
             } => {
                 let (color, icon, default_lbl) = theme.panel_meta(*kind);
-                let border_span = Span::styled("▌ ", Style::default().fg(color).add_modifier(Modifier::BOLD));
+                let accent = if theme.no_color {
+                    Style::default().add_modifier(Modifier::BOLD)
+                } else {
+                    Style::default().fg(color).add_modifier(Modifier::BOLD)
+                };
+                let border_span = Span::styled("▌ ", accent);
                 let mut hdr = prefix.to_vec();
                 hdr.push(border_span.clone());
                 let title_text = title
                     .as_deref()
                     .filter(|t| !t.trim().is_empty())
                     .unwrap_or(default_lbl);
-                hdr.push(Span::styled(
-                    format!("{icon} {title_text}"),
-                    Style::default().fg(color).add_modifier(Modifier::BOLD),
-                ));
+                hdr.push(Span::styled(format!("{icon} {title_text}"), accent));
                 out.push(Line::from(hdr));
 
                 let mut panel_pfx = prefix.to_vec();
                 panel_pfx.push(border_span);
-                render_block_list(inner, width, theme, image_cache, inline_images, &panel_pfx, out);
+                render_block_list(
+                    inner,
+                    width,
+                    theme,
+                    image_cache,
+                    inline_images,
+                    &panel_pfx,
+                    out,
+                );
                 if idx + 1 < blocks.len() {
                     out.push(Line::from(prefix.to_vec()));
                 }
@@ -377,17 +418,20 @@ fn render_block_list(
                 blocks: inner,
             } => {
                 let mut hdr = prefix.to_vec();
-                hdr.push(Span::styled(
-                    format!("▾ {title}"),
-                    Style::default()
-                        .fg(theme.accent)
-                        .add_modifier(Modifier::BOLD),
-                ));
+                hdr.push(Span::styled(format!("▾ {title}"), theme.accent_style()));
                 out.push(Line::from(hdr));
 
                 let mut exp_pfx = prefix.to_vec();
                 exp_pfx.push(Span::styled("  ", theme.muted_style()));
-                render_block_list(inner, width, theme, image_cache, inline_images, &exp_pfx, out);
+                render_block_list(
+                    inner,
+                    width,
+                    theme,
+                    image_cache,
+                    inline_images,
+                    &exp_pfx,
+                    out,
+                );
                 if idx + 1 < blocks.len() {
                     out.push(Line::from(prefix.to_vec()));
                 }
@@ -419,13 +463,18 @@ fn render_block_list(
                         }
                     }
                 }
-                let mut sp = prefix.to_vec();
-                sp.push(Span::styled(
-                    format!("[🖼 {label} — press v to preview]"),
+                let chip_style = if theme.no_color {
+                    Style::default().add_modifier(Modifier::BOLD)
+                } else {
                     Style::default()
                         .bg(theme.chip_bg)
                         .fg(theme.chip_fg)
-                        .add_modifier(Modifier::BOLD),
+                        .add_modifier(Modifier::BOLD)
+                };
+                let mut sp = prefix.to_vec();
+                sp.push(Span::styled(
+                    format!("[Image: {label} — press v to preview]"),
+                    chip_style,
                 ));
                 out.push(Line::from(sp));
                 if idx + 1 < blocks.len() {
@@ -434,10 +483,7 @@ fn render_block_list(
             }
             DocBlock::Rule => {
                 let mut sp = prefix.to_vec();
-                sp.push(Span::styled(
-                    "─".repeat(inner_w.min(64)),
-                    Style::default().fg(theme.border),
-                ));
+                sp.push(Span::styled("─".repeat(inner_w.min(64)), theme.subtle_style()));
                 out.push(Line::from(sp));
                 if idx + 1 < blocks.len() {
                     out.push(Line::from(prefix.to_vec()));
@@ -462,7 +508,15 @@ fn render_list_item(
 ) {
     let mut sub_out = Vec::new();
     let avail = inner_w.saturating_sub(marker.width()).max(8);
-    render_block_list(item_blocks, avail, theme, image_cache, inline_images, &[], &mut sub_out);
+    render_block_list(
+        item_blocks,
+        avail,
+        theme,
+        image_cache,
+        inline_images,
+        &[],
+        &mut sub_out,
+    );
     if sub_out.is_empty() {
         let mut sp = prefix.to_vec();
         sp.push(Span::styled(marker.to_string(), marker_style));
@@ -482,6 +536,16 @@ fn render_list_item(
 }
 
 fn heading_style(level: u8, theme: &Theme) -> (&'static str, Style) {
+    if theme.no_color {
+        return match level {
+            1 => ("H1 ", Style::default().add_modifier(Modifier::BOLD | Modifier::UNDERLINED)),
+            2 => ("H2 ", Style::default().add_modifier(Modifier::BOLD)),
+            3 => ("H3 ", Style::default().add_modifier(Modifier::BOLD)),
+            4 => ("H4 ", Style::default().add_modifier(Modifier::BOLD)),
+            5 => ("H5 ", Style::default().add_modifier(Modifier::BOLD)),
+            _ => ("H6 ", Style::default().add_modifier(Modifier::DIM | Modifier::BOLD)),
+        };
+    }
     match level {
         1 => (
             "H1 ",
@@ -498,7 +562,7 @@ fn heading_style(level: u8, theme: &Theme) -> (&'static str, Style) {
         3 => (
             "H3 ",
             Style::default()
-                .fg(Color::Rgb(179, 212, 255))
+                .fg(theme.accent_soft)
                 .add_modifier(Modifier::BOLD),
         ),
         4 => (
@@ -516,7 +580,7 @@ fn heading_style(level: u8, theme: &Theme) -> (&'static str, Style) {
         _ => (
             "H6 ",
             Style::default()
-                .fg(theme.muted)
+                .fg(theme.fg_muted)
                 .add_modifier(Modifier::BOLD),
         ),
     }
@@ -539,10 +603,11 @@ fn render_code_block(
     let top_fill = box_w
         .saturating_sub(2 + header_title.width())
         .max(1);
+    let border_st = theme.subtle_style();
     let mut top = prefix.to_vec();
     top.push(Span::styled(
         format!("┌{header_title}{}┐", "─".repeat(top_fill)),
-        Style::default().fg(theme.border),
+        border_st,
     ));
     out.push(Line::from(top));
 
@@ -552,24 +617,24 @@ fn render_code_block(
         for seg in wrapped {
             let padded = pad_right_width(&seg, code_inner_w);
             let mut row = prefix.to_vec();
-            row.push(Span::styled("│ ", Style::default().fg(theme.border)));
+            row.push(Span::styled("│ ", border_st));
             row.push(Span::styled(padded, theme.code_style()));
-            row.push(Span::styled(" │", Style::default().fg(theme.border)));
+            row.push(Span::styled(" │", border_st));
             out.push(Line::from(row));
         }
     }
     if code.is_empty() {
         let mut row = prefix.to_vec();
-        row.push(Span::styled("│ ", Style::default().fg(theme.border)));
+        row.push(Span::styled("│ ", border_st));
         row.push(Span::styled(" ".repeat(code_inner_w), theme.code_style()));
-        row.push(Span::styled(" │", Style::default().fg(theme.border)));
+        row.push(Span::styled(" │", border_st));
         out.push(Line::from(row));
     }
 
     let mut bottom = prefix.to_vec();
     bottom.push(Span::styled(
         format!("└{}┘", "─".repeat(box_w.saturating_sub(2))),
-        Style::default().fg(theme.border),
+        border_st,
     ));
     out.push(Line::from(bottom));
 }
@@ -601,12 +666,10 @@ fn render_table(
         }
     }
 
-    // Budget: borders use 1 + col_count * 3 (space + cell + space + │).
     let overhead = 1 + col_count * 3;
     let avail = inner_w.saturating_sub(overhead).max(col_count * 3);
     let total_req: usize = col_widths.iter().sum();
     if total_req > avail {
-        // Proportionally shrink widest columns while keeping minimum 3 cols each.
         let mut remaining = total_req - avail;
         while remaining > 0 {
             let Some((idx, _)) = col_widths.iter().enumerate().max_by_key(|(_, w)| *w) else {
@@ -620,7 +683,7 @@ fn render_table(
         }
     }
 
-    let border_style = Style::default().fg(theme.border);
+    let border_style = theme.subtle_style();
     let make_border = |left: &str, mid: &str, right: &str| -> Line<'static> {
         let mut s = String::from(left);
         for (i, w) in col_widths.iter().enumerate() {
@@ -646,12 +709,7 @@ fn render_table(
                 .map(|n| inline_nodes_plain_text(n))
                 .unwrap_or_default();
             let cell = pad_right_width(&truncate_width(&txt, *w), *w);
-            line_spans.push(Span::styled(
-                format!(" {cell} "),
-                Style::default()
-                    .fg(theme.accent)
-                    .add_modifier(Modifier::BOLD),
-            ));
+            line_spans.push(Span::styled(format!(" {cell} "), theme.accent_style()));
             line_spans.push(Span::styled("│", border_style));
         }
         out.push(Line::from(line_spans));
@@ -697,7 +755,7 @@ pub fn wrap_spans_with_prefix(
     for span in spans {
         let style = span.style;
         let text = span.content.as_ref();
-        // Atomic chips/pills shouldn't break mid-token if possible.
+        // Atomic chips/pills should not break mid-token if possible.
         let is_chip = style.bg.is_some();
 
         for (seg_idx, segment) in text.split('\n').enumerate() {
@@ -760,7 +818,7 @@ mod tests {
             DocBlock::Paragraph {
                 spans: vec![
                     InlineNode::Text {
-                        text: "현재 상태: ".into(),
+                        text: "Current status: ".into(),
                         style: InlineStyle::default(),
                     },
                     InlineNode::StatusLozenge {
@@ -774,17 +832,17 @@ mod tests {
                 title: None,
                 blocks: vec![DocBlock::Paragraph {
                     spans: vec![InlineNode::Text {
-                        text: "정보 패널 본문입니다".into(),
+                        text: "Informational callout body".into(),
                         style: InlineStyle::default(),
                     }],
                 }],
             },
             DocBlock::Panel {
                 kind: PanelKind::Warning,
-                title: Some("주의".into()),
+                title: Some("Caution".into()),
                 blocks: vec![DocBlock::Paragraph {
                     spans: vec![InlineNode::Text {
-                        text: "배포 전 확인".into(),
+                        text: "Verify before deploying".into(),
                         style: InlineStyle::default(),
                     }],
                 }],
@@ -792,11 +850,11 @@ mod tests {
             DocBlock::Table {
                 headers: vec![
                     vec![InlineNode::Text {
-                        text: "키".into(),
+                        text: "Key".into(),
                         style: InlineStyle::default(),
                     }],
                     vec![InlineNode::Text {
-                        text: "담당자".into(),
+                        text: "Assignee".into(),
                         style: InlineStyle::default(),
                     }],
                 ],
@@ -806,7 +864,7 @@ mod tests {
                         style: InlineStyle::default(),
                     }],
                     vec![InlineNode::Text {
-                        text: "김철수".into(),
+                        text: "Alice".into(),
                         style: InlineStyle::default(),
                     }],
                 ]],
@@ -822,7 +880,7 @@ mod tests {
 
         assert!(text.contains(" IN REVIEW "), "expected lozenge in:\n{text}");
         assert!(text.contains("▌ ℹ Info"), "expected info panel in:\n{text}");
-        assert!(text.contains("▌ ⚠ 주의"), "expected warning panel in:\n{text}");
+        assert!(text.contains("▌ ⚠ Caution"), "expected warning panel in:\n{text}");
         assert!(text.contains("┌"), "expected box-drawing table/code in:\n{text}");
         assert!(text.contains("┬"), "expected table header separator in:\n{text}");
         assert!(text.contains("│ ATL-1"), "expected table row in:\n{text}");
@@ -831,8 +889,8 @@ mod tests {
     }
 
     #[test]
-    fn cjk_wrapping_and_truncation_never_split_utf8() {
-        let s = "한글테스트문장입니다";
+    fn wide_unicode_wrapping_and_truncation_never_split_utf8() {
+        let s = "ＡＢＣＤＥＦＧＨＩＪ";
         let truncated = truncate_width(s, 7);
         assert!(truncated.width() <= 7);
         assert!(truncated.ends_with('…'));

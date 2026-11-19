@@ -1,4 +1,5 @@
-//! Unified Jira + Confluence UI module (`ratatui`): Persona Header Bar, 3-tier responsive layout, and rendering pipeline.
+//! Unified Jira + Confluence UI module (`ratatui`): minimal-chrome persona header,
+//! 3-tier responsive hairline layout, density support, and Braille spinner status bar.
 
 pub mod action;
 pub mod app;
@@ -17,21 +18,34 @@ pub mod text_edit;
 pub mod theme;
 pub mod toast;
 
+use std::{sync::OnceLock, time::Instant};
+
 use ratatui::{
     layout::{Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span},
-    widgets::Paragraph,
+    widgets::{Block, Paragraph},
     Frame,
 };
 use unicode_width::UnicodeWidthStr;
 
 use self::{
-    app::{AppState, PaneFocus, UiState, WorkspaceTab, TAB_LABELS},
+    app::{AppState, PaneFocus, UiState, WorkspaceTab},
     doc_view::truncate_width,
     hitmap::HitTarget,
     toast::ToastKind,
 };
+
+const SPINNER_FRAMES: &[&str] = &["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
+
+const WORKSPACE_TAB_LABELS: [&str; 6] = [
+    "1:Board",
+    "2:Issues",
+    "3:My Work",
+    "4:Wiki",
+    "5:Search",
+    "6:Directory",
+];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LayoutMode {
@@ -50,6 +64,72 @@ pub fn layout_mode(width: u16) -> LayoutMode {
     }
 }
 
+pub(crate) fn spinner_glyph() -> &'static str {
+    static START: OnceLock<Instant> = OnceLock::new();
+    let elapsed_ms = START.get_or_init(Instant::now).elapsed().as_millis();
+    SPINNER_FRAMES[((elapsed_ms / 120) as usize) % SPINNER_FRAMES.len()]
+}
+
+pub(crate) fn site_display_english(app: &AppState) -> String {
+    let raw = app.config.site_url.trim();
+    if raw.is_empty() {
+        "Not configured".to_string()
+    } else {
+        raw.trim_start_matches("https://")
+            .trim_start_matches("http://")
+            .trim_end_matches('/')
+            .to_string()
+    }
+}
+
+pub(crate) fn draw_vertical_hairline(
+    frame: &mut Frame,
+    x: u16,
+    y: u16,
+    height: u16,
+    style: Style,
+) {
+    let buf_area = frame.area();
+    if height == 0 || x < buf_area.left() || x >= buf_area.right() {
+        return;
+    }
+    let start_y = y.max(buf_area.top());
+    let end_y = y.saturating_add(height).min(buf_area.bottom());
+    let buf = frame.buffer_mut();
+    for row_y in start_y..end_y {
+        buf[(x, row_y)].set_symbol("│").set_style(style);
+    }
+}
+
+pub(crate) fn draw_horizontal_hairline(
+    frame: &mut Frame,
+    x: u16,
+    y: u16,
+    width: u16,
+    style: Style,
+) {
+    if width == 0 {
+        return;
+    }
+    let buf_area = frame.area();
+    if y < buf_area.top() || y >= buf_area.bottom() {
+        return;
+    }
+    let start_x = x.max(buf_area.left());
+    let end_x = x.saturating_add(width).min(buf_area.right());
+    let buf = frame.buffer_mut();
+    for col_x in start_x..end_x {
+        buf[(col_x, y)].set_symbol("─").set_style(style);
+    }
+}
+
+pub(crate) fn fill_surface(frame: &mut Frame, area: Rect, style: Style) {
+    if area.width == 0 || area.height == 0 {
+        return;
+    }
+    frame.render_widget(Block::default().style(style), area);
+}
+
 pub fn draw(frame: &mut Frame, app: &AppState, ui: &mut UiState) -> Option<(u16, u16)> {
     let area = frame.area();
     ui.term_width = area.width;
@@ -58,6 +138,13 @@ pub fn draw(frame: &mut Frame, app: &AppState, ui: &mut UiState) -> Option<(u16,
 
     if area.width < 12 || area.height < 5 {
         return None;
+    }
+
+    if !ui.theme.no_color {
+        let base_style = Style::default()
+            .bg(ui.theme.bg_canvas)
+            .fg(ui.theme.fg_primary);
+        fill_surface(frame, area, base_style);
     }
 
     let rows = Layout::default()
@@ -73,48 +160,70 @@ pub fn draw(frame: &mut Frame, app: &AppState, ui: &mut UiState) -> Option<(u16,
 
     let mode = layout_mode(area.width);
     let body = rows[1];
-    let has_nav = matches!(
+    let tab_supports_nav = matches!(
         ui.active_tab,
         WorkspaceTab::Board | WorkspaceTab::Issues | WorkspaceTab::Confluence
     );
+    let show_nav = tab_supports_nav && (ui.show_nav_rail || mode == LayoutMode::Narrow);
     let has_drawer = match ui.active_tab {
         WorkspaceTab::Board => ui.board_ui.drawer_open && mode == LayoutMode::Wide,
         WorkspaceTab::Confluence => ui.confluence_ui.toc_open && mode == LayoutMode::Wide,
         _ => false,
     };
 
-    let (nav_rect, main_rect, drawer_rect) = if !has_nav {
-        (None, body, None)
+    let (nav_rect, main_rect, drawer_rect) = if !show_nav {
+        if has_drawer && mode == LayoutMode::Wide {
+            let drawer_w = (body.width * 34 / 100).clamp(34, 54);
+            let cols = Layout::default()
+                .direction(Direction::Horizontal)
+                .constraints([
+                    Constraint::Min(30),
+                    Constraint::Length(1),
+                    Constraint::Length(drawer_w),
+                ])
+                .split(body);
+            (None, cols[0], Some(cols[2]))
+        } else {
+            (None, body, None)
+        }
     } else {
         match mode {
             LayoutMode::Wide => {
                 let nav_w = 28u16;
+                let nav_sep = 1u16;
                 let drawer_w = if has_drawer {
                     (body.width * 34 / 100).clamp(34, 54)
                 } else {
                     0
                 };
+                let drawer_sep = if drawer_w > 0 { 1u16 } else { 0 };
                 let cols = Layout::default()
                     .direction(Direction::Horizontal)
                     .constraints([
                         Constraint::Length(nav_w),
+                        Constraint::Length(nav_sep),
                         Constraint::Min(30),
+                        Constraint::Length(drawer_sep),
                         Constraint::Length(drawer_w),
                     ])
                     .split(body);
                 (
                     Some(cols[0]),
-                    cols[1],
-                    (drawer_w > 0).then_some(cols[2]),
+                    cols[2],
+                    (drawer_w > 0).then_some(cols[4]),
                 )
             }
             LayoutMode::Medium => {
                 let nav_w = 24u16;
                 let cols = Layout::default()
                     .direction(Direction::Horizontal)
-                    .constraints([Constraint::Length(nav_w), Constraint::Min(28)])
+                    .constraints([
+                        Constraint::Length(nav_w),
+                        Constraint::Length(1),
+                        Constraint::Min(28),
+                    ])
                     .split(body);
-                (Some(cols[0]), cols[1], None)
+                (Some(cols[0]), cols[2], None)
             }
             LayoutMode::Narrow => match ui.focus {
                 PaneFocus::Nav => (Some(body), Rect::default(), None),
@@ -145,6 +254,37 @@ pub fn draw(frame: &mut Frame, app: &AppState, ui: &mut UiState) -> Option<(u16,
         }
     }
 
+    // 1px vertical hairline dividers between adjacent panes
+    if let Some(nav_r) = nav_rect {
+        if main_rect.width > 0 {
+            let sep_x = nav_r.right();
+            if sep_x < main_rect.x && sep_x < area.right() {
+                let sep_focused = matches!(ui.focus, PaneFocus::Nav | PaneFocus::Main);
+                let sep_style = if sep_focused {
+                    ui.theme.accent_style()
+                } else {
+                    ui.theme.subtle_style()
+                };
+                draw_vertical_hairline(frame, sep_x, nav_r.y, nav_r.height, sep_style);
+            }
+        }
+    }
+
+    if let Some(drawer_r) = drawer_rect {
+        if main_rect.width > 0 {
+            let sep_x = main_rect.right();
+            if sep_x < drawer_r.x && sep_x < area.right() {
+                let sep_focused = matches!(ui.focus, PaneFocus::Main | PaneFocus::Detail);
+                let sep_style = if sep_focused {
+                    ui.theme.accent_style()
+                } else {
+                    ui.theme.subtle_style()
+                };
+                draw_vertical_hairline(frame, sep_x, drawer_r.y, drawer_r.height, sep_style);
+            }
+        }
+    }
+
     draw_status_bar(frame, rows[2], app, ui);
 
     let mut hitmap = std::mem::take(&mut ui.hitmap);
@@ -158,7 +298,7 @@ pub fn draw(frame: &mut Frame, app: &AppState, ui: &mut UiState) -> Option<(u16,
 
 fn draw_persona_header(frame: &mut Frame, area: Rect, app: &AppState, ui: &mut UiState) {
     let theme = &ui.theme;
-    let header_bg = Color::Rgb(16, 24, 40);
+    let bar_style = theme.surface_style(theme.bg_header);
     let mut spans = Vec::new();
     let mut x = area.x;
 
@@ -166,33 +306,39 @@ fn draw_persona_header(frame: &mut Frame, area: Rect, app: &AppState, ui: &mut U
     x += badge.content.width() as u16;
     spans.push(badge);
 
-    let site = format!(" {} ", app.site_display());
+    let site = format!(" {} ", site_display_english(app));
     x += site.width() as u16;
     spans.push(Span::styled(
         site,
-        Style::default().bg(header_bg).fg(theme.muted),
+        if theme.no_color {
+            Style::default().add_modifier(Modifier::DIM)
+        } else {
+            Style::default().bg(theme.bg_header).fg(theme.fg_muted)
+        },
     ));
 
-    for (idx, label) in TAB_LABELS.iter().enumerate() {
+    for (idx, label) in WORKSPACE_TAB_LABELS.iter().enumerate() {
         let active = ui.active_tab.index() == idx;
         let text = format!(" {label} ");
         let w = text.width() as u16;
         let style = if active {
-            let active_bg = match idx {
-                3 => theme.confluence_teal,
-                _ => theme.jira_cobalt,
-            };
-            let active_fg = if idx == 3 {
-                Color::Rgb(9, 30, 66)
+            if theme.no_color {
+                Style::default().add_modifier(Modifier::REVERSED | Modifier::BOLD)
             } else {
-                Color::White
-            };
+                let (active_bg, active_fg) = if idx == WorkspaceTab::Confluence.index() {
+                    (theme.confluence_teal, theme.confluence_pill_fg)
+                } else {
+                    (theme.jira_cobalt, theme.jira_pill_fg)
+                };
+                Style::default()
+                    .bg(active_bg)
+                    .fg(active_fg)
+                    .add_modifier(Modifier::BOLD)
+            }
+        } else if theme.no_color {
             Style::default()
-                .bg(active_bg)
-                .fg(active_fg)
-                .add_modifier(Modifier::BOLD)
         } else {
-            Style::default().bg(header_bg).fg(Color::Rgb(180, 192, 212))
+            Style::default().bg(theme.bg_header).fg(theme.fg_secondary)
         };
         if x + w <= area.x + area.width {
             ui.hitmap.add_line(x, area.y, w, HitTarget::Tab(idx));
@@ -201,48 +347,84 @@ fn draw_persona_header(frame: &mut Frame, area: Rect, app: &AppState, ui: &mut U
         spans.push(Span::styled(text, style));
     }
 
-    // Right side: user & sync status
+    // Right side: user & sync status with Braille spinner when active
     let user_str = app
         .me
         .as_ref()
         .map(|u| format!("@{}", u.display_name))
-        .unwrap_or_else(|| app.auth.status_summary());
-    let sync_icon = if app.syncing || ui.tasks.first_running().is_some() {
-        "⟳ 동기화"
+        .unwrap_or_else(|| {
+            if app.auth.is_logged_in() {
+                "Authenticated".to_string()
+            } else {
+                "Offline".to_string()
+            }
+        });
+    let is_busy = app.syncing || ui.tasks.first_running().is_some();
+    let sync_status = if is_busy {
+        format!("{} Syncing", spinner_glyph())
+    } else if app.auth.is_logged_in() {
+        "● Connected".to_string()
     } else {
-        "● 연결"
+        "○ Offline".to_string()
     };
-    let right_text = format!(" {user_str} · {sync_icon} ");
+    let right_text = format!(" {user_str} · {sync_status} ");
     let right_w = right_text.width() as u16;
     let remaining = (area.x + area.width).saturating_sub(x);
     if remaining > right_w {
         spans.push(Span::styled(
             " ".repeat((remaining - right_w) as usize),
-            Style::default().bg(header_bg),
+            bar_style,
         ));
+        let status_fg = if theme.no_color {
+            Color::Reset
+        } else if is_busy {
+            theme.accent_soft
+        } else if app.auth.is_logged_in() {
+            theme.success
+        } else {
+            theme.fg_muted
+        };
         spans.push(Span::styled(
             right_text,
-            Style::default().bg(header_bg).fg(theme.confluence_teal),
+            if theme.no_color {
+                Style::default()
+            } else {
+                Style::default().bg(theme.bg_header).fg(status_fg)
+            },
         ));
     } else if remaining > 0 {
-        spans.push(Span::styled(
-            " ".repeat(remaining as usize),
-            Style::default().bg(header_bg),
-        ));
+        spans.push(Span::styled(" ".repeat(remaining as usize), bar_style));
     }
 
-    frame.render_widget(Paragraph::new(Line::from(spans)), area);
+    frame.render_widget(Paragraph::new(Line::from(spans)).style(bar_style), area);
 }
 
 fn draw_status_bar(frame: &mut Frame, area: Rect, app: &AppState, ui: &UiState) {
     let theme = &ui.theme;
-    let bg = Color::Rgb(18, 22, 32);
+    let bar_style = theme.surface_style(theme.bg_header);
+    let bg = if theme.no_color {
+        Color::Reset
+    } else {
+        theme.bg_header
+    };
 
-    let (msg, style) = if let Some(toast) = ui.toasts.current() {
-        let fg = match toast.kind {
-            ToastKind::Info => theme.accent,
-            ToastKind::Success => theme.success,
-            ToastKind::Error => theme.error,
+    let focus_badge = match ui.focus {
+        PaneFocus::Nav => "[NAV]",
+        PaneFocus::Main => "[MAIN]",
+        PaneFocus::Detail => "[DETAIL]",
+        PaneFocus::JqlBar => "[JQL]",
+        PaneFocus::SearchBar => "[SEARCH]",
+    };
+
+    let (left_msg, left_style) = if let Some(toast) = ui.toasts.current() {
+        let fg = if theme.no_color {
+            Color::Reset
+        } else {
+            match toast.kind {
+                ToastKind::Info => theme.accent_soft,
+                ToastKind::Success => theme.success,
+                ToastKind::Error => theme.error,
+            }
         };
         (
             format!(" {} ", toast.message),
@@ -250,32 +432,83 @@ fn draw_status_bar(frame: &mut Frame, area: Rect, app: &AppState, ui: &UiState) 
         )
     } else if let Some(task) = ui.tasks.first_running() {
         (
-            format!(" ⟳ {} ", task.display()),
-            Style::default().bg(bg).fg(theme.confluence_teal),
+            format!(" {} {} ", spinner_glyph(), task.display()),
+            Style::default()
+                .bg(bg)
+                .fg(if theme.no_color {
+                    Color::Reset
+                } else {
+                    theme.accent_soft
+                }),
+        )
+    } else if app.syncing {
+        (
+            format!(" {} Syncing workspace… ", spinner_glyph()),
+            Style::default()
+                .bg(bg)
+                .fg(if theme.no_color {
+                    Color::Reset
+                } else {
+                    theme.accent_soft
+                }),
         )
     } else {
         let hist = if app.nav_history.is_empty() {
             String::new()
         } else {
-            format!(" [Backspace]뒤로({}) ·", app.nav_history.len())
+            format!("[Backspace] Back ({}) · ", app.nav_history.len())
+        };
+        let rail_hint = if !ui.show_nav_rail {
+            "Nav Hidden · "
+        } else {
+            ""
         };
         (
             format!(
-                " {hist} [Tab]패널이동 · [Ctrl+1..6]탭 · [Ctrl+P / :]팔레트 · [?]도움말 · [q]종료 "
+                " {focus_badge} {hist}{rail_hint}[Tab] Pane · [1-6] Tabs · [Ctrl+P] Palette · [?] Help · [q] Quit "
             ),
-            Style::default().bg(bg).fg(theme.muted),
+            if theme.no_color {
+                Style::default().add_modifier(Modifier::DIM)
+            } else {
+                Style::default().bg(bg).fg(theme.fg_muted)
+            },
         )
     };
 
-    let fitted = truncate_width(&msg, area.width as usize);
-    let pad = (area.width as usize).saturating_sub(fitted.width());
-    frame.render_widget(
-        Paragraph::new(Line::from(vec![
-            Span::styled(fitted, style),
-            Span::styled(" ".repeat(pad), Style::default().bg(bg)),
-        ])),
-        area,
-    );
+    let right_meta = format!(" {} ", app.config.density.label());
+    let right_w = right_meta.width();
+    let total_w = area.width as usize;
+
+    if total_w > right_w + 16 {
+        let left_budget = total_w - right_w;
+        let fitted = truncate_width(&left_msg, left_budget);
+        let pad = left_budget.saturating_sub(fitted.width());
+        let right_style = if theme.no_color {
+            Style::default().add_modifier(Modifier::DIM)
+        } else {
+            Style::default().bg(bg).fg(theme.fg_secondary)
+        };
+        frame.render_widget(
+            Paragraph::new(Line::from(vec![
+                Span::styled(fitted, left_style),
+                Span::styled(" ".repeat(pad), bar_style),
+                Span::styled(right_meta, right_style),
+            ]))
+            .style(bar_style),
+            area,
+        );
+    } else {
+        let fitted = truncate_width(&left_msg, total_w);
+        let pad = total_w.saturating_sub(fitted.width());
+        frame.render_widget(
+            Paragraph::new(Line::from(vec![
+                Span::styled(fitted, left_style),
+                Span::styled(" ".repeat(pad), bar_style),
+            ]))
+            .style(bar_style),
+            area,
+        );
+    }
 }
 
 #[cfg(test)]
@@ -284,14 +517,14 @@ mod tests {
     use crate::{
         atlassian::AtlassianClient,
         auth::AuthManager,
-        config::{AppConfig, Persona},
+        config::{AppConfig, DensityMode, Persona, ThemePreset},
         models::{
             IssueDetail, IssuePriority, IssueStatus, IssueSummary, IssueType, PageDetail,
             PageSummary, SpaceSummary, StatusCategory,
         },
         storage::Storage,
         sync,
-        ui::{action, event, keymap::Action},
+        ui::{action, event, keymap::Action, theme::Theme},
     };
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
     use ratatui::{backend::TestBackend, Terminal};
@@ -325,7 +558,7 @@ mod tests {
             IssueSummary {
                 key: "ATL-1".into(),
                 project_key: "ATL".into(),
-                summary: "칸반 보드 구현".into(),
+                summary: "Implement Kanban board".into(),
                 status: IssueStatus {
                     id: "1".into(),
                     name: "To Do".into(),
@@ -346,7 +579,7 @@ mod tests {
             IssueSummary {
                 key: "ATL-2".into(),
                 project_key: "ATL".into(),
-                summary: "Confluence 트리 렌더링".into(),
+                summary: "Render Confluence page tree".into(),
                 status: IssueStatus {
                     id: "2".into(),
                     name: "In Progress".into(),
@@ -358,7 +591,7 @@ mod tests {
         app.issues = app.board_issues.clone();
         app.active_issue = Some(IssueDetail {
             summary: app.board_issues[0].clone(),
-            description_markdown: "관련 문서 확인".into(),
+            description_markdown: "Review architecture documentation".into(),
             ..Default::default()
         });
 
@@ -372,7 +605,7 @@ mod tests {
         let root_page = PageSummary {
             id: "p1".into(),
             space_key: "ENG".into(),
-            title: "시스템 아키텍처".into(),
+            title: "System Architecture".into(),
             version_number: 3,
             has_children: true,
             ..Default::default()
@@ -381,7 +614,7 @@ mod tests {
             .insert("ENG".into(), vec![root_page.clone()]);
         app.active_page = Some(PageDetail {
             summary: root_page,
-            body_markdown: "ATL-1 이슈와 연결됨".into(),
+            body_markdown: "Linked with ATL-1 issue".into(),
             ..Default::default()
         });
 
@@ -417,10 +650,11 @@ mod tests {
         assert_eq!(ui.active_tab, WorkspaceTab::Board);
 
         let screen = render_buffer_text(&app, &mut ui, 130, 36);
-        assert!(screen.contains("JIRA"), "expected JIRA badge:\n{screen}");
+        assert!(screen.contains(" JIRA "), "expected clean JIRA pill:\n{screen}");
         assert!(screen.contains("acme.atlassian.net"), "expected site:\n{screen}");
         assert!(screen.contains("ATL-1"), "expected card ATL-1:\n{screen}");
         assert!(screen.contains("ATL-2"), "expected card ATL-2:\n{screen}");
+        assert!(screen.contains("│"), "expected hairline divider:\n{screen}");
 
         // Navigate right column with `l` / `MoveRight`
         assert_eq!(ui.board_ui.selected_col, 0);
@@ -453,11 +687,11 @@ mod tests {
 
         let screen = render_buffer_text(&app, &mut ui, 130, 36);
         assert!(
-            screen.contains("CONFLUENCE"),
-            "expected CONFLUENCE badge:\n{screen}"
+            screen.contains(" CONFLUENCE "),
+            "expected clean CONFLUENCE pill:\n{screen}"
         );
         assert!(
-            screen.contains("시스템 아키텍처"),
+            screen.contains("System Architecture"),
             "expected page title in tree/reader:\n{screen}"
         );
 
@@ -470,6 +704,43 @@ mod tests {
             action::dispatch(Action::SwitchTab(tab), &mut app, &mut ui);
             let _ = render_buffer_text(&app, &mut ui, 130, 36);
             let _ = render_buffer_text(&app, &mut ui, 70, 24);
+        }
+    }
+
+    #[tokio::test]
+    async fn nav_rail_density_themes_and_spinner_render_cleanly() {
+        let (mut app, mut ui) = test_app(Persona::Jira);
+
+        // Toggle nav rail off
+        ui.show_nav_rail = false;
+        let without_nav = render_buffer_text(&app, &mut ui, 130, 36);
+        assert!(!without_nav.contains("Boards & Sprints"));
+        assert!(without_nav.contains("Nav Hidden"));
+
+        // Density compact + syncing spinner
+        app.config.density = DensityMode::Compact;
+        app.syncing = true;
+        let compact_sync = render_buffer_text(&app, &mut ui, 130, 36);
+        assert!(compact_sync.contains("Compact"));
+        assert!(compact_sync.contains("Syncing"));
+        assert!(
+            SPINNER_FRAMES.iter().any(|f| compact_sync.contains(f)),
+            "expected braille spinner in:\n{compact_sync}"
+        );
+
+        // Verify all 5 theme presets render without panicking
+        app.syncing = false;
+        ui.show_nav_rail = true;
+        for preset in [
+            ThemePreset::Dark,
+            ThemePreset::Light,
+            ThemePreset::Ansi256,
+            ThemePreset::Ansi16,
+            ThemePreset::NoColor,
+        ] {
+            ui.theme = Theme::detect(preset);
+            let out = render_buffer_text(&app, &mut ui, 130, 36);
+            assert!(out.contains("ATL-1"));
         }
     }
 
