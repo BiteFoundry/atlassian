@@ -4,7 +4,7 @@ use ratatui::{
     layout::Rect,
     style::Style,
     text::{Line, Span},
-    widgets::{Block, Borders, Clear, Paragraph, Wrap},
+    widgets::{Clear, Paragraph, Wrap},
     Frame,
 };
 
@@ -12,7 +12,7 @@ use crate::ui::{
     app::{AppState, UiState},
     hitmap::HitMap,
     keymap::Action,
-    overlays::{centered_rect, OverlayOutcome},
+    overlays::{centered_rect, modal_block, OverlayOutcome},
 };
 
 #[derive(Debug, Clone)]
@@ -31,11 +31,17 @@ impl ConfirmDialog {
 
     pub fn handle(&mut self, action: &Action) -> OverlayOutcome {
         match action {
-            Action::ConfirmYes | Action::Activate => match self.on_confirm.clone() {
-                Some(act) => OverlayOutcome::CloseAndDispatch(act),
-                None => OverlayOutcome::Close,
-            },
-            Action::ConfirmNo | Action::CloseOverlay | Action::Input('q') => OverlayOutcome::Close,
+            Action::ConfirmYes | Action::Activate | Action::Input('y') | Action::Input('Y') => {
+                match self.on_confirm.clone() {
+                    Some(act) => OverlayOutcome::CloseAndDispatch(act),
+                    None => OverlayOutcome::Close,
+                }
+            }
+            Action::ConfirmNo
+            | Action::CloseOverlay
+            | Action::Input('n')
+            | Action::Input('N')
+            | Action::Input('q') => OverlayOutcome::Close,
             _ => OverlayOutcome::Handled,
         }
     }
@@ -49,22 +55,60 @@ impl ConfirmDialog {
         _hitmap: &mut HitMap,
     ) {
         let theme = &ui.theme;
-        let rect = centered_rect(area, 52.min(area.width.saturating_sub(4)).max(24), 7);
+        let rect = centered_rect(area, 56.min(area.width.saturating_sub(4)).max(26), 8);
         frame.render_widget(Clear, rect);
 
-        let block = Block::default()
-            .borders(Borders::ALL)
-            .title(Line::from(Span::styled(" 확인 ", theme.title(true))))
-            .border_style(theme.border_style(true));
-        let text = vec![
-            Line::from(self.message.clone()),
-            Line::from(""),
-            Line::from(vec![
-                Span::styled(" [y/Enter] 확인 ", Style::default().fg(theme.success)),
-                Span::raw("   "),
-                Span::styled(" [n/Esc] 취소 ", Style::default().fg(theme.muted)),
-            ]),
-        ];
-        frame.render_widget(Paragraph::new(text).block(block).wrap(Wrap { trim: true }), rect);
+        let block = modal_block(" Confirm ", theme, true);
+        let inner = block.inner(rect);
+        frame.render_widget(block, rect);
+        if inner.width == 0 || inner.height == 0 {
+            return;
+        }
+
+        let msg_area = Rect::new(
+            inner.x,
+            inner.y,
+            inner.width,
+            inner.height.saturating_sub(2).max(1),
+        );
+        frame.render_widget(
+            Paragraph::new(Line::from(Span::styled(
+                format!(" {}", self.message),
+                Style::default().fg(theme.fg),
+            )))
+            .wrap(Wrap { trim: true }),
+            msg_area,
+        );
+
+        let btn_y = inner.y + inner.height.saturating_sub(1);
+        let buttons = Line::from(vec![
+            Span::styled(" [Enter] Confirm ", theme.selection()),
+            Span::raw("   "),
+            Span::styled(" [Esc] Cancel ", theme.muted_style()),
+        ]);
+        frame.render_widget(
+            Paragraph::new(buttons),
+            Rect::new(inner.x, btn_y, inner.width, 1),
+        );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn confirm_dispatches_and_cancel_closes() {
+        let mut dialog = ConfirmDialog::new("Quit Atlassian TUI?", Some(Action::Quit));
+        assert_eq!(
+            dialog.handle(&Action::Activate),
+            OverlayOutcome::CloseAndDispatch(Action::Quit)
+        );
+        assert_eq!(
+            dialog.handle(&Action::ConfirmYes),
+            OverlayOutcome::CloseAndDispatch(Action::Quit)
+        );
+        assert_eq!(dialog.handle(&Action::ConfirmNo), OverlayOutcome::Close);
+        assert_eq!(dialog.handle(&Action::CloseOverlay), OverlayOutcome::Close);
     }
 }

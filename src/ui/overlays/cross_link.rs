@@ -2,9 +2,9 @@
 
 use ratatui::{
     layout::Rect,
-    style::{Modifier, Style},
+    style::{Color, Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, Borders, Clear, Paragraph},
+    widgets::{Clear, Paragraph},
     Frame,
 };
 
@@ -15,7 +15,7 @@ use crate::{
         doc_view::truncate_width,
         hitmap::{HitMap, HitTarget},
         keymap::Action,
-        overlays::{centered_rect, OverlayOutcome},
+        overlays::{centered_rect, modal_block, OverlayOutcome},
     },
 };
 
@@ -35,6 +35,12 @@ impl CrossLinkOverlay {
         }
     }
 
+    pub fn select(&mut self, index: usize) {
+        if index < self.targets.len() {
+            self.selected = index;
+        }
+    }
+
     pub fn selected_target(&self) -> Option<&CrossRefTarget> {
         self.targets.get(self.selected)
     }
@@ -42,17 +48,17 @@ impl CrossLinkOverlay {
     pub fn handle(&mut self, action: &Action) -> OverlayOutcome {
         match action {
             Action::CloseOverlay | Action::Input('q') | Action::Input('g') => OverlayOutcome::Close,
-            Action::MoveUp => {
+            Action::MoveUp | Action::CursorUp | Action::PrevField => {
                 self.selected = self.selected.saturating_sub(1);
                 OverlayOutcome::Handled
             }
-            Action::MoveDown => {
+            Action::MoveDown | Action::CursorDown | Action::NextField => {
                 if self.selected + 1 < self.targets.len() {
                     self.selected += 1;
                 }
                 OverlayOutcome::Handled
             }
-            Action::Activate => {
+            Action::Activate | Action::Submit => {
                 if self.selected_target().is_some() {
                     OverlayOutcome::Dispatch(Action::Submit)
                 } else {
@@ -74,18 +80,16 @@ impl CrossLinkOverlay {
         let theme = &ui.theme;
         let rect = centered_rect(
             area,
-            68.min(area.width.saturating_sub(4)).max(28),
+            70.min(area.width.saturating_sub(4)).max(28),
             18.min(area.height.saturating_sub(2)).max(8),
         );
         frame.render_widget(Clear, rect);
 
-        let block = Block::default()
-            .borders(Borders::ALL)
-            .title(Line::from(Span::styled(
-                format!(" 연결된 Jira/Confluence 이동 — {} ", self.source_label),
-                theme.title(true),
-            )))
-            .border_style(theme.border_style(true));
+        let block = modal_block(
+            format!(" Cross-Links — {} ", self.source_label),
+            theme,
+            true,
+        );
         let inner = block.inner(rect);
         frame.render_widget(block, rect);
         if inner.width == 0 || inner.height < 2 {
@@ -96,16 +100,22 @@ impl CrossLinkOverlay {
         let mut lines = Vec::new();
         if self.targets.is_empty() {
             lines.push(Line::from(Span::styled(
-                " 연결된 이슈나 Confluence 페이지가 없습니다.",
+                " No linked Jira issues or Confluence pages found.",
                 theme.muted_style(),
             )));
         } else {
-            for (idx, target) in self.targets.iter().take(max_rows).enumerate() {
+            let start = if self.selected >= max_rows && max_rows > 0 {
+                self.selected - max_rows + 1
+            } else {
+                0
+            };
+            for (vis_idx, target) in self.targets.iter().skip(start).take(max_rows).enumerate() {
+                let idx = start + vis_idx;
                 let is_sel = idx == self.selected;
                 let row_style = if is_sel {
                     theme.selection()
                 } else {
-                    Style::default()
+                    Style::default().fg(theme.fg)
                 };
                 let prefix = if is_sel { "▸ " } else { "  " };
                 let line = match target {
@@ -121,11 +131,14 @@ impl CrossLinkOverlay {
                                 " [JIRA] ",
                                 Style::default()
                                     .bg(theme.jira_cobalt)
-                                    .fg(ratatui::style::Color::White)
+                                    .fg(Color::White)
                                     .add_modifier(Modifier::BOLD),
                             ),
                             Span::styled(
-                                truncate_width(&format!(" {key}{extra}"), inner.width.saturating_sub(12) as usize),
+                                truncate_width(
+                                    &format!(" {key}{extra}"),
+                                    inner.width.saturating_sub(12) as usize,
+                                ),
                                 row_style,
                             ),
                         ])
@@ -141,18 +154,26 @@ impl CrossLinkOverlay {
                                 " [WIKI] ",
                                 Style::default()
                                     .bg(theme.confluence_teal)
-                                    .fg(ratatui::style::Color::Rgb(9, 30, 66))
+                                    .fg(Color::Rgb(9, 30, 66))
                                     .add_modifier(Modifier::BOLD),
                             ),
                             Span::styled(
-                                truncate_width(&format!(" {lbl} (#{page_id})"), inner.width.saturating_sub(12) as usize),
+                                truncate_width(
+                                    &format!(" {lbl} (#{page_id})"),
+                                    inner.width.saturating_sub(12) as usize,
+                                ),
                                 row_style,
                             ),
                         ])
                     }
                 };
                 lines.push(line);
-                hitmap.add_line(inner.x, inner.y + idx as u16, inner.width, HitTarget::OverlayItem(idx));
+                hitmap.add_line(
+                    inner.x,
+                    inner.y + vis_idx as u16,
+                    inner.width,
+                    HitTarget::OverlayItem(idx),
+                );
             }
         }
 
@@ -162,10 +183,42 @@ impl CrossLinkOverlay {
         let footer_area = Rect::new(inner.x, inner.y + inner.height - 1, inner.width, 1);
         frame.render_widget(
             Paragraph::new(Line::from(Span::styled(
-                truncate_width(" j/k: 이동   Enter: 점프   Backspace: 이전으로   Esc: 닫기", footer_area.width as usize),
+                truncate_width(
+                    " j/k navigate · Enter confirm · Backspace back · Esc cancel",
+                    footer_area.width as usize,
+                ),
                 Style::default().fg(theme.muted).add_modifier(Modifier::DIM),
             ))),
             footer_area,
         );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn cross_link_navigation_and_activation() {
+        let mut ov = CrossLinkOverlay::new(
+            "ENG-1",
+            vec![
+                CrossRefTarget::JiraIssue {
+                    key: "ENG-2".into(),
+                    label: Some("Follow-up".into()),
+                },
+                CrossRefTarget::ConfluencePage {
+                    page_id: "99".into(),
+                    title: Some("Design Doc".into()),
+                },
+            ],
+        );
+        ov.handle(&Action::MoveDown);
+        assert_eq!(ov.selected, 1);
+        assert_eq!(
+            ov.handle(&Action::Activate),
+            OverlayOutcome::Dispatch(Action::Submit)
+        );
+        assert_eq!(ov.handle(&Action::CloseOverlay), OverlayOutcome::Close);
     }
 }
