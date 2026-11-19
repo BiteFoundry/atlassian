@@ -3,9 +3,10 @@
 //! Resolves Jira projects, Jira Agile boards, Confluence spaces, and Atlassian users
 //! from the local SQLite `Storage` cache with optional live `AtlassianClient` API fallback.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use anyhow::{bail, Result};
+use serde::{Deserialize, Serialize};
 
 use crate::{
     atlassian::AtlassianClient,
@@ -14,6 +15,350 @@ use crate::{
 };
 
 const MAX_CANDIDATE_LIST: usize = 8;
+
+/// An entity candidate tagged with the Atlassian site it belongs to.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SiteCandidate<T> {
+    pub site_id: String,
+    pub site_name: String,
+    pub item: T,
+}
+
+fn filter_candidates_by_site<'a, T>(
+    candidates: &'a [SiteCandidate<T>],
+    site_filter: Option<&str>,
+) -> Result<Vec<&'a SiteCandidate<T>>> {
+    let Some(raw_filter) = site_filter.map(str::trim).filter(|s| !s.is_empty()) else {
+        return Ok(candidates.iter().collect());
+    };
+
+    let by_id: Vec<&SiteCandidate<T>> = candidates
+        .iter()
+        .filter(|c| c.site_id.trim().eq_ignore_ascii_case(raw_filter))
+        .collect();
+    if !by_id.is_empty() {
+        return Ok(by_id);
+    }
+
+    let by_name: Vec<&SiteCandidate<T>> = candidates
+        .iter()
+        .filter(|c| c.site_name.trim().eq_ignore_ascii_case(raw_filter))
+        .collect();
+    if !by_name.is_empty() {
+        return Ok(by_name);
+    }
+
+    let mut available_sites: Vec<&str> = Vec::new();
+    let mut seen = HashSet::new();
+    for c in candidates {
+        let key = c.site_id.trim().to_ascii_lowercase();
+        if !key.is_empty() && seen.insert(key) {
+            available_sites.push(c.site_id.trim());
+        }
+    }
+    if available_sites.is_empty() {
+        bail!("Site '{raw_filter}' not found (no sites available).");
+    }
+    bail!(
+        "Site '{raw_filter}' not found. Available sites: {}.",
+        available_sites.join(", ")
+    );
+}
+
+fn count_distinct_sites<T>(matches: &[&SiteCandidate<T>]) -> usize {
+    let mut sites = HashSet::new();
+    for m in matches {
+        sites.insert(m.site_id.trim().to_ascii_lowercase());
+    }
+    sites.len()
+}
+
+fn format_multi_site_matches<T, F>(matches: &[&SiteCandidate<T>], label_fn: F) -> String
+where
+    F: Fn(&SiteCandidate<T>) -> String,
+{
+    let mut parts: Vec<String> = matches
+        .iter()
+        .take(MAX_CANDIDATE_LIST)
+        .map(|m| label_fn(m))
+        .collect();
+    if matches.len() > MAX_CANDIDATE_LIST {
+        parts.push(format!("... and {} more", matches.len() - MAX_CANDIDATE_LIST));
+    }
+    parts.join(", ")
+}
+
+/// Resolves a Jira project query across one or more Atlassian sites.
+///
+/// When `site_filter` is `Some`, resolution is scoped to that site (`site_id` or `site_name`).
+/// When `site_filter` is `None` and the same key/query matches multiple sites, returns an
+/// actionable error listing each matching site and instructing the caller to pass `--site <id>`.
+pub fn resolve_project_across_sites(
+    query: &str,
+    site_filter: Option<&str>,
+    candidates: &[SiteCandidate<ProjectSummary>],
+) -> Result<SiteCandidate<ProjectSummary>> {
+    let q = query.trim();
+    if q.is_empty() {
+        bail!("Jira project key or name is empty.");
+    }
+
+    let scoped = filter_candidates_by_site(candidates, site_filter)?;
+    let q_lower = q.to_lowercase();
+
+    let tiers: [Vec<&SiteCandidate<ProjectSummary>>; 5] = [
+        // Priority 1: Exact case-insensitive key
+        scoped
+            .iter()
+            .copied()
+            .filter(|c| c.item.key.eq_ignore_ascii_case(q))
+            .collect(),
+        // Priority 2: Exact id
+        scoped
+            .iter()
+            .copied()
+            .filter(|c| c.item.id == q)
+            .collect(),
+        // Priority 3: Exact case-insensitive name
+        scoped
+            .iter()
+            .copied()
+            .filter(|c| c.item.name.trim().to_lowercase() == q_lower)
+            .collect(),
+        // Priority 4: Prefix on key or name
+        scoped
+            .iter()
+            .copied()
+            .filter(|c| {
+                c.item.key.to_lowercase().starts_with(&q_lower)
+                    || c.item.name.trim().to_lowercase().starts_with(&q_lower)
+            })
+            .collect(),
+        // Priority 5: Substring on key or name
+        scoped
+            .iter()
+            .copied()
+            .filter(|c| {
+                c.item.key.to_lowercase().contains(&q_lower)
+                    || c.item.name.to_lowercase().contains(&q_lower)
+            })
+            .collect(),
+    ];
+
+    for matches in tiers {
+        if matches.len() == 1 {
+            return Ok(matches[0].clone());
+        }
+        if matches.len() > 1 {
+            if count_distinct_sites(&matches) > 1 {
+                let list = format_multi_site_matches(&matches, |c| {
+                    format!("{} ({})", c.item.key, c.site_id)
+                });
+                bail!(
+                    "Ambiguous project '{q}' matched multiple sites: {list}. Pass --site <id> to disambiguate."
+                );
+            }
+            let items: Vec<&ProjectSummary> = matches.iter().map(|c| &c.item).collect();
+            bail!(
+                "Ambiguous Jira project '{q}' matches {} projects in site '{}'. Specify an exact project key:\n{}",
+                items.len(),
+                matches[0].site_id,
+                format_project_candidates(&items)
+            );
+        }
+    }
+
+    if let Some(filter) = site_filter.map(str::trim).filter(|s| !s.is_empty()) {
+        bail!("Jira project not found: '{q}' in site '{filter}'. Check the project key or run sync first.");
+    }
+    bail!("Jira project not found: '{q}'. Check the project key or run sync first.")
+}
+
+/// Resolves a Confluence space query across one or more Atlassian sites.
+///
+/// When `site_filter` is `Some`, resolution is scoped to that site (`site_id` or `site_name`).
+/// When `site_filter` is `None` and the same key/query matches multiple sites, returns an
+/// actionable error listing each matching site and instructing the caller to pass `--site <id>`.
+pub fn resolve_space_across_sites(
+    query: &str,
+    site_filter: Option<&str>,
+    candidates: &[SiteCandidate<SpaceSummary>],
+) -> Result<SiteCandidate<SpaceSummary>> {
+    let q = query.trim();
+    if q.is_empty() {
+        bail!("Confluence space key or name is empty.");
+    }
+
+    let scoped = filter_candidates_by_site(candidates, site_filter)?;
+    let q_lower = q.to_lowercase();
+
+    let tiers: [Vec<&SiteCandidate<SpaceSummary>>; 5] = [
+        // Priority 1: Exact case-insensitive key
+        scoped
+            .iter()
+            .copied()
+            .filter(|c| c.item.key.eq_ignore_ascii_case(q))
+            .collect(),
+        // Priority 2: Exact id
+        scoped
+            .iter()
+            .copied()
+            .filter(|c| c.item.id == q)
+            .collect(),
+        // Priority 3: Exact case-insensitive name
+        scoped
+            .iter()
+            .copied()
+            .filter(|c| c.item.name.trim().to_lowercase() == q_lower)
+            .collect(),
+        // Priority 4: Prefix on key or name
+        scoped
+            .iter()
+            .copied()
+            .filter(|c| {
+                c.item.key.to_lowercase().starts_with(&q_lower)
+                    || c.item.name.trim().to_lowercase().starts_with(&q_lower)
+            })
+            .collect(),
+        // Priority 5: Substring on key or name
+        scoped
+            .iter()
+            .copied()
+            .filter(|c| {
+                c.item.key.to_lowercase().contains(&q_lower)
+                    || c.item.name.to_lowercase().contains(&q_lower)
+            })
+            .collect(),
+    ];
+
+    for matches in tiers {
+        if matches.len() == 1 {
+            return Ok(matches[0].clone());
+        }
+        if matches.len() > 1 {
+            if count_distinct_sites(&matches) > 1 {
+                let list = format_multi_site_matches(&matches, |c| {
+                    format!("{} ({})", c.item.key, c.site_id)
+                });
+                bail!(
+                    "Ambiguous space '{q}' matched multiple sites: {list}. Pass --site <id> to disambiguate."
+                );
+            }
+            let items: Vec<&SpaceSummary> = matches.iter().map(|c| &c.item).collect();
+            bail!(
+                "Ambiguous Confluence space '{q}' matches {} spaces in site '{}'. Specify an exact space key:\n{}",
+                items.len(),
+                matches[0].site_id,
+                format_space_candidates(&items)
+            );
+        }
+    }
+
+    if let Some(filter) = site_filter.map(str::trim).filter(|s| !s.is_empty()) {
+        bail!("Confluence space not found: '{q}' in site '{filter}'. Check the space key or run sync first.");
+    }
+    bail!("Confluence space not found: '{q}'. Check the space key or run sync first.")
+}
+
+/// Resolves a Jira Agile board query across one or more Atlassian sites.
+///
+/// When `site_filter` is `Some`, resolution is scoped to that site (`site_id` or `site_name`).
+/// When `site_filter` is `None` and the same ID/name/project matches multiple sites, returns an
+/// actionable error listing each matching site and instructing the caller to pass `--site <id>`.
+pub fn resolve_board_across_sites(
+    query: &str,
+    site_filter: Option<&str>,
+    candidates: &[SiteCandidate<BoardSummary>],
+) -> Result<SiteCandidate<BoardSummary>> {
+    let q = query.trim();
+    if q.is_empty() {
+        bail!("Jira board ID or name is empty.");
+    }
+
+    let scoped = filter_candidates_by_site(candidates, site_filter)?;
+    let id_candidate = q.strip_prefix('#').unwrap_or(q).trim();
+    let parsed_id = id_candidate.parse::<i64>().ok();
+    let q_lower = q.to_lowercase();
+
+    let tiers: [Vec<&SiteCandidate<BoardSummary>>; 5] = [
+        // Priority 1: Exact numeric ID (with optional leading '#')
+        match parsed_id {
+            Some(board_id) => scoped
+                .iter()
+                .copied()
+                .filter(|c| c.item.id == board_id)
+                .collect(),
+            None => Vec::new(),
+        },
+        // Priority 2: Exact case-insensitive name
+        scoped
+            .iter()
+            .copied()
+            .filter(|c| c.item.name.trim().to_lowercase() == q_lower)
+            .collect(),
+        // Priority 3: Exact case-insensitive project_key
+        scoped
+            .iter()
+            .copied()
+            .filter(|c| {
+                c.item
+                    .project_key
+                    .as_deref()
+                    .is_some_and(|pk| pk.eq_ignore_ascii_case(q))
+            })
+            .collect(),
+        // Priority 4: Prefix on name
+        scoped
+            .iter()
+            .copied()
+            .filter(|c| c.item.name.trim().to_lowercase().starts_with(&q_lower))
+            .collect(),
+        // Priority 5: Substring on name, project_key, or project_name
+        scoped
+            .iter()
+            .copied()
+            .filter(|c| {
+                c.item.name.to_lowercase().contains(&q_lower)
+                    || c.item
+                        .project_key
+                        .as_deref()
+                        .is_some_and(|pk| pk.to_lowercase().contains(&q_lower))
+                    || c.item
+                        .project_name
+                        .as_deref()
+                        .is_some_and(|pn| pn.to_lowercase().contains(&q_lower))
+            })
+            .collect(),
+    ];
+
+    for matches in tiers {
+        if matches.len() == 1 {
+            return Ok(matches[0].clone());
+        }
+        if matches.len() > 1 {
+            if count_distinct_sites(&matches) > 1 {
+                let list = format_multi_site_matches(&matches, |c| {
+                    format!("#{} {} ({})", c.item.id, c.item.name, c.site_id)
+                });
+                bail!(
+                    "Ambiguous board '{q}' matched multiple sites: {list}. Pass --site <id> to disambiguate."
+                );
+            }
+            let items: Vec<&BoardSummary> = matches.iter().map(|c| &c.item).collect();
+            bail!(
+                "Ambiguous Jira board '{q}' matches {} boards in site '{}'. Specify a board ID:\n{}",
+                items.len(),
+                matches[0].site_id,
+                format_board_candidates(&items)
+            );
+        }
+    }
+
+    if let Some(filter) = site_filter.map(str::trim).filter(|s| !s.is_empty()) {
+        bail!("Jira board not found: '{q}' in site '{filter}'. Check the board ID or run sync first.");
+    }
+    bail!("Jira board not found: '{q}'. Check the board ID or run sync first.")
+}
 
 /// Resolves a Jira project query against an in-memory slice of `ProjectSummary` records.
 ///
@@ -1095,5 +1440,141 @@ mod tests {
         );
 
         server.abort();
+    }
+
+    #[test]
+    fn test_resolve_project_across_sites_disambiguation_and_site_filter() {
+        let candidates = vec![
+            SiteCandidate {
+                site_id: "acme-cloud".into(),
+                site_name: "Acme Cloud".into(),
+                item: sample_project("10001", "ENG", "Acme Engineering"),
+            },
+            SiteCandidate {
+                site_id: "corp-dc".into(),
+                site_name: "Corp Data Center".into(),
+                item: sample_project("20001", "ENG", "Corp Engineering"),
+            },
+            SiteCandidate {
+                site_id: "acme-cloud".into(),
+                site_name: "Acme Cloud".into(),
+                item: sample_project("10002", "PLAT", "Platform Services"),
+            },
+        ];
+
+        // Ambiguous key across sites returns actionable error with each matching site.
+        let err = resolve_project_across_sites("ENG", None, &candidates)
+            .unwrap_err()
+            .to_string();
+        assert_eq!(
+            err,
+            "Ambiguous project 'ENG' matched multiple sites: ENG (acme-cloud), ENG (corp-dc). Pass --site <id> to disambiguate."
+        );
+
+        // Passing --site <id> disambiguates cleanly.
+        let acme = resolve_project_across_sites("eng", Some("acme-cloud"), &candidates).unwrap();
+        assert_eq!(acme.site_id, "acme-cloud");
+        assert_eq!(acme.item.id, "10001");
+
+        let corp =
+            resolve_project_across_sites("ENG", Some("Corp Data Center"), &candidates).unwrap();
+        assert_eq!(corp.site_id, "corp-dc");
+        assert_eq!(corp.item.id, "20001");
+
+        // Unique key across all sites resolves without --site.
+        let plat = resolve_project_across_sites("PLAT", None, &candidates).unwrap();
+        assert_eq!(plat.site_id, "acme-cloud");
+        assert_eq!(plat.item.key, "PLAT");
+
+        // Unknown site filter returns clear error listing available sites.
+        let missing_site = resolve_project_across_sites("ENG", Some("ghost"), &candidates)
+            .unwrap_err()
+            .to_string();
+        assert!(missing_site.contains("Site 'ghost' not found"));
+        assert!(missing_site.contains("acme-cloud"));
+        assert!(missing_site.contains("corp-dc"));
+    }
+
+    #[test]
+    fn test_resolve_space_and_board_across_sites_disambiguation_and_site_filter() {
+        let space_candidates = vec![
+            SiteCandidate {
+                site_id: "acme-cloud".into(),
+                site_name: "Acme Cloud".into(),
+                item: sample_space("sp-1", "DOCS", "Acme Docs"),
+            },
+            SiteCandidate {
+                site_id: "corp-dc".into(),
+                site_name: "Corp DC".into(),
+                item: sample_space("sp-2", "DOCS", "Corp Docs"),
+            },
+            SiteCandidate {
+                site_id: "corp-dc".into(),
+                site_name: "Corp DC".into(),
+                item: sample_space("sp-3", "OPS", "Operations"),
+            },
+        ];
+
+        let space_err = resolve_space_across_sites("DOCS", None, &space_candidates)
+            .unwrap_err()
+            .to_string();
+        assert_eq!(
+            space_err,
+            "Ambiguous space 'DOCS' matched multiple sites: DOCS (acme-cloud), DOCS (corp-dc). Pass --site <id> to disambiguate."
+        );
+
+        let corp_docs =
+            resolve_space_across_sites("docs", Some("corp-dc"), &space_candidates).unwrap();
+        assert_eq!(corp_docs.site_id, "corp-dc");
+        assert_eq!(corp_docs.item.id, "sp-2");
+
+        let ops = resolve_space_across_sites("OPS", None, &space_candidates).unwrap();
+        assert_eq!(ops.site_id, "corp-dc");
+        assert_eq!(ops.item.key, "OPS");
+
+        let board_candidates = vec![
+            SiteCandidate {
+                site_id: "acme-cloud".into(),
+                site_name: "Acme Cloud".into(),
+                item: sample_board(10, "ENG Sprint", Some("ENG")),
+            },
+            SiteCandidate {
+                site_id: "corp-dc".into(),
+                site_name: "Corp DC".into(),
+                item: sample_board(10, "Core Sprint", Some("ENG")),
+            },
+            SiteCandidate {
+                site_id: "acme-cloud".into(),
+                site_name: "Acme Cloud".into(),
+                item: sample_board(25, "Platform Kanban", Some("PLAT")),
+            },
+        ];
+
+        // Colliding board ID across sites requires --site.
+        let board_err = resolve_board_across_sites("#10", None, &board_candidates)
+            .unwrap_err()
+            .to_string();
+        assert!(board_err.contains("Ambiguous board '#10' matched multiple sites:"));
+        assert!(board_err.contains("#10 ENG Sprint (acme-cloud)"));
+        assert!(board_err.contains("#10 Core Sprint (corp-dc)"));
+        assert!(board_err.contains("Pass --site <id> to disambiguate."));
+
+        // Colliding project key across sites requires --site.
+        let board_proj_err = resolve_board_across_sites("ENG", None, &board_candidates)
+            .unwrap_err()
+            .to_string();
+        assert!(board_proj_err.contains("matched multiple sites"));
+        assert!(board_proj_err.contains("acme-cloud"));
+        assert!(board_proj_err.contains("corp-dc"));
+
+        // Passing --site resolves cleanly.
+        let acme_board =
+            resolve_board_across_sites("10", Some("acme-cloud"), &board_candidates).unwrap();
+        assert_eq!(acme_board.site_id, "acme-cloud");
+        assert_eq!(acme_board.item.name, "ENG Sprint");
+
+        let unique_board = resolve_board_across_sites("Kanban", None, &board_candidates).unwrap();
+        assert_eq!(unique_board.site_id, "acme-cloud");
+        assert_eq!(unique_board.item.id, 25);
     }
 }

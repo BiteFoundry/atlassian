@@ -56,6 +56,17 @@ const STOP_POLL_INTERVAL: Duration = Duration::from_millis(30);
 const LOCK_STALE_AGE: Duration = Duration::from_secs(5);
 const BROADCAST_CAPACITY: usize = 256;
 
+/// Per-site synchronization status reported inside `DaemonStatus`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct DaemonSiteStatus {
+    pub site_id: String,
+    pub name: String,
+    pub site_url: String,
+    pub last_sync_at: Option<String>,
+    pub last_error: Option<String>,
+    pub circuit_open: bool,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DaemonStatus {
     pub running: bool,
@@ -71,6 +82,8 @@ pub struct DaemonStatus {
     pub sync_summary: String,
     pub last_sync_at: Option<String>,
     pub last_error: Option<String>,
+    #[serde(default)]
+    pub sites: Vec<DaemonSiteStatus>,
 }
 
 impl Default for DaemonStatus {
@@ -89,6 +102,7 @@ impl Default for DaemonStatus {
             sync_summary: String::new(),
             last_sync_at: None,
             last_error: None,
+            sites: Vec::new(),
         }
     }
 }
@@ -255,6 +269,7 @@ struct SharedSyncStatus {
     sync_summary: String,
     last_sync_at: Option<String>,
     last_error: Option<String>,
+    sites: Vec<DaemonSiteStatus>,
 }
 
 struct DaemonSharedState {
@@ -272,6 +287,14 @@ struct DaemonSharedState {
 
 impl DaemonSharedState {
     fn new(info: &DaemonRuntimeInfo, started_instant: Instant) -> Self {
+        Self::with_sites(info, started_instant, Vec::new())
+    }
+
+    fn with_sites(
+        info: &DaemonRuntimeInfo,
+        started_instant: Instant,
+        initial_sites: Vec<DaemonSiteStatus>,
+    ) -> Self {
         Self {
             pid: info.pid,
             version: info.version.clone(),
@@ -282,7 +305,10 @@ impl DaemonSharedState {
             secret: info.secret.clone(),
             started_instant,
             attached_clients: Arc::new(AtomicUsize::new(0)),
-            sync_status: Mutex::new(SharedSyncStatus::default()),
+            sync_status: Mutex::new(SharedSyncStatus {
+                sites: initial_sites,
+                ..Default::default()
+            }),
         }
     }
 
@@ -309,6 +335,53 @@ impl DaemonSharedState {
             sync_summary: guard.sync_summary.clone(),
             last_sync_at: guard.last_sync_at.clone(),
             last_error: guard.last_error.clone(),
+            sites: guard.sites.clone(),
+        }
+    }
+
+    fn apply_site_results(&self, results: &[sync::SiteSyncResult]) {
+        let mut guard = self
+            .sync_status
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let now_rfc3339 = chrono::Utc::now().to_rfc3339();
+        for res in results {
+            if let Some(existing) = guard
+                .sites
+                .iter_mut()
+                .find(|s| s.site_id.eq_ignore_ascii_case(&res.site_id))
+            {
+                if !res.site_name.trim().is_empty() {
+                    existing.name = res.site_name.clone();
+                }
+                if !res.site_url.trim().is_empty() {
+                    existing.site_url = res.site_url.clone();
+                }
+                if res.succeeded {
+                    existing.last_sync_at = Some(now_rfc3339.clone());
+                    existing.last_error = None;
+                } else if let Some(ref err) = res.error {
+                    existing.last_error = Some(err.clone());
+                }
+                existing.circuit_open = res.circuit_open;
+            } else {
+                guard.sites.push(DaemonSiteStatus {
+                    site_id: res.site_id.clone(),
+                    name: res.site_name.clone(),
+                    site_url: res.site_url.clone(),
+                    last_sync_at: if res.succeeded {
+                        Some(now_rfc3339.clone())
+                    } else {
+                        None
+                    },
+                    last_error: if res.succeeded {
+                        None
+                    } else {
+                        res.error.clone()
+                    },
+                    circuit_open: res.circuit_open,
+                });
+            }
         }
     }
 
@@ -1102,6 +1175,17 @@ pub async fn nudge(cfg: &AppConfig, cmd: SyncCommand) -> Result<bool> {
     nudge_daemon(cfg, Some(cmd)).await
 }
 
+/// Sends a targeted `SyncCommand::RefreshSite` to the running daemon over authenticated IPC.
+pub async fn nudge_site(cfg: &AppConfig, site_id: impl Into<String>) -> Result<bool> {
+    nudge_daemon(
+        cfg,
+        Some(SyncCommand::RefreshSite {
+            site_id: site_id.into(),
+        }),
+    )
+    .await
+}
+
 /// Alias matching sibling CLIs (`teams` / `outlook`).
 pub async fn nudge_daemon(cfg: &AppConfig, cmd: Option<SyncCommand>) -> Result<bool> {
     nudge_daemon_at(&DaemonPaths::for_config(cfg), cmd).await
@@ -1309,13 +1393,96 @@ async fn run_initial_bootstrap(
     }
 }
 
+/// Runs a federated multi-site background sync daemon in the foreground until a `Shutdown` RPC or Ctrl+C arrives.
+pub async fn run_daemon_multi_site_foreground(
+    cfg: AppConfig,
+    targets: Vec<sync::SiteSyncTarget>,
+    storage: Storage,
+    max_concurrency: usize,
+) -> Result<()> {
+    let paths = DaemonPaths::for_config(&cfg);
+    run_daemon_multi_site_inner(cfg, paths, targets, storage, max_concurrency, true).await
+}
+
+async fn run_daemon_multi_site_inner(
+    cfg: AppConfig,
+    paths: DaemonPaths,
+    targets: Vec<sync::SiteSyncTarget>,
+    storage: Storage,
+    max_concurrency: usize,
+    enable_signals: bool,
+) -> Result<()> {
+    let initial_sites: Vec<DaemonSiteStatus> = targets
+        .iter()
+        .map(|t| DaemonSiteStatus {
+            site_id: t.site_id.clone(),
+            name: t.site_name.clone(),
+            site_url: t.client.site_url().to_string(),
+            last_sync_at: None,
+            last_error: None,
+            circuit_open: false,
+        })
+        .collect();
+
+    let (engine_event_tx, engine_event_rx) = mpsc::unbounded_channel::<CoreEvent>();
+    let (site_results_tx, site_results_rx) =
+        mpsc::unbounded_channel::<Vec<sync::SiteSyncResult>>();
+    let sync_ctrl = sync::spawn_multi_site_sync_engine_with_status(
+        cfg.clone(),
+        targets,
+        storage.clone(),
+        max_concurrency,
+        engine_event_tx,
+        Some(site_results_tx),
+    );
+
+    run_daemon_with_engine_and_sites(
+        paths,
+        cfg.profile,
+        cfg.site_url,
+        storage,
+        sync_ctrl,
+        engine_event_rx,
+        initial_sites,
+        Some(site_results_rx),
+        enable_signals,
+    )
+    .await
+}
+
 async fn run_daemon_with_engine(
     paths: DaemonPaths,
     profile: String,
     site_url: String,
     storage: Storage,
     sync_ctrl: SyncController,
+    engine_event_rx: mpsc::UnboundedReceiver<CoreEvent>,
+    enable_signals: bool,
+) -> Result<()> {
+    run_daemon_with_engine_and_sites(
+        paths,
+        profile,
+        site_url,
+        storage,
+        sync_ctrl,
+        engine_event_rx,
+        Vec::new(),
+        None,
+        enable_signals,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn run_daemon_with_engine_and_sites(
+    paths: DaemonPaths,
+    profile: String,
+    site_url: String,
+    storage: Storage,
+    sync_ctrl: SyncController,
     mut engine_event_rx: mpsc::UnboundedReceiver<CoreEvent>,
+    initial_sites: Vec<DaemonSiteStatus>,
+    mut site_results_rx: Option<mpsc::UnboundedReceiver<Vec<sync::SiteSyncResult>>>,
     enable_signals: bool,
 ) -> Result<()> {
     let lock_guard = StartupLockGuard::acquire(&paths.lock_file).await?;
@@ -1345,7 +1512,15 @@ async fn run_daemon_with_engine(
     }
     drop(lock_guard);
 
-    let shared = Arc::new(DaemonSharedState::new(&info, Instant::now()));
+    let shared = if initial_sites.is_empty() {
+        Arc::new(DaemonSharedState::new(&info, Instant::now()))
+    } else {
+        Arc::new(DaemonSharedState::with_sites(
+            &info,
+            Instant::now(),
+            initial_sites,
+        ))
+    };
     let (broadcast_tx, _) = broadcast::channel::<CoreEvent>(BROADCAST_CAPACITY);
     let (shutdown_tx, mut shutdown_rx) = watch::channel(false);
 
@@ -1367,6 +1542,20 @@ async fn run_daemon_with_engine(
                             let _ = fanout_tx.send(ev);
                         }
                         None => break,
+                    }
+                }
+                maybe_sites = async {
+                    if let Some(ref mut rx) = site_results_rx {
+                        rx.recv().await
+                    } else {
+                        std::future::pending::<Option<Vec<sync::SiteSyncResult>>>().await
+                    }
+                }, if site_results_rx.is_some() => {
+                    match maybe_sites {
+                        Some(results) => fanout_shared.apply_site_results(&results),
+                        None => {
+                            site_results_rx = None;
+                        }
                     }
                 }
             }
@@ -1479,8 +1668,22 @@ async fn handle_client_connection(
         }
         ClientOp::Nudge { cmd } => {
             if let Some(c) = cmd {
-                if !matches!(c, SyncCommand::Shutdown) {
-                    sync_ctrl.request(c);
+                match c {
+                    SyncCommand::Shutdown => {}
+                    SyncCommand::RefreshSite { ref site_id } if site_id.trim().is_empty() => {
+                        write_json_line(
+                            &mut write_half,
+                            &ServerFrame::Ack {
+                                ok: false,
+                                error: Some("site_id must not be empty".into()),
+                            },
+                        )
+                        .await?;
+                        return Ok(());
+                    }
+                    other => {
+                        sync_ctrl.request(other);
+                    }
                 }
             }
             write_json_line(
@@ -1524,11 +1727,14 @@ async fn handle_client_connection(
                         match line {
                             Ok(Some(raw)) => {
                                 match serde_json::from_str::<ClientStreamCmd>(&raw) {
-                                    Ok(ClientStreamCmd::Command(cmd)) => {
-                                        if !matches!(cmd, SyncCommand::Shutdown) {
-                                            sync_ctrl.request(cmd);
+                                    Ok(ClientStreamCmd::Command(cmd)) => match cmd {
+                                        SyncCommand::Shutdown => {}
+                                        SyncCommand::RefreshSite { ref site_id }
+                                            if site_id.trim().is_empty() => {}
+                                        other => {
+                                            sync_ctrl.request(other);
                                         }
-                                    }
+                                    },
                                     Ok(ClientStreamCmd::Ping) => {
                                         if write_json_line(&mut write_half, &ServerFrame::Pong).await.is_err() {
                                             break;
@@ -1680,6 +1886,7 @@ mod tests {
             sync_summary: "Synced 3 projects, 2 boards, 10 issues, 4 spaces".into(),
             last_sync_at: Some("2026-11-19T13:00:00Z".into()),
             last_error: None,
+            sites: Vec::new(),
         };
         let encoded = serde_json::to_string(&status).unwrap();
         let decoded: DaemonStatus = serde_json::from_str(&encoded).unwrap();
@@ -1930,5 +2137,276 @@ mod tests {
 
         assert!(stop_daemon_at(&harness.paths).await.unwrap());
         harness.wait_exit().await.unwrap();
+    }
+
+    #[test]
+    fn test_daemon_status_multi_site_serialization_roundtrip_and_backwards_compat() {
+        let status = DaemonStatus {
+            running: true,
+            pid: Some(9001),
+            version: Some(env!("CARGO_PKG_VERSION").into()),
+            transport: Some("tcp".into()),
+            endpoint: Some("127.0.0.1:55555".into()),
+            profile: Some("default".into()),
+            site_url: Some("https://acme.atlassian.net".into()),
+            uptime_secs: Some(42),
+            attached_clients: 1,
+            sync_busy: false,
+            sync_summary: "Synced 1/2 sites (2 projects, 1 boards, 5 issues, 1 spaces)".into(),
+            last_sync_at: Some("2026-11-19T14:00:00Z".into()),
+            last_error: None,
+            sites: vec![
+                DaemonSiteStatus {
+                    site_id: "acme-cloud".into(),
+                    name: "Acme Cloud".into(),
+                    site_url: "https://acme.atlassian.net".into(),
+                    last_sync_at: Some("2026-11-19T14:00:00Z".into()),
+                    last_error: None,
+                    circuit_open: false,
+                },
+                DaemonSiteStatus {
+                    site_id: "corp-dc".into(),
+                    name: "Corp Data Center".into(),
+                    site_url: "https://jira.corp.local".into(),
+                    last_sync_at: None,
+                    last_error: Some("HTTP 403 Forbidden".into()),
+                    circuit_open: true,
+                },
+            ],
+        };
+
+        let encoded = serde_json::to_string(&status).unwrap();
+        let decoded: DaemonStatus = serde_json::from_str(&encoded).unwrap();
+        assert_eq!(decoded, status);
+        assert_eq!(decoded.sites.len(), 2);
+        assert!(!decoded.sites[0].circuit_open);
+        assert!(decoded.sites[1].circuit_open);
+
+        // Legacy JSON payload without "sites" field deserializes cleanly via #[serde(default)].
+        let legacy_json = r#"{
+            "running": true,
+            "pid": 1234,
+            "version": "0.2.0",
+            "transport": "tcp",
+            "endpoint": "127.0.0.1:12345",
+            "profile": "default",
+            "site_url": "https://acme.atlassian.net",
+            "uptime_secs": 10,
+            "attached_clients": 0,
+            "sync_busy": false,
+            "sync_summary": "",
+            "last_sync_at": null,
+            "last_error": null
+        }"#;
+        let legacy: DaemonStatus = serde_json::from_str(legacy_json).unwrap();
+        assert!(legacy.running);
+        assert!(legacy.sites.is_empty());
+
+        // RefreshSite wire frame roundtrip.
+        let refresh_frame = ClientFrame {
+            secret: "ab".repeat(32),
+            op: ClientOp::Nudge {
+                cmd: Some(SyncCommand::RefreshSite {
+                    site_id: "corp-dc".into(),
+                }),
+            },
+        };
+        let raw = serde_json::to_string(&refresh_frame).unwrap();
+        let parsed: ClientFrame = serde_json::from_str(&raw).unwrap();
+        assert!(matches!(
+            parsed.op,
+            ClientOp::Nudge {
+                cmd: Some(SyncCommand::RefreshSite { ref site_id })
+            } if site_id == "corp-dc"
+        ));
+    }
+
+    #[tokio::test]
+    async fn test_daemon_forwards_refresh_site_ipc_and_tracks_site_status() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = DaemonPaths::from_data_dir(dir.path());
+        let (cmd_tx, mut cmd_rx) = mpsc::unbounded_channel::<SyncCommand>();
+        let (_engine_event_tx, engine_event_rx) = mpsc::unbounded_channel::<CoreEvent>();
+        let (site_results_tx, site_results_rx) =
+            mpsc::unbounded_channel::<Vec<sync::SiteSyncResult>>();
+        let sync_ctrl = SyncController::from_channels(cmd_tx);
+
+        let initial_sites = vec![
+            DaemonSiteStatus {
+                site_id: "acme-cloud".into(),
+                name: "Acme Cloud".into(),
+                site_url: "https://acme.atlassian.net".into(),
+                last_sync_at: None,
+                last_error: None,
+                circuit_open: false,
+            },
+            DaemonSiteStatus {
+                site_id: "corp-dc".into(),
+                name: "Corp DC".into(),
+                site_url: "https://jira.corp.local".into(),
+                last_sync_at: None,
+                last_error: None,
+                circuit_open: false,
+            },
+        ];
+
+        let task_paths = paths.clone();
+        let storage = Storage::open_in_memory().unwrap();
+        let handle = tokio::spawn(async move {
+            run_daemon_with_engine_and_sites(
+                task_paths,
+                "default".into(),
+                "https://acme.atlassian.net".into(),
+                storage,
+                sync_ctrl,
+                engine_event_rx,
+                initial_sites,
+                Some(site_results_rx),
+                false,
+            )
+            .await
+        });
+
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while Instant::now() < deadline {
+            if paths.state_file.exists() && is_daemon_alive_fast_at(&paths, "default") {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+
+        // Empty site_id is rejected cleanly without crashing daemon.
+        assert!(
+            !nudge_daemon_at(
+                &paths,
+                Some(SyncCommand::RefreshSite {
+                    site_id: "   ".into(),
+                }),
+            )
+            .await
+            .unwrap()
+        );
+
+        // Nudge with RefreshSite forwards cleanly over authenticated IPC.
+        assert!(
+            nudge_daemon_at(
+                &paths,
+                Some(SyncCommand::RefreshSite {
+                    site_id: "acme-cloud".into(),
+                }),
+            )
+            .await
+            .unwrap()
+        );
+        let forwarded = tokio::time::timeout(Duration::from_secs(1), cmd_rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            forwarded,
+            SyncCommand::RefreshSite {
+                site_id: "acme-cloud".into(),
+            }
+        );
+
+        // Attached TUI client can also forward RefreshSite over the subscribe stream.
+        let cfg = AppConfig {
+            profile: "default".into(),
+            ..Default::default()
+        };
+        let conn = try_connect_tui_at(&cfg, &paths)
+            .await
+            .expect("should attach to running multi-site daemon");
+        assert_eq!(conn.status.sites.len(), 2);
+        let _notify = tokio::time::timeout(Duration::from_secs(1), cmd_rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(conn.sync_ctrl.request(SyncCommand::RefreshSite {
+            site_id: "corp-dc".into(),
+        }));
+        let streamed = tokio::time::timeout(Duration::from_secs(1), cmd_rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            streamed,
+            SyncCommand::RefreshSite {
+                site_id: "corp-dc".into(),
+            }
+        );
+
+        // Site sync results update DaemonStatus.sites.
+        site_results_tx
+            .send(vec![
+                sync::SiteSyncResult {
+                    site_id: "acme-cloud".into(),
+                    site_name: "Acme Cloud".into(),
+                    site_url: "https://acme.atlassian.net".into(),
+                    succeeded: true,
+                    attempted_steps: 4,
+                    succeeded_steps: 4,
+                    skipped_steps: 0,
+                    projects: 2,
+                    boards: 1,
+                    issues: 5,
+                    spaces: 1,
+                    summary: "Synced 2 projects, 1 boards, 5 issues, 1 spaces".into(),
+                    error: None,
+                    circuit_open: false,
+                },
+                sync::SiteSyncResult {
+                    site_id: "corp-dc".into(),
+                    site_name: "Corp DC".into(),
+                    site_url: "https://jira.corp.local".into(),
+                    succeeded: false,
+                    attempted_steps: 4,
+                    succeeded_steps: 0,
+                    skipped_steps: 0,
+                    projects: 0,
+                    boards: 0,
+                    issues: 0,
+                    spaces: 0,
+                    summary: "Synced 0 projects, 0 boards, 0 issues, 0 spaces".into(),
+                    error: Some("HTTP 403 Forbidden".into()),
+                    circuit_open: true,
+                },
+            ])
+            .unwrap();
+
+        let status_deadline = Instant::now() + Duration::from_secs(1);
+        let mut updated = DaemonStatus::default();
+        while Instant::now() < status_deadline {
+            updated = query_daemon_status_at(&paths).await.unwrap();
+            if updated
+                .sites
+                .iter()
+                .any(|s| s.site_id == "corp-dc" && s.circuit_open)
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(15)).await;
+        }
+        let acme = updated
+            .sites
+            .iter()
+            .find(|s| s.site_id == "acme-cloud")
+            .unwrap();
+        assert!(acme.last_sync_at.is_some());
+        assert!(acme.last_error.is_none());
+        assert!(!acme.circuit_open);
+
+        let corp = updated
+            .sites
+            .iter()
+            .find(|s| s.site_id == "corp-dc")
+            .unwrap();
+        assert!(corp.last_sync_at.is_none());
+        assert_eq!(corp.last_error.as_deref(), Some("HTTP 403 Forbidden"));
+        assert!(corp.circuit_open);
+
+        drop(conn);
+        assert!(stop_daemon_at(&paths).await.unwrap());
+        handle.await.unwrap().unwrap();
     }
 }

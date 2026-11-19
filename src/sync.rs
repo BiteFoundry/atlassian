@@ -16,7 +16,7 @@ use rand::Rng;
 use reqwest::StatusCode;
 use serde::{Deserialize, Serialize};
 use tokio::{
-    sync::mpsc,
+    sync::{mpsc, Mutex as AsyncMutex, Semaphore},
     time::{interval_at, Instant as TokioInstant, MissedTickBehavior},
 };
 
@@ -29,6 +29,12 @@ use crate::{
 
 /// Non-intrusive status summary emitted when background polling encounters transient failures.
 pub const POLL_RETRY_SUMMARY: &str = "Sync paused; retrying automatically";
+
+/// Default site identifier used by single-site callers for backwards compatibility.
+pub const DEFAULT_SITE_ID: &str = "default";
+
+/// Default bounded concurrency for parallel multi-site synchronization.
+pub const DEFAULT_MULTI_SITE_CONCURRENCY: usize = 4;
 
 const AUTH_EXPIRY_PAUSE_SECS: u64 = 60;
 const FORBIDDEN_COOLDOWN_SECS: u64 = 300;
@@ -343,76 +349,195 @@ impl EndpointCircuitBreaker {
     }
 }
 
-/// Manages per-endpoint circuit breakers and global auth-expiry cooldown state.
-#[derive(Debug, Default)]
-pub struct CircuitBreakerRegistry {
-    breakers: HashMap<SyncEndpoint, EndpointCircuitBreaker>,
-    auth_pause_until: Option<Instant>,
-    degraded: bool,
+fn normalize_site_id(site_id: &str) -> String {
+    let trimmed = site_id.trim();
+    if trimmed.is_empty() {
+        DEFAULT_SITE_ID.to_string()
+    } else {
+        trimmed.to_string()
+    }
 }
+
+/// Composite circuit breaker key scoping endpoint health to a specific Atlassian site.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct SiteEndpointKey {
+    pub site_id: String,
+    pub endpoint: SyncEndpoint,
+}
+
+impl SiteEndpointKey {
+    pub fn new(site_id: impl Into<String>, endpoint: SyncEndpoint) -> Self {
+        Self {
+            site_id: normalize_site_id(&site_id.into()),
+            endpoint,
+        }
+    }
+}
+
+/// Manages per-site, per-endpoint circuit breakers and per-site auth-expiry cooldown state.
+#[derive(Debug, Default, Clone)]
+pub struct CircuitBreakerRegistry {
+    breakers: HashMap<SiteEndpointKey, EndpointCircuitBreaker>,
+    auth_pause_until: HashMap<String, Instant>,
+    degraded: HashMap<String, bool>,
+}
+
+/// Type alias for multi-site circuit breaker tracking keyed by `(site_id, endpoint)`.
+pub type CircuitBreakerMap = CircuitBreakerRegistry;
 
 impl CircuitBreakerRegistry {
     pub fn new() -> Self {
         Self::default()
     }
 
-    fn breaker_mut(&mut self, endpoint: SyncEndpoint) -> &mut EndpointCircuitBreaker {
+    fn breaker_mut_key(&mut self, key: SiteEndpointKey) -> &mut EndpointCircuitBreaker {
+        let endpoint = key.endpoint;
         self.breakers
-            .entry(endpoint)
+            .entry(key)
             .or_insert_with(|| EndpointCircuitBreaker::new(endpoint))
     }
 
+    pub fn is_auth_paused_for_site(&self, site_id: &str, now: Instant) -> bool {
+        let site = normalize_site_id(site_id);
+        self.auth_pause_until
+            .get(&site)
+            .is_some_and(|until| now < *until)
+    }
+
     pub fn is_auth_paused(&self, now: Instant) -> bool {
-        self.auth_pause_until.is_some_and(|until| now < until)
+        self.is_auth_paused_for_site(DEFAULT_SITE_ID, now)
+    }
+
+    pub fn is_degraded_for_site(&self, site_id: &str) -> bool {
+        let site = normalize_site_id(site_id);
+        self.degraded.get(&site).copied().unwrap_or(false)
     }
 
     pub fn is_degraded(&self) -> bool {
-        self.degraded
+        self.is_degraded_for_site(DEFAULT_SITE_ID)
+    }
+
+    pub fn mark_degraded_for_site(&mut self, site_id: &str) -> bool {
+        let site = normalize_site_id(site_id);
+        let entry = self.degraded.entry(site).or_insert(false);
+        if !*entry {
+            *entry = true;
+            true
+        } else {
+            false
+        }
     }
 
     pub fn mark_degraded(&mut self) -> bool {
-        if !self.degraded {
-            self.degraded = true;
-            true
-        } else {
-            false
+        self.mark_degraded_for_site(DEFAULT_SITE_ID)
+    }
+
+    pub fn clear_degraded_for_site(&mut self, site_id: &str) -> bool {
+        let site = normalize_site_id(site_id);
+        if let Some(flag) = self.degraded.get_mut(&site) {
+            if *flag {
+                *flag = false;
+                return true;
+            }
         }
+        false
     }
 
     pub fn clear_degraded(&mut self) -> bool {
-        if self.degraded {
-            self.degraded = false;
-            true
-        } else {
-            false
-        }
+        self.clear_degraded_for_site(DEFAULT_SITE_ID)
     }
 
-    pub fn state_at(&self, endpoint: SyncEndpoint, now: Instant) -> CircuitState {
-        if self.is_auth_paused(now) {
-            if let Some(until) = self.auth_pause_until {
+    pub fn state_at_key(&self, key: &SiteEndpointKey, now: Instant) -> CircuitState {
+        let site = normalize_site_id(&key.site_id);
+        if let Some(&until) = self.auth_pause_until.get(&site) {
+            if now < until {
                 return CircuitState::Open {
                     reason: CircuitOpenReason::Unauthorized401,
                     cooldown_until: until,
                 };
             }
         }
+        let normalized_key = SiteEndpointKey {
+            site_id: site,
+            endpoint: key.endpoint,
+        };
         self.breakers
-            .get(&endpoint)
+            .get(&normalized_key)
             .map(|b| b.state_at(now))
             .unwrap_or(CircuitState::Closed)
     }
 
-    pub fn should_allow(&mut self, endpoint: SyncEndpoint, now: Instant) -> bool {
-        if self.is_auth_paused(now) {
+    pub fn state_at_site(
+        &self,
+        site_id: &str,
+        endpoint: SyncEndpoint,
+        now: Instant,
+    ) -> CircuitState {
+        let key = SiteEndpointKey::new(site_id, endpoint);
+        self.state_at_key(&key, now)
+    }
+
+    pub fn state_at(&self, endpoint: SyncEndpoint, now: Instant) -> CircuitState {
+        self.state_at_site(DEFAULT_SITE_ID, endpoint, now)
+    }
+
+    pub fn should_allow_key(&mut self, key: &SiteEndpointKey, now: Instant) -> bool {
+        let normalized = SiteEndpointKey::new(&key.site_id, key.endpoint);
+        if self.is_auth_paused_for_site(&normalized.site_id, now) {
             return false;
         }
-        self.breaker_mut(endpoint).should_allow(now)
+        self.breaker_mut_key(normalized).should_allow(now)
+    }
+
+    pub fn should_allow_site(
+        &mut self,
+        site_id: &str,
+        endpoint: SyncEndpoint,
+        now: Instant,
+    ) -> bool {
+        let key = SiteEndpointKey::new(site_id, endpoint);
+        self.should_allow_key(&key, now)
+    }
+
+    pub fn should_allow(&mut self, endpoint: SyncEndpoint, now: Instant) -> bool {
+        self.should_allow_site(DEFAULT_SITE_ID, endpoint, now)
+    }
+
+    pub fn record_success_key(&mut self, key: &SiteEndpointKey) -> bool {
+        let normalized = SiteEndpointKey::new(&key.site_id, key.endpoint);
+        self.auth_pause_until.remove(&normalized.site_id);
+        self.breaker_mut_key(normalized).record_success()
+    }
+
+    pub fn record_success_site(&mut self, site_id: &str, endpoint: SyncEndpoint) -> bool {
+        let key = SiteEndpointKey::new(site_id, endpoint);
+        self.record_success_key(&key)
     }
 
     pub fn record_success(&mut self, endpoint: SyncEndpoint) -> bool {
-        self.auth_pause_until = None;
-        self.breaker_mut(endpoint).record_success()
+        self.record_success_site(DEFAULT_SITE_ID, endpoint)
+    }
+
+    pub fn record_failure_key(
+        &mut self,
+        key: &SiteEndpointKey,
+        err: &anyhow::Error,
+        now: Instant,
+    ) -> (SyncErrorKind, CircuitTripResult) {
+        let kind = classify_sync_error(err);
+        let trip = self.record_failure_kind_key(key, kind, now);
+        (kind, trip)
+    }
+
+    pub fn record_failure_site(
+        &mut self,
+        site_id: &str,
+        endpoint: SyncEndpoint,
+        err: &anyhow::Error,
+        now: Instant,
+    ) -> (SyncErrorKind, CircuitTripResult) {
+        let key = SiteEndpointKey::new(site_id, endpoint);
+        self.record_failure_key(&key, err, now)
     }
 
     pub fn record_failure(
@@ -421,9 +546,33 @@ impl CircuitBreakerRegistry {
         err: &anyhow::Error,
         now: Instant,
     ) -> (SyncErrorKind, CircuitTripResult) {
-        let kind = classify_sync_error(err);
-        let trip = self.record_failure_kind(endpoint, kind, now);
-        (kind, trip)
+        self.record_failure_site(DEFAULT_SITE_ID, endpoint, err, now)
+    }
+
+    pub fn record_failure_kind_key(
+        &mut self,
+        key: &SiteEndpointKey,
+        kind: SyncErrorKind,
+        now: Instant,
+    ) -> CircuitTripResult {
+        let normalized = SiteEndpointKey::new(&key.site_id, key.endpoint);
+        let site_id = normalized.site_id.clone();
+        let trip = self.breaker_mut_key(normalized).record_failure(kind, now);
+        if kind == SyncErrorKind::Unauthorized401 {
+            self.auth_pause_until.insert(site_id, now + trip.cooldown);
+        }
+        trip
+    }
+
+    pub fn record_failure_kind_site(
+        &mut self,
+        site_id: &str,
+        endpoint: SyncEndpoint,
+        kind: SyncErrorKind,
+        now: Instant,
+    ) -> CircuitTripResult {
+        let key = SiteEndpointKey::new(site_id, endpoint);
+        self.record_failure_kind_key(&key, kind, now)
     }
 
     pub fn record_failure_kind(
@@ -432,25 +581,52 @@ impl CircuitBreakerRegistry {
         kind: SyncErrorKind,
         now: Instant,
     ) -> CircuitTripResult {
-        let trip = self.breaker_mut(endpoint).record_failure(kind, now);
-        if kind == SyncErrorKind::Unauthorized401 {
-            self.auth_pause_until = Some(now + trip.cooldown);
+        self.record_failure_kind_site(DEFAULT_SITE_ID, endpoint, kind, now)
+    }
+
+    pub fn reset_site_endpoint(&mut self, site_id: &str, endpoint: SyncEndpoint) {
+        let key = SiteEndpointKey::new(site_id, endpoint);
+        self.auth_pause_until.remove(&key.site_id);
+        if let Some(breaker) = self.breakers.get_mut(&key) {
+            breaker.reset();
         }
-        trip
     }
 
     pub fn reset_endpoint(&mut self, endpoint: SyncEndpoint) {
-        self.auth_pause_until = None;
-        if let Some(breaker) = self.breakers.get_mut(&endpoint) {
-            breaker.reset();
+        self.reset_site_endpoint(DEFAULT_SITE_ID, endpoint);
+    }
+
+    pub fn reset_site(&mut self, site_id: &str) {
+        let site = normalize_site_id(site_id);
+        self.auth_pause_until.remove(&site);
+        self.degraded.remove(&site);
+        for (key, breaker) in &mut self.breakers {
+            if key.site_id == site {
+                breaker.reset();
+            }
         }
     }
 
     pub fn reset_all(&mut self) {
-        self.auth_pause_until = None;
+        self.auth_pause_until.clear();
+        self.degraded.clear();
         for breaker in self.breakers.values_mut() {
             breaker.reset();
         }
+    }
+
+    pub fn open_count_for_site(&self, site_id: &str, now: Instant) -> usize {
+        let site = normalize_site_id(site_id);
+        self.breakers
+            .iter()
+            .filter(|(k, b)| {
+                k.site_id == site && matches!(b.state_at(now), CircuitState::Open { .. })
+            })
+            .count()
+    }
+
+    pub fn has_open_circuit_for_site(&self, site_id: &str, now: Instant) -> bool {
+        self.is_auth_paused_for_site(site_id, now) || self.open_count_for_site(site_id, now) > 0
     }
 
     pub fn open_count(&self, now: Instant) -> usize {
@@ -458,6 +634,49 @@ impl CircuitBreakerRegistry {
             .values()
             .filter(|b| matches!(b.state_at(now), CircuitState::Open { .. }))
             .count()
+    }
+
+    fn extract_site(&self, site_id: &str) -> Self {
+        let site = normalize_site_id(site_id);
+        let breakers = self
+            .breakers
+            .iter()
+            .filter(|(k, _)| k.site_id == site)
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect();
+        let mut auth_pause_until = HashMap::new();
+        if let Some(&until) = self.auth_pause_until.get(&site) {
+            auth_pause_until.insert(site.clone(), until);
+        }
+        let mut degraded = HashMap::new();
+        if let Some(&flag) = self.degraded.get(&site) {
+            degraded.insert(site, flag);
+        }
+        Self {
+            breakers,
+            auth_pause_until,
+            degraded,
+        }
+    }
+
+    fn merge_site(&mut self, site_id: &str, other: Self) {
+        let site = normalize_site_id(site_id);
+        self.breakers.retain(|k, _| k.site_id != site);
+        for (k, v) in other.breakers {
+            if k.site_id == site {
+                self.breakers.insert(k, v);
+            }
+        }
+        if let Some(&until) = other.auth_pause_until.get(&site) {
+            self.auth_pause_until.insert(site.clone(), until);
+        } else {
+            self.auth_pause_until.remove(&site);
+        }
+        if let Some(&flag) = other.degraded.get(&site) {
+            self.degraded.insert(site, flag);
+        } else {
+            self.degraded.remove(&site);
+        }
     }
 }
 
@@ -484,6 +703,9 @@ impl SyncSharedActivity {
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum SyncCommand {
     RefreshAll,
+    RefreshSite {
+        site_id: String,
+    },
     RefreshBoard {
         board_id: i64,
         sprint_id: Option<i64>,
@@ -496,6 +718,42 @@ pub enum SyncCommand {
     },
     NotifyUserActivity,
     Shutdown,
+}
+
+/// Target descriptor for a single Atlassian site participating in federated multi-site sync.
+#[derive(Clone)]
+pub struct SiteSyncTarget {
+    pub site_id: String,
+    pub site_name: String,
+    pub client: AtlassianClient,
+}
+
+/// Per-site outcome emitted by `run_multi_site_sync`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SiteSyncResult {
+    pub site_id: String,
+    pub site_name: String,
+    pub site_url: String,
+    pub succeeded: bool,
+    pub attempted_steps: usize,
+    pub succeeded_steps: usize,
+    pub skipped_steps: usize,
+    pub projects: usize,
+    pub boards: usize,
+    pub issues: usize,
+    pub spaces: usize,
+    pub summary: String,
+    pub error: Option<String>,
+    pub circuit_open: bool,
+}
+
+/// Aggregate outcome returned by `run_multi_site_sync`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MultiSiteSyncOutcome {
+    pub total_sites: usize,
+    pub succeeded_sites: usize,
+    pub per_site: Vec<SiteSyncResult>,
+    pub summary: String,
 }
 
 #[derive(Clone)]
@@ -569,6 +827,12 @@ pub fn spawn_sync_engine(
                             engine_activity.record_activity(Instant::now());
                         }
                         SyncCommand::RefreshAll => {
+                            breakers.reset_all();
+                            let _ = core_tx.send(CoreEvent::SyncStarted);
+                            let outcome = run_full_sync(&client, &storage, Some(&core_tx), &mut breakers).await;
+                            emit_full_sync_events(&core_tx, outcome, &mut breakers, false);
+                        }
+                        SyncCommand::RefreshSite { site_id: _ } => {
                             breakers.reset_all();
                             let _ = core_tx.send(CoreEvent::SyncStarted);
                             let outcome = run_full_sync(&client, &storage, Some(&core_tx), &mut breakers).await;
@@ -689,6 +953,448 @@ pub fn spawn_sync_engine(
     SyncController { tx, activity }
 }
 
+/// Synchronizes multiple Atlassian sites in parallel with bounded concurrency (`Semaphore`)
+/// and strict per-site circuit breaker & failure isolation.
+pub async fn run_multi_site_sync(
+    targets: &[SiteSyncTarget],
+    storage: &Storage,
+    breakers: &mut CircuitBreakerMap,
+    max_concurrency: usize,
+    core_tx: Option<&mpsc::UnboundedSender<CoreEvent>>,
+) -> MultiSiteSyncOutcome {
+    if targets.is_empty() {
+        return MultiSiteSyncOutcome {
+            total_sites: 0,
+            succeeded_sites: 0,
+            per_site: Vec::new(),
+            summary: "No sites configured to sync".to_string(),
+        };
+    }
+
+    let concurrency = if max_concurrency == 0 {
+        DEFAULT_MULTI_SITE_CONCURRENCY
+    } else {
+        max_concurrency
+    };
+    let semaphore = Arc::new(Semaphore::new(concurrency));
+
+    let mut per_site_breakers: HashMap<String, Arc<AsyncMutex<CircuitBreakerMap>>> =
+        HashMap::new();
+    for target in targets {
+        let site_id = normalize_site_id(&target.site_id);
+        per_site_breakers.entry(site_id.clone()).or_insert_with(|| {
+            Arc::new(AsyncMutex::new(breakers.extract_site(&site_id)))
+        });
+    }
+
+    let mut futs = Vec::with_capacity(targets.len());
+    for target in targets {
+        let site_id = normalize_site_id(&target.site_id);
+        let site_name = if target.site_name.trim().is_empty() {
+            site_id.clone()
+        } else {
+            target.site_name.clone()
+        };
+        let site_url = target.client.site_url().to_string();
+        let sem = Arc::clone(&semaphore);
+        let site_breaker_lock = Arc::clone(
+            per_site_breakers
+                .get(&site_id)
+                .expect("per-site breaker map initialized"),
+        );
+
+        futs.push(async move {
+            let _permit = sem.acquire_owned().await.expect("sync semaphore closed");
+            let mut site_breakers = site_breaker_lock.lock().await;
+            let outcome = run_full_sync_for_site(
+                &site_id,
+                &target.client,
+                storage,
+                core_tx,
+                &mut site_breakers,
+            )
+            .await;
+
+            let circuit_open = site_breakers.has_open_circuit_for_site(&site_id, Instant::now());
+            let succeeded = outcome.succeeded_steps > 0;
+            let error = if succeeded {
+                None
+            } else {
+                outcome.first_error.as_ref().map(|e| format!("{e:#}"))
+            };
+            if succeeded {
+                site_breakers.clear_degraded_for_site(&site_id);
+            } else if outcome.first_error.is_some() {
+                site_breakers.mark_degraded_for_site(&site_id);
+            }
+
+            SiteSyncResult {
+                site_id,
+                site_name,
+                site_url,
+                succeeded,
+                attempted_steps: outcome.attempted_steps,
+                succeeded_steps: outcome.succeeded_steps,
+                skipped_steps: outcome.skipped_steps,
+                projects: outcome.project_count,
+                boards: outcome.board_count,
+                issues: outcome.issue_count,
+                spaces: outcome.space_count,
+                summary: outcome.summary,
+                error,
+                circuit_open,
+            }
+        });
+    }
+
+    let per_site = futures::future::join_all(futs).await;
+
+    for (site_id, lock) in per_site_breakers {
+        let updated = match Arc::try_unwrap(lock) {
+            Ok(mutex) => mutex.into_inner(),
+            Err(arc) => arc.lock().await.clone(),
+        };
+        breakers.merge_site(&site_id, updated);
+    }
+
+    let total_sites = per_site.len();
+    let succeeded_sites = per_site.iter().filter(|r| r.succeeded).count();
+    let total_projects: usize = per_site.iter().map(|r| r.projects).sum();
+    let total_boards: usize = per_site.iter().map(|r| r.boards).sum();
+    let total_issues: usize = per_site.iter().map(|r| r.issues).sum();
+    let total_spaces: usize = per_site.iter().map(|r| r.spaces).sum();
+    let summary = format!(
+        "Synced {succeeded_sites}/{total_sites} sites ({total_projects} projects, {total_boards} boards, {total_issues} issues, {total_spaces} spaces)"
+    );
+
+    MultiSiteSyncOutcome {
+        total_sites,
+        succeeded_sites,
+        per_site,
+        summary,
+    }
+}
+
+/// Spawns a federated multi-site background sync engine that polls all configured sites
+/// concurrently with bounded parallelism and per-site circuit breaker isolation.
+pub fn spawn_multi_site_sync_engine(
+    config: AppConfig,
+    targets: Vec<SiteSyncTarget>,
+    storage: Storage,
+    max_concurrency: usize,
+    core_tx: mpsc::UnboundedSender<CoreEvent>,
+) -> SyncController {
+    spawn_multi_site_sync_engine_with_status(
+        config,
+        targets,
+        storage,
+        max_concurrency,
+        core_tx,
+        None,
+    )
+}
+
+/// Spawns a federated multi-site sync engine and optionally streams per-site sync outcomes
+/// to `site_results_tx` (used by the background daemon to maintain `DaemonStatus.sites`).
+pub fn spawn_multi_site_sync_engine_with_status(
+    config: AppConfig,
+    targets: Vec<SiteSyncTarget>,
+    storage: Storage,
+    max_concurrency: usize,
+    core_tx: mpsc::UnboundedSender<CoreEvent>,
+    site_results_tx: Option<mpsc::UnboundedSender<Vec<SiteSyncResult>>>,
+) -> SyncController {
+    let (tx, mut rx) = mpsc::unbounded_channel();
+    let activity = Arc::new(SyncSharedActivity::new());
+    let engine_activity = Arc::clone(&activity);
+
+    tokio::spawn(async move {
+        let secs = config.sync_interval_secs.max(5);
+        let period = Duration::from_secs(secs);
+        let mut ticker = interval_at(TokioInstant::now() + period, period);
+        ticker.set_missed_tick_behavior(MissedTickBehavior::Delay);
+        let mut breakers = CircuitBreakerMap::new();
+        let concurrency = if max_concurrency == 0 {
+            DEFAULT_MULTI_SITE_CONCURRENCY
+        } else {
+            max_concurrency
+        };
+
+        loop {
+            tokio::select! {
+                maybe_cmd = rx.recv() => {
+                    let Some(cmd) = maybe_cmd else {
+                        break;
+                    };
+                    match cmd {
+                        SyncCommand::Shutdown => break,
+                        SyncCommand::NotifyUserActivity => {
+                            engine_activity.record_activity(Instant::now());
+                        }
+                        SyncCommand::RefreshAll => {
+                            breakers.reset_all();
+                            let _ = core_tx.send(CoreEvent::SyncStarted);
+                            let outcome = run_multi_site_sync(
+                                &targets,
+                                &storage,
+                                &mut breakers,
+                                concurrency,
+                                Some(&core_tx),
+                            )
+                            .await;
+                            if let Some(ref results_tx) = site_results_tx {
+                                let _ = results_tx.send(outcome.per_site.clone());
+                            }
+                            emit_multi_site_sync_events(&core_tx, outcome, false);
+                        }
+                        SyncCommand::RefreshSite { site_id } => {
+                            let target_key = site_id.trim();
+                            let matched = targets.iter().find(|t| {
+                                t.site_id.eq_ignore_ascii_case(target_key)
+                                    || t.site_name.eq_ignore_ascii_case(target_key)
+                            });
+                            let Some(target) = matched else {
+                                let _ = core_tx.send(CoreEvent::SyncError(format!(
+                                    "Unknown site '{site_id}' for sync refresh"
+                                )));
+                                continue;
+                            };
+                            breakers.reset_site(&target.site_id);
+                            let _ = core_tx.send(CoreEvent::SyncStarted);
+                            let outcome = run_multi_site_sync(
+                                std::slice::from_ref(target),
+                                &storage,
+                                &mut breakers,
+                                1,
+                                Some(&core_tx),
+                            )
+                            .await;
+                            if let Some(ref results_tx) = site_results_tx {
+                                let _ = results_tx.send(outcome.per_site.clone());
+                            }
+                            emit_multi_site_sync_events(&core_tx, outcome, false);
+                        }
+                        SyncCommand::RefreshBoard { board_id, sprint_id } => {
+                            let Some(primary) = targets.first() else {
+                                let _ = core_tx.send(CoreEvent::SyncError(
+                                    "No sites configured to sync board".to_string(),
+                                ));
+                                continue;
+                            };
+                            breakers.reset_site_endpoint(
+                                &primary.site_id,
+                                SyncEndpoint::JiraAgileBoards,
+                            );
+                            let _ = core_tx.send(CoreEvent::SyncStarted);
+                            match sync_board(
+                                &primary.client,
+                                &storage,
+                                board_id,
+                                sprint_id,
+                                Some(&core_tx),
+                            )
+                            .await
+                            {
+                                Ok(_) => {
+                                    breakers.record_success_site(
+                                        &primary.site_id,
+                                        SyncEndpoint::JiraAgileBoards,
+                                    );
+                                    breakers.clear_degraded_for_site(&primary.site_id);
+                                    let _ = core_tx.send(CoreEvent::SyncFinished {
+                                        summary: format!("Synced board #{board_id}"),
+                                    });
+                                }
+                                Err(err) => {
+                                    let (kind, _) = breakers.record_failure_site(
+                                        &primary.site_id,
+                                        SyncEndpoint::JiraAgileBoards,
+                                        &err,
+                                        Instant::now(),
+                                    );
+                                    if kind.is_quiet_transient() {
+                                        breakers.mark_degraded_for_site(&primary.site_id);
+                                        let _ = core_tx.send(CoreEvent::SyncFinished {
+                                            summary: POLL_RETRY_SUMMARY.to_string(),
+                                        });
+                                    } else {
+                                        let _ = core_tx.send(CoreEvent::SyncError(format!(
+                                            "Failed to sync board #{board_id}: {err:#}"
+                                        )));
+                                    }
+                                }
+                            }
+                        }
+                        SyncCommand::RefreshProjectIssues { project_key } => {
+                            let Some(primary) = targets.first() else {
+                                let _ = core_tx.send(CoreEvent::SyncError(
+                                    "No sites configured to sync project issues".to_string(),
+                                ));
+                                continue;
+                            };
+                            breakers.reset_site_endpoint(
+                                &primary.site_id,
+                                SyncEndpoint::JiraIssues,
+                            );
+                            let _ = core_tx.send(CoreEvent::SyncStarted);
+                            match sync_project_issues(
+                                &primary.client,
+                                &storage,
+                                &project_key,
+                                Some(&core_tx),
+                            )
+                            .await
+                            {
+                                Ok(count) => {
+                                    breakers.record_success_site(
+                                        &primary.site_id,
+                                        SyncEndpoint::JiraIssues,
+                                    );
+                                    breakers.clear_degraded_for_site(&primary.site_id);
+                                    let _ = core_tx.send(CoreEvent::SyncFinished {
+                                        summary: format!(
+                                            "Synced {count} issues for project {project_key}"
+                                        ),
+                                    });
+                                }
+                                Err(err) => {
+                                    let (kind, _) = breakers.record_failure_site(
+                                        &primary.site_id,
+                                        SyncEndpoint::JiraIssues,
+                                        &err,
+                                        Instant::now(),
+                                    );
+                                    if kind.is_quiet_transient() {
+                                        breakers.mark_degraded_for_site(&primary.site_id);
+                                        let _ = core_tx.send(CoreEvent::SyncFinished {
+                                            summary: POLL_RETRY_SUMMARY.to_string(),
+                                        });
+                                    } else {
+                                        let _ = core_tx.send(CoreEvent::SyncError(format!(
+                                            "Failed to sync issues for project {project_key}: {err:#}"
+                                        )));
+                                    }
+                                }
+                            }
+                        }
+                        SyncCommand::RefreshSpace { space_key } => {
+                            let Some(primary) = targets.first() else {
+                                let _ = core_tx.send(CoreEvent::SyncError(
+                                    "No sites configured to sync space".to_string(),
+                                ));
+                                continue;
+                            };
+                            breakers.reset_site_endpoint(
+                                &primary.site_id,
+                                SyncEndpoint::ConfluencePages,
+                            );
+                            let _ = core_tx.send(CoreEvent::SyncStarted);
+                            match sync_space_pages(
+                                &primary.client,
+                                &storage,
+                                &space_key,
+                                Some(&core_tx),
+                            )
+                            .await
+                            {
+                                Ok(count) => {
+                                    breakers.record_success_site(
+                                        &primary.site_id,
+                                        SyncEndpoint::ConfluencePages,
+                                    );
+                                    breakers.clear_degraded_for_site(&primary.site_id);
+                                    let _ = core_tx.send(CoreEvent::SyncFinished {
+                                        summary: format!(
+                                            "Synced {count} pages for space {space_key}"
+                                        ),
+                                    });
+                                }
+                                Err(err) => {
+                                    let (kind, _) = breakers.record_failure_site(
+                                        &primary.site_id,
+                                        SyncEndpoint::ConfluencePages,
+                                        &err,
+                                        Instant::now(),
+                                    );
+                                    if kind.is_quiet_transient() {
+                                        breakers.mark_degraded_for_site(&primary.site_id);
+                                        let _ = core_tx.send(CoreEvent::SyncFinished {
+                                            summary: POLL_RETRY_SUMMARY.to_string(),
+                                        });
+                                    } else {
+                                        let _ = core_tx.send(CoreEvent::SyncError(format!(
+                                            "Failed to sync space {space_key}: {err:#}"
+                                        )));
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                _ = ticker.tick() => {
+                    if targets.is_empty() {
+                        continue;
+                    }
+                    let outcome = run_multi_site_sync(
+                        &targets,
+                        &storage,
+                        &mut breakers,
+                        concurrency,
+                        Some(&core_tx),
+                    )
+                    .await;
+                    if let Some(ref results_tx) = site_results_tx {
+                        let _ = results_tx.send(outcome.per_site.clone());
+                    }
+                    let total_attempted: usize =
+                        outcome.per_site.iter().map(|r| r.attempted_steps).sum();
+                    if total_attempted == 0 {
+                        continue;
+                    }
+                    emit_multi_site_sync_events(&core_tx, outcome, true);
+                }
+            }
+        }
+    });
+
+    SyncController { tx, activity }
+}
+
+fn emit_multi_site_sync_events(
+    core_tx: &mpsc::UnboundedSender<CoreEvent>,
+    outcome: MultiSiteSyncOutcome,
+    quiet_background: bool,
+) {
+    if outcome.succeeded_sites > 0 {
+        let _ = core_tx.send(CoreEvent::SyncFinished {
+            summary: outcome.summary,
+        });
+        return;
+    }
+
+    let first_err = outcome
+        .per_site
+        .iter()
+        .find_map(|r| r.error.as_ref().map(|e| (r.site_id.as_str(), e.as_str())));
+
+    if let Some((site_id, err_msg)) = first_err {
+        let kind = classify_sync_error(&anyhow::anyhow!("{err_msg}"));
+        if quiet_background || kind.is_quiet_transient() {
+            let _ = core_tx.send(CoreEvent::SyncFinished {
+                summary: POLL_RETRY_SUMMARY.to_string(),
+            });
+        } else {
+            let _ = core_tx.send(CoreEvent::SyncError(format!(
+                "Sync failed for site '{site_id}': {err_msg}"
+            )));
+        }
+    } else if !quiet_background {
+        let _ = core_tx.send(CoreEvent::SyncFinished {
+            summary: outcome.summary,
+        });
+    }
+}
+
 fn emit_full_sync_events(
     core_tx: &mpsc::UnboundedSender<CoreEvent>,
     outcome: FullSyncOutcome,
@@ -725,15 +1431,28 @@ fn emit_full_sync_events(
 
 struct FullSyncOutcome {
     summary: String,
+    project_count: usize,
+    board_count: usize,
+    issue_count: usize,
+    space_count: usize,
     attempted_steps: usize,
     succeeded_steps: usize,
-    #[cfg_attr(not(test), allow(dead_code))]
     skipped_steps: usize,
     first_error: Option<anyhow::Error>,
     first_error_kind: Option<SyncErrorKind>,
 }
 
 async fn run_full_sync(
+    client: &AtlassianClient,
+    storage: &Storage,
+    core_tx: Option<&mpsc::UnboundedSender<CoreEvent>>,
+    breakers: &mut CircuitBreakerRegistry,
+) -> FullSyncOutcome {
+    run_full_sync_for_site(DEFAULT_SITE_ID, client, storage, core_tx, breakers).await
+}
+
+async fn run_full_sync_for_site(
+    site_id: &str,
     client: &AtlassianClient,
     storage: &Storage,
     core_tx: Option<&mpsc::UnboundedSender<CoreEvent>>,
@@ -757,11 +1476,11 @@ async fn run_full_sync(
     };
 
     // 1. Jira projects
-    if breakers.should_allow(SyncEndpoint::JiraProjects, Instant::now()) {
+    if breakers.should_allow_site(site_id, SyncEndpoint::JiraProjects, Instant::now()) {
         attempted_steps += 1;
         match client.list_projects().await {
             Ok(projects) => {
-                breakers.record_success(SyncEndpoint::JiraProjects);
+                breakers.record_success_site(site_id, SyncEndpoint::JiraProjects);
                 succeeded_steps += 1;
                 project_count = projects.len();
                 if let Err(err) = storage.upsert_projects(&projects) {
@@ -772,8 +1491,12 @@ async fn run_full_sync(
                 }
             }
             Err(err) => {
-                let (kind, _) =
-                    breakers.record_failure(SyncEndpoint::JiraProjects, &err, Instant::now());
+                let (kind, _) = breakers.record_failure_site(
+                    site_id,
+                    SyncEndpoint::JiraProjects,
+                    &err,
+                    Instant::now(),
+                );
                 record_err(err, kind);
             }
         }
@@ -782,11 +1505,11 @@ async fn run_full_sync(
     }
 
     // 2. Jira Agile boards + top/default board columns, sprints, active sprint issues
-    if breakers.should_allow(SyncEndpoint::JiraAgileBoards, Instant::now()) {
+    if breakers.should_allow_site(site_id, SyncEndpoint::JiraAgileBoards, Instant::now()) {
         attempted_steps += 1;
         match client.list_boards(None).await {
             Ok(mut boards) => {
-                breakers.record_success(SyncEndpoint::JiraAgileBoards);
+                breakers.record_success_site(site_id, SyncEndpoint::JiraAgileBoards);
                 succeeded_steps += 1;
                 board_count = boards.len();
                 if let Err(err) = storage.upsert_boards(&boards) {
@@ -811,8 +1534,12 @@ async fn run_full_sync(
                 }
             }
             Err(err) => {
-                let (kind, _) =
-                    breakers.record_failure(SyncEndpoint::JiraAgileBoards, &err, Instant::now());
+                let (kind, _) = breakers.record_failure_site(
+                    site_id,
+                    SyncEndpoint::JiraAgileBoards,
+                    &err,
+                    Instant::now(),
+                );
                 record_err(err, kind);
             }
         }
@@ -821,14 +1548,14 @@ async fn run_full_sync(
     }
 
     // 3. My open Jira issues
-    if breakers.should_allow(SyncEndpoint::JiraIssues, Instant::now()) {
+    if breakers.should_allow_site(site_id, SyncEndpoint::JiraIssues, Instant::now()) {
         attempted_steps += 1;
         match client
             .search_issues_jql(AtlassianClient::my_open_issues_jql(), 50, None, None)
             .await
         {
             Ok(page) => {
-                breakers.record_success(SyncEndpoint::JiraIssues);
+                breakers.record_success_site(site_id, SyncEndpoint::JiraIssues);
                 succeeded_steps += 1;
                 let fetched = page.issues.len();
                 if fetched > issue_count {
@@ -841,8 +1568,12 @@ async fn run_full_sync(
                 }
             }
             Err(err) => {
-                let (kind, _) =
-                    breakers.record_failure(SyncEndpoint::JiraIssues, &err, Instant::now());
+                let (kind, _) = breakers.record_failure_site(
+                    site_id,
+                    SyncEndpoint::JiraIssues,
+                    &err,
+                    Instant::now(),
+                );
                 record_err(err, kind);
             }
         }
@@ -851,11 +1582,11 @@ async fn run_full_sync(
     }
 
     // 4. Confluence spaces + default/first space root pages
-    if breakers.should_allow(SyncEndpoint::ConfluenceSpaces, Instant::now()) {
+    if breakers.should_allow_site(site_id, SyncEndpoint::ConfluenceSpaces, Instant::now()) {
         attempted_steps += 1;
         match client.list_spaces(50).await {
             Ok(spaces) => {
-                breakers.record_success(SyncEndpoint::ConfluenceSpaces);
+                breakers.record_success_site(site_id, SyncEndpoint::ConfluenceSpaces);
                 succeeded_steps += 1;
                 space_count = spaces.len();
                 if let Err(err) = storage.upsert_spaces(&spaces) {
@@ -865,13 +1596,18 @@ async fn run_full_sync(
                     let _ = tx.send(CoreEvent::SpacesUpdated(stored));
                 }
                 if let Some(target_space) = select_default_space(&spaces, client.config()) {
-                    if breakers.should_allow(SyncEndpoint::ConfluencePages, Instant::now()) {
+                    if breakers.should_allow_site(
+                        site_id,
+                        SyncEndpoint::ConfluencePages,
+                        Instant::now(),
+                    ) {
                         match sync_space_pages(client, storage, &target_space.key, core_tx).await {
                             Ok(_) => {
-                                breakers.record_success(SyncEndpoint::ConfluencePages);
+                                breakers.record_success_site(site_id, SyncEndpoint::ConfluencePages);
                             }
                             Err(err) => {
-                                breakers.record_failure(
+                                breakers.record_failure_site(
+                                    site_id,
                                     SyncEndpoint::ConfluencePages,
                                     &err,
                                     Instant::now(),
@@ -882,8 +1618,12 @@ async fn run_full_sync(
                 }
             }
             Err(err) => {
-                let (kind, _) =
-                    breakers.record_failure(SyncEndpoint::ConfluenceSpaces, &err, Instant::now());
+                let (kind, _) = breakers.record_failure_site(
+                    site_id,
+                    SyncEndpoint::ConfluenceSpaces,
+                    &err,
+                    Instant::now(),
+                );
                 record_err(err, kind);
             }
         }
@@ -894,6 +1634,10 @@ async fn run_full_sync(
     let summary = format_sync_summary(project_count, board_count, issue_count, space_count);
     FullSyncOutcome {
         summary,
+        project_count,
+        board_count,
+        issue_count,
+        space_count,
         attempted_steps,
         succeeded_steps,
         skipped_steps,
@@ -1467,5 +2211,421 @@ mod tests {
 
         assert!(ctrl.request(SyncCommand::Shutdown));
         server.abort();
+    }
+
+    fn make_mock_client(base_url: &str) -> AtlassianClient {
+        let cfg = AppConfig {
+            site_url: base_url.to_string(),
+            deployment: DeploymentKind::Cloud,
+            sync_interval_secs: 300,
+            ..Default::default()
+        };
+        let auth = AuthManager::with_credentials(
+            "test",
+            StoredCredentials::BearerPat {
+                site_url: base_url.to_string(),
+                token: "tok".into(),
+                deployment: DeploymentKind::Cloud,
+            },
+        );
+        AtlassianClient::new(cfg, auth).unwrap()
+    }
+
+    async fn spawn_healthy_mock_site(
+        project_key: &'static str,
+        space_key: &'static str,
+        delay_ms: u64,
+        in_flight: Option<Arc<AtomicUsize>>,
+        peak_in_flight: Option<Arc<AtomicUsize>>,
+        hits: Arc<AtomicUsize>,
+    ) -> (String, tokio::task::JoinHandle<()>) {
+        let p_hits = hits.clone();
+        let p_in = in_flight.clone();
+        let p_peak = peak_in_flight.clone();
+
+        let app = Router::new()
+            .route(
+                "/rest/api/3/project/search",
+                get(move || {
+                    let hits = p_hits.clone();
+                    let in_f = p_in.clone();
+                    let peak = p_peak.clone();
+                    async move {
+                        hits.fetch_add(1, Ordering::SeqCst);
+                        if let (Some(cur_ref), Some(peak_ref)) = (&in_f, &peak) {
+                            let cur = cur_ref.fetch_add(1, Ordering::SeqCst) + 1;
+                            let mut prev = peak_ref.load(Ordering::SeqCst);
+                            while cur > prev {
+                                match peak_ref.compare_exchange(
+                                    prev,
+                                    cur,
+                                    Ordering::SeqCst,
+                                    Ordering::SeqCst,
+                                ) {
+                                    Ok(_) => break,
+                                    Err(actual) => prev = actual,
+                                }
+                            }
+                        }
+                        if delay_ms > 0 {
+                            tokio::time::sleep(Duration::from_millis(delay_ms)).await;
+                        }
+                        if let Some(cur_ref) = &in_f {
+                            cur_ref.fetch_sub(1, Ordering::SeqCst);
+                        }
+                        Json(json!({
+                            "values": [{
+                                "id": format!("id-{project_key}"),
+                                "key": project_key,
+                                "name": format!("{project_key} Project"),
+                                "projectTypeKey": "software"
+                            }]
+                        }))
+                    }
+                }),
+            )
+            .route(
+                "/rest/agile/1.0/board",
+                get(|| async { Json(json!({ "values": [] })) }),
+            )
+            .route(
+                "/rest/api/3/search/jql",
+                post(|| async { Json(json!({ "issues": [] })) }),
+            )
+            .route(
+                "/wiki/api/v2/spaces",
+                get(move || async move {
+                    Json(json!({
+                        "results": [{
+                            "id": format!("sp-{space_key}"),
+                            "key": space_key,
+                            "name": format!("{space_key} Space"),
+                            "type": "global"
+                        }]
+                    }))
+                }),
+            )
+            .route(
+                "/wiki/api/v2/spaces/{space_id}/pages",
+                get(|| async { Json(json!({ "results": [] })) }),
+            )
+            .route(
+                "/wiki/rest/api/space/{space_key}/content/page",
+                get(|| async { Json(json!({ "results": [] })) }),
+            );
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let handle = tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        (format!("http://{addr}"), handle)
+    }
+
+    async fn spawn_failing_mock_site(
+        status: AxumStatus,
+        hits: Arc<AtomicUsize>,
+    ) -> (String, tokio::task::JoinHandle<()>) {
+        let h1 = hits.clone();
+        let h2 = hits.clone();
+        let h3 = hits.clone();
+        let h4 = hits.clone();
+        let app = Router::new()
+            .route(
+                "/rest/api/3/project/search",
+                get(move || {
+                    let h = h1.clone();
+                    async move {
+                        h.fetch_add(1, Ordering::SeqCst);
+                        status
+                    }
+                }),
+            )
+            .route(
+                "/rest/agile/1.0/board",
+                get(move || {
+                    let h = h2.clone();
+                    async move {
+                        h.fetch_add(1, Ordering::SeqCst);
+                        status
+                    }
+                }),
+            )
+            .route(
+                "/rest/api/3/search/jql",
+                post(move || {
+                    let h = h3.clone();
+                    async move {
+                        h.fetch_add(1, Ordering::SeqCst);
+                        status
+                    }
+                }),
+            )
+            .route(
+                "/wiki/api/v2/spaces",
+                get(move || {
+                    let h = h4.clone();
+                    async move {
+                        h.fetch_add(1, Ordering::SeqCst);
+                        status
+                    }
+                }),
+            );
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let handle = tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        (format!("http://{addr}"), handle)
+    }
+
+    #[test]
+    fn test_per_site_circuit_breaker_isolation() {
+        let now = Instant::now();
+        let mut breakers = CircuitBreakerMap::new();
+
+        // Site A encounters 403 on JiraAgileBoards and 401 on JiraProjects.
+        let key_a_boards = SiteEndpointKey::new("acme-cloud", SyncEndpoint::JiraAgileBoards);
+        let key_b_boards = SiteEndpointKey::new("corp-dc", SyncEndpoint::JiraAgileBoards);
+
+        breakers.record_failure_kind_key(&key_a_boards, SyncErrorKind::Forbidden403, now);
+        assert!(!breakers.should_allow_key(&key_a_boards, now));
+        assert!(matches!(
+            breakers.state_at_key(&key_a_boards, now),
+            CircuitState::Open {
+                reason: CircuitOpenReason::Forbidden403,
+                ..
+            }
+        ));
+
+        // Site B MUST remain completely unaffected.
+        assert!(breakers.should_allow_key(&key_b_boards, now));
+        assert_eq!(breakers.state_at_key(&key_b_boards, now), CircuitState::Closed);
+        assert_eq!(breakers.open_count_for_site("acme-cloud", now), 1);
+        assert_eq!(breakers.open_count_for_site("corp-dc", now), 0);
+        assert!(breakers.has_open_circuit_for_site("acme-cloud", now));
+        assert!(!breakers.has_open_circuit_for_site("corp-dc", now));
+
+        // Site A encountering 401 pauses all endpoints for Site A ONLY, never Site B.
+        breakers.record_failure_kind_site(
+            "acme-cloud",
+            SyncEndpoint::JiraProjects,
+            SyncErrorKind::Unauthorized401,
+            now,
+        );
+        assert!(breakers.is_auth_paused_for_site("acme-cloud", now));
+        assert!(!breakers.should_allow_site("acme-cloud", SyncEndpoint::ConfluenceSpaces, now));
+        assert!(!breakers.is_auth_paused_for_site("corp-dc", now));
+        assert!(breakers.should_allow_site("corp-dc", SyncEndpoint::JiraProjects, now));
+        assert!(breakers.should_allow_site("corp-dc", SyncEndpoint::ConfluenceSpaces, now));
+
+        // Site B 429 rate-limit is isolated to Site B, and resetting Site A preserves Site B state.
+        breakers.record_failure_kind_site(
+            "corp-dc",
+            SyncEndpoint::JiraIssues,
+            SyncErrorKind::RateLimited429 {
+                retry_after_secs: Some(30),
+            },
+            now,
+        );
+        breakers.reset_site("acme-cloud");
+        assert!(!breakers.has_open_circuit_for_site("acme-cloud", now));
+        assert!(breakers.should_allow_key(&key_a_boards, now));
+        assert!(!breakers.should_allow_site("corp-dc", SyncEndpoint::JiraIssues, now));
+    }
+
+    #[tokio::test]
+    async fn test_run_multi_site_sync_partial_failure_resilience_and_bounded_concurrency() {
+        let in_flight = Arc::new(AtomicUsize::new(0));
+        let peak_in_flight = Arc::new(AtomicUsize::new(0));
+        let hits_a = Arc::new(AtomicUsize::new(0));
+        let hits_b = Arc::new(AtomicUsize::new(0));
+        let hits_c = Arc::new(AtomicUsize::new(0));
+        let hits_bad = Arc::new(AtomicUsize::new(0));
+
+        let (url_a, srv_a) = spawn_healthy_mock_site(
+            "ACME",
+            "DOCS",
+            60,
+            Some(in_flight.clone()),
+            Some(peak_in_flight.clone()),
+            hits_a.clone(),
+        )
+        .await;
+        let (url_b, srv_b) = spawn_healthy_mock_site(
+            "SIDE",
+            "WIKI",
+            60,
+            Some(in_flight.clone()),
+            Some(peak_in_flight.clone()),
+            hits_b.clone(),
+        )
+        .await;
+        let (url_c, srv_c) = spawn_healthy_mock_site(
+            "PART",
+            "KB",
+            60,
+            Some(in_flight.clone()),
+            Some(peak_in_flight.clone()),
+            hits_c.clone(),
+        )
+        .await;
+        let (url_bad, srv_bad) =
+            spawn_failing_mock_site(AxumStatus::FORBIDDEN, hits_bad.clone()).await;
+
+        let targets = vec![
+            SiteSyncTarget {
+                site_id: "acme-cloud".into(),
+                site_name: "Acme Cloud".into(),
+                client: make_mock_client(&url_a),
+            },
+            SiteSyncTarget {
+                site_id: "offline-dc".into(),
+                site_name: "Offline DC".into(),
+                client: make_mock_client(&url_bad),
+            },
+            SiteSyncTarget {
+                site_id: "side-cloud".into(),
+                site_name: "Side Cloud".into(),
+                client: make_mock_client(&url_b),
+            },
+            SiteSyncTarget {
+                site_id: "partner-cloud".into(),
+                site_name: "Partner Cloud".into(),
+                client: make_mock_client(&url_c),
+            },
+        ];
+
+        let storage = Storage::open_in_memory().unwrap();
+        let mut breakers = CircuitBreakerMap::new();
+
+        // Cycle 1: max_concurrency = 2 across 4 sites; 1 failing site does not block 3 healthy sites.
+        let outcome1 = run_multi_site_sync(&targets, &storage, &mut breakers, 2, None).await;
+        assert_eq!(outcome1.total_sites, 4);
+        assert_eq!(outcome1.succeeded_sites, 3);
+        assert_eq!(outcome1.per_site.len(), 4);
+        assert!(outcome1.summary.contains("3/4 sites"));
+        assert!(
+            peak_in_flight.load(Ordering::SeqCst) <= 2,
+            "bounded semaphore must cap concurrency at 2, observed {}",
+            peak_in_flight.load(Ordering::SeqCst)
+        );
+
+        let bad_res = outcome1
+            .per_site
+            .iter()
+            .find(|r| r.site_id == "offline-dc")
+            .unwrap();
+        assert!(!bad_res.succeeded);
+        assert!(bad_res.circuit_open);
+        assert!(bad_res.error.is_some());
+
+        for healthy_id in ["acme-cloud", "side-cloud", "partner-cloud"] {
+            let res = outcome1
+                .per_site
+                .iter()
+                .find(|r| r.site_id == healthy_id)
+                .unwrap();
+            assert!(res.succeeded, "site {healthy_id} should succeed");
+            assert!(!res.circuit_open);
+            assert!(res.error.is_none());
+        }
+
+        // Cycle 2: offline-dc endpoints are now in cooldown and skipped, while healthy sites keep syncing.
+        let bad_hits_after_cycle1 = hits_bad.load(Ordering::SeqCst);
+        let outcome2 = run_multi_site_sync(&targets, &storage, &mut breakers, 2, None).await;
+        assert_eq!(outcome2.succeeded_sites, 3);
+        assert_eq!(hits_bad.load(Ordering::SeqCst), bad_hits_after_cycle1);
+        assert_eq!(hits_a.load(Ordering::SeqCst), 2);
+        assert_eq!(hits_b.load(Ordering::SeqCst), 2);
+        assert_eq!(hits_c.load(Ordering::SeqCst), 2);
+
+        let bad_res2 = outcome2
+            .per_site
+            .iter()
+            .find(|r| r.site_id == "offline-dc")
+            .unwrap();
+        assert_eq!(bad_res2.attempted_steps, 0);
+        assert_eq!(bad_res2.skipped_steps, 4);
+
+        srv_a.abort();
+        srv_b.abort();
+        srv_c.abort();
+        srv_bad.abort();
+    }
+
+    #[tokio::test]
+    async fn test_spawn_multi_site_sync_engine_refresh_site_command() {
+        let hits_a = Arc::new(AtomicUsize::new(0));
+        let hits_b = Arc::new(AtomicUsize::new(0));
+        let (url_a, srv_a) =
+            spawn_healthy_mock_site("ACME", "DOCS", 0, None, None, hits_a.clone()).await;
+        let (url_b, srv_b) =
+            spawn_healthy_mock_site("CORP", "WIKI", 0, None, None, hits_b.clone()).await;
+
+        let targets = vec![
+            SiteSyncTarget {
+                site_id: "acme-cloud".into(),
+                site_name: "Acme Cloud".into(),
+                client: make_mock_client(&url_a),
+            },
+            SiteSyncTarget {
+                site_id: "corp-dc".into(),
+                site_name: "Corp DC".into(),
+                client: make_mock_client(&url_b),
+            },
+        ];
+
+        let cfg = AppConfig {
+            sync_interval_secs: 300,
+            ..Default::default()
+        };
+        let storage = Storage::open_in_memory().unwrap();
+        let (core_tx, mut core_rx) = mpsc::unbounded_channel();
+        let (site_tx, mut site_rx) = mpsc::unbounded_channel();
+
+        let ctrl = spawn_multi_site_sync_engine_with_status(
+            cfg,
+            targets,
+            storage,
+            DEFAULT_MULTI_SITE_CONCURRENCY,
+            core_tx,
+            Some(site_tx),
+        );
+
+        // Request refresh for only corp-dc.
+        assert!(ctrl.request(SyncCommand::RefreshSite {
+            site_id: "corp-dc".into(),
+        }));
+
+        let results = tokio::time::timeout(Duration::from_secs(3), site_rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].site_id, "corp-dc");
+        assert!(results[0].succeeded);
+        assert_eq!(hits_a.load(Ordering::SeqCst), 0);
+        assert_eq!(hits_b.load(Ordering::SeqCst), 1);
+
+        // Drain until SyncFinished arrives.
+        let mut finished = false;
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while Instant::now() < deadline {
+            if let Ok(Some(ev)) =
+                tokio::time::timeout(Duration::from_millis(200), core_rx.recv()).await
+            {
+                if matches!(ev, CoreEvent::SyncFinished { .. }) {
+                    finished = true;
+                    break;
+                }
+            }
+        }
+        assert!(finished, "expected SyncFinished after RefreshSite");
+
+        assert!(ctrl.request(SyncCommand::Shutdown));
+        srv_a.abort();
+        srv_b.abort();
     }
 }
