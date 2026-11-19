@@ -1,6 +1,9 @@
-//! Core HTTP client with Cloud/DataCenter routing, `429 Retry-After` backoff, and auth header injection.
+//! Core HTTP client with Cloud/DataCenter routing, OAuth 2.0 (3LO) gateway routing,
+//! `401` single-flight OAuth refresh, `429 Retry-After` backoff, and `SiteClientPool`.
 
 use std::{
+    collections::HashMap,
+    path::PathBuf,
     sync::{Arc, RwLock},
     time::Duration,
 };
@@ -17,8 +20,8 @@ use thiserror::Error;
 use url::Url;
 
 use crate::{
-    auth::AuthManager,
-    config::{normalize_base_url, AppConfig, DeploymentKind},
+    auth::{AuthManager, StoredCredentials, DEFAULT_OAUTH_API_BASE, DEFAULT_OAUTH_AUTH_BASE},
+    config::{normalize_base_url, AppConfig, DeploymentKind, SiteProfile},
     models::{AttachmentItem, UserSummary},
 };
 
@@ -34,27 +37,99 @@ pub(crate) struct HttpStatusError {
     pub body: String,
 }
 
+fn build_shared_http_client() -> Result<reqwest::Client> {
+    reqwest::Client::builder()
+        .user_agent(format!("atlassian-cli/{}", env!("CARGO_PKG_VERSION")))
+        .timeout(Duration::from_secs(30))
+        .build()
+        .context("Failed to initialize HTTP client")
+}
+
 #[derive(Clone)]
 pub struct AtlassianClient {
     pub(crate) http: reqwest::Client,
     pub(crate) config: AppConfig,
     pub(crate) auth: AuthManager,
     pub(crate) me_cache: Arc<RwLock<Option<UserSummary>>>,
+    pub(crate) site_id: String,
+    pub(crate) cloud_id: Option<String>,
+    pub(crate) api_gateway_base: String,
+    pub(crate) oauth_auth_base: String,
 }
 
 impl AtlassianClient {
     pub fn new(config: AppConfig, auth: AuthManager) -> Result<Self> {
-        let http = reqwest::Client::builder()
-            .user_agent(format!("atlassian-cli/{}", env!("CARGO_PKG_VERSION")))
-            .timeout(Duration::from_secs(30))
-            .build()
-            .context("HTTP 클라이언트 초기화 실패")?;
+        let http = build_shared_http_client()?;
         Ok(Self {
             http,
             config,
             auth,
             me_cache: Arc::new(RwLock::new(None)),
+            site_id: "default".to_string(),
+            cloud_id: None,
+            api_gateway_base: DEFAULT_OAUTH_API_BASE.to_string(),
+            oauth_auth_base: DEFAULT_OAUTH_AUTH_BASE.to_string(),
         })
+    }
+
+    /// Creates a site-scoped client supporting OAuth 3LO gateway routing when `site.cloud_id` is `Some`.
+    pub fn for_site(
+        site: &SiteProfile,
+        auth: AuthManager,
+        api_gateway_base: Option<String>,
+    ) -> Result<Self> {
+        let http = build_shared_http_client()?;
+        Ok(Self::for_site_with_http(site, auth, http, api_gateway_base))
+    }
+
+    /// Creates a site-scoped client sharing an existing `reqwest::Client` connection pool.
+    pub fn for_site_with_http(
+        site: &SiteProfile,
+        auth: AuthManager,
+        http: reqwest::Client,
+        api_gateway_base: Option<String>,
+    ) -> Self {
+        let mut config = AppConfig::default();
+        config.site_url = normalize_base_url(&site.site_url);
+        config.confluence_url = normalize_base_url(&site.confluence_url);
+        config.deployment = site.deployment;
+        config.profile = site.account_id.clone();
+
+        let gateway = api_gateway_base
+            .as_deref()
+            .map(normalize_base_url)
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| DEFAULT_OAUTH_API_BASE.to_string());
+        let cloud_id = site
+            .cloud_id
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string);
+
+        Self {
+            http,
+            config,
+            auth,
+            me_cache: Arc::new(RwLock::new(None)),
+            site_id: if site.id.trim().is_empty() {
+                "default".to_string()
+            } else {
+                site.id.trim().to_string()
+            },
+            cloud_id,
+            api_gateway_base: gateway,
+            oauth_auth_base: DEFAULT_OAUTH_AUTH_BASE.to_string(),
+        }
+    }
+
+    /// Overrides the OAuth token endpoint base URL (defaults to `https://auth.atlassian.com`).
+    pub fn with_oauth_auth_base(mut self, auth_base: impl Into<String>) -> Self {
+        let normalized = normalize_base_url(&auth_base.into());
+        if !normalized.is_empty() {
+            self.oauth_auth_base = normalized;
+        }
+        self
     }
 
     /// Convenience constructor for tests and programmatic callers with explicit base URLs.
@@ -79,16 +154,95 @@ impl AtlassianClient {
         &self.auth
     }
 
+    pub fn site_id(&self) -> &str {
+        &self.site_id
+    }
+
+    pub fn cloud_id(&self) -> Option<&str> {
+        self.cloud_id.as_deref()
+    }
+
     pub fn deployment(&self) -> DeploymentKind {
         self.config.deployment
     }
 
+    /// Human-facing Atlassian site URL (always preserved for browser `web_url` links).
     pub fn site_url(&self) -> &str {
         &self.config.site_url
     }
 
+    /// Human-facing Confluence root URL (always preserved for browser `web_url` links).
     pub fn confluence_root_url(&self) -> String {
         self.config.effective_confluence_root()
+    }
+
+    /// Effective Jira REST / Agile API base URL:
+    /// - OAuth 3LO Cloud (`cloud_id` present): `{api_gateway_base}/ex/jira/{cloud_id}`
+    /// - Direct Cloud / Data Center: `{site_url}`
+    pub fn jira_api_base_url(&self) -> String {
+        if let Some(cid) = self.cloud_id.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+            format!(
+                "{}/ex/jira/{}",
+                normalize_base_url(&self.api_gateway_base),
+                urlencoding::encode(cid)
+            )
+        } else {
+            normalize_base_url(&self.config.site_url)
+        }
+    }
+
+    /// Effective Confluence REST API base URL:
+    /// - OAuth 3LO Cloud (`cloud_id` present): `{api_gateway_base}/ex/confluence/{cloud_id}/wiki`
+    /// - Direct Cloud / Data Center: `{effective_confluence_root}`
+    pub fn confluence_api_base_url(&self) -> String {
+        if let Some(cid) = self.cloud_id.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+            format!(
+                "{}/ex/confluence/{}/wiki",
+                normalize_base_url(&self.api_gateway_base),
+                urlencoding::encode(cid)
+            )
+        } else {
+            self.config.effective_confluence_root()
+        }
+    }
+
+    /// Translates human-facing site / Confluence URLs into Atlassian OAuth 3LO Gateway URLs
+    /// when `cloud_id` is configured, while leaving non-OAuth or already-routed URLs intact.
+    pub(crate) fn resolve_api_url(&self, url: &str) -> String {
+        let Some(cid) = self.cloud_id.as_deref().map(str::trim).filter(|s| !s.is_empty()) else {
+            return url.to_string();
+        };
+
+        let gateway = normalize_base_url(&self.api_gateway_base);
+        let gateway_ex_prefix = format!("{gateway}/ex/");
+        if url.starts_with(&gateway_ex_prefix) {
+            return url.to_string();
+        }
+
+        // Match Confluence root first because `{site_url}/wiki` is a prefix extension of `{site_url}`.
+        let conf_root = self.confluence_root_url();
+        if !conf_root.is_empty() {
+            if let Some(rest) = strip_url_prefix(url, &conf_root) {
+                return format!(
+                    "{}/ex/confluence/{}/wiki{rest}",
+                    gateway,
+                    urlencoding::encode(cid)
+                );
+            }
+        }
+
+        let site_root = normalize_base_url(self.site_url());
+        if !site_root.is_empty() {
+            if let Some(rest) = strip_url_prefix(url, &site_root) {
+                return format!(
+                    "{}/ex/jira/{}{rest}",
+                    gateway,
+                    urlencoding::encode(cid)
+                );
+            }
+        }
+
+        url.to_string()
     }
 
     pub fn cached_me(&self) -> Option<UserSummary> {
@@ -103,18 +257,26 @@ impl AtlassianClient {
 
     pub(crate) fn require_site_url(&self) -> Result<String> {
         let url = normalize_base_url(self.site_url());
-        if url.is_empty() {
-            bail!("Atlassian 사이트 URL이 설정되지 않았습니다. `jira login --site <URL>` 또는 ATLASSIAN_SITE_URL을 설정하세요.");
+        if !url.is_empty() {
+            return Ok(url);
         }
-        Ok(url)
+        let api_base = self.jira_api_base_url();
+        if !api_base.is_empty() {
+            return Ok(api_base);
+        }
+        bail!("Atlassian site URL is not configured. Run `jira login --site <URL>` or set ATLASSIAN_SITE_URL.");
     }
 
     pub(crate) fn require_confluence_root(&self) -> Result<String> {
         let url = self.confluence_root_url();
-        if url.trim().is_empty() {
-            bail!("Confluence URL이 설정되지 않았습니다. `confluence login --site <URL>` 또는 ATLASSIAN_CONFLUENCE_URL을 설정하세요.");
+        if !url.trim().is_empty() {
+            return Ok(url);
         }
-        Ok(url)
+        let api_base = self.confluence_api_base_url();
+        if !api_base.trim().is_empty() {
+            return Ok(api_base);
+        }
+        bail!("Confluence URL is not configured. Run `confluence login --site <URL>` or set ATLASSIAN_CONFLUENCE_URL.");
     }
 
     pub async fn get_myself(&self) -> Result<UserSummary> {
@@ -130,17 +292,17 @@ impl AtlassianClient {
     }
 
     pub(crate) async fn get_json<T: DeserializeOwned>(&self, url: &str) -> Result<T> {
+        let target_url = self.resolve_api_url(url);
         let resp = self
-            .send_with_retry(|| {
-                let auth_header = self.auth.authorization_header()?;
+            .send_with_retry(|auth_header| {
                 Ok(self
                     .http
-                    .get(url)
+                    .get(&target_url)
                     .header(AUTHORIZATION, auth_header)
                     .header(ACCEPT, "application/json"))
             })
             .await?;
-        decode_json_response(resp, url).await
+        decode_json_response(resp, &target_url).await
     }
 
     pub(crate) async fn post_json<B: Serialize, T: DeserializeOwned>(
@@ -148,27 +310,27 @@ impl AtlassianClient {
         url: &str,
         body: &B,
     ) -> Result<T> {
+        let target_url = self.resolve_api_url(url);
         let resp = self
-            .send_with_retry(|| {
-                let auth_header = self.auth.authorization_header()?;
+            .send_with_retry(|auth_header| {
                 Ok(self
                     .http
-                    .post(url)
+                    .post(&target_url)
                     .header(AUTHORIZATION, auth_header)
                     .header(ACCEPT, "application/json")
                     .json(body))
             })
             .await?;
-        decode_json_response(resp, url).await
+        decode_json_response(resp, &target_url).await
     }
 
     pub(crate) async fn post_json_empty<B: Serialize>(&self, url: &str, body: &B) -> Result<()> {
+        let target_url = self.resolve_api_url(url);
         let _ = self
-            .send_with_retry(|| {
-                let auth_header = self.auth.authorization_header()?;
+            .send_with_retry(|auth_header| {
                 Ok(self
                     .http
-                    .post(url)
+                    .post(&target_url)
                     .header(AUTHORIZATION, auth_header)
                     .header(ACCEPT, "application/json")
                     .json(body))
@@ -182,27 +344,27 @@ impl AtlassianClient {
         url: &str,
         body: &B,
     ) -> Result<T> {
+        let target_url = self.resolve_api_url(url);
         let resp = self
-            .send_with_retry(|| {
-                let auth_header = self.auth.authorization_header()?;
+            .send_with_retry(|auth_header| {
                 Ok(self
                     .http
-                    .put(url)
+                    .put(&target_url)
                     .header(AUTHORIZATION, auth_header)
                     .header(ACCEPT, "application/json")
                     .json(body))
             })
             .await?;
-        decode_json_response(resp, url).await
+        decode_json_response(resp, &target_url).await
     }
 
     pub(crate) async fn put_json_empty<B: Serialize>(&self, url: &str, body: &B) -> Result<()> {
+        let target_url = self.resolve_api_url(url);
         let _ = self
-            .send_with_retry(|| {
-                let auth_header = self.auth.authorization_header()?;
+            .send_with_retry(|auth_header| {
                 Ok(self
                     .http
-                    .put(url)
+                    .put(&target_url)
                     .header(AUTHORIZATION, auth_header)
                     .header(ACCEPT, "application/json")
                     .json(body))
@@ -212,12 +374,12 @@ impl AtlassianClient {
     }
 
     pub(crate) async fn delete_req(&self, url: &str) -> Result<()> {
+        let target_url = self.resolve_api_url(url);
         let _ = self
-            .send_with_retry(|| {
-                let auth_header = self.auth.authorization_header()?;
+            .send_with_retry(|auth_header| {
                 Ok(self
                     .http
-                    .delete(url)
+                    .delete(&target_url)
                     .header(AUTHORIZATION, auth_header)
                     .header(ACCEPT, "application/json"))
             })
@@ -233,52 +395,82 @@ impl AtlassianClient {
         mime_type: &str,
         bytes: Vec<u8>,
     ) -> Result<Value> {
+        let target_url = self.resolve_api_url(url);
         let resp = self
-            .send_with_retry(|| {
-                let auth_header = self.auth.authorization_header()?;
+            .send_with_retry(|auth_header| {
                 let part = Part::bytes(bytes.clone())
                     .file_name(file_name.to_string())
                     .mime_str(mime_type)
-                    .unwrap_or_else(|_| Part::bytes(bytes.clone()).file_name(file_name.to_string()));
+                    .unwrap_or_else(|_| {
+                        Part::bytes(bytes.clone()).file_name(file_name.to_string())
+                    });
                 let form = Form::new().part(field_name.to_string(), part);
                 Ok(self
                     .http
-                    .post(url)
+                    .post(&target_url)
                     .header(AUTHORIZATION, auth_header)
                     .header(ACCEPT, "application/json")
                     .header("X-Atlassian-Token", "no-check")
                     .multipart(form))
             })
             .await?;
-        decode_json_response(resp, url).await
+        decode_json_response(resp, &target_url).await
     }
 
     /// Fetches binary bytes while preserving `Authorization` on same-origin redirects
     /// and stripping it on cross-origin redirects (e.g., signed Atlassian Media / S3 CDN URLs).
     pub(crate) async fn get_bytes(&self, url: &str) -> Result<Vec<u8>> {
-        let auth_header = self.auth.authorization_header()?;
-        let initial_url =
-            Url::parse(url).with_context(|| format!("잘못된 첨부파일 URL: {url}"))?;
+        let target_url = self.resolve_api_url(url);
+        let (mut auth_header, mut oauth_token) = self.resolve_auth_header().await?;
+        let initial_url = Url::parse(&target_url)
+            .with_context(|| format!("Invalid attachment URL: {target_url}"))?;
         let no_redirect_client = reqwest::Client::builder()
             .user_agent(format!("atlassian-cli/{}", env!("CARGO_PKG_VERSION")))
             .timeout(Duration::from_secs(60))
             .redirect(reqwest::redirect::Policy::none())
             .build()
-            .context("다운로드 HTTP 클라이언트 초기화 실패")?;
+            .context("Failed to initialize download HTTP client")?;
 
         let mut current_url = initial_url.clone();
+        let mut refreshed_on_401 = false;
         for _hop in 0..=MAX_REDIRECT_HOPS {
             let send_auth = is_same_origin(&initial_url, &current_url);
-            let resp = send_request_with_retry_client(&no_redirect_client, || {
-                let mut req = no_redirect_client
-                    .request(Method::GET, current_url.clone())
-                    .header(ACCEPT, "*/*");
-                if send_auth {
-                    req = req.header(AUTHORIZATION, auth_header.as_str());
+            let resp = loop {
+                let res = send_request_with_retry_client(&no_redirect_client, || {
+                    let mut req = no_redirect_client
+                        .request(Method::GET, current_url.clone())
+                        .header(ACCEPT, "*/*");
+                    if send_auth {
+                        req = req.header(AUTHORIZATION, auth_header.as_str());
+                    }
+                    Ok(req)
+                })
+                .await;
+
+                match res {
+                    Ok(r) => break r,
+                    Err(err) => {
+                        let is_401 = err
+                            .downcast_ref::<HttpStatusError>()
+                            .is_some_and(|e| e.status == StatusCode::UNAUTHORIZED);
+                        if is_401 && send_auth && oauth_token.is_some() && !refreshed_on_401 {
+                            let refreshed = self
+                                .auth
+                                .force_refresh_credentials(
+                                    &self.http,
+                                    &self.oauth_auth_base,
+                                    oauth_token.as_deref(),
+                                )
+                                .await?;
+                            auth_header = refreshed.authorization_header();
+                            oauth_token = refreshed.oauth_access_token().map(str::to_string);
+                            refreshed_on_401 = true;
+                            continue;
+                        }
+                        return Err(err);
+                    }
                 }
-                Ok(req)
-            })
-            .await?;
+            };
 
             let status = resp.status();
             if status.is_redirection() {
@@ -286,10 +478,12 @@ impl AtlassianClient {
                     .headers()
                     .get(LOCATION)
                     .and_then(|v| v.to_str().ok())
-                    .ok_or_else(|| anyhow!("리다이렉트 응답({status})에 Location 헤더가 없습니다."))?;
+                    .ok_or_else(|| {
+                        anyhow!("Redirect response ({status}) is missing Location header")
+                    })?;
                 current_url = current_url
                     .join(loc)
-                    .with_context(|| format!("리다이렉트 URL 해석 실패: {loc}"))?;
+                    .with_context(|| format!("Failed to resolve redirect URL: {loc}"))?;
                 continue;
             }
 
@@ -307,18 +501,231 @@ impl AtlassianClient {
             let bytes = resp
                 .bytes()
                 .await
-                .context("첨부파일 바이트 응답 읽기 실패")?;
+                .context("Failed to read attachment response bytes")?;
             return Ok(bytes.to_vec());
         }
 
-        bail!("첨부파일 다운로드 리다이렉트 횟수({MAX_REDIRECT_HOPS}회)를 초과했습니다: {url}")
+        bail!("Attachment download exceeded max redirects ({MAX_REDIRECT_HOPS}): {target_url}")
     }
 
-    async fn send_with_retry<F>(&self, build_req: F) -> Result<reqwest::Response>
+    async fn resolve_auth_header(&self) -> Result<(String, Option<String>)> {
+        let creds = self.auth.load_credentials()?.ok_or_else(|| {
+            anyhow!("Not signed in. Run `jira login` or `confluence login` first.")
+        })?;
+        match creds {
+            StoredCredentials::CloudOAuth { .. } => {
+                let fresh = self
+                    .auth
+                    .ensure_fresh_credentials(&self.http, &self.oauth_auth_base)
+                    .await?;
+                let token = fresh.oauth_access_token().map(str::to_string);
+                Ok((fresh.authorization_header(), token))
+            }
+            other => Ok((other.authorization_header(), None)),
+        }
+    }
+
+    async fn send_with_retry<F>(&self, mut build_req: F) -> Result<reqwest::Response>
     where
-        F: FnMut() -> Result<reqwest::RequestBuilder>,
+        F: FnMut(&str) -> Result<reqwest::RequestBuilder>,
     {
-        send_request_with_retry_client(&self.http, build_req).await
+        let (mut auth_header, mut oauth_token) = self.resolve_auth_header().await?;
+        let mut refreshed_on_401 = false;
+
+        loop {
+            let mut attempt = 1usize;
+            let result = loop {
+                let req = build_req(&auth_header)?;
+                let resp = req
+                    .send()
+                    .await
+                    .context("Failed to send Atlassian API request")?;
+                let status = resp.status();
+
+                if status.is_success() || status.is_redirection() {
+                    return Ok(resp);
+                }
+
+                if status == StatusCode::UNAUTHORIZED && oauth_token.is_some() && !refreshed_on_401
+                {
+                    break Err(None);
+                }
+
+                if is_retryable_status(status) && attempt < MAX_RETRY_ATTEMPTS {
+                    let delay = retry_delay(resp.headers().get(RETRY_AFTER), attempt);
+                    if !delay.is_zero() {
+                        tokio::time::sleep(delay).await;
+                    }
+                    attempt += 1;
+                    continue;
+                }
+
+                let body = resp.text().await.unwrap_or_default();
+                let message = extract_atlassian_error(status, &body);
+                break Err(Some(anyhow::Error::from(HttpStatusError {
+                    status,
+                    message,
+                    body,
+                })));
+            };
+
+            match result {
+                Ok(resp) => return Ok(resp),
+                Err(Some(err)) => return Err(err),
+                Err(None) => {
+                    let refreshed = self
+                        .auth
+                        .force_refresh_credentials(
+                            &self.http,
+                            &self.oauth_auth_base,
+                            oauth_token.as_deref(),
+                        )
+                        .await
+                        .context("Failed to refresh expired Atlassian OAuth token after HTTP 401")?;
+                    auth_header = refreshed.authorization_header();
+                    oauth_token = refreshed.oauth_access_token().map(str::to_string);
+                    refreshed_on_401 = true;
+                }
+            }
+        }
+    }
+}
+
+/// Manages per-site [`AtlassianClient`] instances sharing a single `reqwest::Client` connection pool.
+#[derive(Clone)]
+pub struct SiteClientPool {
+    http: reqwest::Client,
+    entries: Vec<(SiteProfile, AtlassianClient)>,
+}
+
+impl SiteClientPool {
+    /// Builds a pool from all effective sites in `config`, sharing one `reqwest::Client`
+    /// and deduplicating `AuthManager` instances per `account_id`.
+    pub fn from_config(config: &AppConfig) -> Result<Self> {
+        Self::from_config_with_options(config, None, None, None)
+    }
+
+    /// Builds a pool from `config` with optional credentials fallback path and OAuth/gateway overrides.
+    pub fn from_config_with_options(
+        config: &AppConfig,
+        fallback_path: Option<PathBuf>,
+        api_gateway_base: Option<String>,
+        oauth_auth_base: Option<String>,
+    ) -> Result<Self> {
+        let mut accounts: HashMap<String, AuthManager> = HashMap::new();
+        let sites = config.effective_sites();
+        let http = build_shared_http_client()?;
+        let mut entries = Vec::with_capacity(sites.len());
+
+        for site in sites {
+            let acct_key = if site.account_id.trim().is_empty() {
+                config.profile.clone()
+            } else {
+                site.account_id.trim().to_string()
+            };
+            let auth = accounts
+                .entry(acct_key.clone())
+                .or_insert_with(|| {
+                    let mut mgr = AuthManager::for_account(acct_key);
+                    if let Some(ref p) = fallback_path {
+                        mgr = mgr.with_fallback_path(p.clone());
+                    }
+                    mgr
+                })
+                .clone();
+
+            let mut client = AtlassianClient::for_site_with_http(
+                &site,
+                auth,
+                http.clone(),
+                api_gateway_base.clone(),
+            );
+            if let Some(ref auth_base) = oauth_auth_base {
+                client = client.with_oauth_auth_base(auth_base.clone());
+            }
+            entries.push((site, client));
+        }
+
+        Ok(Self { http, entries })
+    }
+
+    /// Builds a pool with a custom `AuthManager` resolver per site (useful for tests or DI).
+    pub fn new(
+        sites: Vec<SiteProfile>,
+        auth_resolver: impl Fn(&SiteProfile) -> AuthManager,
+        api_gateway_base: Option<String>,
+        oauth_auth_base: Option<String>,
+    ) -> Result<Self> {
+        let http = build_shared_http_client()?;
+        let mut entries = Vec::with_capacity(sites.len());
+        for site in sites {
+            let auth = auth_resolver(&site);
+            let mut client = AtlassianClient::for_site_with_http(
+                &site,
+                auth,
+                http.clone(),
+                api_gateway_base.clone(),
+            );
+            if let Some(ref auth_base) = oauth_auth_base {
+                client = client.with_oauth_auth_base(auth_base.clone());
+            }
+            entries.push((site, client));
+        }
+        Ok(Self { http, entries })
+    }
+
+    /// Returns a cloned [`AtlassianClient`] for `site_id` (case-insensitive match on site ID).
+    pub fn client_for(&self, site_id: &str) -> Result<AtlassianClient> {
+        let target = site_id.trim();
+        self.entries
+            .iter()
+            .find(|(s, _)| s.id.eq_ignore_ascii_case(target))
+            .map(|(_, c)| c.clone())
+            .ok_or_else(|| anyhow!("Unknown site ID: '{target}'"))
+    }
+
+    /// Returns the [`SiteProfile`] metadata for `site_id` if present in this pool.
+    pub fn site_for(&self, site_id: &str) -> Option<&SiteProfile> {
+        let target = site_id.trim();
+        self.entries
+            .iter()
+            .find(|(s, _)| s.id.eq_ignore_ascii_case(target))
+            .map(|(s, _)| s)
+    }
+
+    /// Returns all registered `(SiteProfile, AtlassianClient)` entries in pool order.
+    pub fn all_clients(&self) -> Vec<(SiteProfile, AtlassianClient)> {
+        self.entries.clone()
+    }
+
+    /// Returns only enabled `(SiteProfile, AtlassianClient)` entries in pool order.
+    pub fn enabled_clients(&self) -> Vec<(SiteProfile, AtlassianClient)> {
+        self.entries
+            .iter()
+            .filter(|(s, _)| s.enabled)
+            .cloned()
+            .collect()
+    }
+
+    pub fn len(&self) -> usize {
+        self.entries.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+
+    pub fn http_client(&self) -> &reqwest::Client {
+        &self.http
+    }
+}
+
+fn strip_url_prefix<'a>(url: &'a str, prefix: &str) -> Option<&'a str> {
+    let rest = url.strip_prefix(prefix)?;
+    if rest.is_empty() || rest.starts_with('/') || rest.starts_with('?') {
+        Some(rest)
+    } else {
+        None
     }
 }
 
@@ -331,7 +738,10 @@ where
 {
     for attempt in 1..=MAX_RETRY_ATTEMPTS {
         let req = build_req()?;
-        let resp = req.send().await.context("Atlassian API 요청 전송 실패")?;
+        let resp = req
+            .send()
+            .await
+            .context("Failed to send Atlassian API request")?;
         let status = resp.status();
 
         if status.is_success() || status.is_redirection() {
@@ -392,10 +802,10 @@ async fn decode_json_response<T: DeserializeOwned>(
     let text = resp
         .text()
         .await
-        .with_context(|| format!("응답 본문 읽기 실패: {url}"))?;
+        .with_context(|| format!("Failed to read response body: {url}"))?;
     serde_json::from_str::<T>(&text).with_context(|| {
         let preview: String = text.chars().take(240).collect();
-        format!("Atlassian JSON 응답 파싱 실패 ({url}): {preview}")
+        format!("Failed to parse Atlassian JSON response ({url}): {preview}")
     })
 }
 
@@ -461,14 +871,14 @@ pub(crate) fn extract_atlassian_error(status: StatusCode, body: &str) -> String 
     if parts.is_empty() {
         let trimmed = body.trim();
         if trimmed.is_empty() {
-            format!("Atlassian API 요청 실패 (HTTP {status})")
+            format!("Atlassian API request failed (HTTP {status})")
         } else {
             let preview: String = trimmed.chars().take(300).collect();
-            format!("Atlassian API 요청 실패 (HTTP {status}): {preview}")
+            format!("Atlassian API request failed (HTTP {status}): {preview}")
         }
     } else {
         format!(
-            "Atlassian API 요청 실패 (HTTP {status}): {}",
+            "Atlassian API request failed (HTTP {status}): {}",
             parts.join(" | ")
         )
     }
@@ -508,14 +918,13 @@ pub(crate) fn parse_user_summary(val: &Value, deployment: DeploymentKind) -> Use
 pub(crate) fn parse_attachment_item(val: &Value, base_url: &str) -> AttachmentItem {
     let id = json_id_to_string(val.get("id"));
     let filename = first_nonempty_str(val, &["filename", "title", "name"]);
-    let mime_type = first_nonempty_str(val, &["mimeType", "mediaType"])
-        .if_empty_then(|| {
-            val.get("metadata")
-                .and_then(|m| m.get("mediaType"))
-                .and_then(|v| v.as_str())
-                .unwrap_or("application/octet-stream")
-                .to_string()
-        });
+    let mime_type = first_nonempty_str(val, &["mimeType", "mediaType"]).if_empty_then(|| {
+        val.get("metadata")
+            .and_then(|m| m.get("mediaType"))
+            .and_then(|v| v.as_str())
+            .unwrap_or("application/octet-stream")
+            .to_string()
+    });
     let size = val
         .get("size")
         .or_else(|| val.get("fileSize"))
@@ -638,10 +1047,10 @@ impl StringExt for String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::auth::StoredCredentials;
+    use crate::auth::{now_epoch_secs, StoredCredentials};
     use axum::{
         http::{HeaderMap, StatusCode as AxumStatus},
-        routing::get,
+        routing::{get, post},
         Json, Router,
     };
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -670,7 +1079,7 @@ mod tests {
                         .starts_with("Basic "));
                     Json(serde_json::json!({
                         "accountId": "acc-123",
-                        "displayName": "김철수",
+                        "displayName": "Chulsoo Kim",
                         "emailAddress": "chulsoo@acme.com",
                         "avatarUrls": { "48x48": "https://cdn.example.com/48.png" },
                         "active": true
@@ -710,7 +1119,7 @@ mod tests {
         assert!(cloud_client.cached_me().is_none());
         let me = cloud_client.get_myself().await.unwrap();
         assert_eq!(me.id, "acc-123");
-        assert_eq!(me.display_name, "김철수");
+        assert_eq!(me.display_name, "Chulsoo Kim");
         assert_eq!(
             me.avatar_url.as_deref(),
             Some("https://cdn.example.com/48.png")
@@ -773,8 +1182,8 @@ mod tests {
                     (
                         AxumStatus::BAD_REQUEST,
                         Json(serde_json::json!({
-                            "errorMessages": ["프로젝트 키가 올바르지 않습니다."],
-                            "errors": { "summary": "필수 입력 항목입니다." }
+                            "errorMessages": ["Invalid project key."],
+                            "errors": { "summary": "Summary is required." }
                         })),
                     )
                 }),
@@ -802,7 +1211,270 @@ mod tests {
             .unwrap_err();
         let msg = format!("{err:#}");
         assert!(msg.contains("400"));
-        assert!(msg.contains("프로젝트 키가 올바르지 않습니다."));
-        assert!(msg.contains("summary: 필수 입력 항목입니다."));
+        assert!(msg.contains("Invalid project key."));
+        assert!(msg.contains("summary: Summary is required."));
+    }
+
+    #[tokio::test]
+    async fn test_oauth_gateway_routing_preserves_human_web_urls() {
+        let app = Router::new()
+            .route(
+                "/ex/jira/cloud-abc/rest/api/3/myself",
+                get(|headers: HeaderMap| async move {
+                    assert_eq!(
+                        headers.get("authorization").unwrap().to_str().unwrap(),
+                        "Bearer oauth-tok-1"
+                    );
+                    Json(serde_json::json!({
+                        "accountId": "oauth-acc-1",
+                        "displayName": "OAuth Alice",
+                        "active": true
+                    }))
+                }),
+            )
+            .route(
+                "/ex/jira/cloud-abc/rest/api/3/search/jql",
+                post(|| async {
+                    Json(serde_json::json!({
+                        "issues": [{
+                            "id": "1001",
+                            "key": "ENG-42",
+                            "fields": {
+                                "summary": "OAuth Gateway Issue",
+                                "status": { "id": "1", "name": "In Progress", "statusCategory": { "key": "indeterminate" } },
+                                "issuetype": { "id": "1", "name": "Task", "subtask": false }
+                            }
+                        }]
+                    }))
+                }),
+            )
+            .route(
+                "/ex/confluence/cloud-abc/wiki/api/v2/spaces",
+                get(|| async {
+                    Json(serde_json::json!({
+                        "results": [{
+                            "id": "sp-1",
+                            "key": "ENG",
+                            "name": "Engineering",
+                            "type": "global",
+                            "_links": { "webui": "/spaces/ENG" }
+                        }]
+                    }))
+                }),
+            );
+        let gateway_base = spawn_router(app).await;
+
+        let site = SiteProfile {
+            id: "acme".into(),
+            name: "Acme Cloud".into(),
+            site_url: "https://acme.atlassian.net".into(),
+            confluence_url: String::new(),
+            deployment: DeploymentKind::Cloud,
+            cloud_id: Some("cloud-abc".into()),
+            account_id: "oauth-main".into(),
+            enabled: true,
+            scopes: vec!["read:jira-work".into()],
+        };
+        let auth = AuthManager::with_credentials(
+            "oauth-main",
+            StoredCredentials::CloudOAuth {
+                email: Some("alice@acme.com".into()),
+                access_token: "oauth-tok-1".into(),
+                refresh_token: Some("ref-1".into()),
+                expires_at_epoch: now_epoch_secs() + 3600,
+                client_id: "cid".into(),
+                client_secret: Some("csec".into()),
+                scopes: vec!["offline_access".into()],
+            },
+        );
+
+        let client = AtlassianClient::for_site(&site, auth, Some(gateway_base.clone())).unwrap();
+        assert_eq!(client.site_url(), "https://acme.atlassian.net");
+        assert_eq!(
+            client.jira_api_base_url(),
+            format!("{gateway_base}/ex/jira/cloud-abc")
+        );
+        assert_eq!(
+            client.confluence_api_base_url(),
+            format!("{gateway_base}/ex/confluence/cloud-abc/wiki")
+        );
+
+        let me = client.get_myself().await.unwrap();
+        assert_eq!(me.id, "oauth-acc-1");
+
+        // Verify Jira search hits gateway while preserving human-facing web_url
+        let page = client
+            .search_issues_jql("project = ENG", 10, None, None)
+            .await
+            .unwrap();
+        assert_eq!(page.issues.len(), 1);
+        assert_eq!(page.issues[0].web_url, "https://acme.atlassian.net/browse/ENG-42");
+
+        // Verify Confluence spaces hit gateway while preserving human-facing web_url
+        let spaces = client.list_spaces(10).await.unwrap();
+        assert_eq!(spaces.len(), 1);
+        assert_eq!(
+            spaces[0].web_url,
+            "https://acme.atlassian.net/wiki/spaces/ENG"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_site_client_pool_401_single_flight_auto_refresh() {
+        let refresh_count = Arc::new(AtomicUsize::new(0));
+        let refresh_clone = refresh_count.clone();
+
+        let app = Router::new()
+            .route(
+                "/oauth/token",
+                post(move |Json(body): Json<Value>| {
+                    let count = refresh_clone.clone();
+                    async move {
+                        count.fetch_add(1, Ordering::SeqCst);
+                        tokio::time::sleep(Duration::from_millis(30)).await;
+                        assert_eq!(body["grant_type"], "refresh_token");
+                        assert_eq!(body["refresh_token"], "ref-stale");
+                        Json(serde_json::json!({
+                            "access_token": "tok-fresh-2",
+                            "refresh_token": "ref-rotated-2",
+                            "expires_in": 3600
+                        }))
+                    }
+                }),
+            )
+            .route(
+                "/ex/jira/cloud-1/rest/api/3/myself",
+                get(|headers: HeaderMap| async move {
+                    let auth = headers
+                        .get("authorization")
+                        .and_then(|v| v.to_str().ok())
+                        .unwrap_or("");
+                    if auth == "Bearer tok-fresh-2" {
+                        (
+                            AxumStatus::OK,
+                            Json(serde_json::json!({
+                                "accountId": "u-site1",
+                                "displayName": "Site 1 User",
+                                "active": true
+                            })),
+                        )
+                    } else {
+                        (
+                            AxumStatus::UNAUTHORIZED,
+                            Json(serde_json::json!({ "message": "Token expired" })),
+                        )
+                    }
+                }),
+            )
+            .route(
+                "/ex/jira/cloud-2/rest/api/3/myself",
+                get(|headers: HeaderMap| async move {
+                    let auth = headers
+                        .get("authorization")
+                        .and_then(|v| v.to_str().ok())
+                        .unwrap_or("");
+                    if auth == "Bearer tok-fresh-2" {
+                        (
+                            AxumStatus::OK,
+                            Json(serde_json::json!({
+                                "accountId": "u-site2",
+                                "displayName": "Site 2 User",
+                                "active": true
+                            })),
+                        )
+                    } else {
+                        (
+                            AxumStatus::UNAUTHORIZED,
+                            Json(serde_json::json!({ "message": "Token expired" })),
+                        )
+                    }
+                }),
+            );
+
+        let mock_base = spawn_router(app).await;
+
+        let shared_oauth = AuthManager::with_credentials(
+            "oauth-main",
+            StoredCredentials::CloudOAuth {
+                email: Some("dev@acme.com".into()),
+                access_token: "tok-stale-1".into(),
+                refresh_token: Some("ref-stale".into()),
+                expires_at_epoch: now_epoch_secs() + 3600, // not locally expired yet -> triggers 401 path!
+                client_id: "cid".into(),
+                client_secret: Some("csec".into()),
+                scopes: vec!["offline_access".into()],
+            },
+        );
+
+        let sites = vec![
+            SiteProfile {
+                id: "site-1".into(),
+                name: "Site One".into(),
+                site_url: "https://one.atlassian.net".into(),
+                confluence_url: String::new(),
+                deployment: DeploymentKind::Cloud,
+                cloud_id: Some("cloud-1".into()),
+                account_id: "oauth-main".into(),
+                enabled: true,
+                scopes: Vec::new(),
+            },
+            SiteProfile {
+                id: "site-2".into(),
+                name: "Site Two".into(),
+                site_url: "https://two.atlassian.net".into(),
+                confluence_url: String::new(),
+                deployment: DeploymentKind::Cloud,
+                cloud_id: Some("cloud-2".into()),
+                account_id: "oauth-main".into(),
+                enabled: true,
+                scopes: Vec::new(),
+            },
+            SiteProfile {
+                id: "disabled-dc".into(),
+                name: "Disabled DC".into(),
+                site_url: "https://dc.local".into(),
+                confluence_url: String::new(),
+                deployment: DeploymentKind::DataCenter,
+                cloud_id: None,
+                account_id: "dc".into(),
+                enabled: false,
+                scopes: Vec::new(),
+            },
+        ];
+
+        let pool = SiteClientPool::new(
+            sites,
+            |_site| shared_oauth.clone(),
+            Some(mock_base.clone()),
+            Some(mock_base.clone()),
+        )
+        .unwrap();
+
+        assert_eq!(pool.all_clients().len(), 3);
+        assert_eq!(pool.enabled_clients().len(), 2);
+        assert!(pool.client_for("nonexistent").is_err());
+
+        let c1 = pool.client_for("site-1").unwrap();
+        let c2 = pool.client_for("site-2").unwrap();
+
+        // Fire concurrent requests on two sites sharing the same OAuth account -> both get 401,
+        // single-flight refresh executes ONLY ONCE, and both retry and succeed!
+        let (r1, r2) = tokio::join!(c1.get_myself(), c2.get_myself());
+        assert_eq!(r1.unwrap().id, "u-site1");
+        assert_eq!(r2.unwrap().id, "u-site2");
+        assert_eq!(refresh_count.load(Ordering::SeqCst), 1);
+
+        // Verify rotated refresh token was saved back to AuthManager
+        match shared_oauth.load_credentials().unwrap().unwrap() {
+            StoredCredentials::CloudOAuth {
+                access_token,
+                refresh_token,
+                ..
+            } => {
+                assert_eq!(access_token, "tok-fresh-2");
+                assert_eq!(refresh_token.as_deref(), Some("ref-rotated-2"));
+            }
+            _ => panic!("expected CloudOAuth"),
+        }
     }
 }
