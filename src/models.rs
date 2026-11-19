@@ -528,3 +528,279 @@ pub enum CoreEvent {
     },
     SyncError(String),
 }
+
+// ============================================================================
+// Multi-Site Federation Models
+// ============================================================================
+
+/// Scope filter for federated vs single-site queries across SQLite, Sync, TUI, CLI, HTTP, and MCP.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Default, Serialize, Deserialize)]
+#[serde(tag = "scope", content = "site_id", rename_all = "snake_case")]
+pub enum SiteScope {
+    #[default]
+    All,
+    Only(String),
+}
+
+impl SiteScope {
+    pub fn from_optional(site_id: Option<&str>) -> Self {
+        match site_id.map(str::trim).filter(|s| !s.is_empty()) {
+            Some(id) if !id.eq_ignore_ascii_case("all") => Self::Only(id.to_string()),
+            _ => Self::All,
+        }
+    }
+
+    pub fn is_all(&self) -> bool {
+        matches!(self, Self::All)
+    }
+
+    pub fn site_id(&self) -> Option<&str> {
+        match self {
+            Self::All => None,
+            Self::Only(id) => Some(id.as_str()),
+        }
+    }
+
+    pub fn matches(&self, site_id: &str) -> bool {
+        match self {
+            Self::All => true,
+            Self::Only(target) => target.eq_ignore_ascii_case(site_id.trim()),
+        }
+    }
+}
+
+/// Aggregated status and cache statistics for one registered Atlassian site.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct SiteStatusSummary {
+    pub site_id: String,
+    pub name: String,
+    pub site_url: String,
+    pub deployment: crate::config::DeploymentKind,
+    pub auth_kind: String,
+    pub enabled: bool,
+    pub last_synced_at: Option<String>,
+    pub last_error: Option<String>,
+    pub issue_count: usize,
+    pub page_count: usize,
+}
+
+/// Site-tagged wrapper around [`ProjectSummary`] for federated multi-site views.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct FederatedProject {
+    #[serde(default)]
+    pub site_id: String,
+    #[serde(default)]
+    pub site_name: Option<String>,
+    #[serde(flatten)]
+    pub project: ProjectSummary,
+}
+
+impl FederatedProject {
+    pub fn new(
+        site_id: impl Into<String>,
+        site_name: Option<String>,
+        project: ProjectSummary,
+    ) -> Self {
+        Self {
+            site_id: site_id.into(),
+            site_name,
+            project,
+        }
+    }
+}
+
+/// Site-tagged wrapper around [`BoardSummary`] for federated multi-site views.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct FederatedBoard {
+    #[serde(default)]
+    pub site_id: String,
+    #[serde(default)]
+    pub site_name: Option<String>,
+    #[serde(flatten)]
+    pub board: BoardSummary,
+}
+
+impl FederatedBoard {
+    pub fn new(
+        site_id: impl Into<String>,
+        site_name: Option<String>,
+        board: BoardSummary,
+    ) -> Self {
+        Self {
+            site_id: site_id.into(),
+            site_name,
+            board,
+        }
+    }
+}
+
+/// Site-tagged wrapper around [`IssueSummary`] for federated multi-site views.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
+pub struct FederatedIssue {
+    #[serde(default)]
+    pub site_id: String,
+    #[serde(default)]
+    pub site_name: Option<String>,
+    #[serde(flatten)]
+    pub issue: IssueSummary,
+}
+
+impl FederatedIssue {
+    pub fn new(
+        site_id: impl Into<String>,
+        site_name: Option<String>,
+        issue: IssueSummary,
+    ) -> Self {
+        Self {
+            site_id: site_id.into(),
+            site_name,
+            issue,
+        }
+    }
+}
+
+/// Site-tagged wrapper around [`SpaceSummary`] for federated multi-site views.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct FederatedSpace {
+    #[serde(default)]
+    pub site_id: String,
+    #[serde(default)]
+    pub site_name: Option<String>,
+    #[serde(flatten)]
+    pub space: SpaceSummary,
+}
+
+impl FederatedSpace {
+    pub fn new(
+        site_id: impl Into<String>,
+        site_name: Option<String>,
+        space: SpaceSummary,
+    ) -> Self {
+        Self {
+            site_id: site_id.into(),
+            site_name,
+            space,
+        }
+    }
+}
+
+/// Site-tagged wrapper around [`PageSummary`] for federated multi-site views.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct FederatedPage {
+    #[serde(default)]
+    pub site_id: String,
+    #[serde(default)]
+    pub site_name: Option<String>,
+    #[serde(flatten)]
+    pub page: PageSummary,
+}
+
+impl FederatedPage {
+    pub fn new(
+        site_id: impl Into<String>,
+        site_name: Option<String>,
+        page: PageSummary,
+    ) -> Self {
+        Self {
+            site_id: site_id.into(),
+            site_name,
+            page,
+        }
+    }
+}
+
+/// Site-tagged wrapper around [`UnifiedSearchHit`] for federated multi-site search results.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FederatedSearchHit {
+    #[serde(default)]
+    pub site_id: String,
+    #[serde(default)]
+    pub site_name: Option<String>,
+    #[serde(flatten)]
+    pub hit: UnifiedSearchHit,
+}
+
+impl FederatedSearchHit {
+    pub fn new(
+        site_id: impl Into<String>,
+        site_name: Option<String>,
+        hit: UnifiedSearchHit,
+    ) -> Self {
+        Self {
+            site_id: site_id.into(),
+            site_name,
+            hit,
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::DeploymentKind;
+
+    #[test]
+    fn site_scope_matching_and_serde() {
+        assert_eq!(SiteScope::from_optional(None), SiteScope::All);
+        assert_eq!(SiteScope::from_optional(Some("  ")), SiteScope::All);
+        assert_eq!(SiteScope::from_optional(Some("all")), SiteScope::All);
+        assert_eq!(
+            SiteScope::from_optional(Some("acme")),
+            SiteScope::Only("acme".into())
+        );
+
+        assert!(SiteScope::All.is_all());
+        assert!(SiteScope::All.matches("any-site"));
+        assert_eq!(SiteScope::All.site_id(), None);
+
+        let only = SiteScope::Only("acme".into());
+        assert!(!only.is_all());
+        assert_eq!(only.site_id(), Some("acme"));
+        assert!(only.matches("ACME"));
+        assert!(!only.matches("corp-dc"));
+
+        let json = serde_json::to_string(&only).unwrap();
+        let decoded: SiteScope = serde_json::from_str(&json).unwrap();
+        assert_eq!(decoded, only);
+    }
+
+    #[test]
+    fn federated_wrappers_flatten_site_metadata_cleanly() {
+        let status = SiteStatusSummary {
+            site_id: "acme".into(),
+            name: "Acme Cloud".into(),
+            site_url: "https://acme.atlassian.net".into(),
+            deployment: DeploymentKind::Cloud,
+            auth_kind: "cloud_oauth".into(),
+            enabled: true,
+            last_synced_at: Some("2026-11-19T14:00:00Z".into()),
+            last_error: None,
+            issue_count: 12,
+            page_count: 5,
+        };
+        let status_json = serde_json::to_string(&status).unwrap();
+        let status_back: SiteStatusSummary = serde_json::from_str(&status_json).unwrap();
+        assert_eq!(status_back, status);
+
+        let hit = FederatedSearchHit::new(
+            "acme",
+            Some("Acme Cloud".into()),
+            UnifiedSearchHit {
+                kind: SearchHitKind::JiraIssue,
+                id_or_key: "ENG-1".into(),
+                container: "ENG".into(),
+                title: "Multi-site search".into(),
+                snippet: "...search...".into(),
+                status_or_version: "In Progress".into(),
+                updated_at: "2026-11-19T14:00:00Z".into(),
+                web_url: "https://acme.atlassian.net/browse/ENG-1".into(),
+            },
+        );
+        let val = serde_json::to_value(&hit).unwrap();
+        assert_eq!(val["site_id"], "acme");
+        assert_eq!(val["site_name"], "Acme Cloud");
+        assert_eq!(val["id_or_key"], "ENG-1");
+        let roundtrip: FederatedSearchHit = serde_json::from_value(val).unwrap();
+        assert_eq!(roundtrip, hit);
+    }
+}

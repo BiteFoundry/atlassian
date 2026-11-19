@@ -232,6 +232,92 @@ impl DeploymentKind {
     }
 }
 
+/// A registered Atlassian Cloud or Data Center site profile.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct SiteProfile {
+    /// Stable slug identifier (e.g. `"acme"`, `"corp-dc"`, `"default"`).
+    pub id: String,
+    /// Human-readable site display name (e.g. `"Acme Cloud"`).
+    pub name: String,
+    /// Human-facing Jira / site base URL (e.g. `https://acme.atlassian.net`).
+    pub site_url: String,
+    /// Optional separate Confluence base URL (primarily for Data Center setups).
+    pub confluence_url: String,
+    /// Cloud vs Data Center API dialect.
+    pub deployment: DeploymentKind,
+    /// Atlassian Cloud `cloudId` discovered via OAuth 2.0 (3LO) `/accessible-resources`.
+    /// When `Some`, API calls route through `https://api.atlassian.com/ex/{jira,confluence}/{cloud_id}`.
+    pub cloud_id: Option<String>,
+    /// Account identifier in `AuthManager` / OS Keyring (multiple sites can share one account).
+    pub account_id: String,
+    /// Whether this site participates in federated sync and search.
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    /// OAuth scopes granted for this Cloud site (empty for API token / PAT sites).
+    #[serde(default)]
+    pub scopes: Vec<String>,
+}
+
+impl Default for SiteProfile {
+    fn default() -> Self {
+        Self {
+            id: String::new(),
+            name: String::new(),
+            site_url: String::new(),
+            confluence_url: String::new(),
+            deployment: DeploymentKind::Cloud,
+            cloud_id: None,
+            account_id: "default".to_string(),
+            enabled: true,
+            scopes: Vec::new(),
+        }
+    }
+}
+
+impl SiteProfile {
+    pub fn normalized_site_url(&self) -> String {
+        normalize_base_url(&self.site_url)
+    }
+
+    pub fn effective_confluence_root(&self) -> String {
+        if !self.confluence_url.trim().is_empty() {
+            return normalize_base_url(&self.confluence_url);
+        }
+        let base = normalize_base_url(&self.site_url);
+        if base.is_empty() {
+            return String::new();
+        }
+        match self.deployment {
+            DeploymentKind::Cloud => {
+                if base.ends_with("/wiki") {
+                    base
+                } else {
+                    format!("{base}/wiki")
+                }
+            }
+            DeploymentKind::DataCenter => base,
+        }
+    }
+
+    pub fn display_name(&self) -> &str {
+        let trimmed = self.name.trim();
+        if !trimmed.is_empty() {
+            trimmed
+        } else {
+            &self.id
+        }
+    }
+
+    pub fn is_oauth_cloud(&self) -> bool {
+        self.cloud_id
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .is_some()
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct AppConfig {
@@ -242,6 +328,21 @@ pub struct AppConfig {
     pub confluence_url: String,
     /// Cloud vs Data Center API dialect.
     pub deployment: DeploymentKind,
+    /// Multi-site profiles (`[[sites]]` in `config.toml`).
+    #[serde(default)]
+    pub sites: Vec<SiteProfile>,
+    /// Active TUI site filter (`None` = All Sites federated view).
+    #[serde(default)]
+    pub active_site: Option<String>,
+    /// Default target site ID for single-site CLI / MCP / HTTP commands when `--site` is omitted.
+    #[serde(default)]
+    pub default_site: Option<String>,
+    /// Optional Atlassian Cloud OAuth 2.0 (3LO) client ID (overridden by `ATLASSIAN_OAUTH_CLIENT_ID`).
+    #[serde(default)]
+    pub oauth_client_id: Option<String>,
+    /// Optional Atlassian Cloud OAuth 2.0 (3LO) client secret (overridden by `ATLASSIAN_OAUTH_CLIENT_SECRET`).
+    #[serde(default)]
+    pub oauth_client_secret: Option<String>,
     /// Default Jira project key (e.g. `PROJ`).
     pub default_project: Option<String>,
     /// Default Agile board ID.
@@ -290,6 +391,11 @@ impl Default for AppConfig {
             site_url: String::new(),
             confluence_url: String::new(),
             deployment: DeploymentKind::Cloud,
+            sites: Vec::new(),
+            active_site: None,
+            default_site: None,
+            oauth_client_id: None,
+            oauth_client_secret: None,
             default_project: None,
             default_board_id: None,
             default_space_key: None,
@@ -384,6 +490,20 @@ impl AppConfig {
         }
         cfg.site_url = normalize_base_url(&cfg.site_url);
         cfg.confluence_url = normalize_base_url(&cfg.confluence_url);
+        for site in &mut cfg.sites {
+            site.site_url = normalize_base_url(&site.site_url);
+            site.confluence_url = normalize_base_url(&site.confluence_url);
+            if site.id.trim().is_empty() {
+                site.id = slugify_site_id(if !site.site_url.is_empty() {
+                    &site.site_url
+                } else {
+                    &site.name
+                });
+            }
+            if site.account_id.trim().is_empty() {
+                site.account_id = cfg.profile.clone();
+            }
+        }
         Ok(cfg)
     }
 
@@ -402,6 +522,274 @@ impl AppConfig {
         let body = toml::to_string_pretty(self).context("Failed to serialize config")?;
         write_atomic(path, body.as_bytes())
             .with_context(|| format!("Failed to save config file: {}", path.display()))
+    }
+
+    /// Returns all configured sites, transparently synthesizing a `"default"` site from
+    /// legacy `site_url` / `confluence_url` / `deployment` when `sites` is empty and
+    /// `site_url` is non-empty.
+    pub fn effective_sites(&self) -> Vec<SiteProfile> {
+        if !self.sites.is_empty() {
+            return self
+                .sites
+                .iter()
+                .cloned()
+                .map(|mut s| {
+                    s.site_url = normalize_base_url(&s.site_url);
+                    s.confluence_url = normalize_base_url(&s.confluence_url);
+                    if s.id.trim().is_empty() {
+                        s.id = slugify_site_id(if !s.site_url.is_empty() {
+                            &s.site_url
+                        } else {
+                            &s.name
+                        });
+                    }
+                    if s.account_id.trim().is_empty() {
+                        s.account_id = if self.profile.trim().is_empty() {
+                            "default".to_string()
+                        } else {
+                            self.profile.trim().to_string()
+                        };
+                    }
+                    s
+                })
+                .collect();
+        }
+
+        let legacy_url = normalize_base_url(&self.site_url);
+        if legacy_url.is_empty() {
+            return Vec::new();
+        }
+
+        let account_id = if self.profile.trim().is_empty() {
+            "default".to_string()
+        } else {
+            self.profile.trim().to_string()
+        };
+        let derived_name = slugify_site_id(&legacy_url);
+        vec![SiteProfile {
+            id: "default".to_string(),
+            name: if derived_name.is_empty() {
+                "default".to_string()
+            } else {
+                derived_name
+            },
+            site_url: legacy_url,
+            confluence_url: normalize_base_url(&self.confluence_url),
+            deployment: self.deployment,
+            cloud_id: None,
+            account_id,
+            enabled: true,
+            scopes: Vec::new(),
+        }]
+    }
+
+    /// Inserts or updates a `SiteProfile` (matching by `id`, then `cloud_id`, then normalized `site_url`).
+    pub fn upsert_site(&mut self, mut site: SiteProfile) {
+        site.site_url = normalize_base_url(&site.site_url);
+        site.confluence_url = normalize_base_url(&site.confluence_url);
+        if site.id.trim().is_empty() {
+            site.id = slugify_site_id(if !site.site_url.is_empty() {
+                &site.site_url
+            } else {
+                &site.name
+            });
+        } else {
+            site.id = site.id.trim().to_string();
+        }
+        if site.name.trim().is_empty() {
+            site.name = site.id.clone();
+        }
+        if site.account_id.trim().is_empty() {
+            site.account_id = if self.profile.trim().is_empty() {
+                "default".to_string()
+            } else {
+                self.profile.trim().to_string()
+            };
+        }
+
+        let incoming_cloud_id = site
+            .cloud_id
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string);
+
+        if let Some(existing) = self
+            .sites
+            .iter_mut()
+            .find(|s| s.id.eq_ignore_ascii_case(&site.id))
+        {
+            *existing = site;
+            return;
+        }
+        if let Some(ref cid) = incoming_cloud_id {
+            if let Some(existing) = self.sites.iter_mut().find(|s| {
+                s.cloud_id
+                    .as_deref()
+                    .map(str::trim)
+                    .is_some_and(|ecid| ecid == cid)
+            }) {
+                *existing = site;
+                return;
+            }
+        }
+        if !site.site_url.is_empty() {
+            if let Some(existing) = self
+                .sites
+                .iter_mut()
+                .find(|s| normalize_base_url(&s.site_url).eq_ignore_ascii_case(&site.site_url))
+            {
+                *existing = site;
+                return;
+            }
+        }
+
+        self.sites.push(site);
+    }
+
+    /// Removes a site profile by ID (case-insensitive). Returns `true` if removed.
+    pub fn remove_site(&mut self, id: &str) -> bool {
+        let target = id.trim();
+        if target.is_empty() {
+            return false;
+        }
+        let before = self.sites.len();
+        self.sites.retain(|s| !s.id.eq_ignore_ascii_case(target));
+        let removed = self.sites.len() < before;
+        if removed {
+            if self
+                .active_site
+                .as_deref()
+                .is_some_and(|a| a.eq_ignore_ascii_case(target))
+            {
+                self.active_site = None;
+            }
+            if self
+                .default_site
+                .as_deref()
+                .is_some_and(|d| d.eq_ignore_ascii_case(target))
+            {
+                self.default_site = None;
+            }
+        }
+        removed
+    }
+
+    /// Finds a configured site by `id`, `name`, or normalized URL (case-insensitive).
+    pub fn find_site(&self, query: &str) -> Option<&SiteProfile> {
+        let q = query.trim();
+        if q.is_empty() {
+            return None;
+        }
+        if let Some(s) = self.sites.iter().find(|s| s.id.eq_ignore_ascii_case(q)) {
+            return Some(s);
+        }
+        if let Some(s) = self
+            .sites
+            .iter()
+            .find(|s| s.name.trim().eq_ignore_ascii_case(q))
+        {
+            return Some(s);
+        }
+        let norm_q = normalize_url_for_match(q);
+        if let Some(s) = self.sites.iter().find(|s| {
+            let norm_site = normalize_url_for_match(&s.site_url);
+            !norm_site.is_empty() && norm_site == norm_q
+        }) {
+            return Some(s);
+        }
+        self.sites.iter().find(|s| {
+            s.cloud_id
+                .as_deref()
+                .map(str::trim)
+                .is_some_and(|cid| cid.eq_ignore_ascii_case(q))
+        })
+    }
+
+    /// Same matching rules as [`Self::find_site`], but also considers the synthesized legacy `"default"` site.
+    pub fn find_effective_site(&self, query: &str) -> Option<SiteProfile> {
+        let q = query.trim();
+        if q.is_empty() {
+            return None;
+        }
+        let sites = self.effective_sites();
+        if let Some(s) = sites.iter().find(|s| s.id.eq_ignore_ascii_case(q)) {
+            return Some(s.clone());
+        }
+        if let Some(s) = sites
+            .iter()
+            .find(|s| s.name.trim().eq_ignore_ascii_case(q))
+        {
+            return Some(s.clone());
+        }
+        let norm_q = normalize_url_for_match(q);
+        if let Some(s) = sites.iter().find(|s| {
+            let norm_site = normalize_url_for_match(&s.site_url);
+            !norm_site.is_empty() && norm_site == norm_q
+        }) {
+            return Some(s.clone());
+        }
+        sites
+            .into_iter()
+            .find(|s| {
+                s.cloud_id
+                    .as_deref()
+                    .map(str::trim)
+                    .is_some_and(|cid| cid.eq_ignore_ascii_case(q))
+            })
+    }
+
+    /// Returns all enabled sites from [`Self::effective_sites`].
+    pub fn enabled_sites(&self) -> Vec<SiteProfile> {
+        self.effective_sites()
+            .into_iter()
+            .filter(|s| s.enabled)
+            .collect()
+    }
+
+    /// Resolves the default site profile (`default_site` -> `active_site` -> first enabled site).
+    pub fn default_site_profile(&self) -> Option<SiteProfile> {
+        if let Some(ref def_id) = self.default_site {
+            if let Some(site) = self.find_effective_site(def_id) {
+                return Some(site);
+            }
+        }
+        if let Some(ref active_id) = self.active_site {
+            if let Some(site) = self.find_effective_site(active_id) {
+                return Some(site);
+            }
+        }
+        self.enabled_sites().into_iter().next()
+    }
+
+    /// Resolves OAuth 2.0 (3LO) client ID (`ATLASSIAN_OAUTH_CLIENT_ID` env var takes precedence).
+    pub fn effective_oauth_client_id(&self) -> Option<String> {
+        if let Ok(env_val) = std::env::var("ATLASSIAN_OAUTH_CLIENT_ID") {
+            let trimmed = env_val.trim();
+            if !trimmed.is_empty() {
+                return Some(trimmed.to_string());
+            }
+        }
+        self.oauth_client_id
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string)
+    }
+
+    /// Resolves OAuth 2.0 (3LO) client secret (`ATLASSIAN_OAUTH_CLIENT_SECRET` env var takes precedence).
+    pub fn effective_oauth_client_secret(&self) -> Option<String> {
+        if let Ok(env_val) = std::env::var("ATLASSIAN_OAUTH_CLIENT_SECRET") {
+            let trimmed = env_val.trim();
+            if !trimmed.is_empty() {
+                return Some(trimmed.to_string());
+            }
+        }
+        self.oauth_client_secret
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string)
     }
 
     pub fn jira_base_url(&self) -> String {
@@ -512,6 +900,83 @@ impl DraftStore {
 
 pub fn normalize_base_url(raw: &str) -> String {
     raw.trim().trim_end_matches('/').to_string()
+}
+
+/// Normalizes a URL or host string for case-insensitive site matching (strips scheme and trailing slashes).
+fn normalize_url_for_match(raw: &str) -> String {
+    let trimmed = normalize_base_url(raw).to_ascii_lowercase();
+    trimmed
+        .strip_prefix("https://")
+        .or_else(|| trimmed.strip_prefix("http://"))
+        .unwrap_or(&trimmed)
+        .trim_end_matches('/')
+        .to_string()
+}
+
+/// Derives a clean, stable lowercase slug identifier from a site URL or display name.
+///
+/// Examples:
+/// - `"https://acme-corp.atlassian.net"` -> `"acme-corp"`
+/// - `"https://jira.company.com/"` -> `"jira-company-com"`
+/// - `"Acme Prod (EU)"` -> `"acme-prod-eu"`
+pub fn slugify_site_id(url_or_name: &str) -> String {
+    let trimmed = url_or_name.trim();
+    if trimmed.is_empty() {
+        return "site".to_string();
+    }
+
+    let candidate = if trimmed.contains("://") {
+        url::Url::parse(trimmed)
+            .ok()
+            .and_then(|u| {
+                let host = u.host_str()?.to_ascii_lowercase();
+                if let Some(sub) = host.strip_suffix(".atlassian.net") {
+                    if !sub.is_empty() {
+                        return Some(sub.to_string());
+                    }
+                }
+                if let Some(sub) = host.strip_suffix(".jira.com") {
+                    if !sub.is_empty() {
+                        return Some(sub.to_string());
+                    }
+                }
+                if let Some(port) = u.port() {
+                    Some(format!("{host}-{port}"))
+                } else {
+                    Some(host)
+                }
+            })
+            .unwrap_or_else(|| trimmed.to_string())
+    } else if !trimmed.contains(char::is_whitespace) && trimmed.contains('.') {
+        let lower = trimmed.to_ascii_lowercase();
+        if let Some(sub) = lower.strip_suffix(".atlassian.net") {
+            sub.to_string()
+        } else if let Some(sub) = lower.strip_suffix(".jira.com") {
+            sub.to_string()
+        } else {
+            lower
+        }
+    } else {
+        trimmed.to_string()
+    };
+
+    let mut out = String::with_capacity(candidate.len());
+    let mut prev_dash = false;
+    for ch in candidate.chars() {
+        if ch.is_ascii_alphanumeric() {
+            out.push(ch.to_ascii_lowercase());
+            prev_dash = false;
+        } else if !prev_dash && !out.is_empty() {
+            out.push('-');
+            prev_dash = true;
+        }
+    }
+    let out = out.trim_matches('-').to_string();
+    if out.is_empty() {
+        "site".to_string()
+    } else {
+        out
+    }
 }
 
 pub fn config_dir() -> PathBuf {
@@ -814,5 +1279,170 @@ mod tests {
             Some("Working on the fix.".to_string())
         );
         assert!(loaded.is_empty());
+    }
+
+    #[test]
+    fn slugify_site_id_handles_urls_and_names() {
+        assert_eq!(slugify_site_id("https://acme.atlassian.net"), "acme");
+        assert_eq!(slugify_site_id("https://My-Team.atlassian.net/"), "my-team");
+        assert_eq!(
+            slugify_site_id("https://jira.company.com:8443/"),
+            "jira-company-com-8443"
+        );
+        assert_eq!(slugify_site_id("Acme Corp (Prod)"), "acme-corp-prod");
+        assert_eq!(slugify_site_id("side-project.atlassian.net"), "side-project");
+        assert_eq!(slugify_site_id("   "), "site");
+    }
+
+    #[test]
+    fn app_config_legacy_migration_and_multisite_helpers() {
+        // Legacy single-site config transparently synthesizes "default" site
+        let legacy = AppConfig {
+            site_url: "https://legacy.atlassian.net/".into(),
+            deployment: DeploymentKind::Cloud,
+            profile: "work".into(),
+            ..Default::default()
+        };
+        let eff = legacy.effective_sites();
+        assert_eq!(eff.len(), 1);
+        assert_eq!(eff[0].id, "default");
+        assert_eq!(eff[0].site_url, "https://legacy.atlassian.net");
+        assert_eq!(
+            eff[0].effective_confluence_root(),
+            "https://legacy.atlassian.net/wiki"
+        );
+        assert_eq!(eff[0].account_id, "work");
+        assert!(eff[0].enabled);
+        assert_eq!(
+            legacy
+                .find_effective_site("https://legacy.atlassian.net")
+                .map(|s| s.id),
+            Some("default".into())
+        );
+
+        // Multi-site CRUD, find_site, enabled_sites, and TOML roundtrip
+        let mut cfg = AppConfig::default();
+        assert!(cfg.effective_sites().is_empty());
+
+        cfg.upsert_site(SiteProfile {
+            id: "acme".into(),
+            name: "Acme Cloud".into(),
+            site_url: "https://acme.atlassian.net/".into(),
+            confluence_url: String::new(),
+            deployment: DeploymentKind::Cloud,
+            cloud_id: Some("cloud-aaa".into()),
+            account_id: "oauth-main".into(),
+            enabled: true,
+            scopes: vec!["read:jira-work".into()],
+        });
+        cfg.upsert_site(SiteProfile {
+            id: "corp-dc".into(),
+            name: "Corp On-Prem".into(),
+            site_url: "https://jira.corp.local/".into(),
+            confluence_url: "https://wiki.corp.local/".into(),
+            deployment: DeploymentKind::DataCenter,
+            cloud_id: None,
+            account_id: "dc-pat".into(),
+            enabled: false,
+            scopes: Vec::new(),
+        });
+        cfg.active_site = Some("acme".into());
+        cfg.default_site = Some("acme".into());
+
+        // Match by id, name, full URL, scheme-less URL, and cloud_id
+        assert_eq!(cfg.find_site("ACME").map(|s| s.id.as_str()), Some("acme"));
+        assert_eq!(
+            cfg.find_site("Corp On-Prem").map(|s| s.id.as_str()),
+            Some("corp-dc")
+        );
+        assert_eq!(
+            cfg.find_site("https://acme.atlassian.net/")
+                .map(|s| s.id.as_str()),
+            Some("acme")
+        );
+        assert_eq!(
+            cfg.find_site("jira.corp.local").map(|s| s.id.as_str()),
+            Some("corp-dc")
+        );
+        assert_eq!(
+            cfg.find_site("cloud-aaa").map(|s| s.id.as_str()),
+            Some("acme")
+        );
+        assert!(cfg.find_site("missing").is_none());
+
+        assert_eq!(cfg.enabled_sites().len(), 1);
+        assert_eq!(cfg.enabled_sites()[0].id, "acme");
+
+        // Upsert by matching cloud_id updates in place without duplicating
+        cfg.upsert_site(SiteProfile {
+            id: "acme-renamed".into(),
+            name: "Acme Updated".into(),
+            site_url: "https://acme.atlassian.net".into(),
+            confluence_url: String::new(),
+            deployment: DeploymentKind::Cloud,
+            cloud_id: Some("cloud-aaa".into()),
+            account_id: "oauth-main".into(),
+            enabled: true,
+            scopes: vec!["read:jira-work".into(), "write:jira-work".into()],
+        });
+        assert_eq!(cfg.sites.len(), 2);
+        assert_eq!(cfg.find_site("acme-renamed").unwrap().name, "Acme Updated");
+
+        // TOML persistence roundtrip
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("multisite.toml");
+        cfg.save_to(&path).unwrap();
+        let reloaded = AppConfig::load_from(&path).unwrap();
+        assert_eq!(reloaded.sites.len(), 2);
+        assert_eq!(reloaded.sites[0].cloud_id.as_deref(), Some("cloud-aaa"));
+        assert_eq!(reloaded.sites[1].confluence_url, "https://wiki.corp.local");
+
+        // Removing active/default site clears references
+        cfg.active_site = Some("acme-renamed".into());
+        cfg.default_site = Some("acme-renamed".into());
+        assert!(cfg.remove_site("acme-renamed"));
+        assert!(!cfg.remove_site("acme-renamed"));
+        assert_eq!(cfg.active_site, None);
+        assert_eq!(cfg.default_site, None);
+        assert_eq!(cfg.sites.len(), 1);
+    }
+
+    #[test]
+    fn effective_oauth_client_config_prefers_env_over_file() {
+        static OAUTH_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        let _lock = OAUTH_ENV_LOCK.lock().unwrap();
+
+        let prev_id = std::env::var("ATLASSIAN_OAUTH_CLIENT_ID").ok();
+        let prev_secret = std::env::var("ATLASSIAN_OAUTH_CLIENT_SECRET").ok();
+        std::env::remove_var("ATLASSIAN_OAUTH_CLIENT_ID");
+        std::env::remove_var("ATLASSIAN_OAUTH_CLIENT_SECRET");
+
+        let cfg = AppConfig {
+            oauth_client_id: Some("file-cid".into()),
+            oauth_client_secret: Some("file-csec".into()),
+            ..Default::default()
+        };
+        assert_eq!(cfg.effective_oauth_client_id().as_deref(), Some("file-cid"));
+        assert_eq!(
+            cfg.effective_oauth_client_secret().as_deref(),
+            Some("file-csec")
+        );
+
+        std::env::set_var("ATLASSIAN_OAUTH_CLIENT_ID", "env-cid");
+        std::env::set_var("ATLASSIAN_OAUTH_CLIENT_SECRET", "env-csec");
+        assert_eq!(cfg.effective_oauth_client_id().as_deref(), Some("env-cid"));
+        assert_eq!(
+            cfg.effective_oauth_client_secret().as_deref(),
+            Some("env-csec")
+        );
+
+        match prev_id {
+            Some(v) => std::env::set_var("ATLASSIAN_OAUTH_CLIENT_ID", v),
+            None => std::env::remove_var("ATLASSIAN_OAUTH_CLIENT_ID"),
+        }
+        match prev_secret {
+            Some(v) => std::env::set_var("ATLASSIAN_OAUTH_CLIENT_SECRET", v),
+            None => std::env::remove_var("ATLASSIAN_OAUTH_CLIENT_SECRET"),
+        }
     }
 }
