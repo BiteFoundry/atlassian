@@ -12,7 +12,7 @@ use std::{
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 
-pub const DEFAULT_GITHUB_REPO: &str = "shinick-dev/atlassian";
+pub const DEFAULT_GITHUB_REPO: &str = "BiteFoundry/atlassian";
 pub const DEFAULT_SERVE_PORT: u16 = 8789;
 
 /// Layout density mode in TUI (`Cozy` spacious default vs `Compact` high-density rows).

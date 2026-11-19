@@ -4,7 +4,7 @@
 
 .DESCRIPTION
     1. Ensures <RepoRoot>\target\release\jira.exe exists (downloads the prebuilt
-       release binary from GitHub `shinick-dev/atlassian` via `gh` when missing, so
+       release binary from GitHub `BiteFoundry/atlassian` via `gh` when missing, so
        Rust/Cargo is NOT required on target PCs).
     2. Registers/updates `# >>> atlassian launcher >>>` (`function jira`,
        `function confluence`, and `function conf`) in PowerShell $PROFILE. All three
@@ -39,10 +39,10 @@ $releaseExe = Join-Path $releaseDir 'jira.exe'
 
 if (-not (Test-Path -LiteralPath $releaseExe)) {
     $gh = Get-Command gh -ErrorAction SilentlyContinue
-    if ($gh -and $PSCmdlet.ShouldProcess($releaseExe, 'Download prebuilt jira.exe from shinick-dev/atlassian GitHub Release')) {
-        Write-Output "[atlassian] Downloading prebuilt jira.exe from shinick-dev/atlassian GitHub Release..."
+    if ($gh -and $PSCmdlet.ShouldProcess($releaseExe, 'Download prebuilt jira.exe from BiteFoundry/atlassian GitHub Release')) {
+        Write-Output "[atlassian] Downloading prebuilt jira.exe from BiteFoundry/atlassian GitHub Release..."
         New-Item -ItemType Directory -Force -Path $releaseDir | Out-Null
-        & $gh.Source release download -R 'shinick-dev/atlassian' --pattern 'jira.exe' --dir $releaseDir --clobber
+        & $gh.Source release download -R 'BiteFoundry/atlassian' --pattern 'jira.exe' --dir $releaseDir --clobber
     }
 }
 
@@ -60,7 +60,7 @@ function jira {
         if (Get-Command gh -ErrorAction SilentlyContinue) {
             `$relDir = Split-Path -Parent `$exe
             New-Item -ItemType Directory -Force -Path `$relDir | Out-Null
-            gh release download -R 'shinick-dev/atlassian' --pattern 'jira.exe' --dir `$relDir --clobber 2>`$null
+            gh release download -R 'BiteFoundry/atlassian' --pattern 'jira.exe' --dir `$relDir --clobber 2>`$null
         }
     }
     if (-not (Test-Path -LiteralPath `$exe)) {

@@ -1835,7 +1835,7 @@ async fn e2e_serve_http_mcp_image_preview_and_self_updater() {
 
     let gh_app = Router::new()
         .route(
-            "/repos/shinick-dev/atlassian/releases/latest",
+            "/repos/BiteFoundry/atlassian/releases/latest",
             get(move || {
                 let gh_base = gh_base_clone.read().unwrap().clone();
                 let asset = asset_name_owned.clone();
@@ -1844,7 +1844,7 @@ async fn e2e_serve_http_mcp_image_preview_and_self_updater() {
                 async move {
                     Json(json!({
                         "tag_name": "v9.9.9",
-                        "html_url": format!("{gh_base}/shinick-dev/atlassian/releases/tag/v9.9.9"),
+                        "html_url": format!("{gh_base}/BiteFoundry/atlassian/releases/tag/v9.9.9"),
                         "assets": [
                             {
                                 "name": asset,
@@ -1885,7 +1885,7 @@ async fn e2e_serve_http_mcp_image_preview_and_self_updater() {
 
     let check_res = updater::check_or_apply_update_at(
         &gh_url,
-        "shinick-dev/atlassian",
+        "BiteFoundry/atlassian",
         true,
         false,
         &target_exe,
@@ -1898,7 +1898,7 @@ async fn e2e_serve_http_mcp_image_preview_and_self_updater() {
 
     let apply_res = updater::check_or_apply_update_at(
         &gh_url,
-        "shinick-dev/atlassian",
+        "BiteFoundry/atlassian",
         false,
         false,
         &target_exe,

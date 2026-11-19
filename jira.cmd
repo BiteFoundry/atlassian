@@ -7,9 +7,9 @@ if exist "%ROOT%target\release\jira.exe" goto run
 
 where gh >nul 2>nul
 if %errorlevel% equ 0 (
-    echo [atlassian] downloading prebuilt binary from GitHub Release ^(shinick-dev/atlassian^)... >&2
+    echo [atlassian] downloading prebuilt binary from GitHub Release ^(BiteFoundry/atlassian^)... >&2
     if not exist "%ROOT%target\release" mkdir "%ROOT%target\release"
-    gh release download -R shinick-dev/atlassian --pattern "jira.exe" --dir "%ROOT%target\release" --clobber >nul 2>&1
+    gh release download -R BiteFoundry/atlassian --pattern "jira.exe" --dir "%ROOT%target\release" --clobber >nul 2>&1
     if exist "%ROOT%target\release\jira.exe" goto run
 )
 

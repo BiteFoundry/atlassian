@@ -24,7 +24,7 @@ function launch(commandName = 'jira', persona = process.env.ATLASSIAN_PERSONA ||
   const platform = process.platform;
   const arch = process.arch;
   const platformKey = `${platform}-${arch}`;
-  const packageName = `@shinick/atlassian-${platformKey}`;
+  const packageName = `@bitefoundry/atlassian-${platformKey}`;
   const binaryName = platform === 'win32' ? 'jira.exe' : 'jira';
 
   let packageDir = null;
@@ -39,8 +39,8 @@ function launch(commandName = 'jira', persona = process.env.ATLASSIAN_PERSONA ||
   if (!binaryPath || !fs.existsSync(binaryPath)) {
     const fallbackNpx =
       commandName === 'jira'
-        ? '  npx --yes @shinick/atlassian'
-        : `  npx --yes -p @shinick/atlassian ${commandName}`;
+        ? '  npx --yes @bitefoundry/atlassian'
+        : `  npx --yes -p @bitefoundry/atlassian ${commandName}`;
     const lines = [
       `no prebuilt binary found for ${platformKey}.`,
       '',
@@ -50,8 +50,8 @@ function launch(commandName = 'jira', persona = process.env.ATLASSIAN_PERSONA ||
       `Supported platforms: ${SUPPORTED.join(', ')}`,
       '',
       'Try one of:',
-      '  npm install -g @shinick/atlassian --include=optional',
-      '  npm install @shinick/atlassian --include=optional',
+      '  npm install -g @bitefoundry/atlassian --include=optional',
+      '  npm install @bitefoundry/atlassian --include=optional',
       fallbackNpx,
       '',
       'If you are on an unsupported platform (for example Alpine/musl Linux),',

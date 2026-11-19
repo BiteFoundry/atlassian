@@ -2,7 +2,7 @@
 # Unix launcher for jira (analogous to jira.cmd on Windows).
 #
 # Uses prebuilt release binary if present, attempts `gh release download` from
-# shinick-dev/atlassian when available, and falls back to `cargo build --release`.
+# BiteFoundry/atlassian when available, and falls back to `cargo build --release`.
 set -eu
 
 ROOT=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
@@ -22,7 +22,7 @@ if [ ! -x "$BIN" ] && command -v gh >/dev/null 2>&1; then
     if [ -n "$TRIPLE" ]; then
         mkdir -p "$TARGET_DIR/release"
         TMP_TGZ="$TARGET_DIR/release/atlassian-$TRIPLE.tar.gz"
-        if gh release download -R shinick-dev/atlassian --pattern "atlassian-*-$TRIPLE.tar.gz" -O "$TMP_TGZ" --clobber >/dev/null 2>&1; then
+        if gh release download -R BiteFoundry/atlassian --pattern "atlassian-*-$TRIPLE.tar.gz" -O "$TMP_TGZ" --clobber >/dev/null 2>&1; then
             tar -xzf "$TMP_TGZ" -C "$TARGET_DIR/release" >/dev/null 2>&1 || true
             rm -f "$TMP_TGZ"
             [ -f "$BIN" ] && chmod +x "$BIN"

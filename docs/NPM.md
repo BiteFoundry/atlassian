@@ -1,6 +1,6 @@
 # npm distribution
 
-`@shinick/atlassian` is distributed on npm as small JavaScript launchers plus
+`@bitefoundry/atlassian` is distributed on npm as small JavaScript launchers plus
 one optional dependency per platform. The launchers resolve the prebuilt Rust
 binary and exec it, so there is no compiler, Node native addon, or postinstall
 download step.
@@ -8,25 +8,25 @@ download step.
 The Rust crate is named `atlassian-cli` and produces a single unified binary
 (`jira` / `jira.exe`) that powers Jira (`jira`) and Confluence (`confluence` /
 `conf`, via `ATLASSIAN_PERSONA=confluence`). The npm package is scoped as
-`@shinick/atlassian` and installs **all three** commands (`jira`, `confluence`,
+`@bitefoundry/atlassian` and installs **all three** commands (`jira`, `confluence`,
 and `conf`).
 
 ## Install and run
 
 ```sh
 # one-off
-npx @shinick/atlassian --version
-npx --yes -p @shinick/atlassian confluence --version
-npx --yes -p @shinick/atlassian conf --version
+npx @bitefoundry/atlassian --version
+npx --yes -p @bitefoundry/atlassian confluence --version
+npx --yes -p @bitefoundry/atlassian conf --version
 
 # global install (installs `jira`, `confluence`, and `conf`)
-npm install -g @shinick/atlassian
+npm install -g @bitefoundry/atlassian
 jira --version
 confluence --version
 conf --version
 
 # project-local
-npm install @shinick/atlassian
+npm install @bitefoundry/atlassian
 npx jira boards
 npx confluence spaces
 npx conf pages --space ENG
@@ -43,12 +43,12 @@ Token or Data Center PAT), SQLite WAL + FTS5 cache (`cache.db`), HTTP JSON API
 
 | npm package                       | OS      | CPU   | Rust target                 |
 | --------------------------------- | ------- | ----- | --------------------------- |
-| `@shinick/atlassian-win32-x64`    | Windows | x64   | `x86_64-pc-windows-msvc`    |
-| `@shinick/atlassian-win32-arm64`  | Windows | arm64 | `aarch64-pc-windows-msvc`   |
-| `@shinick/atlassian-darwin-x64`   | macOS   | x64   | `x86_64-apple-darwin`       |
-| `@shinick/atlassian-darwin-arm64` | macOS   | arm64 | `aarch64-apple-darwin`      |
-| `@shinick/atlassian-linux-x64`    | Linux   | x64   | `x86_64-unknown-linux-gnu`  |
-| `@shinick/atlassian-linux-arm64`  | Linux   | arm64 | `aarch64-unknown-linux-gnu` |
+| `@bitefoundry/atlassian-win32-x64`    | Windows | x64   | `x86_64-pc-windows-msvc`    |
+| `@bitefoundry/atlassian-win32-arm64`  | Windows | arm64 | `aarch64-pc-windows-msvc`   |
+| `@bitefoundry/atlassian-darwin-x64`   | macOS   | x64   | `x86_64-apple-darwin`       |
+| `@bitefoundry/atlassian-darwin-arm64` | macOS   | arm64 | `aarch64-apple-darwin`      |
+| `@bitefoundry/atlassian-linux-x64`    | Linux   | x64   | `x86_64-unknown-linux-gnu`  |
+| `@bitefoundry/atlassian-linux-arm64`  | Linux   | arm64 | `aarch64-unknown-linux-gnu` |
 
 Linux packages are built against glibc. Alpine/musl users should build from
 source with Cargo; there is no musl package yet.
@@ -56,8 +56,8 @@ source with Cargo; there is no musl package yet.
 ## How resolution works
 
 `bin/jira.js`, `bin/confluence.js`, and `bin/conf.js` look up
-`@shinick/atlassian-<platform>-<arch>` through `require.resolve`, then execute
-`node_modules/@shinick/atlassian-<platform>-<arch>/bin/jira` (or `jira.exe` on
+`@bitefoundry/atlassian-<platform>-<arch>` through `require.resolve`, then execute
+`node_modules/@bitefoundry/atlassian-<platform>-<arch>/bin/jira` (or `jira.exe` on
 Windows) with `stdio: 'inherit'`. `bin/confluence.js` and `bin/conf.js` set
 `ATLASSIAN_PERSONA=confluence` before spawning the binary so the unified
 executable boots directly in Confluence mode. Signals (`SIGINT`, `SIGTERM`,
@@ -69,7 +69,7 @@ skipped), the launcher prints the supported platforms and the
 ## Layout
 
 ```text
-package.json                     # @shinick/atlassian launcher package (bin: jira, confluence, conf)
+package.json                     # @bitefoundry/atlassian launcher package (bin: jira, confluence, conf)
 bin/jira.js                      # jira launcher
 bin/confluence.js                # confluence launcher (sets ATLASSIAN_PERSONA=confluence)
 bin/conf.js                      # conf launcher (sets ATLASSIAN_PERSONA=confluence)
@@ -116,7 +116,7 @@ Publishing is automated by `.github/workflows/release.yml`, which is triggered
 by pushing a `v*` tag (or manually via `workflow_dispatch`).
 
 1. Add a repository secret `NPM_TOKEN` (an npm automation token with publish
-   rights for the `@shinick/atlassian` packages).
+   rights for the `@bitefoundry/atlassian` packages).
 2. Bump the version in `Cargo.toml`, run `node scripts/sync-version.mjs`,
    commit, and push `v<version>`.
 3. The workflow builds six targets, stages binaries into the platform
@@ -159,8 +159,8 @@ the current host.
 
 - **`no prebuilt binary found for <platform>-<arch>`** — the optional
   dependency was skipped. Reinstall with
-  `npm install -g @shinick/atlassian --include=optional` or
-  `npm install @shinick/atlassian --include=optional`. Check that your npm
+  `npm install -g @bitefoundry/atlassian --include=optional` or
+  `npm install @bitefoundry/atlassian --include=optional`. Check that your npm
   config does not set `omit=optional`.
 - **`EBADPLATFORM` / package skipped** — npm installs only the matching
   `os`/`cpu` package. Cross-installing (for example x64 Node on ARM Windows via
@@ -170,11 +170,11 @@ the current host.
 - **macOS Gatekeeper** — npm-installed binaries are not notarized. If macOS
   blocks execution, allow the binary in System Settings -> Privacy & Security,
   or build from source.
-- **Corporate proxy/firewall** — `npx @shinick/atlassian` performs a registry
+- **Corporate proxy/firewall** — `npx @bitefoundry/atlassian` performs a registry
   download each time unless cached; use a global install for offline-friendly
   use.
 - **Verify the binary** —
-  `node -p "require.resolve('@shinick/atlassian-win32-x64/package.json')"`
+  `node -p "require.resolve('@bitefoundry/atlassian-win32-x64/package.json')"`
   (adjust for your platform) shows which platform package npm selected.
 - **Tag push did not publish** — check the publish job log; a tag/version
   mismatch or a missing `NPM_TOKEN` fails the job before any publish.

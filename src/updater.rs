@@ -1,4 +1,4 @@
-//! One-click GitHub Releases self-updater (`shinick-dev/atlassian`) with SHA-256 verification and Windows NTFS `.old` atomic replacement.
+//! One-click GitHub Releases self-updater (`BiteFoundry/atlassian`) with SHA-256 verification and Windows NTFS `.old` atomic replacement.
 
 use std::{
     ffi::OsString,
@@ -41,7 +41,7 @@ pub fn cleanup_stale_old_binary() {
     }
 }
 
-/// Checks GitHub Releases (default `"shinick-dev/atlassian"`) for a newer version and optionally replaces the current binary.
+/// Checks GitHub Releases (default `"BiteFoundry/atlassian"`) for a newer version and optionally replaces the current binary.
 pub async fn check_or_apply_update(
     github_repo: &str,
     check_only: bool,
@@ -649,7 +649,7 @@ mod tests {
         }
         let body = serde_json::json!({
             "tag_name": state.tag_name,
-            "html_url": format!("{}/shinick-dev/atlassian/releases/tag/{}", state.base_url, state.tag_name),
+            "html_url": format!("{}/BiteFoundry/atlassian/releases/tag/{}", state.base_url, state.tag_name),
             "assets": [
                 {
                     "name": state.asset_name,
@@ -710,7 +710,7 @@ mod tests {
 
         let app = Router::new()
             .route(
-                "/repos/shinick-dev/atlassian/releases/latest",
+                "/repos/BiteFoundry/atlassian/releases/latest",
                 get(mock_latest_release),
             )
             .route("/assets/binary", get(mock_binary_api))
@@ -729,7 +729,7 @@ mod tests {
 
         let check_res = check_or_apply_update_at(
             &base_url,
-            "shinick-dev/atlassian",
+            "BiteFoundry/atlassian",
             true,
             false,
             &fake_exe,
@@ -744,7 +744,7 @@ mod tests {
 
         let apply_res = check_or_apply_update_at(
             &base_url,
-            "shinick-dev/atlassian",
+            "BiteFoundry/atlassian",
             false,
             false,
             &fake_exe,
@@ -782,7 +782,7 @@ mod tests {
 
         let app = Router::new()
             .route(
-                "/repos/shinick-dev/atlassian/releases/latest",
+                "/repos/BiteFoundry/atlassian/releases/latest",
                 get(mock_latest_release),
             )
             .route("/assets/binary", get(mock_binary_api))
@@ -801,7 +801,7 @@ mod tests {
 
         let err = check_or_apply_update_at(
             &base_url,
-            "shinick-dev/atlassian",
+            "BiteFoundry/atlassian",
             false,
             false,
             &fake_exe,

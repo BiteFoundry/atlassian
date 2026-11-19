@@ -1,6 +1,6 @@
 {
-  "name": "@shinick/atlassian-linux-arm64",
-  "version": "0.3.1",
+  "name": "@bitefoundry/atlassian-linux-arm64",
+  "version": "0.1.0",
   "description": "Prebuilt jira binary for Linux arm64 (glibc)",
   "license": "MIT",
   "os": [

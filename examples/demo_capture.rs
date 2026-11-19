@@ -1198,7 +1198,7 @@ async fn main() {
 
     let spec = json!({
         "title": "atlassian · jira · confluence",
-        "badge": "@shinick/atlassian v0.3.1",
+        "badge": "@bitefoundry/atlassian v0.1.0",
         "width": WIDTH,
         "height": HEIGHT,
         "bg": [17, 19, 24],
