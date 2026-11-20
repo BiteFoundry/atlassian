@@ -22,6 +22,15 @@ use crate::{
     },
 };
 
+/// Subresource fetch health flags returned alongside [`PageDetail`] so callers can
+/// preserve previously cached labels, attachments, or comments on transient subresource failures.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct PageSubresourceStatus {
+    pub labels_ok: bool,
+    pub attachments_ok: bool,
+    pub comments_ok: bool,
+}
+
 impl AtlassianClient {
     pub async fn list_spaces(&self, limit: usize) -> Result<Vec<SpaceSummary>> {
         let conf_root = self.require_confluence_root()?;
@@ -150,6 +159,14 @@ impl AtlassianClient {
     }
 
     pub async fn get_page(&self, page_id: &str) -> Result<PageDetail> {
+        let (detail, _) = self.get_page_with_meta(page_id).await?;
+        Ok(detail)
+    }
+
+    pub async fn get_page_with_meta(
+        &self,
+        page_id: &str,
+    ) -> Result<(PageDetail, PageSubresourceStatus)> {
         let conf_root = self.require_confluence_root()?;
         let encoded_id = urlencoding::encode(page_id.trim());
 
@@ -188,58 +205,74 @@ impl AtlassianClient {
 
                 let summary = parse_cloud_page_summary(&val, &conf_root);
 
-                let labels = match self
+                let (labels, labels_ok) = match self
                     .get_json::<Value>(&format!("{conf_root}/api/v2/pages/{encoded_id}/labels"))
                     .await
                 {
-                    Ok(v) => v
-                        .get("results")
-                        .and_then(|r| r.as_array())
-                        .map(|arr| {
-                            arr.iter()
-                                .filter_map(|l| l.get("name").and_then(|n| n.as_str()).map(str::to_string))
-                                .collect()
-                        })
-                        .unwrap_or_default(),
-                    Err(_) => Vec::new(),
+                    Ok(v) => (
+                        v.get("results")
+                            .and_then(|r| r.as_array())
+                            .map(|arr| {
+                                arr.iter()
+                                    .filter_map(|l| {
+                                        l.get("name").and_then(|n| n.as_str()).map(str::to_string)
+                                    })
+                                    .collect()
+                            })
+                            .unwrap_or_default(),
+                        true,
+                    ),
+                    Err(_) => (Vec::new(), false),
                 };
 
-                let attachments = match self
+                let (attachments, attachments_ok) = match self
                     .get_json::<Value>(&format!(
                         "{conf_root}/api/v2/pages/{encoded_id}/attachments"
                     ))
                     .await
                 {
-                    Ok(v) => v
-                        .get("results")
-                        .and_then(|r| r.as_array())
-                        .map(|arr| {
-                            arr.iter()
-                                .map(|a| parse_attachment_item(a, &conf_root))
-                                .collect()
-                        })
-                        .unwrap_or_default(),
-                    Err(_) => Vec::new(),
+                    Ok(v) => (
+                        v.get("results")
+                            .and_then(|r| r.as_array())
+                            .map(|arr| {
+                                arr.iter()
+                                    .map(|a| parse_attachment_item(a, &conf_root))
+                                    .collect()
+                            })
+                            .unwrap_or_default(),
+                        true,
+                    ),
+                    Err(_) => (Vec::new(), false),
                 };
 
-                let comments = self.list_page_comments(page_id).await.unwrap_or_default();
+                let (comments, comments_ok) = match self.list_page_comments(page_id).await {
+                    Ok(c) => (c, true),
+                    Err(_) => (Vec::new(), false),
+                };
                 let body_markdown = blocks_to_markdown(&blocks);
                 let toc = extract_toc(&blocks);
                 let linked_issue_keys = extract_linked_issue_keys(&blocks, &body_raw);
 
-                Ok(PageDetail {
-                    summary,
-                    ancestors: Vec::new(),
-                    labels,
-                    body_raw,
-                    body_representation,
-                    body_markdown,
-                    blocks,
-                    toc,
-                    attachments,
-                    comments,
-                    linked_issue_keys,
-                })
+                Ok((
+                    PageDetail {
+                        summary,
+                        ancestors: Vec::new(),
+                        labels,
+                        body_raw,
+                        body_representation,
+                        body_markdown,
+                        blocks,
+                        toc,
+                        attachments,
+                        comments,
+                        linked_issue_keys,
+                    },
+                    PageSubresourceStatus {
+                        labels_ok,
+                        attachments_ok,
+                        comments_ok,
+                    },
+                ))
             }
             DeploymentKind::DataCenter => {
                 let url = format!(
@@ -296,21 +329,31 @@ impl AtlassianClient {
                 let body_markdown = blocks_to_markdown(&blocks);
                 let toc = extract_toc(&blocks);
                 let linked_issue_keys = extract_linked_issue_keys(&blocks, &body_raw);
-                let comments = self.list_page_comments(page_id).await.unwrap_or_default();
+                let (comments, comments_ok) = match self.list_page_comments(page_id).await {
+                    Ok(c) => (c, true),
+                    Err(_) => (Vec::new(), false),
+                };
 
-                Ok(PageDetail {
-                    summary,
-                    ancestors,
-                    labels,
-                    body_raw,
-                    body_representation: "storage".to_string(),
-                    body_markdown,
-                    blocks,
-                    toc,
-                    attachments,
-                    comments,
-                    linked_issue_keys,
-                })
+                Ok((
+                    PageDetail {
+                        summary,
+                        ancestors,
+                        labels,
+                        body_raw,
+                        body_representation: "storage".to_string(),
+                        body_markdown,
+                        blocks,
+                        toc,
+                        attachments,
+                        comments,
+                        linked_issue_keys,
+                    },
+                    PageSubresourceStatus {
+                        labels_ok: true,
+                        attachments_ok: true,
+                        comments_ok,
+                    },
+                ))
             }
         }
     }
@@ -396,15 +439,33 @@ impl AtlassianClient {
 
         match self.deployment() {
             DeploymentKind::Cloud => {
-                let adf_str = serde_json::to_string(&markdown_to_adf(&patch.body_markdown))
-                    .context("ADF 직렬화 실패")?;
+                let (representation, body_value) = match patch
+                    .body_raw_passthrough
+                    .as_deref()
+                    .filter(|s| !s.trim().is_empty())
+                {
+                    Some(raw) => {
+                        let repr = patch
+                            .body_representation
+                            .as_deref()
+                            .map(str::trim)
+                            .filter(|s| matches!(*s, "atlas_doc_format" | "storage"))
+                            .unwrap_or("atlas_doc_format");
+                        (repr, raw.to_string())
+                    }
+                    None => (
+                        "atlas_doc_format",
+                        serde_json::to_string(&markdown_to_adf(&patch.body_markdown))
+                            .context("ADF 직렬화 실패")?,
+                    ),
+                };
                 let payload = json!({
                     "id": page_id,
                     "status": "current",
                     "title": patch.title,
                     "body": {
-                        "representation": "atlas_doc_format",
-                        "value": adf_str,
+                        "representation": representation,
+                        "value": body_value,
                     },
                     "version": {
                         "number": next_version,
@@ -415,7 +476,14 @@ impl AtlassianClient {
                 let _: Value = self.put_json(&url, &payload).await?;
             }
             DeploymentKind::DataCenter => {
-                let storage_html = markdown_to_storage_xhtml(&patch.body_markdown);
+                let storage_html = match patch
+                    .body_raw_passthrough
+                    .as_deref()
+                    .filter(|s| !s.trim().is_empty())
+                {
+                    Some(raw) => raw.to_string(),
+                    None => markdown_to_storage_xhtml(&patch.body_markdown),
+                };
                 let payload = json!({
                     "id": page_id,
                     "type": "page",
@@ -1075,6 +1143,7 @@ mod tests {
                     body_markdown: "Updated body".into(),
                     prev_version: 3,
                     version_message: Some("bump".into()),
+                    ..Default::default()
                 },
             )
             .await
@@ -1184,6 +1253,7 @@ mod tests {
                     body_markdown: "Updated".into(),
                     prev_version: 2,
                     version_message: None,
+                    ..Default::default()
                 },
             )
             .await

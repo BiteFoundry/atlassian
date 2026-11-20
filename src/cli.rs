@@ -11,7 +11,7 @@ use serde_json::json;
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use crate::{
-    atlassian::{AtlassianClient, SiteClientPool},
+    atlassian::{client::is_not_found_error, AtlassianClient, SiteClientPool},
     auth::{
         fetch_accessible_resources, run_oauth_loopback_login, AuthManager, OAuthLoopbackOptions,
         StoredCredentials, DEFAULT_OAUTH_API_BASE, DEFAULT_OAUTH_AUTH_BASE,
@@ -590,7 +590,7 @@ pub enum ConfluenceCommand {
         #[arg(long)]
         json: bool,
     },
-    /// Edit a Confluence page (auto-fetches version_number)
+    /// Edit a Confluence page
     Edit {
         page_id: String,
         #[arg(long)]
@@ -599,6 +599,9 @@ pub enum ConfluenceCommand {
         body: Option<String>,
         #[arg(long = "body-file")]
         body_file: Option<PathBuf>,
+        /// Base version number read before editing (required when replacing body)
+        #[arg(long = "prev-version")]
+        prev_version: Option<i32>,
         #[arg(long)]
         message: Option<String>,
         #[arg(long)]
@@ -773,6 +776,9 @@ pub enum WikiCommand {
         body: Option<String>,
         #[arg(long = "body-file")]
         body_file: Option<PathBuf>,
+        /// Base version number read before editing (required when replacing body)
+        #[arg(long = "prev-version")]
+        prev_version: Option<i32>,
         #[arg(long)]
         message: Option<String>,
         #[arg(long)]
@@ -1064,7 +1070,6 @@ fn apply_site_override(cfg: &AppConfig, site_override: Option<&str>) -> Result<A
     scoped.site_url = found.site_url.clone();
     scoped.confluence_url = found.confluence_url.clone();
     scoped.deployment = found.deployment;
-    scoped.profile = found.account_id;
     Ok(scoped)
 }
 
@@ -1476,6 +1481,7 @@ async fn dispatch_confluence_cli(
             title,
             body,
             body_file,
+            prev_version,
             message,
             json,
         }) => {
@@ -1486,6 +1492,7 @@ async fn dispatch_confluence_cli(
                 title,
                 body.as_deref(),
                 body_file.as_deref(),
+                prev_version,
                 message,
                 json,
             ))
@@ -1651,6 +1658,7 @@ async fn dispatch_wiki_subcommand(cfg: &AppConfig, command: WikiCommand) -> Resu
             title,
             body,
             body_file,
+            prev_version,
             message,
             json,
         } => {
@@ -1660,6 +1668,7 @@ async fn dispatch_wiki_subcommand(cfg: &AppConfig, command: WikiCommand) -> Resu
                 title,
                 body.as_deref(),
                 body_file.as_deref(),
+                prev_version,
                 message,
                 json,
             ))
@@ -2838,7 +2847,13 @@ async fn cmd_sites(cfg: &mut AppConfig, action: SitesCommand) -> Result<()> {
 }
 
 fn cmd_logout(cfg: &AppConfig, json_out: bool) -> Result<()> {
-    let auth = AuthManager::new(&cfg.profile);
+    let account_id = cfg
+        .active_site
+        .as_deref()
+        .and_then(|id| cfg.find_effective_site(id))
+        .map(|s| s.account_id)
+        .unwrap_or_else(|| cfg.profile.clone());
+    let auth = AuthManager::for_account(&account_id);
     auth.delete_credentials()?;
     if json_out {
         println!("{}", serde_json::to_string_pretty(&json!({ "ok": true }))?);
@@ -2846,6 +2861,30 @@ fn cmd_logout(cfg: &AppConfig, json_out: bool) -> Result<()> {
         println!("로그아웃했습니다. 저장된 자격 증명을 삭제했습니다.");
     }
     Ok(())
+}
+
+async fn refresh_cli_issue_cache(client: &AtlassianClient, storage: &Storage, key: &str) {
+    let site_id = client.site_id();
+    if let Ok((mut detail, meta)) = client.get_issue_with_meta(key).await {
+        let _ = storage.upsert_issue_detail_for_site_merging(
+            site_id,
+            &mut detail,
+            !meta.remote_links_ok,
+        );
+    }
+}
+
+async fn refresh_cli_page_cache(client: &AtlassianClient, storage: &Storage, page_id: &str) {
+    let site_id = client.site_id();
+    if let Ok((mut detail, meta)) = client.get_page_with_meta(page_id).await {
+        let _ = storage.upsert_page_detail_for_site_merging(
+            site_id,
+            &mut detail,
+            !meta.labels_ok,
+            !meta.attachments_ok,
+            !meta.comments_ok,
+        );
+    }
 }
 
 async fn cmd_whoami(cfg: &AppConfig, persona: Persona, json_out: bool) -> Result<()> {
@@ -2991,14 +3030,15 @@ async fn cmd_doctor(
 // ---------------------------------------------------------------------------
 
 async fn cmd_projects(cfg: &AppConfig, refresh: bool, json_out: bool) -> Result<()> {
-    let (_auth, client, storage) = open_runtime(cfg, refresh)?;
-    let cached = storage.list_projects()?;
+    let (auth, client, storage) = open_runtime(cfg, refresh)?;
+    let site_id = client.site_id();
+    let cached = storage.list_projects_for_site(site_id)?;
     let projects = if refresh || cached.is_empty() {
-        if !refresh && !AuthManager::new(&cfg.profile).is_logged_in() {
+        if !refresh && !auth.is_logged_in() {
             cached
         } else {
             let fetched = client.list_projects().await?;
-            let _ = storage.upsert_projects(&fetched);
+            let _ = storage.upsert_projects_for_site(site_id, &fetched);
             fetched
         }
     } else {
@@ -3029,14 +3069,15 @@ async fn cmd_boards(
     refresh: bool,
     json_out: bool,
 ) -> Result<()> {
-    let (_auth, client, storage) = open_runtime(cfg, refresh)?;
-    let cached = storage.list_boards(project)?;
+    let (auth, client, storage) = open_runtime(cfg, refresh)?;
+    let site_id = client.site_id();
+    let cached = storage.list_boards_for_site(site_id, project)?;
     let boards = if refresh || cached.is_empty() {
-        if !refresh && !AuthManager::new(&cfg.profile).is_logged_in() {
+        if !refresh && !auth.is_logged_in() {
             cached
         } else {
             let fetched = client.list_boards(project).await?;
-            let _ = storage.upsert_boards(&fetched);
+            let _ = storage.upsert_boards_for_site(site_id, &fetched);
             fetched
         }
     } else {
@@ -3063,8 +3104,9 @@ async fn cmd_boards(
 
 async fn cmd_sprints(cfg: &AppConfig, board_id: i64, json_out: bool) -> Result<()> {
     let (_auth, client, storage) = open_runtime(cfg, true)?;
+    let site_id = client.site_id();
     let sprints = client.list_board_sprints(board_id).await?;
-    let _ = storage.upsert_sprints(&sprints);
+    let _ = storage.upsert_sprints_for_site(site_id, &sprints);
 
     if json_out {
         println!(
@@ -3095,11 +3137,12 @@ async fn cmd_board(
     json_out: bool,
 ) -> Result<()> {
     let (_auth, client, storage) = open_runtime(cfg, true)?;
+    let site_id = client.site_id();
 
-    let mut boards = storage.list_boards(cfg.default_project.as_deref())?;
+    let mut boards = storage.list_boards_for_site(site_id, cfg.default_project.as_deref())?;
     if boards.is_empty() {
         boards = client.list_boards(cfg.default_project.as_deref()).await?;
-        let _ = storage.upsert_boards(&boards);
+        let _ = storage.upsert_boards_for_site(site_id, &boards);
     }
 
     let mut board = match board_id.or(cfg.default_board_id) {
@@ -3125,7 +3168,7 @@ async fn cmd_board(
     }
 
     let sprints = client.list_board_sprints(board.id).await.unwrap_or_default();
-    let _ = storage.upsert_sprints(&sprints);
+    let _ = storage.upsert_sprints_for_site(site_id, &sprints);
 
     let active_sprint = if let Some(sid) = sprint_id {
         sprints.iter().find(|s| s.id == sid).cloned()
@@ -3137,10 +3180,15 @@ async fn cmd_board(
     };
 
     let chosen_sprint_id = sprint_id.or_else(|| active_sprint.as_ref().map(|s| s.id));
+    let board_limit = 100usize;
     let issues = client
-        .list_board_issues(board.id, chosen_sprint_id, 100)
+        .list_board_issues(board.id, chosen_sprint_id, board_limit)
         .await?;
-    let _ = storage.upsert_issues(&issues);
+    let _ = storage.upsert_board_issues_for_site(site_id, board.id, chosen_sprint_id, &issues);
+    if issues.len() < board_limit {
+        let keep: Vec<String> = issues.iter().map(|i| i.key.clone()).collect();
+        let _ = storage.prune_board_issues_for_site(site_id, board.id, chosen_sprint_id, &keep);
+    }
 
     if json_out {
         println!(
@@ -3172,10 +3220,11 @@ async fn cmd_issues(
     json_out: bool,
 ) -> Result<()> {
     let (_auth, client, storage) = open_runtime(cfg, !offline)?;
+    let site_id = client.site_id();
     let limit = serve::clamp_limit(limit);
 
     let mut issues = if offline {
-        let mut list = storage.list_issues(project, limit)?;
+        let mut list = storage.list_issues_for_site(site_id, project, limit)?;
         if let Some(st) = status {
             let st_low = st.trim().to_ascii_lowercase();
             list.retain(|i| i.status.name.to_ascii_lowercase().contains(&st_low));
@@ -3206,7 +3255,7 @@ async fn cmd_issues(
         let page = client
             .search_issues_jql(&effective_jql, limit, None, None)
             .await?;
-        let _ = storage.upsert_issues(&page.issues);
+        let _ = storage.upsert_issues_for_site(site_id, &page.issues);
         page.issues
     };
 
@@ -3245,22 +3294,49 @@ async fn cmd_issue_view(
     json_out: bool,
 ) -> Result<()> {
     let (_auth, client, storage) = open_runtime(cfg, !offline)?;
-    let detail = if offline {
-        storage
-            .get_issue_detail(key)?
-            .with_context(|| format!("오프라인 캐시에서 이슈 '{key}'를 찾을 수 없습니다."))?
+    let site_id = client.site_id();
+    let (detail, detail_stale) = if offline {
+        let d = storage
+            .get_issue_detail_for_site(site_id, key)?
+            .with_context(|| format!("오프라인 캐시에서 이슈 '{key}'를 찾을 수 없습니다."))?;
+        let stale = storage
+            .is_issue_detail_stale_for_site(site_id, key)
+            .unwrap_or(false);
+        (d, stale)
     } else {
-        let fetched = client.get_issue(key).await?;
-        let _ = storage.upsert_issue_detail(&fetched);
-        fetched
+        let (mut fetched, meta) = match client.get_issue_with_meta(key).await {
+            Ok(res) => res,
+            Err(err) => {
+                if is_not_found_error(&err) {
+                    let _ = storage.delete_issue_for_site(site_id, key);
+                }
+                return Err(err);
+            }
+        };
+        let _ = storage.upsert_issue_detail_for_site_merging(
+            site_id,
+            &mut fetched,
+            !meta.remote_links_ok,
+        );
+        (fetched, false)
     };
 
     if json_out {
-        println!("{}", serde_json::to_string_pretty(&json!({ "issue": detail }))?);
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&json!({
+                "site_id": site_id,
+                "detail_stale": detail_stale,
+                "issue": detail,
+            }))?
+        );
         return Ok(());
     }
 
     print_issue_detail(&detail);
+    if detail_stale {
+        println!("\n[안내] 캐시된 상세 본문은 이전 수정 시각 기준입니다. 온라인에서 다시 조회하세요.");
+    }
 
     if preview_images && !offline {
         render_attachments_preview(&client, &detail.attachments, None, None).await;
@@ -3290,6 +3366,7 @@ async fn cmd_issue_create(
     let description_markdown = read_body_arg(body, body_file)?.unwrap_or_default();
 
     let (_auth, client, storage) = open_runtime(cfg, true)?;
+    let site_id = client.site_id();
     let assignee_id = match assignee.map(str::trim) {
         Some(v) if v.eq_ignore_ascii_case("me") => Some(client.get_myself().await?.id),
         Some(v) if !v.is_empty() => Some(v.to_string()),
@@ -3307,7 +3384,7 @@ async fn cmd_issue_create(
         parent_key: parent.map(str::to_string),
     };
     let created = client.create_issue(&req).await?;
-    let _ = storage.upsert_issue_detail(&created);
+    let _ = storage.upsert_issue_detail_for_site(site_id, &created);
 
     if json_out {
         println!(
@@ -3346,6 +3423,7 @@ async fn cmd_issue_edit(
     }
 
     let (_auth, client, storage) = open_runtime(cfg, true)?;
+    let site_id = client.site_id();
     let assignee_id = match assignee.as_deref().map(str::trim) {
         None => None,
         Some("") | Some("none") | Some("unassign") => Some(None),
@@ -3361,7 +3439,7 @@ async fn cmd_issue_edit(
         labels,
     };
     let updated = client.update_issue(key, &patch).await?;
-    let _ = storage.upsert_issue_detail(&updated);
+    let _ = storage.upsert_issue_detail_for_site(site_id, &updated);
 
     if json_out {
         println!(
@@ -3385,7 +3463,7 @@ async fn cmd_issue_transition(
     list: bool,
     json_out: bool,
 ) -> Result<()> {
-    let (_auth, client, _storage) = open_runtime(cfg, true)?;
+    let (_auth, client, storage) = open_runtime(cfg, true)?;
 
     if list || status.is_none() {
         let transitions = client.list_transitions(key).await?;
@@ -3407,6 +3485,7 @@ async fn cmd_issue_transition(
 
     let target = status.unwrap();
     client.transition_issue(key, target, comment).await?;
+    refresh_cli_issue_cache(&client, &storage, key).await;
 
     if json_out {
         println!(
@@ -3433,7 +3512,7 @@ async fn cmd_issue_assign(
     if !unassign && to.is_none() {
         bail!("`--to <USER_OR_ME>` 또는 `--unassign` 을 지정하세요.");
     }
-    let (_auth, client, _storage) = open_runtime(cfg, true)?;
+    let (_auth, client, storage) = open_runtime(cfg, true)?;
     let target_id = if unassign {
         None
     } else {
@@ -3446,6 +3525,7 @@ async fn cmd_issue_assign(
     };
 
     client.assign_issue(key, target_id.as_deref()).await?;
+    refresh_cli_issue_cache(&client, &storage, key).await;
 
     if json_out {
         println!(
@@ -3465,8 +3545,9 @@ async fn cmd_issue_assign(
 }
 
 async fn cmd_issue_comment(cfg: &AppConfig, key: &str, body: &str, json_out: bool) -> Result<()> {
-    let (_auth, client, _storage) = open_runtime(cfg, true)?;
+    let (_auth, client, storage) = open_runtime(cfg, true)?;
     let comment = client.add_issue_comment(key, body).await?;
+    refresh_cli_issue_cache(&client, &storage, key).await;
     if json_out {
         println!(
             "{}",
@@ -3479,8 +3560,9 @@ async fn cmd_issue_comment(cfg: &AppConfig, key: &str, body: &str, json_out: boo
 }
 
 async fn cmd_issue_attach(cfg: &AppConfig, key: &str, file: &Path, json_out: bool) -> Result<()> {
-    let (_auth, client, _storage) = open_runtime(cfg, true)?;
+    let (_auth, client, storage) = open_runtime(cfg, true)?;
     let uploaded = client.upload_issue_attachment(key, file).await?;
+    refresh_cli_issue_cache(&client, &storage, key).await;
     if json_out {
         println!(
             "{}",
@@ -3544,13 +3626,14 @@ async fn cmd_issue_delete(cfg: &AppConfig, key: &str, yes: bool, json_out: bool)
     delete_gate(yes, json_out, answer.as_deref())?;
 
     let (_auth, client, storage) = open_runtime(cfg, true)?;
+    let site_id = client.site_id();
     client.delete_issue(key).await?;
-    let _ = storage.delete_issue(key);
+    let _ = storage.delete_issue_for_site(site_id, key);
 
     if json_out {
         println!(
             "{}",
-            serde_json::to_string_pretty(&json!({ "ok": true, "key": key }))?
+            serde_json::to_string_pretty(&json!({ "ok": true, "site_id": site_id, "key": key }))?
         );
     } else {
         println!("Jira 이슈 '{key}'를 삭제했습니다.");
@@ -3569,6 +3652,7 @@ async fn cmd_issue_search(
     let limit = serve::clamp_limit(limit);
     let use_remote = remote || jql;
     let (_auth, client, storage) = open_runtime(cfg, use_remote)?;
+    let site_id = client.site_id();
 
     if use_remote {
         let effective_jql = if jql || serve::looks_like_query_expr(query) {
@@ -3582,13 +3666,14 @@ async fn cmd_issue_search(
         let page = client
             .search_issues_jql(&effective_jql, limit, None, None)
             .await?;
-        let _ = storage.upsert_issues(&page.issues);
+        let _ = storage.upsert_issues_for_site(site_id, &page.issues);
 
         if json_out {
             println!(
                 "{}",
                 serde_json::to_string_pretty(&json!({
                     "remote": true,
+                    "site_id": site_id,
                     "jql": effective_jql,
                     "issues": page.issues,
                 }))?
@@ -3601,7 +3686,16 @@ async fn cmd_issue_search(
             }
         }
     } else {
-        let hits = storage.search_issues(query, limit)?;
+        let scope_site = if cfg.active_site.is_some() || cfg.effective_sites().len() <= 1 {
+            Some(site_id)
+        } else {
+            None
+        };
+        let hits: Vec<_> = storage
+            .search_issues_scoped(query, scope_site, limit)?
+            .into_iter()
+            .map(|(_, h)| h)
+            .collect();
         if json_out {
             println!(
                 "{}",
@@ -3626,10 +3720,11 @@ async fn cmd_issue_search(
 }
 
 async fn cmd_issue_open(cfg: &AppConfig, key: &str) -> Result<()> {
-    let (_auth, client, storage) = open_runtime(cfg, false)?;
-    let url = if let Ok(Some(detail)) = storage.get_issue_detail(key) {
+    let (auth, client, storage) = open_runtime(cfg, false)?;
+    let site_id = client.site_id();
+    let url = if let Ok(Some(detail)) = storage.get_issue_detail_for_site(site_id, key) {
         detail.summary.web_url
-    } else if AuthManager::new(&cfg.profile).is_logged_in() {
+    } else if auth.is_logged_in() {
         client.get_issue(key).await?.summary.web_url
     } else if !cfg.site_url.trim().is_empty() {
         format!("{}/browse/{key}", cfg.jira_base_url())
@@ -3647,14 +3742,15 @@ async fn cmd_issue_open(cfg: &AppConfig, key: &str) -> Result<()> {
 
 async fn cmd_spaces(cfg: &AppConfig, refresh: bool, limit: usize, json_out: bool) -> Result<()> {
     let limit = serve::clamp_limit(limit);
-    let (_auth, client, storage) = open_runtime(cfg, refresh)?;
-    let cached = storage.list_spaces()?;
+    let (auth, client, storage) = open_runtime(cfg, refresh)?;
+    let site_id = client.site_id();
+    let cached = storage.list_spaces_for_site(site_id)?;
     let mut spaces = if refresh || cached.is_empty() {
-        if !refresh && !AuthManager::new(&cfg.profile).is_logged_in() {
+        if !refresh && !auth.is_logged_in() {
             cached
         } else {
             let fetched = client.list_spaces(limit).await?;
-            let _ = storage.upsert_spaces(&fetched);
+            let _ = storage.upsert_spaces_for_site(site_id, &fetched);
             fetched
         }
     } else {
@@ -3684,25 +3780,34 @@ async fn cmd_pages(
 ) -> Result<()> {
     let limit = serve::clamp_limit(limit);
     let (_auth, client, storage) = open_runtime(cfg, !offline)?;
+    let site_id = client.site_id();
 
     let mut pages = if let Some(parent_id) = parent {
         if offline {
-            storage.list_child_pages(parent_id)?
+            storage.list_child_pages_for_site(site_id, parent_id)?
         } else {
             let fetched = client.list_child_pages(parent_id).await?;
-            let _ = storage.upsert_pages(&fetched);
+            let _ = storage.upsert_pages_for_site(site_id, &fetched);
+            if fetched.len() < 100 {
+                let keep: Vec<String> = fetched.iter().map(|p| p.id.clone()).collect();
+                let _ = storage.prune_child_pages_for_site(site_id, parent_id, &keep);
+            }
             fetched
         }
     } else if let Some(sp) = space.or(cfg.default_space_key.as_deref()) {
         if offline {
-            storage.list_space_root_pages(sp)?
+            storage.list_space_root_pages_for_site(site_id, sp)?
         } else {
             let fetched = client.list_space_root_pages(sp, limit).await?;
-            let _ = storage.upsert_pages(&fetched);
+            let _ = storage.upsert_pages_for_site(site_id, &fetched);
+            if fetched.len() < limit {
+                let keep: Vec<String> = fetched.iter().map(|p| p.id.clone()).collect();
+                let _ = storage.prune_space_root_pages_for_site(site_id, sp, &keep);
+            }
             fetched
         }
     } else if offline {
-        storage.list_recent_pages(limit)?
+        storage.list_recent_pages_for_site(site_id, limit)?
     } else {
         bail!("스페이스 키 또는 `--parent <PAGE_ID>` 를 지정하세요.");
     };
@@ -3732,22 +3837,51 @@ async fn cmd_page_view(
     json_out: bool,
 ) -> Result<()> {
     let (_auth, client, storage) = open_runtime(cfg, !offline)?;
-    let detail = if offline {
-        storage
-            .get_page_detail(page_id)?
-            .with_context(|| format!("오프라인 캐시에서 페이지 '{page_id}'를 찾을 수 없습니다."))?
+    let site_id = client.site_id();
+    let (detail, detail_stale) = if offline {
+        let d = storage
+            .get_page_detail_for_site(site_id, page_id)?
+            .with_context(|| format!("오프라인 캐시에서 페이지 '{page_id}'를 찾을 수 없습니다."))?;
+        let stale = storage
+            .is_page_detail_stale_for_site(site_id, page_id)
+            .unwrap_or(false);
+        (d, stale)
     } else {
-        let fetched = client.get_page(page_id).await?;
-        let _ = storage.upsert_page_detail(&fetched);
-        fetched
+        let (mut fetched, meta) = match client.get_page_with_meta(page_id).await {
+            Ok(res) => res,
+            Err(err) => {
+                if is_not_found_error(&err) {
+                    let _ = storage.delete_page_for_site(site_id, page_id);
+                }
+                return Err(err);
+            }
+        };
+        let _ = storage.upsert_page_detail_for_site_merging(
+            site_id,
+            &mut fetched,
+            !meta.labels_ok,
+            !meta.attachments_ok,
+            !meta.comments_ok,
+        );
+        (fetched, false)
     };
 
     if json_out {
-        println!("{}", serde_json::to_string_pretty(&json!({ "page": detail }))?);
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&json!({
+                "site_id": site_id,
+                "detail_stale": detail_stale,
+                "page": detail,
+            }))?
+        );
         return Ok(());
     }
 
     print_page_detail(&detail);
+    if detail_stale {
+        println!("\n[안내] 캐시된 페이지 본문은 이전 버전 기준입니다. 온라인에서 다시 조회하세요.");
+    }
 
     if preview_images && !offline {
         render_attachments_preview(&client, &detail.attachments, None, None).await;
@@ -3772,6 +3906,7 @@ async fn cmd_page_create(
     let body_markdown = read_body_arg(body, body_file)?.unwrap_or_default();
 
     let (_auth, client, storage) = open_runtime(cfg, true)?;
+    let site_id = client.site_id();
     let req = OutgoingPage {
         space_id_or_key: space_id_or_key.to_string(),
         parent_id: parent.map(str::to_string),
@@ -3779,7 +3914,7 @@ async fn cmd_page_create(
         body_markdown,
     };
     let created = client.create_page(&req).await?;
-    let _ = storage.upsert_page_detail(&created);
+    let _ = storage.upsert_page_detail_for_site(site_id, &created);
 
     if json_out {
         println!(
@@ -3795,12 +3930,14 @@ async fn cmd_page_create(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn cmd_page_edit(
     cfg: &AppConfig,
     page_id: &str,
     title: Option<String>,
     body: Option<&str>,
     body_file: Option<&Path>,
+    prev_version: Option<i32>,
     message: Option<String>,
     json_out: bool,
 ) -> Result<()> {
@@ -3808,23 +3945,62 @@ async fn cmd_page_edit(
     if title.is_none() && body_opt.is_none() {
         bail!("수정할 제목(`--title`) 또는 본문(`--body` / `--body-file`)을 지정하세요.");
     }
+    if body_opt.is_some() && prev_version.unwrap_or(0) <= 0 {
+        bail!(
+            "Confluence 본문을 교체하려면 읽을 때 확인한 기준 버전을 `--prev-version <N>`으로 지정해야 합니다 (예: `jira wiki view {page_id}`로 버전을 확인한 뒤 `jira wiki edit {page_id} --prev-version <N> --body ...`). 기준 버전 없이 최신 버전으로 자동 덮어쓰기하지 않습니다."
+        );
+    }
 
     let (_auth, client, storage) = open_runtime(cfg, true)?;
-    let current = client.get_page(page_id).await?;
+    let site_id = client.site_id();
+    let need_current = title.is_none() || body_opt.is_none();
+    let current = if need_current {
+        Some(client.get_page(page_id).await?)
+    } else {
+        None
+    };
+
+    let resolved_title = title.unwrap_or_else(|| {
+        current
+            .as_ref()
+            .map(|c| c.summary.title.clone())
+            .unwrap_or_default()
+    });
+    let (body_markdown, body_raw_passthrough, body_representation) = match body_opt {
+        Some(b) => (b, None, None),
+        None => {
+            let cur = current.as_ref();
+            let raw = cur
+                .map(|c| c.body_raw.clone())
+                .filter(|s| !s.trim().is_empty());
+            let repr = cur.map(|c| c.body_representation.clone());
+            let md = cur.map(|c| c.body_markdown.clone()).unwrap_or_default();
+            (md, raw, repr)
+        }
+    };
+    let effective_prev_version = match prev_version {
+        Some(v) if v > 0 => v,
+        _ => current
+            .as_ref()
+            .map(|c| c.summary.version_number)
+            .unwrap_or(1),
+    };
 
     let patch = PageUpdate {
-        title: title.unwrap_or_else(|| current.summary.title.clone()),
-        body_markdown: body_opt.unwrap_or_else(|| current.body_markdown.clone()),
-        prev_version: current.summary.version_number,
+        title: resolved_title,
+        body_markdown,
+        body_raw_passthrough,
+        body_representation,
+        prev_version: effective_prev_version,
         version_message: message,
     };
     let updated = client.update_page(page_id, &patch).await?;
-    let _ = storage.upsert_page_detail(&updated);
+    let _ = storage.upsert_page_detail_for_site(site_id, &updated);
 
     if json_out {
         println!(
             "{}",
-            serde_json::to_string_pretty(&json!({ "ok": true, "page": updated }))?
+            serde_json::to_string_pretty(&json!({ "ok": true, "site_id": site_id, "page": updated }))?
         );
     } else {
         println!(
@@ -3841,8 +4017,9 @@ async fn cmd_page_comment(
     body: &str,
     json_out: bool,
 ) -> Result<()> {
-    let (_auth, client, _storage) = open_runtime(cfg, true)?;
+    let (_auth, client, storage) = open_runtime(cfg, true)?;
     let comment = client.add_page_comment(page_id, body).await?;
+    refresh_cli_page_cache(&client, &storage, page_id).await;
     if json_out {
         println!(
             "{}",
@@ -3860,8 +4037,9 @@ async fn cmd_page_attach(
     file: &Path,
     json_out: bool,
 ) -> Result<()> {
-    let (_auth, client, _storage) = open_runtime(cfg, true)?;
+    let (_auth, client, storage) = open_runtime(cfg, true)?;
     let uploaded = client.upload_page_attachment(page_id, file).await?;
+    refresh_cli_page_cache(&client, &storage, page_id).await;
     if json_out {
         println!(
             "{}",
@@ -3929,13 +4107,14 @@ async fn cmd_page_delete(cfg: &AppConfig, page_id: &str, yes: bool, json_out: bo
     delete_gate(yes, json_out, answer.as_deref())?;
 
     let (_auth, client, storage) = open_runtime(cfg, true)?;
+    let site_id = client.site_id();
     client.delete_page(page_id).await?;
-    let _ = storage.delete_page(page_id);
+    let _ = storage.delete_page_for_site(site_id, page_id);
 
     if json_out {
         println!(
             "{}",
-            serde_json::to_string_pretty(&json!({ "ok": true, "page_id": page_id }))?
+            serde_json::to_string_pretty(&json!({ "ok": true, "site_id": site_id, "page_id": page_id }))?
         );
     } else {
         println!("Confluence 페이지 '{page_id}'를 삭제했습니다.");
@@ -3954,6 +4133,7 @@ async fn cmd_page_search(
     let limit = serve::clamp_limit(limit);
     let use_remote = remote || cql;
     let (_auth, client, storage) = open_runtime(cfg, use_remote)?;
+    let site_id = client.site_id();
 
     if use_remote {
         let effective_cql = if cql || serve::looks_like_query_expr(query) {
@@ -3962,13 +4142,14 @@ async fn cmd_page_search(
             format!("text ~ \"{}\"", serve::escape_jql_str(query))
         };
         let pages = client.search_confluence_cql(&effective_cql, limit).await?;
-        let _ = storage.upsert_pages(&pages);
+        let _ = storage.upsert_pages_for_site(site_id, &pages);
 
         if json_out {
             println!(
                 "{}",
                 serde_json::to_string_pretty(&json!({
                     "remote": true,
+                    "site_id": site_id,
                     "cql": effective_cql,
                     "pages": pages,
                 }))?
@@ -3981,7 +4162,16 @@ async fn cmd_page_search(
             }
         }
     } else {
-        let hits = storage.search_pages(query, limit)?;
+        let scope_site = if cfg.active_site.is_some() || cfg.effective_sites().len() <= 1 {
+            Some(site_id)
+        } else {
+            None
+        };
+        let hits: Vec<_> = storage
+            .search_pages_scoped(query, scope_site, limit)?
+            .into_iter()
+            .map(|(_, h)| h)
+            .collect();
         if json_out {
             println!(
                 "{}",
@@ -4006,10 +4196,11 @@ async fn cmd_page_search(
 }
 
 async fn cmd_page_open(cfg: &AppConfig, page_id: &str) -> Result<()> {
-    let (_auth, client, storage) = open_runtime(cfg, false)?;
-    let url = if let Ok(Some(detail)) = storage.get_page_detail(page_id) {
+    let (auth, client, storage) = open_runtime(cfg, false)?;
+    let site_id = client.site_id();
+    let url = if let Ok(Some(detail)) = storage.get_page_detail_for_site(site_id, page_id) {
         detail.summary.web_url
-    } else if AuthManager::new(&cfg.profile).is_logged_in() {
+    } else if auth.is_logged_in() {
         client.get_page(page_id).await?.summary.web_url
     } else {
         let root = cfg.effective_confluence_root();

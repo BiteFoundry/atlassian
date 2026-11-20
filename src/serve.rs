@@ -17,13 +17,16 @@ use tokio::{net::TcpListener, sync::mpsc};
 use tower_http::cors::CorsLayer;
 
 use crate::{
-    atlassian::{AtlassianClient, SiteClientPool},
+    atlassian::{
+        client::{http_status_code, is_not_found_error},
+        AtlassianClient, SiteClientPool,
+    },
     config::AppConfig,
     models::{
         FederatedSearchHit, IssueSummary, IssueUpdate, OutgoingIssue, OutgoingPage, PageSummary,
         PageUpdate, SearchHitKind, UnifiedSearchHit,
     },
-    storage::{Storage, DEFAULT_SITE_ID},
+    storage::Storage,
     sync::{self, SiteSyncTarget, SyncCommand},
 };
 
@@ -85,7 +88,15 @@ impl IntoResponse for ApiError {
 
 impl From<anyhow::Error> for ApiError {
     fn from(err: anyhow::Error) -> Self {
-        Self::new(StatusCode::INTERNAL_SERVER_ERROR, format!("{err:#}"))
+        let status = match http_status_code(&err) {
+            Some(reqwest::StatusCode::BAD_REQUEST) => StatusCode::BAD_REQUEST,
+            Some(reqwest::StatusCode::UNAUTHORIZED) => StatusCode::UNAUTHORIZED,
+            Some(reqwest::StatusCode::FORBIDDEN) => StatusCode::FORBIDDEN,
+            Some(reqwest::StatusCode::NOT_FOUND) => StatusCode::NOT_FOUND,
+            Some(reqwest::StatusCode::CONFLICT) => StatusCode::CONFLICT,
+            _ => StatusCode::INTERNAL_SERVER_ERROR,
+        };
+        Self::new(status, format!("{err:#}"))
     }
 }
 
@@ -182,6 +193,16 @@ pub struct CreateIssueBody {
     pub labels: Vec<String>,
     #[serde(default)]
     pub parent_key: Option<String>,
+    #[serde(default)]
+    pub site: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct PatchIssueBody {
+    #[serde(flatten)]
+    pub update: IssueUpdate,
+    #[serde(default)]
+    pub site: Option<String>,
 }
 
 fn default_task_type() -> String {
@@ -193,17 +214,23 @@ pub struct TransitionBody {
     pub transition: String,
     #[serde(default)]
     pub comment: Option<String>,
+    #[serde(default)]
+    pub site: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
 pub struct AssigneeBody {
     #[serde(default)]
     pub assignee_id: Option<String>,
+    #[serde(default)]
+    pub site: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
 pub struct CommentBody {
     pub body_markdown: String,
+    #[serde(default)]
+    pub site: Option<String>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -234,6 +261,8 @@ pub struct CreatePageBody {
     pub title: String,
     #[serde(default)]
     pub body_markdown: String,
+    #[serde(default)]
+    pub site: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -246,6 +275,8 @@ pub struct UpdatePageBody {
     pub prev_version: i32,
     #[serde(default)]
     pub version_message: Option<String>,
+    #[serde(default)]
+    pub site: Option<String>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -398,23 +429,89 @@ fn resolve_site_id(state: &AppState, raw_site: Option<&str>) -> Option<String> {
     if let Some(found) = state.config.find_effective_site(trimmed) {
         return Some(found.id);
     }
+    if trimmed.eq_ignore_ascii_case(state.client.site_id()) {
+        return Some(state.client.site_id().to_string());
+    }
+    if let Some(found) = state.site_pool.site_for(trimmed) {
+        return Some(found.id.clone());
+    }
     Some(trimmed.to_string())
 }
 
-fn resolve_site_client(state: &AppState, raw_site: Option<&str>) -> Result<(String, AtlassianClient), ApiError> {
-    if let Some(site_id) = resolve_site_id(state, raw_site) {
-        if site_id.eq_ignore_ascii_case(state.client.site_id()) {
-            return Ok((site_id, state.client.clone()));
-        }
-        if let Ok(client) = state.site_pool.client_for(&site_id) {
-            return Ok((site_id, client));
-        }
-        if site_id.eq_ignore_ascii_case(DEFAULT_SITE_ID) {
-            return Ok((site_id, state.client.clone()));
-        }
-        return Err(ApiError::not_found(format!("site not found: '{site_id}'")));
+fn resolve_single_site_id(state: &AppState, raw_site: Option<&str>) -> Result<String, ApiError> {
+    let Some(trimmed) = raw_site.map(str::trim).filter(|s| !s.is_empty()) else {
+        return Ok(state.client.site_id().to_string());
+    };
+    if trimmed.eq_ignore_ascii_case("all") {
+        return Ok(state.client.site_id().to_string());
     }
-    Ok((state.client.site_id().to_string(), state.client.clone()))
+    if let Some(found) = state.config.find_effective_site(trimmed) {
+        return Ok(found.id);
+    }
+    if trimmed.eq_ignore_ascii_case(state.client.site_id()) {
+        return Ok(state.client.site_id().to_string());
+    }
+    if let Some(found) = state.site_pool.site_for(trimmed) {
+        return Ok(found.id.clone());
+    }
+    Err(ApiError::not_found(format!("site not found: '{trimmed}'")))
+}
+
+fn resolve_site_client(
+    state: &AppState,
+    raw_site: Option<&str>,
+) -> Result<(String, AtlassianClient), ApiError> {
+    let Some(trimmed) = raw_site.map(str::trim).filter(|s| !s.is_empty()) else {
+        return Ok((state.client.site_id().to_string(), state.client.clone()));
+    };
+    if trimmed.eq_ignore_ascii_case("all") {
+        return Ok((state.client.site_id().to_string(), state.client.clone()));
+    }
+    let canonical = state
+        .config
+        .find_effective_site(trimmed)
+        .map(|s| s.id)
+        .unwrap_or_else(|| trimmed.to_string());
+
+    if canonical.eq_ignore_ascii_case(state.client.site_id()) {
+        return Ok((state.client.site_id().to_string(), state.client.clone()));
+    }
+    if let Ok(client) = state.site_pool.client_for(&canonical) {
+        return Ok((client.site_id().to_string(), client));
+    }
+    Err(ApiError::not_found(format!("site not found: '{trimmed}'")))
+}
+
+async fn refresh_issue_cache_after_write(
+    client: &AtlassianClient,
+    storage: &Storage,
+    site_id: &str,
+    key: &str,
+) {
+    if let Ok((mut detail, meta)) = client.get_issue_with_meta(key).await {
+        let _ = storage.upsert_issue_detail_for_site_merging(
+            site_id,
+            &mut detail,
+            !meta.remote_links_ok,
+        );
+    }
+}
+
+async fn refresh_page_cache_after_write(
+    client: &AtlassianClient,
+    storage: &Storage,
+    site_id: &str,
+    page_id: &str,
+) {
+    if let Ok((mut detail, meta)) = client.get_page_with_meta(page_id).await {
+        let _ = storage.upsert_page_detail_for_site_merging(
+            site_id,
+            &mut detail,
+            !meta.labels_ok,
+            !meta.attachments_ok,
+            !meta.comments_ok,
+        );
+    }
 }
 
 fn site_name_lookup(config: &AppConfig, site_id: &str) -> Option<String> {
@@ -496,11 +593,8 @@ async fn list_projects(
     State(state): State<Arc<AppState>>,
     Query(query): Query<RefreshQuery>,
 ) -> Result<Json<Value>, ApiError> {
-    let scoped_site = resolve_site_id(&state, query.site.as_deref());
-    let cached = match scoped_site.as_deref() {
-        Some(sid) => state.storage.list_projects_for_site(sid)?,
-        None => state.storage.list_projects()?,
-    };
+    let target_site = resolve_single_site_id(&state, query.site.as_deref())?;
+    let cached = state.storage.list_projects_for_site(&target_site)?;
     let projects = if query.refresh || cached.is_empty() {
         let (target_site, client) = resolve_site_client(&state, query.site.as_deref())?;
         match client.list_projects().await {
@@ -530,7 +624,7 @@ async fn list_projects(
         cached
     };
 
-    Ok(Json(json!({ "site_id": scoped_site, "projects": projects })))
+    Ok(Json(json!({ "site_id": target_site, "projects": projects })))
 }
 
 async fn list_boards(
@@ -542,11 +636,8 @@ async fn list_boards(
         .as_deref()
         .map(str::trim)
         .filter(|s| !s.is_empty());
-    let scoped_site = resolve_site_id(&state, query.site.as_deref());
-    let cached = match scoped_site.as_deref() {
-        Some(sid) => state.storage.list_boards_for_site(sid, project)?,
-        None => state.storage.list_boards(project)?,
-    };
+    let target_site = resolve_single_site_id(&state, query.site.as_deref())?;
+    let cached = state.storage.list_boards_for_site(&target_site, project)?;
     let boards = if query.refresh || cached.is_empty() {
         if !query.refresh && state.config.site_url.trim().is_empty() && state.config.sites.is_empty() {
             cached
@@ -565,7 +656,7 @@ async fn list_boards(
         cached
     };
 
-    Ok(Json(json!({ "site_id": scoped_site, "boards": boards })))
+    Ok(Json(json!({ "site_id": target_site, "boards": boards })))
 }
 
 async fn list_board_sprints(
@@ -573,12 +664,9 @@ async fn list_board_sprints(
     Path(board_id): Path<i64>,
     Query(query): Query<SprintsQuery>,
 ) -> Result<Json<Value>, ApiError> {
-    let scoped_site = resolve_site_id(&state, query.site.as_deref());
+    let target_site = resolve_single_site_id(&state, query.site.as_deref())?;
     let sprints = if query.offline {
-        match scoped_site.as_deref() {
-            Some(sid) => state.storage.list_sprints_for_site(sid, board_id)?,
-            None => state.storage.list_sprints(board_id)?,
-        }
+        state.storage.list_sprints_for_site(&target_site, board_id)?
     } else {
         let (target_site, client) = resolve_site_client(&state, query.site.as_deref())?;
         let fetched = client.list_board_sprints(board_id).await?;
@@ -586,7 +674,7 @@ async fn list_board_sprints(
         fetched
     };
 
-    Ok(Json(json!({ "site_id": scoped_site, "board_id": board_id, "sprints": sprints })))
+    Ok(Json(json!({ "site_id": target_site, "board_id": board_id, "sprints": sprints })))
 }
 
 async fn list_board_issues(
@@ -595,27 +683,36 @@ async fn list_board_issues(
     Query(query): Query<BoardIssuesQuery>,
 ) -> Result<Json<Value>, ApiError> {
     let limit = clamp_limit(query.limit.unwrap_or(50));
-    let scoped_site = resolve_site_id(&state, query.site.as_deref());
+    let target_site = resolve_single_site_id(&state, query.site.as_deref())?;
     let issues = if query.offline {
-        match scoped_site.as_deref() {
-            Some(sid) => state
-                .storage
-                .list_board_issues_for_site(sid, board_id, query.sprint_id, limit)?,
-            None => state
-                .storage
-                .list_board_issues(board_id, query.sprint_id, limit)?,
-        }
+        state
+            .storage
+            .list_board_issues_for_site(&target_site, board_id, query.sprint_id, limit)?
     } else {
         let (target_site, client) = resolve_site_client(&state, query.site.as_deref())?;
         let fetched = client
             .list_board_issues(board_id, query.sprint_id, limit)
             .await?;
-        let _ = state.storage.upsert_issues_for_site(&target_site, &fetched);
+        let _ = state.storage.upsert_board_issues_for_site(
+            &target_site,
+            board_id,
+            query.sprint_id,
+            &fetched,
+        );
+        if fetched.len() < limit {
+            let keep: Vec<String> = fetched.iter().map(|i| i.key.clone()).collect();
+            let _ = state.storage.prune_board_issues_for_site(
+                &target_site,
+                board_id,
+                query.sprint_id,
+                &keep,
+            );
+        }
         fetched
     };
 
     Ok(Json(json!({
-        "site_id": scoped_site,
+        "site_id": target_site,
         "board_id": board_id,
         "sprint_id": query.sprint_id,
         "issues": issues,
@@ -632,16 +729,13 @@ async fn list_issues(
         .as_deref()
         .map(str::trim)
         .filter(|s| !s.is_empty());
-    let scoped_site = resolve_site_id(&state, query.site.as_deref());
 
     if query.offline {
-        let issues = match scoped_site.as_deref() {
-            Some(sid) => state.storage.list_issues_for_site(sid, project, limit)?,
-            None => state.storage.list_issues(project, limit)?,
-        };
+        let target_site = resolve_single_site_id(&state, query.site.as_deref())?;
+        let issues = state.storage.list_issues_for_site(&target_site, project, limit)?;
         let total = issues.len();
         return Ok(Json(json!({
-            "site_id": scoped_site,
+            "site_id": target_site,
             "issues": issues,
             "next_page_token": null,
             "next_start_at": null,
@@ -676,6 +770,7 @@ async fn list_issues(
 
 async fn create_issue(
     State(state): State<Arc<AppState>>,
+    Query(query): Query<SiteQuery>,
     Json(body): Json<CreateIssueBody>,
 ) -> Result<Json<Value>, ApiError> {
     let project_key = body.project_key.trim();
@@ -692,6 +787,8 @@ async fn create_issue(
         body.issue_type.trim().to_string()
     };
 
+    let (target_site, client) =
+        resolve_site_client(&state, query.site.as_deref().or(body.site.as_deref()))?;
     let outgoing = OutgoingIssue {
         project_key: project_key.to_string(),
         issue_type,
@@ -703,10 +800,10 @@ async fn create_issue(
         parent_key: body.parent_key.filter(|s| !s.trim().is_empty()),
     };
 
-    let detail = state.client.create_issue(&outgoing).await?;
-    let _ = state.storage.upsert_issue_detail(&detail);
+    let detail = client.create_issue(&outgoing).await?;
+    let _ = state.storage.upsert_issue_detail_for_site(&target_site, &detail);
 
-    Ok(Json(json!({ "ok": true, "issue": detail })))
+    Ok(Json(json!({ "ok": true, "site_id": target_site, "issue": detail })))
 }
 
 async fn get_issue(
@@ -719,32 +816,53 @@ async fn get_issue(
         return Err(ApiError::bad_request("issue key must not be empty"));
     }
 
-    let scoped_site = resolve_site_id(&state, query.site.as_deref());
-    let detail = if query.offline {
-        match scoped_site.as_deref() {
-            Some(sid) => state.storage.get_issue_detail_for_site(sid, key)?,
-            None => state.storage.get_issue_detail(key)?,
-        }
-        .ok_or_else(|| ApiError::not_found(format!("issue not found in cache: {key}")))?
-    } else {
-        let (target_site, client) = resolve_site_client(&state, query.site.as_deref())?;
-        let fetched = client.get_issue(key).await?;
-        let _ = state.storage.upsert_issue_detail_for_site(&target_site, &fetched);
-        fetched
-    };
+    if query.offline {
+        let target_site = resolve_single_site_id(&state, query.site.as_deref())?;
+        let detail = state
+            .storage
+            .get_issue_detail_for_site(&target_site, key)?
+            .ok_or_else(|| ApiError::not_found(format!("issue not found in cache: {key}")))?;
+        let stale = state
+            .storage
+            .is_issue_detail_stale_for_site(&target_site, key)
+            .unwrap_or(false);
+        return Ok(Json(json!({
+            "site_id": target_site,
+            "detail_stale": stale,
+            "issue": detail,
+        })));
+    }
 
-    Ok(Json(json!({ "site_id": scoped_site, "issue": detail })))
+    let (target_site, client) = resolve_site_client(&state, query.site.as_deref())?;
+    let (mut fetched, meta) = match client.get_issue_with_meta(key).await {
+        Ok(res) => res,
+        Err(err) => {
+            if is_not_found_error(&err) {
+                let _ = state.storage.delete_issue_for_site(&target_site, key);
+            }
+            return Err(err.into());
+        }
+    };
+    let _ = state.storage.upsert_issue_detail_for_site_merging(
+        &target_site,
+        &mut fetched,
+        !meta.remote_links_ok,
+    );
+
+    Ok(Json(json!({ "site_id": target_site, "detail_stale": false, "issue": fetched })))
 }
 
 async fn patch_issue(
     State(state): State<Arc<AppState>>,
     Path(key): Path<String>,
-    Json(patch): Json<IssueUpdate>,
+    Query(query): Query<SiteQuery>,
+    Json(body): Json<PatchIssueBody>,
 ) -> Result<Json<Value>, ApiError> {
     let key = key.trim();
     if key.is_empty() {
         return Err(ApiError::bad_request("issue key must not be empty"));
     }
+    let patch = body.update;
     if patch.summary.is_none()
         && patch.description_markdown.is_none()
         && patch.priority.is_none()
@@ -756,40 +874,47 @@ async fn patch_issue(
         ));
     }
 
-    let detail = state.client.update_issue(key, &patch).await?;
-    let _ = state.storage.upsert_issue_detail(&detail);
+    let (target_site, client) =
+        resolve_site_client(&state, query.site.as_deref().or(body.site.as_deref()))?;
+    let detail = client.update_issue(key, &patch).await?;
+    let _ = state.storage.upsert_issue_detail_for_site(&target_site, &detail);
 
-    Ok(Json(json!({ "ok": true, "issue": detail })))
+    Ok(Json(json!({ "ok": true, "site_id": target_site, "issue": detail })))
 }
 
 async fn delete_issue(
     State(state): State<Arc<AppState>>,
     Path(key): Path<String>,
+    Query(query): Query<SiteQuery>,
 ) -> Result<Json<Value>, ApiError> {
     let key = key.trim();
     if key.is_empty() {
         return Err(ApiError::bad_request("issue key must not be empty"));
     }
-    state.client.delete_issue(key).await?;
-    let _ = state.storage.delete_issue(key);
-    Ok(Json(json!({ "ok": true, "key": key })))
+    let (target_site, client) = resolve_site_client(&state, query.site.as_deref())?;
+    client.delete_issue(key).await?;
+    let _ = state.storage.delete_issue_for_site(&target_site, key);
+    Ok(Json(json!({ "ok": true, "site_id": target_site, "key": key })))
 }
 
 async fn list_transitions(
     State(state): State<Arc<AppState>>,
     Path(key): Path<String>,
+    Query(query): Query<SiteQuery>,
 ) -> Result<Json<Value>, ApiError> {
     let key = key.trim();
     if key.is_empty() {
         return Err(ApiError::bad_request("issue key must not be empty"));
     }
-    let transitions = state.client.list_transitions(key).await?;
-    Ok(Json(json!({ "key": key, "transitions": transitions })))
+    let (target_site, client) = resolve_site_client(&state, query.site.as_deref())?;
+    let transitions = client.list_transitions(key).await?;
+    Ok(Json(json!({ "site_id": target_site, "key": key, "transitions": transitions })))
 }
 
 async fn transition_issue(
     State(state): State<Arc<AppState>>,
     Path(key): Path<String>,
+    Query(query): Query<SiteQuery>,
     Json(body): Json<TransitionBody>,
 ) -> Result<Json<Value>, ApiError> {
     let key = key.trim();
@@ -799,12 +924,15 @@ async fn transition_issue(
             "issue key and transition must not be empty",
         ));
     }
-    state
-        .client
+    let (target_site, client) =
+        resolve_site_client(&state, query.site.as_deref().or(body.site.as_deref()))?;
+    client
         .transition_issue(key, transition, body.comment.as_deref())
         .await?;
+    refresh_issue_cache_after_write(&client, &state.storage, &target_site, key).await;
     Ok(Json(json!({
         "ok": true,
+        "site_id": target_site,
         "key": key,
         "transition": transition,
     })))
@@ -813,24 +941,29 @@ async fn transition_issue(
 async fn assign_issue(
     State(state): State<Arc<AppState>>,
     Path(key): Path<String>,
+    Query(query): Query<SiteQuery>,
     Json(body): Json<AssigneeBody>,
 ) -> Result<Json<Value>, ApiError> {
     let key = key.trim();
     if key.is_empty() {
         return Err(ApiError::bad_request("issue key must not be empty"));
     }
+    let (target_site, client) =
+        resolve_site_client(&state, query.site.as_deref().or(body.site.as_deref()))?;
     let resolved = match body.assignee_id.as_deref().map(str::trim) {
         None | Some("") => None,
         Some(raw) if raw.eq_ignore_ascii_case("me") => {
-            let me = state.client.get_myself().await?;
+            let me = client.get_myself().await?;
             Some(me.id)
         }
         Some(raw) => Some(raw.to_string()),
     };
 
-    state.client.assign_issue(key, resolved.as_deref()).await?;
+    client.assign_issue(key, resolved.as_deref()).await?;
+    refresh_issue_cache_after_write(&client, &state.storage, &target_site, key).await;
     Ok(Json(json!({
         "ok": true,
+        "site_id": target_site,
         "key": key,
         "assignee_id": resolved,
     })))
@@ -839,26 +972,31 @@ async fn assign_issue(
 async fn list_issue_comments(
     State(state): State<Arc<AppState>>,
     Path(key): Path<String>,
+    Query(query): Query<SiteQuery>,
 ) -> Result<Json<Value>, ApiError> {
     let key = key.trim();
-    let comments = state.client.list_issue_comments(key).await?;
-    Ok(Json(json!({ "key": key, "comments": comments })))
+    let (target_site, client) = resolve_site_client(&state, query.site.as_deref())?;
+    let comments = client.list_issue_comments(key).await?;
+    Ok(Json(json!({ "site_id": target_site, "key": key, "comments": comments })))
 }
 
 async fn add_issue_comment(
     State(state): State<Arc<AppState>>,
     Path(key): Path<String>,
+    Query(query): Query<SiteQuery>,
     Json(body): Json<CommentBody>,
 ) -> Result<Json<Value>, ApiError> {
     let key = key.trim();
     if body.body_markdown.trim().is_empty() {
         return Err(ApiError::bad_request("body_markdown must not be empty"));
     }
-    let comment = state
-        .client
+    let (target_site, client) =
+        resolve_site_client(&state, query.site.as_deref().or(body.site.as_deref()))?;
+    let comment = client
         .add_issue_comment(key, &body.body_markdown)
         .await?;
-    Ok(Json(json!({ "ok": true, "comment": comment })))
+    refresh_issue_cache_after_write(&client, &state.storage, &target_site, key).await;
+    Ok(Json(json!({ "ok": true, "site_id": target_site, "comment": comment })))
 }
 
 async fn list_spaces(
@@ -866,11 +1004,8 @@ async fn list_spaces(
     Query(query): Query<SpacesQuery>,
 ) -> Result<Json<Value>, ApiError> {
     let limit = clamp_limit(query.limit.unwrap_or(50));
-    let scoped_site = resolve_site_id(&state, query.site.as_deref());
-    let cached = match scoped_site.as_deref() {
-        Some(sid) => state.storage.list_spaces_for_site(sid)?,
-        None => state.storage.list_spaces()?,
-    };
+    let target_site = resolve_single_site_id(&state, query.site.as_deref())?;
+    let cached = state.storage.list_spaces_for_site(&target_site)?;
     let mut spaces = if query.refresh || cached.is_empty() {
         if !query.refresh && state.config.site_url.trim().is_empty() && state.config.sites.is_empty() {
             cached
@@ -889,7 +1024,7 @@ async fn list_spaces(
         cached
     };
     spaces.truncate(limit);
-    Ok(Json(json!({ "site_id": scoped_site, "spaces": spaces })))
+    Ok(Json(json!({ "site_id": target_site, "spaces": spaces })))
 }
 
 async fn list_space_pages(
@@ -899,20 +1034,25 @@ async fn list_space_pages(
 ) -> Result<Json<Value>, ApiError> {
     let limit = clamp_limit(query.limit.unwrap_or(50));
     let space = space.trim();
-    let scoped_site = resolve_site_id(&state, query.site.as_deref());
+    let target_site = resolve_single_site_id(&state, query.site.as_deref())?;
     let mut pages = if query.offline {
-        match scoped_site.as_deref() {
-            Some(sid) => state.storage.list_space_root_pages_for_site(sid, space)?,
-            None => state.storage.list_space_root_pages(space)?,
-        }
+        state
+            .storage
+            .list_space_root_pages_for_site(&target_site, space)?
     } else {
         let (target_site, client) = resolve_site_client(&state, query.site.as_deref())?;
         let fetched = client.list_space_root_pages(space, limit).await?;
         let _ = state.storage.upsert_pages_for_site(&target_site, &fetched);
+        if fetched.len() < limit {
+            let keep: Vec<String> = fetched.iter().map(|p| p.id.clone()).collect();
+            let _ = state
+                .storage
+                .prune_space_root_pages_for_site(&target_site, space, &keep);
+        }
         fetched
     };
     pages.truncate(limit);
-    Ok(Json(json!({ "site_id": scoped_site, "space": space, "pages": pages })))
+    Ok(Json(json!({ "site_id": target_site, "space": space, "pages": pages })))
 }
 
 async fn get_page(
@@ -921,20 +1061,41 @@ async fn get_page(
     Query(query): Query<OfflineQuery>,
 ) -> Result<Json<Value>, ApiError> {
     let id = id.trim();
-    let scoped_site = resolve_site_id(&state, query.site.as_deref());
-    let detail = if query.offline {
-        match scoped_site.as_deref() {
-            Some(sid) => state.storage.get_page_detail_for_site(sid, id)?,
-            None => state.storage.get_page_detail(id)?,
+    if query.offline {
+        let target_site = resolve_single_site_id(&state, query.site.as_deref())?;
+        let detail = state
+            .storage
+            .get_page_detail_for_site(&target_site, id)?
+            .ok_or_else(|| ApiError::not_found(format!("page not found in cache: {id}")))?;
+        let stale = state
+            .storage
+            .is_page_detail_stale_for_site(&target_site, id)
+            .unwrap_or(false);
+        return Ok(Json(json!({
+            "site_id": target_site,
+            "detail_stale": stale,
+            "page": detail,
+        })));
+    }
+
+    let (target_site, client) = resolve_site_client(&state, query.site.as_deref())?;
+    let (mut fetched, meta) = match client.get_page_with_meta(id).await {
+        Ok(res) => res,
+        Err(err) => {
+            if is_not_found_error(&err) {
+                let _ = state.storage.delete_page_for_site(&target_site, id);
+            }
+            return Err(err.into());
         }
-        .ok_or_else(|| ApiError::not_found(format!("page not found in cache: {id}")))?
-    } else {
-        let (target_site, client) = resolve_site_client(&state, query.site.as_deref())?;
-        let fetched = client.get_page(id).await?;
-        let _ = state.storage.upsert_page_detail_for_site(&target_site, &fetched);
-        fetched
     };
-    Ok(Json(json!({ "site_id": scoped_site, "page": detail })))
+    let _ = state.storage.upsert_page_detail_for_site_merging(
+        &target_site,
+        &mut fetched,
+        !meta.labels_ok,
+        !meta.attachments_ok,
+        !meta.comments_ok,
+    );
+    Ok(Json(json!({ "site_id": target_site, "detail_stale": false, "page": fetched })))
 }
 
 async fn list_child_pages(
@@ -943,23 +1104,27 @@ async fn list_child_pages(
     Query(query): Query<OfflineQuery>,
 ) -> Result<Json<Value>, ApiError> {
     let id = id.trim();
-    let scoped_site = resolve_site_id(&state, query.site.as_deref());
+    let target_site = resolve_single_site_id(&state, query.site.as_deref())?;
     let pages = if query.offline {
-        match scoped_site.as_deref() {
-            Some(sid) => state.storage.list_child_pages_for_site(sid, id)?,
-            None => state.storage.list_child_pages(id)?,
-        }
+        state.storage.list_child_pages_for_site(&target_site, id)?
     } else {
         let (target_site, client) = resolve_site_client(&state, query.site.as_deref())?;
         let fetched = client.list_child_pages(id).await?;
         let _ = state.storage.upsert_pages_for_site(&target_site, &fetched);
+        if fetched.len() < 100 {
+            let keep: Vec<String> = fetched.iter().map(|p| p.id.clone()).collect();
+            let _ = state
+                .storage
+                .prune_child_pages_for_site(&target_site, id, &keep);
+        }
         fetched
     };
-    Ok(Json(json!({ "site_id": scoped_site, "parent_id": id, "pages": pages })))
+    Ok(Json(json!({ "site_id": target_site, "parent_id": id, "pages": pages })))
 }
 
 async fn create_page(
     State(state): State<Arc<AppState>>,
+    Query(query): Query<SiteQuery>,
     Json(body): Json<CreatePageBody>,
 ) -> Result<Json<Value>, ApiError> {
     let space = body.space_id_or_key.trim();
@@ -970,20 +1135,23 @@ async fn create_page(
     if title.is_empty() {
         return Err(ApiError::bad_request("title must not be empty"));
     }
+    let (target_site, client) =
+        resolve_site_client(&state, query.site.as_deref().or(body.site.as_deref()))?;
     let req = OutgoingPage {
         space_id_or_key: space.to_string(),
         parent_id: body.parent_id.filter(|s| !s.trim().is_empty()),
         title: title.to_string(),
         body_markdown: body.body_markdown,
     };
-    let detail = state.client.create_page(&req).await?;
-    let _ = state.storage.upsert_page_detail(&detail);
-    Ok(Json(json!({ "ok": true, "page": detail })))
+    let detail = client.create_page(&req).await?;
+    let _ = state.storage.upsert_page_detail_for_site(&target_site, &detail);
+    Ok(Json(json!({ "ok": true, "site_id": target_site, "page": detail })))
 }
 
 async fn update_page(
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,
+    Query(query): Query<SiteQuery>,
     Json(body): Json<UpdatePageBody>,
 ) -> Result<Json<Value>, ApiError> {
     let id = id.trim();
@@ -992,10 +1160,17 @@ async fn update_page(
             "at least one of title or body_markdown must be provided",
         ));
     }
-    let need_current =
-        body.prev_version <= 0 || body.title.is_none() || body.body_markdown.is_none();
+    if body.body_markdown.is_some() && body.prev_version <= 0 {
+        return Err(ApiError::bad_request(
+            "prev_version (>= 1) is required when replacing body_markdown; read GET /pages/{id} first and pass summary.version_number as prev_version",
+        ));
+    }
+    let (target_site, client) =
+        resolve_site_client(&state, query.site.as_deref().or(body.site.as_deref()))?;
+
+    let need_current = body.title.is_none() || body.body_markdown.is_none();
     let current = if need_current {
-        Some(state.client.get_page(id).await?)
+        Some(client.get_page(id).await?)
     } else {
         None
     };
@@ -1008,12 +1183,17 @@ async fn update_page(
             .map(|c| c.summary.title.clone())
             .unwrap_or_default(),
     };
-    let body_markdown = match body.body_markdown {
-        Some(b) => b,
-        None => current
-            .as_ref()
-            .map(|c| c.body_markdown.clone())
-            .unwrap_or_default(),
+    let (body_markdown, body_raw_passthrough, body_representation) = match body.body_markdown {
+        Some(b) => (b, None, None),
+        None => {
+            let cur = current.as_ref();
+            let raw = cur
+                .map(|c| c.body_raw.clone())
+                .filter(|s| !s.trim().is_empty());
+            let repr = cur.map(|c| c.body_representation.clone());
+            let md = cur.map(|c| c.body_markdown.clone()).unwrap_or_default();
+            (md, raw, repr)
+        }
     };
     let prev_version = if body.prev_version > 0 {
         body.prev_version
@@ -1027,50 +1207,59 @@ async fn update_page(
     let patch = PageUpdate {
         title,
         body_markdown,
+        body_raw_passthrough,
+        body_representation,
         prev_version,
         version_message: body.version_message,
     };
-    let detail = state.client.update_page(id, &patch).await?;
-    let _ = state.storage.upsert_page_detail(&detail);
-    Ok(Json(json!({ "ok": true, "page": detail })))
+    let detail = client.update_page(id, &patch).await?;
+    let _ = state.storage.upsert_page_detail_for_site(&target_site, &detail);
+    Ok(Json(json!({ "ok": true, "site_id": target_site, "page": detail })))
 }
 
 async fn delete_page(
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,
+    Query(query): Query<SiteQuery>,
 ) -> Result<Json<Value>, ApiError> {
     let id = id.trim();
     if id.is_empty() {
         return Err(ApiError::bad_request("page id must not be empty"));
     }
-    state.client.delete_page(id).await?;
-    let _ = state.storage.delete_page(id);
-    Ok(Json(json!({ "ok": true, "id": id })))
+    let (target_site, client) = resolve_site_client(&state, query.site.as_deref())?;
+    client.delete_page(id).await?;
+    let _ = state.storage.delete_page_for_site(&target_site, id);
+    Ok(Json(json!({ "ok": true, "site_id": target_site, "id": id })))
 }
 
 async fn list_page_comments(
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,
+    Query(query): Query<SiteQuery>,
 ) -> Result<Json<Value>, ApiError> {
     let id = id.trim();
-    let comments = state.client.list_page_comments(id).await?;
-    Ok(Json(json!({ "page_id": id, "comments": comments })))
+    let (target_site, client) = resolve_site_client(&state, query.site.as_deref())?;
+    let comments = client.list_page_comments(id).await?;
+    Ok(Json(json!({ "site_id": target_site, "page_id": id, "comments": comments })))
 }
 
 async fn add_page_comment(
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,
+    Query(query): Query<SiteQuery>,
     Json(body): Json<CommentBody>,
 ) -> Result<Json<Value>, ApiError> {
     let id = id.trim();
     if body.body_markdown.trim().is_empty() {
         return Err(ApiError::bad_request("body_markdown must not be empty"));
     }
-    let comment = state
-        .client
+    let (target_site, client) =
+        resolve_site_client(&state, query.site.as_deref().or(body.site.as_deref()))?;
+    let comment = client
         .add_page_comment(id, &body.body_markdown)
         .await?;
-    Ok(Json(json!({ "ok": true, "comment": comment })))
+    refresh_page_cache_after_write(&client, &state.storage, &target_site, id).await;
+    Ok(Json(json!({ "ok": true, "site_id": target_site, "comment": comment })))
 }
 
 async fn search(
@@ -1190,11 +1379,12 @@ async fn sync_workspace(
             "counts": counts,
         })));
     }
-    let (_site_id, client) = resolve_site_client(&state, query.site.as_deref())?;
-    let summary = sync::bootstrap_workspace(&client, &state.storage).await?;
+    let (site_id, client) = resolve_site_client(&state, query.site.as_deref())?;
+    let summary = sync::bootstrap_workspace_for_site(&site_id, &client, &state.storage).await?;
     let counts = state.storage.cache_counts()?;
     Ok(Json(json!({
         "ok": true,
+        "site_id": site_id,
         "summary": summary,
         "counts": counts,
     })))

@@ -1484,6 +1484,7 @@ async fn e2e_cloud_confluence_v2_and_unified_search() {
                 body_markdown: "# 배포 절차 (업데이트)\n\n검증 완료".into(),
                 prev_version: 1,
                 version_message: Some("2차 수정".into()),
+                ..Default::default()
             },
         )
         .await

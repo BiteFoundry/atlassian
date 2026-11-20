@@ -467,6 +467,13 @@ pub struct OutgoingPage {
 pub struct PageUpdate {
     pub title: String,
     pub body_markdown: String,
+    /// Optional raw body (`atlas_doc_format` JSON or Confluence `storage` XHTML) preserved verbatim
+    /// on title-only edits so macros, mentions, status lozenges, and panels are not lost.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub body_raw_passthrough: Option<String>,
+    /// Representation matching `body_raw_passthrough` (`"atlas_doc_format"` or `"storage"`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub body_representation: Option<String>,
     /// Previous version number (client sends `prev_version + 1` to Atlassian).
     pub prev_version: i32,
     pub version_message: Option<String>,

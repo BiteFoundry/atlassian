@@ -10,7 +10,7 @@ use tokio::sync::mpsc;
 
 use crate::{
     adf,
-    atlassian::{AtlassianClient, SiteClientPool},
+    atlassian::{client::is_not_found_error, AtlassianClient, SiteClientPool},
     auth::{
         fetch_accessible_resources, run_oauth_loopback_login, AuthManager, OAuthLoopbackOptions,
         StoredCredentials, DEFAULT_OAUTH_API_BASE, DEFAULT_OAUTH_AUTH_BASE,
@@ -23,7 +23,7 @@ use crate::{
     models::{
         AttachmentItem, BoardColumn, BoardSummary, ConfluenceComment, CoreEvent, CrossRefTarget,
         DownloadedFile, IssueComment, IssueDetail, IssueStatus, IssueSummary, IssueTransition,
-        IssueUpdate, OutgoingIssue, OutgoingPage, PageDetail, PageSummary, PageUpdate,
+        OutgoingIssue, OutgoingPage, PageDetail, PageSummary, PageUpdate,
         ProjectSummary, SavedFilter, SiteScope, SpaceSummary, SprintSummary, StatusCategory,
         UnifiedSearchHit, UpdateCheckResult, UserSummary,
     },
@@ -232,12 +232,16 @@ pub enum UiMsg {
     IssuesLoadFailed(String),
     SavedFiltersLoaded(Vec<SavedFilter>),
     IssueDetailLoaded {
+        seq: Option<u64>,
+        site_id: String,
         key: String,
         detail: Result<IssueDetail, String>,
+        not_found: bool,
     },
     IssueMutated {
         detail: IssueDetail,
         toast: String,
+        clear_draft_key: Option<String>,
     },
     IssueTransitioned {
         key: String,
@@ -269,6 +273,7 @@ pub enum UiMsg {
         page_id: Option<String>,
         optimistic_id: Option<String>,
         task_label: String,
+        clear_draft_key: Option<String>,
         result: Result<(), String>,
     },
     SpacesLoaded(Result<Vec<SpaceSummary>, String>),
@@ -281,12 +286,16 @@ pub enum UiMsg {
         children: Result<Vec<PageSummary>, String>,
     },
     PageDetailLoaded {
+        seq: Option<u64>,
+        site_id: String,
         page_id: String,
         detail: Result<PageDetail, String>,
+        not_found: bool,
     },
     PageMutated {
         detail: PageDetail,
         toast: String,
+        clear_draft_key: Option<String>,
     },
     PageActionFailed(String),
     MyWorkLoaded {
@@ -490,6 +499,13 @@ pub struct AppState {
     /// Optional file path overrides for isolated persistence in tests.
     pub config_path_override: Option<PathBuf>,
     pub drafts_path_override: Option<PathBuf>,
+
+    /// Monotonic sequence counters guarding against out-of-order async detail responses.
+    pub issue_detail_req_seq: u64,
+    pub page_detail_req_seq: u64,
+    /// Site IDs for currently opened issue / page details.
+    pub active_issue_site_id: Option<String>,
+    pub active_page_site_id: Option<String>,
 }
 
 impl AppState {
@@ -556,6 +572,42 @@ impl AppState {
             drafts,
             config_path_override: None,
             drafts_path_override: None,
+            issue_detail_req_seq: 0,
+            page_detail_req_seq: 0,
+            active_issue_site_id: None,
+            active_page_site_id: None,
+        }
+    }
+
+    /// Resolves the canonical `(site_id, AtlassianClient)` for the current `site_scope`
+    /// (falling back to `self.client`'s bound site).
+    pub fn effective_site_id_and_client(&self) -> (String, AtlassianClient) {
+        if let Some(sid) = self.site_scope.site_id() {
+            if let Ok(c) = self.site_pool.client_for(sid) {
+                return (c.site_id().to_string(), c);
+            }
+            if sid.eq_ignore_ascii_case(self.client.site_id()) {
+                return (self.client.site_id().to_string(), self.client.clone());
+            }
+        }
+        (self.client.site_id().to_string(), self.client.clone())
+    }
+
+    fn site_id_and_client_for(&self, explicit_site: Option<&str>) -> (String, AtlassianClient) {
+        if let Some(sid) = explicit_site.map(str::trim).filter(|s| !s.is_empty()) {
+            if let Ok(c) = self.site_pool.client_for(sid) {
+                return (c.site_id().to_string(), c);
+            }
+            if sid.eq_ignore_ascii_case(self.client.site_id()) {
+                return (self.client.site_id().to_string(), self.client.clone());
+            }
+        }
+        self.effective_site_id_and_client()
+    }
+
+    fn clear_draft_and_save(&mut self, key: &str) {
+        if self.drafts.remove(key).is_some() {
+            let _ = self.save_drafts();
         }
     }
 
@@ -1061,12 +1113,31 @@ impl AppState {
                     self.issues = issues.clone();
                     self.my_issues = issues.iter().take(20).cloned().collect();
                     self.my_issue_site_labels = vec![None; self.my_issues.len()];
-                    if let Some(first) = issues.first() {
+                    let preserved_key = self
+                        .active_issue
+                        .as_ref()
+                        .map(|d| d.summary.key.clone())
+                        .filter(|k| issues.iter().any(|i| &i.key == k));
+                    if let Some(key) = preserved_key {
+                        if let Ok(Some(detail)) = self.storage.get_issue_detail_for_site(site_id, &key) {
+                            self.active_issue = Some(detail);
+                            self.active_issue_site_id = Some(site_id.clone());
+                        }
+                    } else if let Some(first) = issues.first() {
                         if let Ok(Some(detail)) =
                             self.storage.get_issue_detail_for_site(site_id, &first.key)
                         {
                             self.active_issue = Some(detail);
+                            self.active_issue_site_id = Some(site_id.clone());
                         }
+                    }
+                }
+                if let Some(active_page_id) = self.active_page.as_ref().map(|p| p.summary.id.clone()) {
+                    if let Ok(Some(detail)) =
+                        self.storage.get_page_detail_for_site(site_id, &active_page_id)
+                    {
+                        self.active_page = Some(detail);
+                        self.active_page_site_id = Some(site_id.clone());
                     }
                 }
                 if let Ok(spaces) = self.storage.list_spaces_for_site(site_id) {
@@ -1160,13 +1231,43 @@ impl AppState {
                         .collect();
                     self.my_issues = my_work_pairs.into_iter().map(|(_, i)| i).collect();
 
-                    if let Some((first_sid, first)) = filtered.first() {
+                    let preserved = self.active_issue.as_ref().and_then(|d| {
+                        let existing_sid = self.active_issue_site_id.as_deref();
+                        filtered
+                            .iter()
+                            .find(|(sid, i)| {
+                                i.key == d.summary.key
+                                    && existing_sid
+                                        .map(|e| e.eq_ignore_ascii_case(sid))
+                                        .unwrap_or(true)
+                            })
+                            .map(|(sid, i)| (sid.clone(), i.key.clone()))
+                    });
+                    if let Some((sid, key)) = preserved {
+                        if let Ok(Some(detail)) = self.storage.get_issue_detail_for_site(&sid, &key) {
+                            self.active_issue = Some(detail);
+                            self.active_issue_site_id = Some(sid);
+                        }
+                    } else if let Some((first_sid, first)) = filtered.first() {
                         if let Ok(Some(detail)) = self
                             .storage
                             .get_issue_detail_for_site(first_sid, &first.key)
                         {
                             self.active_issue = Some(detail);
+                            self.active_issue_site_id = Some(first_sid.clone());
                         }
+                    }
+                }
+                if let Some(active_page_id) = self.active_page.as_ref().map(|p| p.summary.id.clone()) {
+                    let target_sid = self
+                        .active_page_site_id
+                        .clone()
+                        .unwrap_or_else(|| self.client.site_id().to_string());
+                    if let Ok(Some(detail)) =
+                        self.storage.get_page_detail_for_site(&target_sid, &active_page_id)
+                    {
+                        self.active_page = Some(detail);
+                        self.active_page_site_id = Some(target_sid);
                     }
                 }
                 if let Ok(spaces_all) = self.storage.list_spaces_all_sites() {
@@ -1527,14 +1628,20 @@ impl AppState {
             return;
         }
         ui.tasks.begin(format!("Board #{board_id}"));
-        let client = self.client.clone();
+        let board_site = self
+            .boards
+            .iter()
+            .position(|b| b.id == board_id)
+            .and_then(|idx| self.board_site_ids.get(idx))
+            .map(String::as_str);
+        let (site_id, client) = self.site_id_and_client_for(board_site);
         let storage = self.storage.clone();
         let tx = self.ui_tx.clone();
         tokio::spawn(async move {
             let columns = client.get_board_columns(board_id).await.unwrap_or_default();
             let sprints = client.list_board_sprints(board_id).await.unwrap_or_default();
             if !sprints.is_empty() {
-                let _ = storage.upsert_sprints(&sprints);
+                let _ = storage.upsert_sprints_for_site(&site_id, &sprints);
             }
             let effective_sprint = sprint_id.or_else(|| {
                 sprints
@@ -1542,9 +1649,27 @@ impl AppState {
                     .find(|s| s.state.eq_ignore_ascii_case("active"))
                     .map(|s| s.id)
             });
-            match client.list_board_issues(board_id, effective_sprint, 150).await {
+            let board_limit = 150usize;
+            match client
+                .list_board_issues(board_id, effective_sprint, board_limit)
+                .await
+            {
                 Ok(issues) => {
-                    let _ = storage.upsert_issues(&issues);
+                    let _ = storage.upsert_board_issues_for_site(
+                        &site_id,
+                        board_id,
+                        effective_sprint,
+                        &issues,
+                    );
+                    if issues.len() < board_limit {
+                        let keep: Vec<String> = issues.iter().map(|i| i.key.clone()).collect();
+                        let _ = storage.prune_board_issues_for_site(
+                            &site_id,
+                            board_id,
+                            effective_sprint,
+                            &keep,
+                        );
+                    }
                     let _ = tx.send(UiMsg::BoardDataLoaded {
                         board_id,
                         columns,
@@ -1564,13 +1689,13 @@ impl AppState {
             return;
         }
         ui.tasks.begin(format!("JQL: {label}"));
-        let client = self.client.clone();
+        let (site_id, client) = self.effective_site_id_and_client();
         let storage = self.storage.clone();
         let tx = self.ui_tx.clone();
         tokio::spawn(async move {
             match client.search_issues_jql(&jql, 80, None, None).await {
                 Ok(page) => {
-                    let _ = storage.upsert_issues(&page.issues);
+                    let _ = storage.upsert_issues_for_site(&site_id, &page.issues);
                     let _ = tx.send(UiMsg::IssuesLoaded {
                         issues: page.issues,
                         label,
@@ -1584,31 +1709,60 @@ impl AppState {
     }
 
     pub fn request_issue_detail(&mut self, ui: &mut UiState, key: &str) {
-        if let Ok(Some(cached)) = self.storage.get_issue_detail(key) {
+        let explicit_site = self
+            .issues
+            .iter()
+            .position(|i| i.key == key)
+            .and_then(|idx| self.issue_site_ids.get(idx))
+            .cloned()
+            .or_else(|| {
+                self.active_issue
+                    .as_ref()
+                    .filter(|d| d.summary.key == key)
+                    .and_then(|_| self.active_issue_site_id.clone())
+            });
+        let (site_id, client) = self.site_id_and_client_for(explicit_site.as_deref());
+        if let Ok(Some(cached)) = self.storage.get_issue_detail_for_site(&site_id, key) {
             self.active_issue = Some(cached);
+            self.active_issue_site_id = Some(site_id.clone());
         }
         ui.issue_ui.detail_scroll = 0;
         ui.board_ui.detail_scroll = 0;
+        self.issue_detail_req_seq = self.issue_detail_req_seq.wrapping_add(1);
+        let seq = self.issue_detail_req_seq;
         if tokio::runtime::Handle::try_current().is_err() {
             return;
         }
-        let client = self.client.clone();
         let storage = self.storage.clone();
         let tx = self.ui_tx.clone();
         let key_owned = key.to_string();
         tokio::spawn(async move {
-            match client.get_issue(&key_owned).await {
-                Ok(detail) => {
-                    let _ = storage.upsert_issue_detail(&detail);
+            match client.get_issue_with_meta(&key_owned).await {
+                Ok((mut detail, meta)) => {
+                    let _ = storage.upsert_issue_detail_for_site_merging(
+                        &site_id,
+                        &mut detail,
+                        !meta.remote_links_ok,
+                    );
                     let _ = tx.send(UiMsg::IssueDetailLoaded {
+                        seq: Some(seq),
+                        site_id,
                         key: key_owned,
                         detail: Ok(detail),
+                        not_found: false,
                     });
                 }
                 Err(e) => {
+                    let not_found = is_not_found_error(&e);
+                    if not_found {
+                        let _ = storage.delete_issue_for_site(&site_id, &key_owned);
+                    }
                     let _ = tx.send(UiMsg::IssueDetailLoaded {
+                        seq: Some(seq),
+                        site_id,
                         key: key_owned,
                         detail: Err(e.to_string()),
+                        not_found,
                     });
                 }
             }
@@ -1620,7 +1774,7 @@ impl AppState {
         if tokio::runtime::Handle::try_current().is_err() {
             return;
         }
-        let client = self.client.clone();
+        let (_, client) = self.site_id_and_client_for(self.active_issue_site_id.as_deref());
         let tx = self.ui_tx.clone();
         let key = issue_key.to_string();
         tokio::spawn(async move {
@@ -1647,7 +1801,7 @@ impl AppState {
             return;
         }
         ui.tasks.begin(format!("Transition {key}"));
-        let client = self.client.clone();
+        let (site_id, client) = self.site_id_and_client_for(self.active_issue_site_id.as_deref());
         let storage = self.storage.clone();
         let tx = self.ui_tx.clone();
         let key_owned = key.to_string();
@@ -1659,11 +1813,18 @@ impl AppState {
                         to_status: tr.to_status.clone(),
                         toast: format!("{key_owned} → {}", tr.to_status.name),
                     });
-                    if let Ok(detail) = client.get_issue(&key_owned).await {
-                        let _ = storage.upsert_issue_detail(&detail);
+                    if let Ok((mut detail, meta)) = client.get_issue_with_meta(&key_owned).await {
+                        let _ = storage.upsert_issue_detail_for_site_merging(
+                            &site_id,
+                            &mut detail,
+                            !meta.remote_links_ok,
+                        );
                         let _ = tx.send(UiMsg::IssueDetailLoaded {
+                            seq: None,
+                            site_id,
                             key: key_owned,
                             detail: Ok(detail),
+                            not_found: false,
                         });
                     }
                 }
@@ -1797,18 +1958,23 @@ impl AppState {
         }
         let task_label = format!("Assign {key} to me");
         ui.tasks.begin(&task_label);
-        let client = self.client.clone();
+        let (site_id, client) = self.site_id_and_client_for(self.active_issue_site_id.as_deref());
         let storage = self.storage.clone();
         let tx = self.ui_tx.clone();
         let key_owned = key.to_string();
         tokio::spawn(async move {
             match client.assign_issue(&key_owned, Some(&me.id)).await {
-                Ok(()) => match client.get_issue(&key_owned).await {
-                    Ok(detail) => {
-                        let _ = storage.upsert_issue_detail(&detail);
+                Ok(()) => match client.get_issue_with_meta(&key_owned).await {
+                    Ok((mut detail, meta)) => {
+                        let _ = storage.upsert_issue_detail_for_site_merging(
+                            &site_id,
+                            &mut detail,
+                            !meta.remote_links_ok,
+                        );
                         let _ = tx.send(UiMsg::IssueMutated {
                             detail,
                             toast: format!("Assigned {key_owned} to you"),
+                            clear_draft_key: None,
                         });
                     }
                     Err(e) => {
@@ -1841,7 +2007,7 @@ impl AppState {
         if tokio::runtime::Handle::try_current().is_err() {
             return;
         }
-        let client = self.client.clone();
+        let (_, client) = self.site_id_and_client_for(self.active_issue_site_id.as_deref());
         let tx = self.ui_tx.clone();
         let key = project_or_issue.to_string();
         let q = query.to_string();
@@ -1867,19 +2033,24 @@ impl AppState {
         }
         let task_label = format!("Assign {key}");
         ui.tasks.begin(&task_label);
-        let client = self.client.clone();
+        let (site_id, client) = self.site_id_and_client_for(self.active_issue_site_id.as_deref());
         let storage = self.storage.clone();
         let tx = self.ui_tx.clone();
         let key_owned = key.to_string();
         tokio::spawn(async move {
             let id_ref = user.as_ref().map(|u| u.id.as_str());
             match client.assign_issue(&key_owned, id_ref).await {
-                Ok(()) => match client.get_issue(&key_owned).await {
-                    Ok(detail) => {
-                        let _ = storage.upsert_issue_detail(&detail);
+                Ok(()) => match client.get_issue_with_meta(&key_owned).await {
+                    Ok((mut detail, meta)) => {
+                        let _ = storage.upsert_issue_detail_for_site_merging(
+                            &site_id,
+                            &mut detail,
+                            !meta.remote_links_ok,
+                        );
                         let _ = tx.send(UiMsg::IssueMutated {
                             detail,
                             toast: format!("{key_owned} assignee → {label}"),
+                            clear_draft_key: None,
                         });
                     }
                     Err(e) => {
@@ -1903,35 +2074,49 @@ impl AppState {
         });
     }
 
-    pub fn request_submit_issue_form(&self, ui: &mut UiState, form: &IssueFormOverlay) {
+    pub fn request_submit_issue_form(
+        &mut self,
+        ui: &mut UiState,
+        form: &IssueFormOverlay,
+        draft_key: Option<String>,
+    ) {
         if tokio::runtime::Handle::try_current().is_err() {
+            if let Some(dk) = draft_key.as_deref() {
+                self.clear_draft_and_save(dk);
+            }
             return;
         }
-        let client = self.client.clone();
+        let (site_id, client) = self.site_id_and_client_for(self.active_issue_site_id.as_deref());
         let storage = self.storage.clone();
         let tx = self.ui_tx.clone();
         if let Some(key) = form.edit_key.clone() {
+            let patch = form.build_edit_patch();
+            if patch.summary.is_none()
+                && patch.description_markdown.is_none()
+                && patch.priority.is_none()
+                && patch.assignee_id.is_none()
+                && patch.labels.is_none()
+            {
+                if let Some(dk) = draft_key.as_deref() {
+                    self.clear_draft_and_save(dk);
+                }
+                ui.info(format!("{key}: no fields changed"));
+                return;
+            }
             ui.tasks.begin(format!("Update {key}"));
-            let patch = IssueUpdate {
-                summary: Some(form.summary.text.trim().to_string()),
-                description_markdown: Some(form.description.text.clone()),
-                priority: (!form.priority.text.trim().is_empty())
-                    .then(|| form.priority.text.trim().to_string()),
-                assignee_id: None,
-                labels: Some(form.parsed_labels()),
-            };
             tokio::spawn(async move {
                 match client.update_issue(&key, &patch).await {
                     Ok(detail) => {
-                        let _ = storage.upsert_issue_detail(&detail);
+                        let _ = storage.upsert_issue_detail_for_site(&site_id, &detail);
                         let _ = tx.send(UiMsg::IssueMutated {
                             detail,
                             toast: format!("Updated {key}"),
+                            clear_draft_key: draft_key,
                         });
                     }
                     Err(e) => {
                         let _ = tx.send(UiMsg::IssueActionFailed(format!(
-                            "Failed to update issue: {e}"
+                            "Failed to update issue (draft preserved): {e}"
                         )));
                     }
                 }
@@ -1953,15 +2138,16 @@ impl AppState {
                 match client.create_issue(&req).await {
                     Ok(detail) => {
                         let k = detail.summary.key.clone();
-                        let _ = storage.upsert_issue_detail(&detail);
+                        let _ = storage.upsert_issue_detail_for_site(&site_id, &detail);
                         let _ = tx.send(UiMsg::IssueMutated {
                             detail,
                             toast: format!("Created {k}"),
+                            clear_draft_key: draft_key,
                         });
                     }
                     Err(e) => {
                         let _ = tx.send(UiMsg::IssueActionFailed(format!(
-                            "Failed to create issue: {e}"
+                            "Failed to create issue (draft preserved): {e}"
                         )));
                     }
                 }
@@ -1969,8 +2155,18 @@ impl AppState {
         }
     }
 
-    pub fn request_submit_comment(&mut self, ui: &mut UiState, overlay: &CommentOverlay) {
-        self.request_add_comment(ui, overlay.target.clone(), overlay.body.text.clone());
+    pub fn request_submit_comment(
+        &mut self,
+        ui: &mut UiState,
+        overlay: &CommentOverlay,
+        draft_key: Option<String>,
+    ) {
+        self.request_add_comment_with_draft(
+            ui,
+            overlay.target.clone(),
+            overlay.body.text.clone(),
+            draft_key,
+        );
     }
 
     pub fn request_add_comment(
@@ -1978,6 +2174,16 @@ impl AppState {
         ui: &mut UiState,
         target: CommentTarget,
         body: String,
+    ) {
+        self.request_add_comment_with_draft(ui, target, body, None);
+    }
+
+    fn request_add_comment_with_draft(
+        &mut self,
+        ui: &mut UiState,
+        target: CommentTarget,
+        body: String,
+        draft_key: Option<String>,
     ) {
         let optimistic_id = format!("optimistic:{}", uuid::Uuid::new_v4());
         let now = chrono::Utc::now().to_rfc3339();
@@ -2028,11 +2234,18 @@ impl AppState {
         }
 
         if tokio::runtime::Handle::try_current().is_err() {
+            if let Some(dk) = draft_key.as_deref() {
+                self.clear_draft_and_save(dk);
+            }
             ui.success("Comment posted");
             return;
         }
 
-        let client = self.client.clone();
+        let explicit_site = match &target {
+            CommentTarget::Issue(_) => self.active_issue_site_id.as_deref(),
+            CommentTarget::Page { .. } => self.active_page_site_id.as_deref(),
+        };
+        let (_, client) = self.site_id_and_client_for(explicit_site);
         let tx = self.ui_tx.clone();
         match target {
             CommentTarget::Issue(key) => {
@@ -2049,6 +2262,7 @@ impl AppState {
                         page_id: None,
                         optimistic_id: Some(optimistic_id),
                         task_label,
+                        clear_draft_key: draft_key,
                         result: res,
                     });
                 });
@@ -2067,6 +2281,7 @@ impl AppState {
                         page_id: Some(page_id),
                         optimistic_id: Some(optimistic_id),
                         task_label,
+                        clear_draft_key: draft_key,
                         result: res,
                     });
                 });
@@ -2075,7 +2290,17 @@ impl AppState {
     }
 
     pub fn request_space_root_pages(&mut self, ui: &mut UiState, space_key: &str) {
-        if let Ok(roots) = self.storage.list_space_root_pages(space_key) {
+        let space_site = self
+            .spaces
+            .iter()
+            .position(|s| s.key == space_key)
+            .and_then(|idx| self.space_site_ids.get(idx))
+            .map(String::as_str);
+        let (site_id, client) = self.site_id_and_client_for(space_site);
+        if let Ok(roots) = self
+            .storage
+            .list_space_root_pages_for_site(&site_id, space_key)
+        {
             if !roots.is_empty() {
                 self.root_pages_by_space
                     .insert(space_key.to_string(), roots);
@@ -2085,14 +2310,18 @@ impl AppState {
             return;
         }
         ui.tasks.begin(format!("Space {space_key}"));
-        let client = self.client.clone();
         let storage = self.storage.clone();
         let tx = self.ui_tx.clone();
         let sk = space_key.to_string();
         tokio::spawn(async move {
-            match client.list_space_root_pages(&sk, 100).await {
+            let page_limit = 100usize;
+            match client.list_space_root_pages(&sk, page_limit).await {
                 Ok(pages) => {
-                    let _ = storage.upsert_pages(&pages);
+                    let _ = storage.upsert_pages_for_site(&site_id, &pages);
+                    if pages.len() < page_limit {
+                        let keep: Vec<String> = pages.iter().map(|p| p.id.clone()).collect();
+                        let _ = storage.prune_space_root_pages_for_site(&site_id, &sk, &keep);
+                    }
                     let _ = tx.send(UiMsg::RootPagesLoaded {
                         space_key: sk,
                         pages: Ok(pages),
@@ -2118,23 +2347,27 @@ impl AppState {
         if self.page_children_map.contains_key(&page.id) {
             return;
         }
-        if let Ok(cached) = self.storage.list_child_pages(&page.id) {
+        let (site_id, client) = self.site_id_and_client_for(self.active_page_site_id.as_deref());
+        if let Ok(cached) = self.storage.list_child_pages_for_site(&site_id, &page.id) {
             if !cached.is_empty() {
                 self.page_children_map.insert(page.id.clone(), cached);
             }
         }
-        if !page.has_children || tokio::runtime::Handle::try_current().is_err() {
+        if tokio::runtime::Handle::try_current().is_err() {
             return;
         }
         ui.tasks.begin(format!("Child pages: {}", page.title));
-        let client = self.client.clone();
         let storage = self.storage.clone();
         let tx = self.ui_tx.clone();
         let pid = page.id.clone();
         tokio::spawn(async move {
             match client.list_child_pages(&pid).await {
                 Ok(children) => {
-                    let _ = storage.upsert_pages(&children);
+                    let _ = storage.upsert_pages_for_site(&site_id, &children);
+                    if children.len() < 100 {
+                        let keep: Vec<String> = children.iter().map(|p| p.id.clone()).collect();
+                        let _ = storage.prune_child_pages_for_site(&site_id, &pid, &keep);
+                    }
                     let _ = tx.send(UiMsg::ChildPagesLoaded {
                         parent_id: pid,
                         children: Ok(children),
@@ -2151,63 +2384,98 @@ impl AppState {
     }
 
     pub fn request_page_detail(&mut self, ui: &mut UiState, page_id: &str) {
-        if let Ok(Some(cached)) = self.storage.get_page_detail(page_id) {
+        let (site_id, client) = self.site_id_and_client_for(self.active_page_site_id.as_deref());
+        if let Ok(Some(cached)) = self.storage.get_page_detail_for_site(&site_id, page_id) {
             self.active_page = Some(cached);
+            self.active_page_site_id = Some(site_id.clone());
         }
         ui.confluence_ui.reader_scroll = 0;
+        self.page_detail_req_seq = self.page_detail_req_seq.wrapping_add(1);
+        let seq = self.page_detail_req_seq;
         if tokio::runtime::Handle::try_current().is_err() {
             return;
         }
-        let client = self.client.clone();
         let storage = self.storage.clone();
         let tx = self.ui_tx.clone();
         let pid = page_id.to_string();
         tokio::spawn(async move {
-            match client.get_page(&pid).await {
-                Ok(detail) => {
-                    let _ = storage.upsert_page_detail(&detail);
+            match client.get_page_with_meta(&pid).await {
+                Ok((mut detail, meta)) => {
+                    let _ = storage.upsert_page_detail_for_site_merging(
+                        &site_id,
+                        &mut detail,
+                        !meta.labels_ok,
+                        !meta.attachments_ok,
+                        !meta.comments_ok,
+                    );
                     let _ = tx.send(UiMsg::PageDetailLoaded {
+                        seq: Some(seq),
+                        site_id,
                         page_id: pid,
                         detail: Ok(detail),
+                        not_found: false,
                     });
                 }
                 Err(e) => {
+                    let not_found = is_not_found_error(&e);
+                    if not_found {
+                        let _ = storage.delete_page_for_site(&site_id, &pid);
+                    }
                     let _ = tx.send(UiMsg::PageDetailLoaded {
+                        seq: Some(seq),
+                        site_id,
                         page_id: pid,
                         detail: Err(e.to_string()),
+                        not_found,
                     });
                 }
             }
         });
     }
 
-    pub fn request_submit_page_form(&self, ui: &mut UiState, form: &PageFormOverlay) {
+    pub fn request_submit_page_form(
+        &mut self,
+        ui: &mut UiState,
+        form: &PageFormOverlay,
+        draft_key: Option<String>,
+    ) {
         if tokio::runtime::Handle::try_current().is_err() {
+            if let Some(dk) = draft_key.as_deref() {
+                self.clear_draft_and_save(dk);
+            }
             return;
         }
-        let client = self.client.clone();
+        let (site_id, client) = self.site_id_and_client_for(self.active_page_site_id.as_deref());
         let storage = self.storage.clone();
         let tx = self.ui_tx.clone();
         if let Some(pid) = form.edit_page_id.clone() {
             ui.tasks.begin("Update page");
+            let body_unchanged = form.body.text == form.initial_body;
             let patch = PageUpdate {
                 title: form.title.text.trim().to_string(),
                 body_markdown: form.body.text.clone(),
+                body_raw_passthrough: body_unchanged
+                    .then(|| form.initial_body_raw.clone())
+                    .flatten(),
+                body_representation: body_unchanged
+                    .then(|| form.initial_body_representation.clone())
+                    .flatten(),
                 prev_version: form.prev_version,
                 version_message: Some("Edited via atlassian-cli TUI".to_string()),
             };
             tokio::spawn(async move {
                 match client.update_page(&pid, &patch).await {
                     Ok(detail) => {
-                        let _ = storage.upsert_page_detail(&detail);
+                        let _ = storage.upsert_page_detail_for_site(&site_id, &detail);
                         let _ = tx.send(UiMsg::PageMutated {
                             detail,
                             toast: "Confluence page saved".to_string(),
+                            clear_draft_key: draft_key,
                         });
                     }
                     Err(e) => {
                         let _ = tx.send(UiMsg::PageActionFailed(format!(
-                            "Failed to update page: {e}"
+                            "Failed to update page (draft preserved): {e}"
                         )));
                     }
                 }
@@ -2223,15 +2491,16 @@ impl AppState {
             tokio::spawn(async move {
                 match client.create_page(&req).await {
                     Ok(detail) => {
-                        let _ = storage.upsert_page_detail(&detail);
+                        let _ = storage.upsert_page_detail_for_site(&site_id, &detail);
                         let _ = tx.send(UiMsg::PageMutated {
                             detail,
                             toast: "Created Confluence page".to_string(),
+                            clear_draft_key: draft_key,
                         });
                     }
                     Err(e) => {
                         let _ = tx.send(UiMsg::PageActionFailed(format!(
-                            "Failed to create page: {e}"
+                            "Failed to create page (draft preserved): {e}"
                         )));
                     }
                 }
@@ -2633,6 +2902,35 @@ impl AppState {
     // Event handlers
     // ------------------------------------------------------------------
 
+    fn maybe_refresh_open_items_after_sync(&mut self, ui: &mut UiState) {
+        if let Some(key) = self.active_issue.as_ref().map(|d| d.summary.key.clone()) {
+            let sid = self
+                .active_issue_site_id
+                .clone()
+                .unwrap_or_else(|| self.effective_site_id_and_client().0);
+            let stale = self
+                .storage
+                .is_issue_detail_stale_for_site(&sid, &key)
+                .unwrap_or(false);
+            if stale {
+                self.request_issue_detail(ui, &key);
+            }
+        }
+        if let Some(pid) = self.active_page.as_ref().map(|p| p.summary.id.clone()) {
+            let sid = self
+                .active_page_site_id
+                .clone()
+                .unwrap_or_else(|| self.effective_site_id_and_client().0);
+            let stale = self
+                .storage
+                .is_page_detail_stale_for_site(&sid, &pid)
+                .unwrap_or(false);
+            if stale {
+                self.request_page_detail(ui, &pid);
+            }
+        }
+    }
+
     pub fn handle_core_event(&mut self, ui: &mut UiState, ev: CoreEvent) {
         match ev {
             CoreEvent::SyncStarted => {
@@ -2644,6 +2942,7 @@ impl AppState {
                 if let Ok(counts) = self.storage.cache_counts() {
                     self.cache_counts = counts;
                 }
+                self.maybe_refresh_open_items_after_sync(ui);
                 ui.tasks.finish("Sync", None);
                 ui.success(summary);
             }
@@ -2658,21 +2957,54 @@ impl AppState {
                 sprint,
                 issues,
             } => {
+                let active_needs_refresh = self.active_issue.as_ref().and_then(|cur| {
+                    issues.iter().find(|i| i.key == cur.summary.key).and_then(|inc| {
+                        (crate::storage::jira::compare_updated_at(
+                            &inc.updated_at,
+                            &cur.summary.updated_at,
+                        ) == std::cmp::Ordering::Greater)
+                            .then(|| cur.summary.key.clone())
+                    })
+                });
                 self.board_issues = issues;
                 if let Some(sp) = sprint {
                     if !self.sprints.iter().any(|s| s.id == sp.id) {
                         self.sprints.push(sp);
                     }
                 }
+                if let Some(key) = active_needs_refresh {
+                    self.request_issue_detail(ui, &key);
+                }
             }
             CoreEvent::IssuesUpdated(issues) => {
+                let active_needs_refresh = self.active_issue.as_ref().and_then(|cur| {
+                    issues.iter().find(|i| i.key == cur.summary.key).and_then(|inc| {
+                        (crate::storage::jira::compare_updated_at(
+                            &inc.updated_at,
+                            &cur.summary.updated_at,
+                        ) == std::cmp::Ordering::Greater)
+                            .then(|| cur.summary.key.clone())
+                    })
+                });
                 self.issues = issues;
+                if let Some(key) = active_needs_refresh {
+                    self.request_issue_detail(ui, &key);
+                }
             }
             CoreEvent::SpacesUpdated(spaces) => {
                 self.spaces = spaces;
             }
             CoreEvent::SpacePagesUpdated { space_key, pages } => {
+                let active_needs_refresh = self.active_page.as_ref().and_then(|cur| {
+                    pages.iter().find(|p| p.id == cur.summary.id).and_then(|inc| {
+                        (inc.version_number > cur.summary.version_number)
+                            .then(|| cur.summary.id.clone())
+                    })
+                });
                 self.root_pages_by_space.insert(space_key, pages);
+                if let Some(pid) = active_needs_refresh {
+                    self.request_page_detail(ui, &pid);
+                }
             }
             CoreEvent::SyncError(err) => {
                 self.syncing = false;
@@ -2749,13 +3081,54 @@ impl AppState {
                 }
                 self.saved_filters = combined;
             }
-            UiMsg::IssueDetailLoaded { key: _, detail } => match detail {
-                Ok(d) => {
-                    self.active_issue = Some(d);
+            UiMsg::IssueDetailLoaded {
+                seq,
+                site_id,
+                key,
+                detail,
+                not_found,
+            } => {
+                if let Some(req_seq) = seq {
+                    if req_seq != self.issue_detail_req_seq {
+                        return;
+                    }
+                } else if self
+                    .active_issue
+                    .as_ref()
+                    .is_some_and(|cur| cur.summary.key != key)
+                {
+                    return;
                 }
-                Err(err) => ui.error(format!("Failed to load issue detail: {err}")),
-            },
-            UiMsg::IssueMutated { detail, toast } => {
+                match detail {
+                    Ok(d) => {
+                        self.active_issue = Some(d);
+                        self.active_issue_site_id = Some(site_id);
+                    }
+                    Err(err) => {
+                        if not_found {
+                            self.issues.retain(|i| i.key != key);
+                            self.board_issues.retain(|i| i.key != key);
+                            self.my_issues.retain(|i| i.key != key);
+                            if self
+                                .active_issue
+                                .as_ref()
+                                .is_some_and(|cur| cur.summary.key == key)
+                            {
+                                self.active_issue = None;
+                            }
+                        }
+                        ui.error(format!("Failed to load issue detail: {err}"));
+                    }
+                }
+            }
+            UiMsg::IssueMutated {
+                detail,
+                toast,
+                clear_draft_key,
+            } => {
+                if let Some(dk) = clear_draft_key.as_deref() {
+                    self.clear_draft_and_save(dk);
+                }
                 let key = detail.summary.key.clone();
                 let summary = detail.summary.summary.clone();
                 ui.tasks.finish(&format!("Assign {key} to me"), None);
@@ -2845,9 +3218,13 @@ impl AppState {
                 page_id,
                 optimistic_id,
                 task_label,
+                clear_draft_key,
                 result,
             } => match result {
                 Ok(()) => {
+                    if let Some(dk) = clear_draft_key.as_deref() {
+                        self.clear_draft_and_save(dk);
+                    }
                     ui.tasks.finish(&task_label, None);
                     ui.success("Comment posted");
                     if let Some(k) = issue_key {
@@ -2872,7 +3249,7 @@ impl AppState {
                     }
                 }
                 Err(e) => {
-                    let msg = format!("Failed to post comment: {e}");
+                    let msg = format!("Failed to post comment (draft preserved): {e}");
                     ui.tasks.finish(&task_label, Some(msg.clone()));
                     if let Some(ref opt_id) = optimistic_id {
                         if let Some(ref k) = issue_key {
@@ -2915,11 +3292,58 @@ impl AppState {
                 }
                 Err(e) => ui.error(format!("Failed to load child pages: {e}")),
             },
-            UiMsg::PageDetailLoaded { page_id: _, detail } => match detail {
-                Ok(d) => self.active_page = Some(d),
-                Err(e) => ui.error(format!("Failed to load page: {e}")),
-            },
-            UiMsg::PageMutated { detail, toast } => {
+            UiMsg::PageDetailLoaded {
+                seq,
+                site_id,
+                page_id,
+                detail,
+                not_found,
+            } => {
+                if let Some(req_seq) = seq {
+                    if req_seq != self.page_detail_req_seq {
+                        return;
+                    }
+                } else if self
+                    .active_page
+                    .as_ref()
+                    .is_some_and(|cur| cur.summary.id != page_id)
+                {
+                    return;
+                }
+                match detail {
+                    Ok(d) => {
+                        self.active_page = Some(d);
+                        self.active_page_site_id = Some(site_id);
+                    }
+                    Err(e) => {
+                        if not_found {
+                            for roots in self.root_pages_by_space.values_mut() {
+                                roots.retain(|p| p.id != page_id);
+                            }
+                            for children in self.page_children_map.values_mut() {
+                                children.retain(|p| p.id != page_id);
+                            }
+                            self.my_pages.retain(|p| p.id != page_id);
+                            if self
+                                .active_page
+                                .as_ref()
+                                .is_some_and(|cur| cur.summary.id == page_id)
+                            {
+                                self.active_page = None;
+                            }
+                        }
+                        ui.error(format!("Failed to load page: {e}"));
+                    }
+                }
+            }
+            UiMsg::PageMutated {
+                detail,
+                toast,
+                clear_draft_key,
+            } => {
+                if let Some(dk) = clear_draft_key.as_deref() {
+                    self.clear_draft_and_save(dk);
+                }
                 ui.tasks.finish("Update page", None);
                 ui.tasks.finish("Create page", None);
                 let sk = detail.summary.space_key.clone();
@@ -3007,6 +3431,7 @@ impl AppState {
                 self.sync_summary = outcome.summary.clone();
                 ui.tasks.finish("Sync all sites", None);
                 self.load_cached_initial();
+                self.maybe_refresh_open_items_after_sync(ui);
                 ui.success(outcome.summary);
             }
             UiMsg::ImageLoaded {
@@ -3575,10 +4000,96 @@ mod tests {
                 page_id: None,
                 optimistic_id: Some(opt_id),
                 task_label: "Comment on ATL-99".into(),
+                clear_draft_key: None,
                 result: Err("network error".into()),
             },
         );
         assert!(app.active_issue.as_ref().unwrap().comments.is_empty());
         assert_eq!(app.active_issue.as_ref().unwrap().summary.comment_count, 0);
+    }
+
+    #[tokio::test]
+    async fn tui_async_detail_sequence_and_multisite_sync_preserve_open_issue_and_404_clears() {
+        use crate::models::{IssueDetail, IssueSummary};
+        use crate::sync::MultiSiteSyncOutcome;
+
+        let cfg = AppConfig::default();
+        let auth = AuthManager::new("test-seq");
+        let client = AtlassianClient::new(cfg.clone(), auth.clone()).unwrap();
+        let storage = Storage::open_in_memory().unwrap();
+        let (core_tx, _core_rx) = mpsc::unbounded_channel();
+        let sync_ctrl = sync::spawn_sync_engine(cfg.clone(), client.clone(), storage.clone(), core_tx);
+        let (ui_tx, _ui_rx) = mpsc::unbounded_channel();
+        let mut app = AppState::new_with_persona(
+            cfg.clone(),
+            Persona::Jira,
+            auth,
+            client,
+            storage.clone(),
+            sync_ctrl,
+            ui_tx,
+        );
+        let mut ui = UiState::from_config_with_persona(&cfg, Persona::Jira);
+
+        let mk = |key: &str, summary: &str, updated: &str| IssueDetail {
+            summary: IssueSummary {
+                id: key.into(),
+                key: key.into(),
+                project_key: "ATL".into(),
+                summary: summary.into(),
+                updated_at: updated.into(),
+                ..Default::default()
+            },
+            description_markdown: format!("Body of {key}"),
+            ..Default::default()
+        };
+
+        let d1 = mk("ATL-1", "First issue", "2026-11-18T10:00:00Z");
+        let d2 = mk("ATL-2", "Second issue", "2026-11-17T10:00:00Z");
+        storage.upsert_issue_detail_for_site("default", &d1).unwrap();
+        storage.upsert_issue_detail_for_site("default", &d2).unwrap();
+
+        app.active_issue = Some(d2.clone());
+        app.active_issue_site_id = Some("default".into());
+
+        // MultiSiteSyncFinished must preserve currently open ATL-2 instead of hijacking to ATL-1
+        app.handle_ui_msg(
+            &mut ui,
+            UiMsg::MultiSiteSyncFinished(MultiSiteSyncOutcome {
+                summary: "Synced".into(),
+                total_sites: 1,
+                succeeded_sites: 1,
+                per_site: vec![],
+            }),
+        );
+        assert_eq!(app.active_issue.as_ref().unwrap().summary.key, "ATL-2");
+
+        // Stale out-of-order response (seq=1 when current seq=2) must be ignored
+        app.issue_detail_req_seq = 2;
+        app.handle_ui_msg(
+            &mut ui,
+            UiMsg::IssueDetailLoaded {
+                seq: Some(1),
+                site_id: "default".into(),
+                key: "ATL-1".into(),
+                detail: Ok(d1),
+                not_found: false,
+            },
+        );
+        assert_eq!(app.active_issue.as_ref().unwrap().summary.key, "ATL-2");
+
+        // Matching seq with not_found=true clears active_issue and removes zombie from lists
+        app.handle_ui_msg(
+            &mut ui,
+            UiMsg::IssueDetailLoaded {
+                seq: Some(2),
+                site_id: "default".into(),
+                key: "ATL-2".into(),
+                detail: Err("HTTP 404".into()),
+                not_found: true,
+            },
+        );
+        assert!(app.active_issue.is_none());
+        assert!(!app.issues.iter().any(|i| i.key == "ATL-2"));
     }
 }

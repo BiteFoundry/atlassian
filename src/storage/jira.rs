@@ -350,7 +350,10 @@ impl Storage {
         {
             for issue in issues {
                 let eff_sprint_id = issue.sprint_id.or(default_sprint_id);
-                upsert_issue_row(&tx, site_id, issue, board_id, eff_sprint_id)?;
+                let applied = upsert_issue_row(&tx, site_id, issue, board_id, eff_sprint_id)?;
+                if !applied {
+                    continue;
+                }
                 let existing_desc: String = tx
                     .query_row(
                         "SELECT description_markdown FROM issues WHERE site_id = ?1 AND key = ?2",
@@ -378,16 +381,70 @@ impl Storage {
     }
 
     pub fn upsert_issue_detail_for_site(&self, site_id: &str, detail: &IssueDetail) -> Result<()> {
+        let mut owned = detail.clone();
+        self.upsert_issue_detail_for_site_merging(site_id, &mut owned, false)
+    }
+
+    /// Upserts a Jira issue detail for `site_id`, enforcing monotonic `updated_at` and optionally
+    /// preserving previously cached `linked_pages` when `/remotelink` transiently failed.
+    pub fn upsert_issue_detail_for_site_merging(
+        &self,
+        site_id: &str,
+        detail: &mut IssueDetail,
+        preserve_linked_pages: bool,
+    ) -> Result<()> {
         let mut conn = self.lock_conn()?;
         let tx = conn.transaction()?;
         {
+            let existing_detail_raw: Option<String> = tx
+                .query_row(
+                    "SELECT detail_json FROM issues WHERE site_id = ?1 AND key = ?2",
+                    params![site_id, &detail.summary.key],
+                    |row| row.get(0),
+                )
+                .optional()?
+                .flatten();
+
+            let applied =
+                upsert_issue_row(&tx, site_id, &detail.summary, None, detail.summary.sprint_id)?;
+            if !applied {
+                if let Some(raw) = existing_detail_raw.as_deref() {
+                    if let Ok(newer) = serde_json::from_str::<IssueDetail>(raw) {
+                        *detail = newer;
+                    }
+                }
+                tx.commit()?;
+                return Ok(());
+            }
+
+            if preserve_linked_pages {
+                if let Some(raw) = existing_detail_raw.as_deref() {
+                    if let Ok(prev) = serde_json::from_str::<IssueDetail>(raw) {
+                        for lp in prev.linked_pages {
+                            let exists = detail.linked_pages.iter().any(|cur| {
+                                (!lp.page_id.is_empty() && cur.page_id == lp.page_id)
+                                    || (!lp.web_url.is_empty() && cur.web_url == lp.web_url)
+                            });
+                            if !exists {
+                                detail.linked_pages.push(lp);
+                            }
+                        }
+                    }
+                }
+            }
+
             let issue = &detail.summary;
-            upsert_issue_row(&tx, site_id, issue, None, issue.sprint_id)?;
             let detail_json =
                 serde_json::to_string(detail).context("Failed to serialize IssueDetail")?;
             tx.execute(
-                "UPDATE issues SET description_markdown = ?1, detail_json = ?2 WHERE site_id = ?3 AND key = ?4",
-                params![detail.description_markdown, detail_json, site_id, issue.key],
+                "UPDATE issues SET description_markdown = ?1, detail_json = ?2, detail_updated_at = ?3 WHERE site_id = ?4 AND key = ?5",
+                params![
+                    detail.description_markdown,
+                    detail_json,
+                    issue.updated_at,
+                    site_id,
+                    issue.key
+                ],
             )?;
             let plain_desc = if !detail.description_blocks.is_empty() {
                 adf::blocks_to_plain_text(&detail.description_blocks)
@@ -418,22 +475,106 @@ impl Storage {
         key: &str,
     ) -> Result<Option<IssueDetail>> {
         let conn = self.lock_conn()?;
-        let raw: Option<String> = conn
+        let row_opt: Option<(IssueSummary, Option<String>)> = conn
             .query_row(
-                "SELECT detail_json FROM issues WHERE site_id = ?1 AND key = ?2",
+                "
+                SELECT
+                    id, key, project_key, summary, status_json, priority_json,
+                    issue_type_json, assignee_json, reporter_json, parent_key,
+                    parent_summary, labels_json, story_points, sprint_id,
+                    sprint_name, comment_count, attachment_count, created_at,
+                    updated_at, web_url, detail_json
+                FROM issues
+                WHERE site_id = ?1 AND key = ?2
+                ",
                 params![site_id, key],
-                |row| row.get(0),
+                |row| {
+                    let summary = map_issue_summary_row(row, 0)?;
+                    let detail_json: Option<String> = row.get(20)?;
+                    Ok((summary, detail_json))
+                },
             )
-            .optional()?
-            .flatten();
-        match raw {
-            Some(json_str) if !json_str.trim().is_empty() => {
-                let detail = serde_json::from_str::<IssueDetail>(&json_str)
+            .optional()?;
+        match row_opt {
+            Some((summary, Some(json_str))) if !json_str.trim().is_empty() => {
+                let mut detail = serde_json::from_str::<IssueDetail>(&json_str)
                     .context("Failed to deserialize IssueDetail")?;
+                // Reconcile summary fields from authoritative table columns so list and offline
+                // reader views never split-brain after list/sync updates.
+                detail.summary = summary;
                 Ok(Some(detail))
             }
             _ => Ok(None),
         }
+    }
+
+    /// Returns `true` when cached `detail_json` was captured at an older `updated_at` than the
+    /// latest list/sync summary row for `(site_id, key)`.
+    pub fn is_issue_detail_stale_for_site(&self, site_id: &str, key: &str) -> Result<bool> {
+        let conn = self.lock_conn()?;
+        let row_opt: Option<(String, Option<String>, Option<String>)> = conn
+            .query_row(
+                "SELECT updated_at, detail_updated_at, detail_json FROM issues WHERE site_id = ?1 AND key = ?2",
+                params![site_id, key],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .optional()?;
+        let Some((row_updated, detail_updated, detail_json)) = row_opt else {
+            return Ok(false);
+        };
+        if detail_json.as_deref().map(str::trim).unwrap_or("").is_empty() {
+            return Ok(false);
+        }
+        let Some(du) = detail_updated.as_deref().map(str::trim).filter(|s| !s.is_empty()) else {
+            return Ok(false);
+        };
+        if row_updated.trim().is_empty() {
+            return Ok(false);
+        }
+        Ok(compare_updated_at(du, &row_updated) == std::cmp::Ordering::Less)
+    }
+
+    /// Removes cached issues belonging to `(site_id, board_id, sprint_id)` that are absent from
+    /// a complete board/sprint snapshot. Never touches other sites or other boards.
+    pub fn prune_board_issues_for_site(
+        &self,
+        site_id: &str,
+        board_id: i64,
+        sprint_id: Option<i64>,
+        keep_keys: &[String],
+    ) -> Result<usize> {
+        let keep: HashSet<&str> = keep_keys.iter().map(String::as_str).collect();
+        let mut conn = self.lock_conn()?;
+        let tx = conn.transaction()?;
+        let existing_keys: Vec<String> = if let Some(sid) = sprint_id {
+            let mut stmt = tx.prepare(
+                "SELECT key FROM issues WHERE site_id = ?1 AND board_id = ?2 AND sprint_id = ?3",
+            )?;
+            let rows = stmt.query_map(params![site_id, board_id, sid], |r| r.get(0))?;
+            rows.collect::<rusqlite::Result<Vec<_>>>()?
+        } else {
+            let mut stmt =
+                tx.prepare("SELECT key FROM issues WHERE site_id = ?1 AND board_id = ?2")?;
+            let rows = stmt.query_map(params![site_id, board_id], |r| r.get(0))?;
+            rows.collect::<rusqlite::Result<Vec<_>>>()?
+        };
+
+        let mut removed = 0usize;
+        for key in existing_keys {
+            if !keep.contains(key.as_str()) {
+                tx.execute(
+                    "DELETE FROM issues_fts WHERE site_id = ?1 AND issue_key = ?2",
+                    params![site_id, &key],
+                )?;
+                tx.execute(
+                    "DELETE FROM issues WHERE site_id = ?1 AND key = ?2",
+                    params![site_id, &key],
+                )?;
+                removed += 1;
+            }
+        }
+        tx.commit()?;
+        Ok(removed)
     }
 
     pub fn list_issues(
@@ -814,13 +955,54 @@ fn map_board_row(row: &Row<'_>, offset: usize) -> rusqlite::Result<BoardSummary>
     })
 }
 
+pub(crate) fn compare_updated_at(incoming: &str, existing: &str) -> std::cmp::Ordering {
+    let inc = incoming.trim();
+    let ex = existing.trim();
+    if ex.is_empty() {
+        return std::cmp::Ordering::Greater;
+    }
+    if inc.is_empty() {
+        return std::cmp::Ordering::Equal;
+    }
+    let parse_ts = |s: &str| {
+        chrono::DateTime::parse_from_rfc3339(s)
+            .or_else(|_| chrono::DateTime::parse_from_str(s, "%Y-%m-%dT%H:%M:%S%.f%z"))
+            .or_else(|_| chrono::DateTime::parse_from_str(s, "%Y-%m-%dT%H:%M:%S%z"))
+            .ok()
+    };
+    if let (Some(a), Some(b)) = (parse_ts(inc), parse_ts(ex)) {
+        a.cmp(&b)
+    } else {
+        inc.cmp(ex)
+    }
+}
+
 fn upsert_issue_row(
     conn: &Connection,
     site_id: &str,
     issue: &IssueSummary,
     board_id: Option<i64>,
     sprint_id: Option<i64>,
-) -> Result<()> {
+) -> Result<bool> {
+    if let Some(existing_updated) = conn
+        .query_row(
+            "SELECT updated_at FROM issues WHERE site_id = ?1 AND key = ?2",
+            params![site_id, &issue.key],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()?
+    {
+        if compare_updated_at(&issue.updated_at, &existing_updated) == std::cmp::Ordering::Less {
+            if let Some(bid) = board_id {
+                conn.execute(
+                    "UPDATE issues SET board_id = COALESCE(board_id, ?1), sprint_id = COALESCE(sprint_id, ?2) WHERE site_id = ?3 AND key = ?4",
+                    params![bid, sprint_id, site_id, &issue.key],
+                )?;
+            }
+            return Ok(false);
+        }
+    }
+
     let status_json = serde_json::to_string(&issue.status)?;
     let priority_json = issue
         .priority
@@ -840,7 +1022,12 @@ fn upsert_issue_row(
         .transpose()?;
     let labels_json = serde_json::to_string(&issue.labels)?;
 
-    conn.execute(
+    let sprint_update_sql = if board_id.is_some() {
+        "sprint_id = excluded.sprint_id,\n            sprint_name = excluded.sprint_name,"
+    } else {
+        "sprint_id = COALESCE(excluded.sprint_id, issues.sprint_id),\n            sprint_name = COALESCE(excluded.sprint_name, issues.sprint_name),"
+    };
+    let sql = format!(
         "
         INSERT INTO issues (
             site_id, key, id, project_key, board_id, sprint_id, summary,
@@ -857,24 +1044,26 @@ fn upsert_issue_row(
             id = excluded.id,
             project_key = excluded.project_key,
             board_id = COALESCE(excluded.board_id, issues.board_id),
-            sprint_id = COALESCE(excluded.sprint_id, issues.sprint_id),
+            {sprint_update_sql}
             summary = excluded.summary,
             status_json = excluded.status_json,
             priority_json = excluded.priority_json,
             issue_type_json = excluded.issue_type_json,
             assignee_json = excluded.assignee_json,
             reporter_json = excluded.reporter_json,
-            parent_key = COALESCE(excluded.parent_key, issues.parent_key),
-            parent_summary = COALESCE(excluded.parent_summary, issues.parent_summary),
+            parent_key = excluded.parent_key,
+            parent_summary = excluded.parent_summary,
             labels_json = excluded.labels_json,
-            story_points = COALESCE(excluded.story_points, issues.story_points),
-            sprint_name = COALESCE(excluded.sprint_name, issues.sprint_name),
+            story_points = excluded.story_points,
             comment_count = excluded.comment_count,
             attachment_count = excluded.attachment_count,
             created_at = excluded.created_at,
             updated_at = excluded.updated_at,
             web_url = excluded.web_url
-        ",
+        "
+    );
+    conn.execute(
+        &sql,
         params![
             site_id,
             issue.key,
@@ -900,7 +1089,7 @@ fn upsert_issue_row(
             issue.web_url,
         ],
     )?;
-    Ok(())
+    Ok(true)
 }
 
 fn refresh_issue_fts(
@@ -1351,6 +1540,101 @@ mod tests {
                 .list_board_issues_for_site("corp-dc", 1, Some(10), 20)
                 .unwrap()
                 .len(),
+            1
+        );
+    }
+
+    #[test]
+    fn test_monotonic_updated_at_split_brain_remotelink_preserve_and_board_prune() {
+        use crate::models::LinkedConfluencePage;
+
+        let storage = Storage::open_in_memory().unwrap();
+        let mut v1 = sample_issue("PROJ-10", "PROJ", "v1 summary", Some(10));
+        v1.updated_at = "2026-11-16T10:00:00.000+0000".into();
+
+        let detail_v1 = IssueDetail {
+            summary: v1.clone(),
+            description_markdown: "v1 description".into(),
+            linked_pages: vec![LinkedConfluencePage {
+                page_id: "2001".into(),
+                title: "Design Doc".into(),
+                space_key: Some("ENG".into()),
+                web_url: "https://acme.atlassian.net/wiki/spaces/ENG/pages/2001".into(),
+            }],
+            ..Default::default()
+        };
+        storage
+            .upsert_issue_detail_for_site("site-a", &detail_v1)
+            .unwrap();
+        assert!(!storage
+            .is_issue_detail_stale_for_site("site-a", "PROJ-10")
+            .unwrap());
+
+        // Newer list summary updates authoritative fields and marks cached detail stale
+        let mut v2 = v1.clone();
+        v2.summary = "v2 remote summary".into();
+        v2.status = IssueStatus {
+            id: "13".into(),
+            name: "In Review".into(),
+            category: StatusCategory::InProgress,
+        };
+        v2.sprint_id = None;
+        v2.sprint_name = None;
+        v2.updated_at = "2026-11-17T10:00:00.000+0000".into();
+        storage
+            .upsert_board_issues_for_site("site-a", 11, None, &[v2.clone()])
+            .unwrap();
+
+        assert!(storage
+            .is_issue_detail_stale_for_site("site-a", "PROJ-10")
+            .unwrap());
+        let reconciled = storage
+            .get_issue_detail_for_site("site-a", "PROJ-10")
+            .unwrap()
+            .unwrap();
+        assert_eq!(reconciled.summary.summary, "v2 remote summary");
+        assert_eq!(reconciled.summary.status.name, "In Review");
+        // Non-sticky sprint cleared when remote returned None
+        assert!(reconciled.summary.sprint_id.is_none());
+        assert!(reconciled.summary.sprint_name.is_none());
+
+        // Older v1 upsert must NOT regress v2
+        storage.upsert_issues_for_site("site-a", &[v1]).unwrap();
+        let after_old = storage
+            .list_issues_for_site("site-a", None, 10)
+            .unwrap();
+        assert_eq!(after_old[0].summary, "v2 remote summary");
+
+        // Transient /remotelink failure preserves cached linked_pages when merging
+        let mut v2_detail_503 = IssueDetail {
+            summary: v2.clone(),
+            description_markdown: "v2 description".into(),
+            linked_pages: vec![],
+            ..Default::default()
+        };
+        storage
+            .upsert_issue_detail_for_site_merging("site-a", &mut v2_detail_503, true)
+            .unwrap();
+        assert_eq!(v2_detail_503.linked_pages.len(), 1);
+        assert_eq!(v2_detail_503.linked_pages[0].page_id, "2001");
+        assert!(!storage
+            .is_issue_detail_stale_for_site("site-a", "PROJ-10")
+            .unwrap());
+
+        // Pruning board 11 on site-a removes PROJ-10 while preserving site-b
+        storage
+            .upsert_board_issues_for_site("site-b", 11, None, &[v2])
+            .unwrap();
+        let removed = storage
+            .prune_board_issues_for_site("site-a", 11, None, &[])
+            .unwrap();
+        assert_eq!(removed, 1);
+        assert!(storage
+            .get_issue_detail_for_site("site-a", "PROJ-10")
+            .unwrap()
+            .is_none());
+        assert_eq!(
+            storage.list_issues_for_site("site-b", None, 10).unwrap().len(),
             1
         );
     }

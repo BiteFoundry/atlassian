@@ -34,6 +34,8 @@ pub enum PageFormField {
 pub struct PageFormDraft {
     pub title: String,
     pub body: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub base_version: Option<i32>,
 }
 
 #[derive(Debug, Clone)]
@@ -45,6 +47,9 @@ pub struct PageFormOverlay {
     pub parent_id: Option<String>,
     pub title: TextBuffer,
     pub body: TextBuffer,
+    pub initial_body: String,
+    pub initial_body_raw: Option<String>,
+    pub initial_body_representation: Option<String>,
     pub field: PageFormField,
     pub error: Option<String>,
 }
@@ -58,6 +63,9 @@ impl PageFormOverlay {
             parent_id,
             title: TextBuffer::new(),
             body: TextBuffer::new(),
+            initial_body: String::new(),
+            initial_body_raw: None,
+            initial_body_representation: None,
             field: PageFormField::Title,
             error: None,
         }
@@ -71,6 +79,11 @@ impl PageFormOverlay {
             parent_id: detail.summary.parent_id.clone(),
             title: TextBuffer::from_text(detail.summary.title.clone()),
             body: TextBuffer::from_text(detail.body_markdown.clone()),
+            initial_body: detail.body_markdown.clone(),
+            initial_body_raw: (!detail.body_raw.trim().is_empty())
+                .then(|| detail.body_raw.clone()),
+            initial_body_representation: (!detail.body_representation.trim().is_empty())
+                .then(|| detail.body_representation.clone()),
             field: PageFormField::Body,
             error: None,
         }
@@ -91,6 +104,7 @@ impl PageFormOverlay {
         PageFormDraft {
             title: self.title.text.clone(),
             body: self.body.text.clone(),
+            base_version: self.edit_page_id.as_ref().map(|_| self.prev_version),
         }
     }
 
@@ -108,6 +122,19 @@ impl PageFormOverlay {
                 self.title.set_text(draft.title);
             }
             self.body.set_text(draft.body);
+            if self.edit_page_id.is_some() {
+                if let Some(draft_ver) = draft.base_version.filter(|v| *v > 0) {
+                    let current_ver = self.prev_version;
+                    if draft_ver != current_ver {
+                        // Keep the draft's original base_version so submitting checks version
+                        // conflict instead of silently promoting a stale draft over a newer page.
+                        self.prev_version = draft_ver;
+                        self.error = Some(format!(
+                            "Draft based on v{draft_ver}, but page is now v{current_ver}; submitting will detect conflict"
+                        ));
+                    }
+                }
+            }
             return true;
         }
         self.body.set_text(raw);
@@ -366,5 +393,38 @@ mod tests {
             restored.handle(&Action::Submit),
             OverlayOutcome::Dispatch(Action::Submit)
         );
+    }
+
+    #[test]
+    fn page_form_draft_preserves_base_version_and_warns_on_stale_version() {
+        use crate::models::PageSummary;
+        let v1_detail = PageDetail {
+            summary: PageSummary {
+                id: "3001".into(),
+                space_key: "ENG".into(),
+                title: "Spec v1".into(),
+                version_number: 1,
+                ..Default::default()
+            },
+            body_raw: r#"{"type":"doc","version":1,"content":[]}"#.into(),
+            body_representation: "atlas_doc_format".into(),
+            body_markdown: "v1 body".into(),
+            ..Default::default()
+        };
+        let mut form_v1 = PageFormOverlay::edit_page(&v1_detail);
+        form_v1.body.set_text("Local v1 draft edit");
+        let draft_json = form_v1.to_draft_json();
+
+        let mut v2_detail = v1_detail;
+        v2_detail.summary.version_number = 2;
+        v2_detail.body_markdown = "Remote v2 edit".into();
+
+        let mut form_v2 = PageFormOverlay::edit_page(&v2_detail);
+        assert_eq!(form_v2.prev_version, 2);
+        assert!(form_v2.apply_draft_raw(&draft_json));
+        // Must NOT silently promote v1 draft to prev_version=2 (which would submit v3).
+        assert_eq!(form_v2.prev_version, 1);
+        assert_eq!(form_v2.body.text, "Local v1 draft edit");
+        assert!(form_v2.error.as_deref().unwrap_or("").contains("v1"));
     }
 }

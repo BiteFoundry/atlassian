@@ -10,7 +10,7 @@ use ratatui::{
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    models::IssueDetail,
+    models::{IssueDetail, IssueUpdate},
     ui::{
         app::{AppState, ExternalEditorTarget, UiState},
         doc_view::{truncate_width, wrap_plain_text},
@@ -83,6 +83,10 @@ pub struct IssueFormOverlay {
     pub priority: TextBuffer,
     pub labels: TextBuffer,
     pub description: TextBuffer,
+    pub initial_summary: String,
+    pub initial_priority: String,
+    pub initial_labels: Vec<String>,
+    pub initial_description: String,
     pub field: IssueFormField,
     pub error: Option<String>,
 }
@@ -97,6 +101,10 @@ impl IssueFormOverlay {
             priority: TextBuffer::from_text("Medium"),
             labels: TextBuffer::new(),
             description: TextBuffer::new(),
+            initial_summary: String::new(),
+            initial_priority: String::new(),
+            initial_labels: Vec::new(),
+            initial_description: String::new(),
             field: if default_project.trim().is_empty() {
                 IssueFormField::Project
             } else {
@@ -107,23 +115,46 @@ impl IssueFormOverlay {
     }
 
     pub fn edit_issue(detail: &IssueDetail) -> Self {
+        let initial_priority = detail
+            .summary
+            .priority
+            .as_ref()
+            .map(|p| p.name.clone())
+            .unwrap_or_default();
+        let initial_labels = detail.summary.labels.clone();
         Self {
             edit_key: Some(detail.summary.key.clone()),
             project: TextBuffer::from_text(detail.summary.project_key.clone()),
             issue_type: TextBuffer::from_text(detail.summary.issue_type.name.clone()),
             summary: TextBuffer::from_text(detail.summary.summary.clone()),
-            priority: TextBuffer::from_text(
-                detail
-                    .summary
-                    .priority
-                    .as_ref()
-                    .map(|p| p.name.clone())
-                    .unwrap_or_default(),
-            ),
-            labels: TextBuffer::from_text(detail.summary.labels.join(", ")),
+            priority: TextBuffer::from_text(initial_priority.clone()),
+            labels: TextBuffer::from_text(initial_labels.join(", ")),
             description: TextBuffer::from_text(detail.description_markdown.clone()),
+            initial_summary: detail.summary.summary.clone(),
+            initial_priority,
+            initial_labels,
+            initial_description: detail.description_markdown.clone(),
             field: IssueFormField::Summary,
             error: None,
+        }
+    }
+
+    /// Builds a minimal Jira `IssueUpdate` containing only fields actually changed since the edit
+    /// form opened, preventing unmodified description/priority/labels from overwriting remote edits.
+    pub fn build_edit_patch(&self) -> IssueUpdate {
+        let cur_summary = self.summary.text.trim();
+        let cur_priority = self.priority.text.trim();
+        let cur_labels = self.parsed_labels();
+
+        IssueUpdate {
+            summary: (cur_summary != self.initial_summary.trim())
+                .then(|| cur_summary.to_string()),
+            description_markdown: (self.description.text != self.initial_description)
+                .then(|| self.description.text.clone()),
+            priority: (!cur_priority.is_empty() && cur_priority != self.initial_priority.trim())
+                .then(|| cur_priority.to_string()),
+            assignee_id: None,
+            labels: (cur_labels != self.initial_labels).then_some(cur_labels),
         }
     }
 
@@ -482,5 +513,49 @@ mod tests {
             restored.handle(&Action::Submit),
             OverlayOutcome::Dispatch(Action::Submit)
         );
+    }
+
+    #[test]
+    fn issue_form_edit_patch_sends_only_modified_fields() {
+        use crate::models::{IssuePriority, IssueStatus, IssueSummary, IssueType, StatusCategory};
+        let detail = IssueDetail {
+            summary: IssueSummary {
+                id: "100".into(),
+                key: "ENG-7".into(),
+                project_key: "ENG".into(),
+                summary: "Original title".into(),
+                status: IssueStatus {
+                    id: "1".into(),
+                    name: "In Progress".into(),
+                    category: StatusCategory::InProgress,
+                },
+                priority: Some(IssuePriority {
+                    id: "2".into(),
+                    name: "High".into(),
+                }),
+                issue_type: IssueType {
+                    id: "10001".into(),
+                    name: "Story".into(),
+                    subtask: false,
+                    epic: false,
+                },
+                labels: vec!["backend".into(), "sync".into()],
+                ..Default::default()
+            },
+            description_markdown: "Rich body markdown".into(),
+            ..Default::default()
+        };
+
+        let mut form = IssueFormOverlay::edit_issue(&detail);
+        let empty_patch = form.build_edit_patch();
+        assert_eq!(empty_patch, IssueUpdate::default());
+
+        form.summary.set_text("Updated title only");
+        let patch = form.build_edit_patch();
+        assert_eq!(patch.summary.as_deref(), Some("Updated title only"));
+        assert!(patch.description_markdown.is_none());
+        assert!(patch.priority.is_none());
+        assert!(patch.labels.is_none());
+        assert!(patch.assignee_id.is_none());
     }
 }

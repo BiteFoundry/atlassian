@@ -266,7 +266,20 @@ fn init_connection(conn: &Connection, is_memory: bool) -> Result<()> {
                 .context("Failed to update SQLite PRAGMA user_version to v2")?;
         }
     }
+    ensure_detail_freshness_columns(conn)?;
 
+    Ok(())
+}
+
+fn ensure_detail_freshness_columns(conn: &Connection) -> Result<()> {
+    if table_exists(conn, "issues")? && !table_has_column(conn, "issues", "detail_updated_at")? {
+        conn.execute("ALTER TABLE issues ADD COLUMN detail_updated_at TEXT", [])
+            .context("Failed to add detail_updated_at column to issues")?;
+    }
+    if table_exists(conn, "pages")? && !table_has_column(conn, "pages", "detail_version")? {
+        conn.execute("ALTER TABLE pages ADD COLUMN detail_version INTEGER", [])
+            .context("Failed to add detail_version column to pages")?;
+    }
     Ok(())
 }
 

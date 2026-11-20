@@ -788,8 +788,16 @@ impl SyncController {
 }
 
 pub async fn bootstrap_workspace(client: &AtlassianClient, storage: &Storage) -> Result<String> {
+    bootstrap_workspace_for_site(client.site_id(), client, storage).await
+}
+
+pub async fn bootstrap_workspace_for_site(
+    site_id: &str,
+    client: &AtlassianClient,
+    storage: &Storage,
+) -> Result<String> {
     let mut breakers = CircuitBreakerRegistry::new();
-    let outcome = run_full_sync(client, storage, None, &mut breakers).await;
+    let outcome = run_full_sync_for_site(site_id, client, storage, None, &mut breakers).await;
     if outcome.succeeded_steps == 0 {
         if let Some(err) = outcome.first_error {
             return Err(err);
@@ -1448,7 +1456,7 @@ async fn run_full_sync(
     core_tx: Option<&mpsc::UnboundedSender<CoreEvent>>,
     breakers: &mut CircuitBreakerRegistry,
 ) -> FullSyncOutcome {
-    run_full_sync_for_site(DEFAULT_SITE_ID, client, storage, core_tx, breakers).await
+    run_full_sync_for_site(client.site_id(), client, storage, core_tx, breakers).await
 }
 
 async fn run_full_sync_for_site(
@@ -1710,11 +1718,16 @@ async fn sync_board_details_for_site(
     };
     let target_sprint_id = explicit_sprint_id.or_else(|| active_sprint.as_ref().map(|s| s.id));
 
+    let board_limit = 50usize;
     let issues: Vec<IssueSummary> = client
-        .list_board_issues(board_id, target_sprint_id, 50)
+        .list_board_issues(board_id, target_sprint_id, board_limit)
         .await?;
     let count = issues.len();
     storage.upsert_board_issues_for_site(site_id, board_id, target_sprint_id, &issues)?;
+    if count < board_limit {
+        let keep_keys: Vec<String> = issues.iter().map(|i| i.key.clone()).collect();
+        let _ = storage.prune_board_issues_for_site(site_id, board_id, target_sprint_id, &keep_keys);
+    }
 
     if let Some(tx) = core_tx {
         let _ = tx.send(CoreEvent::BoardIssuesUpdated {
@@ -1758,9 +1771,14 @@ async fn sync_space_pages_for_site(
     space_key: &str,
     core_tx: Option<&mpsc::UnboundedSender<CoreEvent>>,
 ) -> Result<usize> {
-    let pages = client.list_space_root_pages(space_key, 50).await?;
+    let page_limit = 50usize;
+    let pages = client.list_space_root_pages(space_key, page_limit).await?;
     let count = pages.len();
     storage.upsert_pages_for_site(site_id, &pages)?;
+    if count < page_limit {
+        let keep_ids: Vec<String> = pages.iter().map(|p| p.id.clone()).collect();
+        let _ = storage.prune_space_root_pages_for_site(site_id, space_key, &keep_ids);
+    }
     if let Some(tx) = core_tx {
         let _ = tx.send(CoreEvent::SpacePagesUpdated {
             space_key: space_key.to_string(),

@@ -654,12 +654,6 @@ fn close_top_overlay_and_save_draft(app: &mut AppState, ui: &mut UiState) {
     }
 }
 
-fn clear_draft_key(app: &mut AppState, key: &str) {
-    if app.drafts.remove(key).is_some() {
-        let _ = app.save_drafts();
-    }
-}
-
 fn sync_open_settings_overlay(app: &AppState, ui: &mut UiState) {
     let caps = ui.graphics_caps;
     for overlay in &mut ui.overlays {
@@ -809,18 +803,27 @@ fn handle_overlay_dispatch(action: Action, app: &mut AppState, ui: &mut UiState)
                 }
                 Overlay::IssueForm(ov) => {
                     let draft_key = ov.draft_key();
-                    clear_draft_key(app, &draft_key);
-                    app.request_submit_issue_form(ui, &ov);
+                    if ov.has_unsent_content() {
+                        app.drafts.set(draft_key.clone(), ov.to_draft_json());
+                        let _ = app.save_drafts();
+                    }
+                    app.request_submit_issue_form(ui, &ov, Some(draft_key));
                 }
                 Overlay::PageForm(ov) => {
                     let draft_key = ov.draft_key();
-                    clear_draft_key(app, &draft_key);
-                    app.request_submit_page_form(ui, &ov);
+                    if ov.has_unsent_content() {
+                        app.drafts.set(draft_key.clone(), ov.to_draft_json());
+                        let _ = app.save_drafts();
+                    }
+                    app.request_submit_page_form(ui, &ov, Some(draft_key));
                 }
                 Overlay::Comment(ov) => {
                     let draft_key = ov.draft_key();
-                    clear_draft_key(app, &draft_key);
-                    app.request_submit_comment(ui, &ov);
+                    if ov.has_unsent_content() {
+                        app.drafts.set(draft_key.clone(), ov.draft_text());
+                        let _ = app.save_drafts();
+                    }
+                    app.request_submit_comment(ui, &ov, Some(draft_key));
                 }
                 Overlay::CrossLink(ov) => {
                     if let Some(target) = ov.selected_target().cloned() {
@@ -1766,6 +1769,7 @@ mod tests {
         models::{AttachmentItem, IssueDetail, IssueSummary, PageDetail, PageSummary, SpaceSummary},
         storage::Storage,
         sync,
+        ui::app::UiMsg,
     };
     use tokio::sync::mpsc;
 
@@ -1950,7 +1954,7 @@ mod tests {
     async fn drafts_persist_on_close_restore_on_reopen_and_clear_on_submit() {
         let (mut app, mut ui, dir) = test_app_and_ui();
 
-        // Comment draft lifecycle
+        // Comment draft lifecycle: preserved on submit failure, cleared only on API success
         dispatch(Action::OpenComment, &mut app, &mut ui);
         dispatch(Action::Paste("WIP comment draft".into()), &mut app, &mut ui);
         dispatch(Action::CloseOverlay, &mut app, &mut ui);
@@ -1967,8 +1971,40 @@ mod tests {
             Some(Overlay::Comment(ov)) => assert_eq!(ov.draft_text(), "WIP comment draft"),
             other => panic!("expected Comment overlay, got {other:?}"),
         }
-        // Submit clears draft
+        // Submit keeps draft until server confirms success
         dispatch(Action::Submit, &mut app, &mut ui);
+        assert_eq!(
+            app.drafts.get("comment:issue:ATL-42"),
+            Some("WIP comment draft")
+        );
+        // API failure preserves the draft
+        app.handle_ui_msg(
+            &mut ui,
+            UiMsg::CommentAdded {
+                issue_key: Some("ATL-42".into()),
+                page_id: None,
+                optimistic_id: None,
+                task_label: "Comment on ATL-42".into(),
+                clear_draft_key: Some("comment:issue:ATL-42".into()),
+                result: Err("HTTP 503".into()),
+            },
+        );
+        assert_eq!(
+            app.drafts.get("comment:issue:ATL-42"),
+            Some("WIP comment draft")
+        );
+        // API success clears the draft
+        app.handle_ui_msg(
+            &mut ui,
+            UiMsg::CommentAdded {
+                issue_key: Some("ATL-42".into()),
+                page_id: None,
+                optimistic_id: None,
+                task_label: "Comment on ATL-42".into(),
+                clear_draft_key: Some("comment:issue:ATL-42".into()),
+                result: Ok(()),
+            },
+        );
         assert!(app.drafts.get("comment:issue:ATL-42").is_none());
 
         // Issue form draft lifecycle
@@ -1983,6 +2019,18 @@ mod tests {
             other => panic!("expected IssueForm overlay, got {other:?}"),
         }
         dispatch(Action::Submit, &mut app, &mut ui);
+        assert!(app.drafts.get("issue:new:ATL").is_some());
+        app.handle_ui_msg(&mut ui, UiMsg::IssueActionFailed("HTTP 500".into()));
+        assert!(app.drafts.get("issue:new:ATL").is_some());
+        let created_issue = app.active_issue.clone().unwrap();
+        app.handle_ui_msg(
+            &mut ui,
+            UiMsg::IssueMutated {
+                detail: created_issue,
+                toast: "Created".into(),
+                clear_draft_key: Some("issue:new:ATL".into()),
+            },
+        );
         assert!(app.drafts.get("issue:new:ATL").is_none());
 
         // Confluence page form draft lifecycle
@@ -1998,6 +2046,18 @@ mod tests {
             other => panic!("expected PageForm overlay, got {other:?}"),
         }
         dispatch(Action::Submit, &mut app, &mut ui);
+        assert!(app.drafts.get("page:new:ENG:900").is_some());
+        app.handle_ui_msg(&mut ui, UiMsg::PageActionFailed("HTTP 409 Conflict".into()));
+        assert!(app.drafts.get("page:new:ENG:900").is_some());
+        let created_page = app.active_page.clone().unwrap();
+        app.handle_ui_msg(
+            &mut ui,
+            UiMsg::PageMutated {
+                detail: created_page,
+                toast: "Saved".into(),
+                clear_draft_key: Some("page:new:ENG:900".into()),
+            },
+        );
         assert!(app.drafts.get("page:new:ENG:900").is_none());
     }
 

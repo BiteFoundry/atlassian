@@ -201,7 +201,8 @@ jobs:
           set -euo pipefail
           for dir in dist/atlassian-*; do
             echo "publishing $(basename "${dir}")"
-            npm publish "${dir}" --access public
+            chmod +x "${dir}"/bin/*
+            npm publish "./${dir}" --access public
           done
 
       - name: Publish root package
@@ -227,10 +228,18 @@ jobs:
           cd release-assets
           sha256sum * > SHA256SUMS.txt
 
+      - name: Prepare release notes
+        shell: bash
+        run: |
+          echo 'Single unified binary (`jira` / `jira.exe`) powers `jira`, `confluence`, and `conf` (`ATLASSIAN_PERSONA=confluence`).' > release-body.md
+          if [ -f "release-notes/${GITHUB_REF_NAME}.md" ]; then
+            echo >> release-body.md
+            cat "release-notes/${GITHUB_REF_NAME}.md" >> release-body.md
+          fi
+
       - name: Publish GitHub release
         uses: softprops/action-gh-release@v2
         with:
           files: release-assets/*
           generate_release_notes: true
-          body: |
-            Single unified binary (`jira` / `jira.exe`) powers `jira`, `confluence`, and `conf` (`ATLASSIAN_PERSONA=confluence`).
+          body_path: release-body.md

@@ -123,7 +123,10 @@ impl Storage {
         let tx = conn.transaction()?;
         {
             for page in pages {
-                upsert_page_row(&tx, site_id, page)?;
+                let applied = upsert_page_row(&tx, site_id, page)?;
+                if !applied {
+                    continue;
+                }
                 let existing_body: String = tx
                     .query_row(
                         "SELECT body_markdown FROM pages WHERE site_id = ?1 AND id = ?2",
@@ -150,16 +153,72 @@ impl Storage {
     }
 
     pub fn upsert_page_detail_for_site(&self, site_id: &str, detail: &PageDetail) -> Result<()> {
+        let mut owned = detail.clone();
+        self.upsert_page_detail_for_site_merging(site_id, &mut owned, false, false, false)
+    }
+
+    /// Upserts a Confluence page detail for `site_id`, enforcing monotonic `version_number` and
+    /// optionally preserving previously cached labels, attachments, or comments when those
+    /// subresource calls fail transiently.
+    pub fn upsert_page_detail_for_site_merging(
+        &self,
+        site_id: &str,
+        detail: &mut PageDetail,
+        preserve_labels: bool,
+        preserve_attachments: bool,
+        preserve_comments: bool,
+    ) -> Result<()> {
         let mut conn = self.lock_conn()?;
         let tx = conn.transaction()?;
         {
+            let existing_detail_raw: Option<String> = tx
+                .query_row(
+                    "SELECT detail_json FROM pages WHERE site_id = ?1 AND id = ?2",
+                    params![site_id, &detail.summary.id],
+                    |row| row.get(0),
+                )
+                .optional()?
+                .flatten();
+
+            let applied = upsert_page_row(&tx, site_id, &detail.summary)?;
+            if !applied {
+                if let Some(raw) = existing_detail_raw.as_deref() {
+                    if let Ok(newer) = serde_json::from_str::<PageDetail>(raw) {
+                        *detail = newer;
+                    }
+                }
+                tx.commit()?;
+                return Ok(());
+            }
+
+            if preserve_labels || preserve_attachments || preserve_comments {
+                if let Some(raw) = existing_detail_raw.as_deref() {
+                    if let Ok(prev) = serde_json::from_str::<PageDetail>(raw) {
+                        if preserve_labels && detail.labels.is_empty() {
+                            detail.labels = prev.labels;
+                        }
+                        if preserve_attachments && detail.attachments.is_empty() {
+                            detail.attachments = prev.attachments;
+                        }
+                        if preserve_comments && detail.comments.is_empty() {
+                            detail.comments = prev.comments;
+                        }
+                    }
+                }
+            }
+
             let page = &detail.summary;
-            upsert_page_row(&tx, site_id, page)?;
             let detail_json =
                 serde_json::to_string(detail).context("Failed to serialize PageDetail")?;
             tx.execute(
-                "UPDATE pages SET body_markdown = ?1, detail_json = ?2 WHERE site_id = ?3 AND id = ?4",
-                params![detail.body_markdown, detail_json, site_id, page.id],
+                "UPDATE pages SET body_markdown = ?1, detail_json = ?2, detail_version = ?3 WHERE site_id = ?4 AND id = ?5",
+                params![
+                    detail.body_markdown,
+                    detail_json,
+                    page.version_number,
+                    site_id,
+                    page.id
+                ],
             )?;
             let plain_body = if !detail.blocks.is_empty() {
                 adf::blocks_to_plain_text(&detail.blocks)
@@ -189,22 +248,125 @@ impl Storage {
         page_id: &str,
     ) -> Result<Option<PageDetail>> {
         let conn = self.lock_conn()?;
-        let raw: Option<String> = conn
+        let row_opt: Option<(PageSummary, Option<String>)> = conn
             .query_row(
-                "SELECT detail_json FROM pages WHERE site_id = ?1 AND id = ?2",
+                "
+                SELECT
+                    id, space_id, space_key, parent_id, title, status,
+                    version_number, author_name, updated_at, position, has_children, web_url,
+                    detail_json
+                FROM pages
+                WHERE site_id = ?1 AND id = ?2
+                ",
                 params![site_id, page_id],
-                |row| row.get(0),
+                |row| {
+                    let summary = map_page_summary_row(row, 0)?;
+                    let detail_json: Option<String> = row.get(12)?;
+                    Ok((summary, detail_json))
+                },
             )
-            .optional()?
-            .flatten();
-        match raw {
-            Some(json_str) if !json_str.trim().is_empty() => {
-                let detail = serde_json::from_str::<PageDetail>(&json_str)
+            .optional()?;
+        match row_opt {
+            Some((summary, Some(json_str))) if !json_str.trim().is_empty() => {
+                let mut detail = serde_json::from_str::<PageDetail>(&json_str)
                     .context("Failed to deserialize PageDetail")?;
+                // Reconcile summary metadata with authoritative table columns so list and
+                // offline reader views never split-brain after list/sync updates.
+                detail.summary = summary;
                 Ok(Some(detail))
             }
             _ => Ok(None),
         }
+    }
+
+    /// Returns `true` when cached `detail_json` was captured at an older `version_number` than
+    /// the latest list/sync summary row for `(site_id, page_id)`.
+    pub fn is_page_detail_stale_for_site(&self, site_id: &str, page_id: &str) -> Result<bool> {
+        let conn = self.lock_conn()?;
+        let row_opt: Option<(i32, Option<i32>, Option<String>)> = conn
+            .query_row(
+                "SELECT version_number, detail_version, detail_json FROM pages WHERE site_id = ?1 AND id = ?2",
+                params![site_id, page_id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .optional()?;
+        let Some((row_ver, detail_ver, detail_json)) = row_opt else {
+            return Ok(false);
+        };
+        if detail_json.as_deref().map(str::trim).unwrap_or("").is_empty() {
+            return Ok(false);
+        }
+        Ok(detail_ver.is_some_and(|dv| dv < row_ver))
+    }
+
+    /// Removes cached root pages in `(site_id, space_key)` that are absent from a complete
+    /// root-page listing snapshot. Never touches child pages or other spaces/sites.
+    pub fn prune_space_root_pages_for_site(
+        &self,
+        site_id: &str,
+        space_key: &str,
+        keep_ids: &[String],
+    ) -> Result<usize> {
+        let keep: HashSet<&str> = keep_ids.iter().map(String::as_str).collect();
+        let mut conn = self.lock_conn()?;
+        let tx = conn.transaction()?;
+        let existing_ids: Vec<String> = {
+            let mut stmt = tx.prepare(
+                "SELECT id FROM pages WHERE site_id = ?1 AND space_key = ?2 AND (parent_id IS NULL OR parent_id = '')",
+            )?;
+            let rows = stmt.query_map(params![site_id, space_key], |r| r.get(0))?;
+            rows.collect::<rusqlite::Result<Vec<_>>>()?
+        };
+        let mut removed = 0usize;
+        for pid in existing_ids {
+            if !keep.contains(pid.as_str()) {
+                tx.execute(
+                    "DELETE FROM pages_fts WHERE site_id = ?1 AND page_id = ?2",
+                    params![site_id, &pid],
+                )?;
+                tx.execute(
+                    "DELETE FROM pages WHERE site_id = ?1 AND id = ?2",
+                    params![site_id, &pid],
+                )?;
+                removed += 1;
+            }
+        }
+        tx.commit()?;
+        Ok(removed)
+    }
+
+    /// Removes cached child pages under `(site_id, parent_id)` absent from a complete child listing.
+    pub fn prune_child_pages_for_site(
+        &self,
+        site_id: &str,
+        parent_id: &str,
+        keep_ids: &[String],
+    ) -> Result<usize> {
+        let keep: HashSet<&str> = keep_ids.iter().map(String::as_str).collect();
+        let mut conn = self.lock_conn()?;
+        let tx = conn.transaction()?;
+        let existing_ids: Vec<String> = {
+            let mut stmt =
+                tx.prepare("SELECT id FROM pages WHERE site_id = ?1 AND parent_id = ?2")?;
+            let rows = stmt.query_map(params![site_id, parent_id], |r| r.get(0))?;
+            rows.collect::<rusqlite::Result<Vec<_>>>()?
+        };
+        let mut removed = 0usize;
+        for pid in existing_ids {
+            if !keep.contains(pid.as_str()) {
+                tx.execute(
+                    "DELETE FROM pages_fts WHERE site_id = ?1 AND page_id = ?2",
+                    params![site_id, &pid],
+                )?;
+                tx.execute(
+                    "DELETE FROM pages WHERE site_id = ?1 AND id = ?2",
+                    params![site_id, &pid],
+                )?;
+                removed += 1;
+            }
+        }
+        tx.commit()?;
+        Ok(removed)
     }
 
     pub fn list_pages_for_site(
@@ -472,7 +634,28 @@ fn map_space_row(row: &Row<'_>, offset: usize) -> rusqlite::Result<SpaceSummary>
     })
 }
 
-fn upsert_page_row(conn: &Connection, site_id: &str, page: &PageSummary) -> Result<()> {
+fn upsert_page_row(conn: &Connection, site_id: &str, page: &PageSummary) -> Result<bool> {
+    if let Some((existing_ver, existing_updated)) = conn
+        .query_row(
+            "SELECT version_number, updated_at FROM pages WHERE site_id = ?1 AND id = ?2",
+            params![site_id, &page.id],
+            |row| Ok((row.get::<_, i32>(0)?, row.get::<_, String>(1)?)),
+        )
+        .optional()?
+    {
+        if page.version_number < existing_ver {
+            return Ok(false);
+        }
+        if page.version_number == existing_ver
+            && !existing_updated.trim().is_empty()
+            && !page.updated_at.trim().is_empty()
+            && crate::storage::jira::compare_updated_at(&page.updated_at, &existing_updated)
+                == std::cmp::Ordering::Less
+        {
+            return Ok(false);
+        }
+    }
+
     conn.execute(
         "
         INSERT INTO pages (
@@ -511,7 +694,7 @@ fn upsert_page_row(conn: &Connection, site_id: &str, page: &PageSummary) -> Resu
             page.web_url,
         ],
     )?;
-    Ok(())
+    Ok(true)
 }
 
 fn refresh_page_fts(
@@ -784,6 +967,83 @@ mod tests {
 
         storage.delete_page("101").unwrap();
         assert!(storage.search_pages("체크리스트", 10).unwrap().is_empty());
+    }
+
+    #[test]
+    fn test_monotonic_version_split_brain_subresource_preserve_and_prune() {
+        let storage = Storage::open_in_memory().unwrap();
+        let mut p1 = sample_page("2001", None, "Runbook v1", 1);
+        p1.version_number = 1;
+        p1.updated_at = "2026-11-15T10:00:00Z".into();
+
+        let d1 = PageDetail {
+            summary: p1.clone(),
+            labels: vec!["runbook".into()],
+            body_markdown: "Runbook body v1".into(),
+            ..Default::default()
+        };
+        storage.upsert_page_detail_for_site("site-a", &d1).unwrap();
+        assert!(!storage
+            .is_page_detail_stale_for_site("site-a", "2001")
+            .unwrap());
+
+        // Newer v2 summary updates title/version and marks detail stale
+        let mut p2 = p1.clone();
+        p2.title = "Runbook v2".into();
+        p2.version_number = 2;
+        p2.updated_at = "2026-11-17T10:00:00Z".into();
+        storage.upsert_pages_for_site("site-a", &[p2.clone()]).unwrap();
+
+        assert!(storage
+            .is_page_detail_stale_for_site("site-a", "2001")
+            .unwrap());
+        let reconciled = storage
+            .get_page_detail_for_site("site-a", "2001")
+            .unwrap()
+            .unwrap();
+        assert_eq!(reconciled.summary.title, "Runbook v2");
+        assert_eq!(reconciled.summary.version_number, 2);
+
+        // Stale v1 upsert must NOT regress v2
+        storage.upsert_pages_for_site("site-a", &[p1]).unwrap();
+        let list = storage
+            .list_space_root_pages_for_site("site-a", "ENG")
+            .unwrap();
+        assert_eq!(list[0].version_number, 2);
+        assert_eq!(list[0].title, "Runbook v2");
+
+        // Subresource failure preserves cached labels
+        let mut d2 = PageDetail {
+            summary: p2.clone(),
+            labels: vec![],
+            body_markdown: "Runbook body v2".into(),
+            ..Default::default()
+        };
+        storage
+            .upsert_page_detail_for_site_merging("site-a", &mut d2, true, true, true)
+            .unwrap();
+        assert_eq!(d2.labels, vec!["runbook".to_string()]);
+        assert!(!storage
+            .is_page_detail_stale_for_site("site-a", "2001")
+            .unwrap());
+
+        // Pruning root pages on site-a removes 2001 while preserving site-b
+        storage.upsert_pages_for_site("site-b", &[p2]).unwrap();
+        let removed = storage
+            .prune_space_root_pages_for_site("site-a", "ENG", &[])
+            .unwrap();
+        assert_eq!(removed, 1);
+        assert!(storage
+            .get_page_detail_for_site("site-a", "2001")
+            .unwrap()
+            .is_none());
+        assert_eq!(
+            storage
+                .list_space_root_pages_for_site("site-b", "ENG")
+                .unwrap()
+                .len(),
+            1
+        );
     }
 
     #[test]

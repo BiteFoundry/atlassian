@@ -37,6 +37,14 @@ pub(crate) struct HttpStatusError {
     pub body: String,
 }
 
+pub(crate) fn http_status_code(err: &anyhow::Error) -> Option<StatusCode> {
+    err.downcast_ref::<HttpStatusError>().map(|e| e.status)
+}
+
+pub(crate) fn is_not_found_error(err: &anyhow::Error) -> bool {
+    http_status_code(err) == Some(StatusCode::NOT_FOUND)
+}
+
 fn build_shared_http_client() -> Result<reqwest::Client> {
     reqwest::Client::builder()
         .user_agent(format!("atlassian-cli/{}", env!("CARGO_PKG_VERSION")))
@@ -60,16 +68,29 @@ pub struct AtlassianClient {
 impl AtlassianClient {
     pub fn new(config: AppConfig, auth: AuthManager) -> Result<Self> {
         let http = build_shared_http_client()?;
+        let site_id = config
+            .default_site_profile()
+            .map(|s| s.id)
+            .filter(|s| !s.trim().is_empty())
+            .unwrap_or_else(|| "default".to_string());
         Ok(Self {
             http,
             config,
             auth,
             me_cache: Arc::new(RwLock::new(None)),
-            site_id: "default".to_string(),
+            site_id,
             cloud_id: None,
             api_gateway_base: DEFAULT_OAUTH_API_BASE.to_string(),
             oauth_auth_base: DEFAULT_OAUTH_AUTH_BASE.to_string(),
         })
+    }
+
+    pub fn with_site_id(mut self, site_id: impl Into<String>) -> Self {
+        let trimmed = site_id.into().trim().to_string();
+        if !trimmed.is_empty() {
+            self.site_id = trimmed;
+        }
+        self
     }
 
     /// Creates a site-scoped client supporting OAuth 3LO gateway routing when `site.cloud_id` is `Some`.

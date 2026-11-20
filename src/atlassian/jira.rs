@@ -45,6 +45,13 @@ const SEARCH_FIELDS: &[&str] = &[
     "customfield_10020",
 ];
 
+/// Subresource fetch health flags returned alongside [`IssueDetail`] so callers can
+/// preserve previously cached collections on transient 503/429/403 subresource errors.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct IssueSubresourceStatus {
+    pub remote_links_ok: bool,
+}
+
 impl AtlassianClient {
     fn jira_api_version(&self) -> &'static str {
         match self.deployment() {
@@ -203,6 +210,14 @@ impl AtlassianClient {
     }
 
     pub async fn get_issue(&self, key: &str) -> Result<IssueDetail> {
+        let (detail, _) = self.get_issue_with_meta(key).await?;
+        Ok(detail)
+    }
+
+    pub async fn get_issue_with_meta(
+        &self,
+        key: &str,
+    ) -> Result<(IssueDetail, IssueSubresourceStatus)> {
         let base = self.require_site_url()?;
         let encoded_key = urlencoding::encode(key);
         let url = match self.deployment() {
@@ -280,10 +295,11 @@ impl AtlassianClient {
             })
             .unwrap_or_default();
 
-        let mut linked_pages = self
-            .get_issue_remote_confluence_links(key)
-            .await
-            .unwrap_or_default();
+        let (mut linked_pages, remote_links_ok) = match self.get_issue_remote_confluence_links(key).await
+        {
+            Ok(links) => (links, true),
+            Err(_) => (Vec::new(), false),
+        };
         collect_confluence_links_from_text(
             &description_blocks,
             &description_raw,
@@ -292,19 +308,22 @@ impl AtlassianClient {
             &mut linked_pages,
         );
 
-        Ok(IssueDetail {
-            summary,
-            description_raw,
-            description_markdown,
-            description_blocks,
-            fix_versions,
-            components,
-            subtasks,
-            linked_issues,
-            linked_pages,
-            attachments,
-            comments,
-        })
+        Ok((
+            IssueDetail {
+                summary,
+                description_raw,
+                description_markdown,
+                description_blocks,
+                fix_versions,
+                components,
+                subtasks,
+                linked_issues,
+                linked_pages,
+                attachments,
+                comments,
+            },
+            IssueSubresourceStatus { remote_links_ok },
+        ))
     }
 
     pub async fn create_issue(&self, req: &OutgoingIssue) -> Result<IssueDetail> {

@@ -17,12 +17,12 @@ use serde_json::{json, Value};
 use tokio::io::{AsyncBufReadExt, BufReader};
 
 use crate::{
-    atlassian::{AtlassianClient, SiteClientPool},
+    atlassian::{client::is_not_found_error, AtlassianClient, SiteClientPool},
     config::AppConfig,
     img_preview,
     models::{FederatedSearchHit, IssueUpdate, OutgoingIssue, OutgoingPage, PageUpdate},
     serve::{clamp_limit, escape_jql_str, issue_to_hit, looks_like_query_expr, page_to_hit},
-    storage::{Storage, DEFAULT_SITE_ID},
+    storage::Storage,
     sync::{self, SiteSyncTarget},
 };
 
@@ -40,10 +40,18 @@ pub async fn run(
     client: AtlassianClient,
     storage: Storage,
 ) -> Result<()> {
-    let projects_empty = storage.list_projects().unwrap_or_default().is_empty();
-    let spaces_empty = storage.list_spaces().unwrap_or_default().is_empty();
+    let projects_empty = storage
+        .list_projects_for_site(client.site_id())
+        .unwrap_or_default()
+        .is_empty();
+    let spaces_empty = storage
+        .list_spaces_for_site(client.site_id())
+        .unwrap_or_default()
+        .is_empty();
     if projects_empty && spaces_empty && !config.site_url.trim().is_empty() {
-        if let Err(err) = sync::bootstrap_workspace(&client, &storage).await {
+        if let Err(err) =
+            sync::bootstrap_workspace_for_site(client.site_id(), &client, &storage).await
+        {
             eprintln!("{SERVER_NAME} MCP warning: initial workspace bootstrap failed: {err:#}");
         }
     }
@@ -131,7 +139,11 @@ pub async fn handle_rpc_line(
     }
 }
 
-fn resolve_mcp_site_id(config: &AppConfig, raw_site: Option<&str>) -> Option<String> {
+fn resolve_mcp_site_id(
+    config: &AppConfig,
+    fallback_client: &AtlassianClient,
+    raw_site: Option<&str>,
+) -> Option<String> {
     let trimmed = raw_site.map(str::trim).filter(|s| !s.is_empty())?;
     if trimmed.eq_ignore_ascii_case("all") {
         return None;
@@ -139,7 +151,30 @@ fn resolve_mcp_site_id(config: &AppConfig, raw_site: Option<&str>) -> Option<Str
     if let Some(found) = config.find_effective_site(trimmed) {
         return Some(found.id);
     }
+    if trimmed.eq_ignore_ascii_case(fallback_client.site_id()) {
+        return Some(fallback_client.site_id().to_string());
+    }
     Some(trimmed.to_string())
+}
+
+fn resolve_mcp_single_site_id(
+    config: &AppConfig,
+    fallback_client: &AtlassianClient,
+    raw_site: Option<&str>,
+) -> Result<String, String> {
+    let Some(trimmed) = raw_site.map(str::trim).filter(|s| !s.is_empty()) else {
+        return Ok(fallback_client.site_id().to_string());
+    };
+    if trimmed.eq_ignore_ascii_case("all") {
+        return Ok(fallback_client.site_id().to_string());
+    }
+    if let Some(found) = config.find_effective_site(trimmed) {
+        return Ok(found.id);
+    }
+    if trimmed.eq_ignore_ascii_case(fallback_client.site_id()) {
+        return Ok(fallback_client.site_id().to_string());
+    }
+    Err(format!("site not found: '{trimmed}'"))
 }
 
 fn resolve_mcp_client(
@@ -147,24 +182,66 @@ fn resolve_mcp_client(
     fallback_client: &AtlassianClient,
     raw_site: Option<&str>,
 ) -> Result<(String, AtlassianClient), String> {
-    if let Some(site_id) = resolve_mcp_site_id(config, raw_site) {
-        if site_id.eq_ignore_ascii_case(fallback_client.site_id()) {
-            return Ok((site_id, fallback_client.clone()));
-        }
-        if let Ok(pool) = SiteClientPool::from_config(config) {
-            if let Ok(c) = pool.client_for(&site_id) {
-                return Ok((site_id, c));
-            }
-        }
-        if site_id.eq_ignore_ascii_case(DEFAULT_SITE_ID) {
-            return Ok((site_id, fallback_client.clone()));
-        }
-        return Err(format!("site not found: '{site_id}'"));
+    let Some(trimmed) = raw_site.map(str::trim).filter(|s| !s.is_empty()) else {
+        return Ok((
+            fallback_client.site_id().to_string(),
+            fallback_client.clone(),
+        ));
+    };
+    if trimmed.eq_ignore_ascii_case("all") {
+        return Ok((
+            fallback_client.site_id().to_string(),
+            fallback_client.clone(),
+        ));
     }
-    Ok((
-        fallback_client.site_id().to_string(),
-        fallback_client.clone(),
-    ))
+    let canonical = config
+        .find_effective_site(trimmed)
+        .map(|s| s.id)
+        .unwrap_or_else(|| trimmed.to_string());
+    if canonical.eq_ignore_ascii_case(fallback_client.site_id()) {
+        return Ok((
+            fallback_client.site_id().to_string(),
+            fallback_client.clone(),
+        ));
+    }
+    if let Ok(pool) = SiteClientPool::from_config(config) {
+        if let Ok(c) = pool.client_for(&canonical) {
+            return Ok((c.site_id().to_string(), c));
+        }
+    }
+    Err(format!("site not found: '{trimmed}'"))
+}
+
+async fn refresh_mcp_issue_cache(
+    client: &AtlassianClient,
+    storage: &Storage,
+    site_id: &str,
+    key: &str,
+) {
+    if let Ok((mut detail, meta)) = client.get_issue_with_meta(key).await {
+        let _ = storage.upsert_issue_detail_for_site_merging(
+            site_id,
+            &mut detail,
+            !meta.remote_links_ok,
+        );
+    }
+}
+
+async fn refresh_mcp_page_cache(
+    client: &AtlassianClient,
+    storage: &Storage,
+    site_id: &str,
+    page_id: &str,
+) {
+    if let Ok((mut detail, meta)) = client.get_page_with_meta(page_id).await {
+        let _ = storage.upsert_page_detail_for_site_merging(
+            site_id,
+            &mut detail,
+            !meta.labels_ok,
+            !meta.attachments_ok,
+            !meta.comments_ok,
+        );
+    }
 }
 
 async fn call_tool(
@@ -176,7 +253,7 @@ async fn call_tool(
 ) -> Result<Value, String> {
     let args = Args::new(arguments);
     let site_arg = args.optional_str("site")?;
-    let scoped_site = resolve_mcp_site_id(config, site_arg.as_deref());
+    let scoped_site = resolve_mcp_site_id(config, client, site_arg.as_deref());
 
     match name {
         // -------------------------------------------------------------------
@@ -249,10 +326,10 @@ async fn call_tool(
 
         "list_projects" => {
             let refresh = args.optional_bool("refresh")?.unwrap_or(false);
-            let cached = match scoped_site.as_deref() {
-                Some(sid) => storage.list_projects_for_site(sid).map_err(format_error)?,
-                None => storage.list_projects().map_err(format_error)?,
-            };
+            let target_site = resolve_mcp_single_site_id(config, client, site_arg.as_deref())?;
+            let cached = storage
+                .list_projects_for_site(&target_site)
+                .map_err(format_error)?;
             let projects = if refresh || cached.is_empty() {
                 if !refresh && config.site_url.trim().is_empty() && config.sites.is_empty() {
                     cached
@@ -273,20 +350,16 @@ async fn call_tool(
             } else {
                 cached
             };
-            Ok(json!({ "site_id": scoped_site, "projects": projects }))
+            Ok(json!({ "site_id": target_site, "projects": projects }))
         }
 
         "list_boards" => {
             let project = args.optional_str("project")?;
             let refresh = args.optional_bool("refresh")?.unwrap_or(false);
-            let cached = match scoped_site.as_deref() {
-                Some(sid) => storage
-                    .list_boards_for_site(sid, project.as_deref())
-                    .map_err(format_error)?,
-                None => storage
-                    .list_boards(project.as_deref())
-                    .map_err(format_error)?,
-            };
+            let target_site = resolve_mcp_single_site_id(config, client, site_arg.as_deref())?;
+            let cached = storage
+                .list_boards_for_site(&target_site, project.as_deref())
+                .map_err(format_error)?;
             let boards = if refresh || cached.is_empty() {
                 if !refresh && config.site_url.trim().is_empty() && config.sites.is_empty() {
                     cached
@@ -310,19 +383,17 @@ async fn call_tool(
             } else {
                 cached
             };
-            Ok(json!({ "site_id": scoped_site, "boards": boards }))
+            Ok(json!({ "site_id": target_site, "boards": boards }))
         }
 
         "list_sprints" => {
             let board_id = args.required_i64("board_id")?;
             let offline = args.optional_bool("offline")?.unwrap_or(false);
+            let target_site = resolve_mcp_single_site_id(config, client, site_arg.as_deref())?;
             let sprints = if offline {
-                match scoped_site.as_deref() {
-                    Some(sid) => storage
-                        .list_sprints_for_site(sid, board_id)
-                        .map_err(format_error)?,
-                    None => storage.list_sprints(board_id).map_err(format_error)?,
-                }
+                storage
+                    .list_sprints_for_site(&target_site, board_id)
+                    .map_err(format_error)?
             } else {
                 let (target_site, target_client) =
                     resolve_mcp_client(config, client, site_arg.as_deref())?;
@@ -333,7 +404,7 @@ async fn call_tool(
                 let _ = storage.upsert_sprints_for_site(&target_site, &fetched);
                 fetched
             };
-            Ok(json!({ "site_id": scoped_site, "board_id": board_id, "sprints": sprints }))
+            Ok(json!({ "site_id": target_site, "board_id": board_id, "sprints": sprints }))
         }
 
         "get_board_issues" => {
@@ -341,16 +412,12 @@ async fn call_tool(
             let sprint_id = args.optional_i64("sprint_id")?;
             let limit = clamp_limit(args.optional_usize("limit")?.unwrap_or(50));
             let offline = args.optional_bool("offline")?.unwrap_or(false);
+            let target_site = resolve_mcp_single_site_id(config, client, site_arg.as_deref())?;
 
             let issues = if offline {
-                match scoped_site.as_deref() {
-                    Some(sid) => storage
-                        .list_board_issues_for_site(sid, board_id, sprint_id, limit)
-                        .map_err(format_error)?,
-                    None => storage
-                        .list_board_issues(board_id, sprint_id, limit)
-                        .map_err(format_error)?,
-                }
+                storage
+                    .list_board_issues_for_site(&target_site, board_id, sprint_id, limit)
+                    .map_err(format_error)?
             } else {
                 let (target_site, target_client) =
                     resolve_mcp_client(config, client, site_arg.as_deref())?;
@@ -358,11 +425,25 @@ async fn call_tool(
                     .list_board_issues(board_id, sprint_id, limit)
                     .await
                     .map_err(format_error)?;
-                let _ = storage.upsert_issues_for_site(&target_site, &fetched);
+                let _ = storage.upsert_board_issues_for_site(
+                    &target_site,
+                    board_id,
+                    sprint_id,
+                    &fetched,
+                );
+                if fetched.len() < limit {
+                    let keep: Vec<String> = fetched.iter().map(|i| i.key.clone()).collect();
+                    let _ = storage.prune_board_issues_for_site(
+                        &target_site,
+                        board_id,
+                        sprint_id,
+                        &keep,
+                    );
+                }
                 fetched
             };
             Ok(json!({
-                "site_id": scoped_site,
+                "site_id": target_site,
                 "board_id": board_id,
                 "sprint_id": sprint_id,
                 "issues": issues,
@@ -397,17 +478,14 @@ async fn call_tool(
                         "hits": hits,
                     }));
                 }
-                let issues = match scoped_site.as_deref() {
-                    Some(sid) => storage
-                        .list_issues_for_site(sid, project.as_deref(), limit)
-                        .map_err(format_error)?,
-                    None => storage
-                        .list_issues(project.as_deref(), limit)
-                        .map_err(format_error)?,
-                };
+                let target_site =
+                    resolve_mcp_single_site_id(config, client, site_arg.as_deref())?;
+                let issues = storage
+                    .list_issues_for_site(&target_site, project.as_deref(), limit)
+                    .map_err(format_error)?;
                 return Ok(json!({
                     "offline": true,
-                    "site_id": scoped_site,
+                    "site_id": target_site,
                     "issues": issues,
                 }));
             }
@@ -456,22 +534,43 @@ async fn call_tool(
         "get_jira_issue" => {
             let key = args.required_str("key")?;
             let offline = args.optional_bool("offline")?.unwrap_or(false);
-            let detail = if offline {
-                match scoped_site.as_deref() {
-                    Some(sid) => storage
-                        .get_issue_detail_for_site(sid, &key)
-                        .map_err(format_error)?,
-                    None => storage.get_issue_detail(&key).map_err(format_error)?,
+            if offline {
+                let target_site =
+                    resolve_mcp_single_site_id(config, client, site_arg.as_deref())?;
+                let detail = storage
+                    .get_issue_detail_for_site(&target_site, &key)
+                    .map_err(format_error)?
+                    .ok_or_else(|| format!("issue not found in cache: {key}"))?;
+                let stale = storage
+                    .is_issue_detail_stale_for_site(&target_site, &key)
+                    .unwrap_or(false);
+                return Ok(json!({
+                    "site_id": target_site,
+                    "detail_stale": stale,
+                    "issue": detail,
+                }));
+            }
+            let (target_site, target_client) =
+                resolve_mcp_client(config, client, site_arg.as_deref())?;
+            let (mut fetched, meta) = match target_client.get_issue_with_meta(&key).await {
+                Ok(res) => res,
+                Err(err) => {
+                    if is_not_found_error(&err) {
+                        let _ = storage.delete_issue_for_site(&target_site, &key);
+                    }
+                    return Err(format_error(err));
                 }
-                .ok_or_else(|| format!("issue not found in cache: {key}"))?
-            } else {
-                let (target_site, target_client) =
-                    resolve_mcp_client(config, client, site_arg.as_deref())?;
-                let fetched = target_client.get_issue(&key).await.map_err(format_error)?;
-                let _ = storage.upsert_issue_detail_for_site(&target_site, &fetched);
-                fetched
             };
-            Ok(json!({ "site_id": scoped_site, "issue": detail }))
+            let _ = storage.upsert_issue_detail_for_site_merging(
+                &target_site,
+                &mut fetched,
+                !meta.remote_links_ok,
+            );
+            Ok(json!({
+                "site_id": target_site,
+                "detail_stale": false,
+                "issue": fetched,
+            }))
         }
 
         "create_jira_issue" => {
@@ -486,6 +585,8 @@ async fn call_tool(
             let labels = args.optional_str_array("labels")?;
             let parent_key = args.optional_str("parent_key")?;
 
+            let (target_site, target_client) =
+                resolve_mcp_client(config, client, site_arg.as_deref())?;
             let req = OutgoingIssue {
                 project_key,
                 issue_type,
@@ -496,9 +597,12 @@ async fn call_tool(
                 labels,
                 parent_key,
             };
-            let detail = client.create_issue(&req).await.map_err(format_error)?;
-            let _ = storage.upsert_issue_detail(&detail);
-            Ok(json!({ "ok": true, "issue": detail }))
+            let detail = target_client
+                .create_issue(&req)
+                .await
+                .map_err(format_error)?;
+            let _ = storage.upsert_issue_detail_for_site(&target_site, &detail);
+            Ok(json!({ "ok": true, "site_id": target_site, "issue": detail }))
         }
 
         "update_jira_issue" => {
@@ -509,6 +613,8 @@ async fn call_tool(
             let assignee_id = args.optional_nullable_str("assignee_id")?;
             let labels = args.optional_str_array_opt("labels")?;
 
+            let (target_site, target_client) =
+                resolve_mcp_client(config, client, site_arg.as_deref())?;
             let patch = IssueUpdate {
                 summary,
                 description_markdown,
@@ -516,30 +622,39 @@ async fn call_tool(
                 assignee_id,
                 labels,
             };
-            let detail = client
+            let detail = target_client
                 .update_issue(&key, &patch)
                 .await
                 .map_err(format_error)?;
-            let _ = storage.upsert_issue_detail(&detail);
-            Ok(json!({ "ok": true, "issue": detail }))
+            let _ = storage.upsert_issue_detail_for_site(&target_site, &detail);
+            Ok(json!({ "ok": true, "site_id": target_site, "issue": detail }))
         }
 
         "list_jira_transitions" => {
             let key = args.required_str("key")?;
-            let transitions = client.list_transitions(&key).await.map_err(format_error)?;
-            Ok(json!({ "key": key, "transitions": transitions }))
+            let (target_site, target_client) =
+                resolve_mcp_client(config, client, site_arg.as_deref())?;
+            let transitions = target_client
+                .list_transitions(&key)
+                .await
+                .map_err(format_error)?;
+            Ok(json!({ "site_id": target_site, "key": key, "transitions": transitions }))
         }
 
         "transition_jira_issue" => {
             let key = args.required_str("key")?;
             let transition = args.required_str("transition")?;
             let comment = args.optional_text("comment_markdown")?;
-            client
+            let (target_site, target_client) =
+                resolve_mcp_client(config, client, site_arg.as_deref())?;
+            target_client
                 .transition_issue(&key, &transition, comment.as_deref())
                 .await
                 .map_err(format_error)?;
+            refresh_mcp_issue_cache(&target_client, storage, &target_site, &key).await;
             Ok(json!({
                 "ok": true,
+                "site_id": target_site,
                 "key": key,
                 "transition": transition,
             }))
@@ -548,20 +663,24 @@ async fn call_tool(
         "assign_jira_issue" => {
             let key = args.required_str("key")?;
             let raw_assignee = args.optional_str("assignee_id")?;
+            let (target_site, target_client) =
+                resolve_mcp_client(config, client, site_arg.as_deref())?;
             let resolved = match raw_assignee.as_deref() {
                 None => None,
                 Some(v) if v.eq_ignore_ascii_case("me") => {
-                    let me = client.get_myself().await.map_err(format_error)?;
+                    let me = target_client.get_myself().await.map_err(format_error)?;
                     Some(me.id)
                 }
                 Some(v) => Some(v.to_string()),
             };
-            client
+            target_client
                 .assign_issue(&key, resolved.as_deref())
                 .await
                 .map_err(format_error)?;
+            refresh_mcp_issue_cache(&target_client, storage, &target_site, &key).await;
             Ok(json!({
                 "ok": true,
+                "site_id": target_site,
                 "key": key,
                 "assignee_id": resolved,
             }))
@@ -570,28 +689,39 @@ async fn call_tool(
         "add_jira_comment" => {
             let key = args.required_str("key")?;
             let body_markdown = args.required_text("body_markdown")?;
-            let comment = client
+            let (target_site, target_client) =
+                resolve_mcp_client(config, client, site_arg.as_deref())?;
+            let comment = target_client
                 .add_issue_comment(&key, &body_markdown)
                 .await
                 .map_err(format_error)?;
-            Ok(json!({ "ok": true, "comment": comment }))
+            refresh_mcp_issue_cache(&target_client, storage, &target_site, &key).await;
+            Ok(json!({ "ok": true, "site_id": target_site, "comment": comment }))
         }
 
         "upload_jira_attachment" => {
             let key = args.required_str("key")?;
             let path = args.required_str("path")?;
-            let uploaded = client
+            let (target_site, target_client) =
+                resolve_mcp_client(config, client, site_arg.as_deref())?;
+            let uploaded = target_client
                 .upload_issue_attachment(&key, Path::new(&path))
                 .await
                 .map_err(format_error)?;
-            Ok(json!({ "ok": true, "key": key, "attachments": uploaded }))
+            refresh_mcp_issue_cache(&target_client, storage, &target_site, &key).await;
+            Ok(json!({ "ok": true, "site_id": target_site, "key": key, "attachments": uploaded }))
         }
 
         "delete_jira_issue" => {
             let key = args.required_str("key")?;
-            client.delete_issue(&key).await.map_err(format_error)?;
-            let _ = storage.delete_issue(&key);
-            Ok(json!({ "ok": true, "key": key }))
+            let (target_site, target_client) =
+                resolve_mcp_client(config, client, site_arg.as_deref())?;
+            target_client
+                .delete_issue(&key)
+                .await
+                .map_err(format_error)?;
+            let _ = storage.delete_issue_for_site(&target_site, &key);
+            Ok(json!({ "ok": true, "site_id": target_site, "key": key }))
         }
 
         // -------------------------------------------------------------------
@@ -600,10 +730,10 @@ async fn call_tool(
         "list_confluence_spaces" => {
             let refresh = args.optional_bool("refresh")?.unwrap_or(false);
             let limit = clamp_limit(args.optional_usize("limit")?.unwrap_or(50));
-            let cached = match scoped_site.as_deref() {
-                Some(sid) => storage.list_spaces_for_site(sid).map_err(format_error)?,
-                None => storage.list_spaces().map_err(format_error)?,
-            };
+            let target_site = resolve_mcp_single_site_id(config, client, site_arg.as_deref())?;
+            let cached = storage
+                .list_spaces_for_site(&target_site)
+                .map_err(format_error)?;
             let mut spaces = if refresh || cached.is_empty() {
                 if !refresh && config.site_url.trim().is_empty() && config.sites.is_empty() {
                     cached
@@ -628,22 +758,18 @@ async fn call_tool(
                 cached
             };
             spaces.truncate(limit);
-            Ok(json!({ "site_id": scoped_site, "spaces": spaces }))
+            Ok(json!({ "site_id": target_site, "spaces": spaces }))
         }
 
         "list_space_pages" => {
             let space_key = args.required_str("space_key")?;
             let limit = clamp_limit(args.optional_usize("limit")?.unwrap_or(50));
             let offline = args.optional_bool("offline")?.unwrap_or(false);
+            let target_site = resolve_mcp_single_site_id(config, client, site_arg.as_deref())?;
             let mut pages = if offline {
-                match scoped_site.as_deref() {
-                    Some(sid) => storage
-                        .list_space_root_pages_for_site(sid, &space_key)
-                        .map_err(format_error)?,
-                    None => storage
-                        .list_space_root_pages(&space_key)
-                        .map_err(format_error)?,
-                }
+                storage
+                    .list_space_root_pages_for_site(&target_site, &space_key)
+                    .map_err(format_error)?
             } else {
                 let (target_site, target_client) =
                     resolve_mcp_client(config, client, site_arg.as_deref())?;
@@ -652,22 +778,25 @@ async fn call_tool(
                     .await
                     .map_err(format_error)?;
                 let _ = storage.upsert_pages_for_site(&target_site, &fetched);
+                if fetched.len() < limit {
+                    let keep: Vec<String> = fetched.iter().map(|p| p.id.clone()).collect();
+                    let _ =
+                        storage.prune_space_root_pages_for_site(&target_site, &space_key, &keep);
+                }
                 fetched
             };
             pages.truncate(limit);
-            Ok(json!({ "site_id": scoped_site, "space_key": space_key, "pages": pages }))
+            Ok(json!({ "site_id": target_site, "space_key": space_key, "pages": pages }))
         }
 
         "list_child_pages" => {
             let page_id = args.required_str("page_id")?;
             let offline = args.optional_bool("offline")?.unwrap_or(false);
+            let target_site = resolve_mcp_single_site_id(config, client, site_arg.as_deref())?;
             let pages = if offline {
-                match scoped_site.as_deref() {
-                    Some(sid) => storage
-                        .list_child_pages_for_site(sid, &page_id)
-                        .map_err(format_error)?,
-                    None => storage.list_child_pages(&page_id).map_err(format_error)?,
-                }
+                storage
+                    .list_child_pages_for_site(&target_site, &page_id)
+                    .map_err(format_error)?
             } else {
                 let (target_site, target_client) =
                     resolve_mcp_client(config, client, site_arg.as_deref())?;
@@ -676,30 +805,57 @@ async fn call_tool(
                     .await
                     .map_err(format_error)?;
                 let _ = storage.upsert_pages_for_site(&target_site, &fetched);
+                if fetched.len() < 100 {
+                    let keep: Vec<String> = fetched.iter().map(|p| p.id.clone()).collect();
+                    let _ = storage.prune_child_pages_for_site(&target_site, &page_id, &keep);
+                }
                 fetched
             };
-            Ok(json!({ "site_id": scoped_site, "parent_id": page_id, "pages": pages }))
+            Ok(json!({ "site_id": target_site, "parent_id": page_id, "pages": pages }))
         }
 
         "get_confluence_page" => {
             let page_id = args.required_str("page_id")?;
             let offline = args.optional_bool("offline")?.unwrap_or(false);
-            let detail = if offline {
-                match scoped_site.as_deref() {
-                    Some(sid) => storage
-                        .get_page_detail_for_site(sid, &page_id)
-                        .map_err(format_error)?,
-                    None => storage.get_page_detail(&page_id).map_err(format_error)?,
+            if offline {
+                let target_site =
+                    resolve_mcp_single_site_id(config, client, site_arg.as_deref())?;
+                let detail = storage
+                    .get_page_detail_for_site(&target_site, &page_id)
+                    .map_err(format_error)?
+                    .ok_or_else(|| format!("page not found in cache: {page_id}"))?;
+                let stale = storage
+                    .is_page_detail_stale_for_site(&target_site, &page_id)
+                    .unwrap_or(false);
+                return Ok(json!({
+                    "site_id": target_site,
+                    "detail_stale": stale,
+                    "page": detail,
+                }));
+            }
+            let (target_site, target_client) =
+                resolve_mcp_client(config, client, site_arg.as_deref())?;
+            let (mut fetched, meta) = match target_client.get_page_with_meta(&page_id).await {
+                Ok(res) => res,
+                Err(err) => {
+                    if is_not_found_error(&err) {
+                        let _ = storage.delete_page_for_site(&target_site, &page_id);
+                    }
+                    return Err(format_error(err));
                 }
-                .ok_or_else(|| format!("page not found in cache: {page_id}"))?
-            } else {
-                let (target_site, target_client) =
-                    resolve_mcp_client(config, client, site_arg.as_deref())?;
-                let fetched = target_client.get_page(&page_id).await.map_err(format_error)?;
-                let _ = storage.upsert_page_detail_for_site(&target_site, &fetched);
-                fetched
             };
-            Ok(json!({ "site_id": scoped_site, "page": detail }))
+            let _ = storage.upsert_page_detail_for_site_merging(
+                &target_site,
+                &mut fetched,
+                !meta.labels_ok,
+                !meta.attachments_ok,
+                !meta.comments_ok,
+            );
+            Ok(json!({
+                "site_id": target_site,
+                "detail_stale": false,
+                "page": fetched,
+            }))
         }
 
         "create_confluence_page" => {
@@ -708,15 +864,20 @@ async fn call_tool(
             let title = args.required_str("title")?;
             let body_markdown = args.optional_text("body_markdown")?.unwrap_or_default();
 
+            let (target_site, target_client) =
+                resolve_mcp_client(config, client, site_arg.as_deref())?;
             let req = OutgoingPage {
                 space_id_or_key,
                 parent_id,
                 title,
                 body_markdown,
             };
-            let detail = client.create_page(&req).await.map_err(format_error)?;
-            let _ = storage.upsert_page_detail(&detail);
-            Ok(json!({ "ok": true, "page": detail }))
+            let detail = target_client
+                .create_page(&req)
+                .await
+                .map_err(format_error)?;
+            let _ = storage.upsert_page_detail_for_site(&target_site, &detail);
+            Ok(json!({ "ok": true, "site_id": target_site, "page": detail }))
         }
 
         "update_confluence_page" => {
@@ -726,10 +887,23 @@ async fn call_tool(
             let prev_version_opt = args.optional_i64("prev_version")?;
             let version_message = args.optional_str("version_message")?;
 
-            let need_current =
-                prev_version_opt.unwrap_or(0) <= 0 || title_opt.is_none() || body_opt.is_none();
+            if body_opt.is_some() && prev_version_opt.unwrap_or(0) <= 0 {
+                return Err(
+                    "prev_version (>= 1) is required when replacing body_markdown in update_confluence_page; call get_confluence_page first and pass summary.version_number as prev_version so concurrent edits are not overwritten"
+                        .to_string(),
+                );
+            }
+
+            let (target_site, target_client) =
+                resolve_mcp_client(config, client, site_arg.as_deref())?;
+            let need_current = title_opt.is_none() || body_opt.is_none();
             let current = if need_current {
-                Some(client.get_page(&page_id).await.map_err(format_error)?)
+                Some(
+                    target_client
+                        .get_page(&page_id)
+                        .await
+                        .map_err(format_error)?,
+                )
             } else {
                 None
             };
@@ -740,12 +914,18 @@ async fn call_tool(
                     .map(|c| c.summary.title.clone())
                     .unwrap_or_default()
             });
-            let body_markdown = body_opt.unwrap_or_else(|| {
-                current
-                    .as_ref()
-                    .map(|c| c.body_markdown.clone())
-                    .unwrap_or_default()
-            });
+            let (body_markdown, body_raw_passthrough, body_representation) = match body_opt {
+                Some(b) => (b, None, None),
+                None => {
+                    let cur = current.as_ref();
+                    let raw = cur
+                        .map(|c| c.body_raw.clone())
+                        .filter(|s| !s.trim().is_empty());
+                    let repr = cur.map(|c| c.body_representation.clone());
+                    let md = cur.map(|c| c.body_markdown.clone()).unwrap_or_default();
+                    (md, raw, repr)
+                }
+            };
             let prev_version = match prev_version_opt {
                 Some(v) if v > 0 => v as i32,
                 _ => current
@@ -757,25 +937,30 @@ async fn call_tool(
             let patch = PageUpdate {
                 title,
                 body_markdown,
+                body_raw_passthrough,
+                body_representation,
                 prev_version,
                 version_message,
             };
-            let detail = client
+            let detail = target_client
                 .update_page(&page_id, &patch)
                 .await
                 .map_err(format_error)?;
-            let _ = storage.upsert_page_detail(&detail);
-            Ok(json!({ "ok": true, "page": detail }))
+            let _ = storage.upsert_page_detail_for_site(&target_site, &detail);
+            Ok(json!({ "ok": true, "site_id": target_site, "page": detail }))
         }
 
         "add_confluence_comment" => {
             let page_id = args.required_str("page_id")?;
             let body_markdown = args.required_text("body_markdown")?;
-            let comment = client
+            let (target_site, target_client) =
+                resolve_mcp_client(config, client, site_arg.as_deref())?;
+            let comment = target_client
                 .add_page_comment(&page_id, &body_markdown)
                 .await
                 .map_err(format_error)?;
-            Ok(json!({ "ok": true, "comment": comment }))
+            refresh_mcp_page_cache(&target_client, storage, &target_site, &page_id).await;
+            Ok(json!({ "ok": true, "site_id": target_site, "comment": comment }))
         }
 
         "search_confluence_pages" => {
@@ -966,14 +1151,15 @@ async fn call_tool(
                     }
                 }
             }
-            let (_target_site, target_client) =
+            let (target_site, target_client) =
                 resolve_mcp_client(config, client, site_arg.as_deref())?;
-            let summary = sync::bootstrap_workspace(&target_client, storage)
+            let summary = sync::bootstrap_workspace_for_site(&target_site, &target_client, storage)
                 .await
                 .map_err(format_error)?;
             let counts = storage.cache_counts().map_err(format_error)?;
             Ok(json!({
                 "ok": true,
+                "site_id": target_site,
                 "summary": summary,
                 "counts": counts,
             }))
@@ -1793,7 +1979,7 @@ fn tool_catalog() -> Vec<Value> {
         }),
         json!({
             "name": "update_confluence_page",
-            "description": "Update a Confluence page (auto-fetches current version if prev_version is omitted).",
+            "description": "Update a Confluence page. Pass prev_version from get_confluence_page when replacing body_markdown; title-only updates preserve original rich ADF/XHTML body.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
