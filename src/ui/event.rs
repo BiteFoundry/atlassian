@@ -39,8 +39,16 @@ pub fn mouse_to_action(mouse: MouseEvent, hitmap: &HitMap) -> Option<Action> {
             row: mouse.row,
             col: mouse.column,
         }),
-        MouseEventKind::ScrollUp => Some(Action::ScrollUp),
-        MouseEventKind::ScrollDown => Some(Action::ScrollDown),
+        MouseEventKind::ScrollUp => Some(Action::MouseScroll {
+            delta: -3,
+            row: mouse.row,
+            col: mouse.column,
+        }),
+        MouseEventKind::ScrollDown => Some(Action::MouseScroll {
+            delta: 3,
+            row: mouse.row,
+            col: mouse.column,
+        }),
         _ => None,
     }
 }

@@ -90,6 +90,7 @@ pub enum Action {
     // Mouse
     MouseClick { row: u16, col: u16 },
     MouseRightClick { row: u16, col: u16 },
+    MouseScroll { delta: i32, row: u16, col: u16 },
     LoadPreviewImage,
     DownloadPreviewImage,
 }

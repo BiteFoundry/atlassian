@@ -135,7 +135,13 @@ pub fn dispatch(action: Action, app: &mut AppState, ui: &mut UiState) -> bool {
     }
 
     // Inline text bar input (JQL / Local Filter / Unified Search).
-    if ui.accepts_text_input() {
+    // Allow mouse wheel / scroll actions to pass through so results still scroll while typing.
+    if ui.accepts_text_input()
+        && !matches!(
+            action,
+            Action::MouseScroll { .. } | Action::ScrollUp | Action::ScrollDown
+        )
+    {
         return handle_inline_text_action(action, app, ui);
     }
 
@@ -298,10 +304,11 @@ pub fn dispatch(action: Action, app: &mut AppState, ui: &mut UiState) -> bool {
         Action::MoveDown => move_direction(app, ui, 1, 0),
         Action::MoveLeft => move_direction(app, ui, 0, -1),
         Action::MoveRight => move_direction(app, ui, 0, 1),
-        Action::ScrollUp | Action::PageUp => scroll_active_pane(ui, -6),
-        Action::ScrollDown | Action::PageDown => scroll_active_pane(ui, 6),
-        Action::GoTop => scroll_active_pane(ui, -10000),
-        Action::GoBottom => scroll_active_pane(ui, 10000),
+        Action::ScrollUp | Action::PageUp => scroll_active_pane(app, ui, -6),
+        Action::ScrollDown | Action::PageDown => scroll_active_pane(app, ui, 6),
+        Action::MouseScroll { delta, row, col } => handle_mouse_scroll(delta, row, col, app, ui),
+        Action::GoTop => scroll_active_pane(app, ui, -10000),
+        Action::GoBottom => scroll_active_pane(app, ui, 10000),
         Action::Activate => activate_selection(app, ui),
         Action::ExpandOrToggle => {
             if ui.active_tab == WorkspaceTab::Confluence {
@@ -1219,7 +1226,53 @@ fn move_direction(app: &mut AppState, ui: &mut UiState, dy: i32, dx: i32) {
     }
 }
 
-fn scroll_active_pane(ui: &mut UiState, delta: i32) {
+fn handle_mouse_scroll(delta: i32, row: u16, col: u16, app: &mut AppState, ui: &mut UiState) {
+    let step = if delta < 0 { -1 } else { 1 };
+    match ui.hitmap.hit(row, col) {
+        Some(
+            HitTarget::NavPane
+            | HitTarget::BoardItem(_)
+            | HitTarget::SprintItem(_)
+            | HitTarget::FilterItem(_)
+            | HitTarget::IssueRow(_)
+            | HitTarget::SpaceItem(_)
+            | HitTarget::TreeRow(_)
+            | HitTarget::SiteGroupHeader(_),
+        ) => {
+            let prev_focus = ui.focus;
+            ui.focus = PaneFocus::Nav;
+            move_direction(app, ui, step, 0);
+            ui.focus = prev_focus;
+        }
+        Some(HitTarget::TocItem(_)) => {
+            let prev_focus = ui.focus;
+            ui.focus = PaneFocus::Detail;
+            move_direction(app, ui, step, 0);
+            ui.focus = prev_focus;
+        }
+        Some(HitTarget::KanbanCard { .. }) => {
+            let prev_focus = ui.focus;
+            ui.focus = PaneFocus::Main;
+            move_direction(app, ui, step, 0);
+            ui.focus = prev_focus;
+        }
+        Some(HitTarget::DetailPane) => {
+            scroll_active_pane(app, ui, delta);
+        }
+        _ => {
+            if ui.active_tab == WorkspaceTab::Board && !ui.board_ui.drawer_open {
+                let prev_focus = ui.focus;
+                ui.focus = PaneFocus::Main;
+                move_direction(app, ui, step, 0);
+                ui.focus = prev_focus;
+            } else {
+                scroll_active_pane(app, ui, delta);
+            }
+        }
+    }
+}
+
+fn scroll_active_pane(app: &mut AppState, ui: &mut UiState, delta: i32) {
     match ui.active_tab {
         WorkspaceTab::Board => {
             ui.board_ui.detail_scroll = apply_scroll(ui.board_ui.detail_scroll, delta);
@@ -1230,7 +1283,10 @@ fn scroll_active_pane(ui: &mut UiState, delta: i32) {
         WorkspaceTab::Confluence => {
             ui.confluence_ui.reader_scroll = apply_scroll(ui.confluence_ui.reader_scroll, delta);
         }
-        _ => {}
+        WorkspaceTab::MyWork | WorkspaceTab::Search | WorkspaceTab::Directory => {
+            let step = if delta < 0 { -1 } else { 1 };
+            move_direction(app, ui, step, 0);
+        }
     }
 }
 

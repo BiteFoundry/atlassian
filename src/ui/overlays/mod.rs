@@ -219,23 +219,35 @@ impl Overlay {
     }
 
     pub fn handle(&mut self, action: &Action) -> OverlayOutcome {
+        let scroll_as_move = match action {
+            Action::ScrollUp => Some(Action::MoveUp),
+            Action::ScrollDown => Some(Action::MoveDown),
+            Action::MouseScroll { delta, .. } if *delta < 0 => Some(Action::MoveUp),
+            Action::MouseScroll { delta, .. } if *delta > 0 => Some(Action::MoveDown),
+            _ => None,
+        };
+        let wheel_as_scroll = match action {
+            Action::MouseScroll { delta, .. } if *delta < 0 => Some(Action::ScrollUp),
+            Action::MouseScroll { delta, .. } if *delta > 0 => Some(Action::ScrollDown),
+            _ => None,
+        };
         match self {
-            Overlay::Transition(o) => o.handle(action),
-            Overlay::Assignee(o) => o.handle(action),
+            Overlay::Transition(o) => o.handle(scroll_as_move.as_ref().unwrap_or(action)),
+            Overlay::Assignee(o) => o.handle(scroll_as_move.as_ref().unwrap_or(action)),
             Overlay::IssueForm(o) => o.handle(action),
             Overlay::PageForm(o) => o.handle(action),
             Overlay::Comment(o) => o.handle(action),
-            Overlay::CrossLink(o) => o.handle(action),
-            Overlay::Links(o) => o.handle(action),
-            Overlay::ImagePreview(o) => o.handle(action),
-            Overlay::HtmlPreview(o) => o.handle(action),
+            Overlay::CrossLink(o) => o.handle(scroll_as_move.as_ref().unwrap_or(action)),
+            Overlay::Links(o) => o.handle(scroll_as_move.as_ref().unwrap_or(action)),
+            Overlay::ImagePreview(o) => o.handle(wheel_as_scroll.as_ref().unwrap_or(action)),
+            Overlay::HtmlPreview(o) => o.handle(wheel_as_scroll.as_ref().unwrap_or(action)),
             Overlay::PathInput(o) => o.handle(action),
-            Overlay::FilePicker(o) => o.handle(action),
-            Overlay::CommandPalette(o) => o.handle(action),
-            Overlay::SiteSwitcher(o) => o.handle(action),
-            Overlay::Settings(o) => o.handle(action),
-            Overlay::ContextMenu(o) => o.handle(action),
-            Overlay::Attachments(o) => o.handle(action),
+            Overlay::FilePicker(o) => o.handle(scroll_as_move.as_ref().unwrap_or(action)),
+            Overlay::CommandPalette(o) => o.handle(scroll_as_move.as_ref().unwrap_or(action)),
+            Overlay::SiteSwitcher(o) => o.handle(scroll_as_move.as_ref().unwrap_or(action)),
+            Overlay::Settings(o) => o.handle(scroll_as_move.as_ref().unwrap_or(action)),
+            Overlay::ContextMenu(o) => o.handle(scroll_as_move.as_ref().unwrap_or(action)),
+            Overlay::Attachments(o) => o.handle(scroll_as_move.as_ref().unwrap_or(action)),
             Overlay::Confirm(o) => o.handle(action),
             Overlay::Help => match action {
                 Action::CloseOverlay | Action::OpenHelp | Action::Input('q') | Action::Activate => {
