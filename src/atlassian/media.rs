@@ -145,6 +145,7 @@ fn guess_mime_type(path: &Path) -> &'static str {
         "gif" => "image/gif",
         "webp" => "image/webp",
         "svg" => "image/svg+xml",
+        "html" | "htm" => "text/html",
         "pdf" => "application/pdf",
         "txt" | "log" | "csv" => "text/plain",
         "md" => "text/markdown",

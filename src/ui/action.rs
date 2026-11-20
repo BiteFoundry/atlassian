@@ -14,6 +14,7 @@ use crate::{
             context_menu::{ContextMenuAction, ContextMenuOverlay},
             cross_link::CrossLinkOverlay,
             file_picker::FilePickerOverlay,
+            html_preview::{self, HtmlPreviewCommand, HtmlPreviewOverlay},
             image_preview::ImagePreviewOverlay,
             issue_form::IssueFormOverlay,
             links::{LinkCommand, LinksOverlay},
@@ -38,10 +39,42 @@ pub fn dispatch(action: Action, app: &mut AppState, ui: &mut UiState) -> bool {
     if !ui.overlays.is_empty() {
         match action {
             Action::MouseClick { row, col } => {
-                if let Some(HitTarget::OverlayItem(idx)) = ui.hitmap.hit(row, col) {
-                    return handle_overlay_item_click(idx, app, ui);
+                match ui.hitmap.hit(row, col) {
+                    Some(HitTarget::OverlayItem(idx)) => {
+                        return handle_overlay_item_click(idx, app, ui);
+                    }
+                    Some(HitTarget::OverlayClose) => {
+                        close_top_overlay_and_save_draft(app, ui);
+                        return false;
+                    }
+                    Some(HitTarget::Button(btn)) => {
+                        return dispatch_active_overlay(
+                            crate::ui::event::button_to_action(btn),
+                            app,
+                            ui,
+                        );
+                    }
+                    Some(HitTarget::OverlayBody) => {
+                        let cmds = if let Some(Overlay::HtmlPreview(ov)) = ui.overlays.last_mut() {
+                            ov.handle_mouse_click(row, col);
+                            ov.take_pending_commands()
+                        } else {
+                            Vec::new()
+                        };
+                        apply_html_preview_commands(cmds, app, ui);
+                        return false;
+                    }
+                    _ => {}
                 }
-                if matches!(ui.overlays.last(), Some(Overlay::ContextMenu(_))) {
+                if matches!(
+                    ui.overlays.last(),
+                    Some(
+                        Overlay::ContextMenu(_)
+                            | Overlay::ImagePreview(_)
+                            | Overlay::HtmlPreview(_)
+                            | Overlay::Help
+                    )
+                ) {
                     ui.pop_overlay();
                 }
                 return false;
@@ -221,6 +254,7 @@ pub fn dispatch(action: Action, app: &mut AppState, ui: &mut UiState) -> bool {
         Action::UploadAttachment => open_upload_attachment(app, ui),
         Action::DownloadAttachment => download_first_attachment(app, ui),
         Action::OpenImagePreview => open_image_preview(app, ui),
+        Action::OpenHtmlPreview => open_html_preview(app, ui),
         Action::OpenInBrowser => open_in_browser(app, ui),
         Action::FocusJql => {
             if ui.active_tab != WorkspaceTab::Issues {
@@ -520,6 +554,14 @@ fn dispatch_active_overlay(action: Action, app: &mut AppState, ui: &mut UiState)
                     ui.pop_overlay();
                     open_image_preview_with(app, ui, owner, &items, Some(idx));
                 }
+                AttachmentCommand::PreviewHtml(idx) => {
+                    let owner = ov.owner_label.clone();
+                    let att = ov.items.get(idx).cloned();
+                    ui.pop_overlay();
+                    if let Some(att) = att {
+                        open_html_attachment_preview(app, ui, owner, att);
+                    }
+                }
                 AttachmentCommand::Download(idx) => {
                     if let Some(att) = ov.items.get(idx).cloned() {
                         app.request_download_attachment(ui, att);
@@ -536,6 +578,14 @@ fn dispatch_active_overlay(action: Action, app: &mut AppState, ui: &mut UiState)
                 }
             }
             return false;
+        }
+    }
+
+    // Drain HtmlPreviewOverlay side-effect commands (native browser serving, links, alerts/toasts).
+    if let Some(Overlay::HtmlPreview(ov)) = ui.overlays.last_mut() {
+        let cmds = ov.take_pending_commands();
+        if !cmds.is_empty() {
+            apply_html_preview_commands(cmds, app, ui);
         }
     }
 
@@ -1020,10 +1070,16 @@ fn handle_mouse_click(row: u16, col: u16, app: &mut AppState, ui: &mut UiState) 
                 }
             }
         }
-        HitTarget::Button(ButtonId::SiteSwitcher) => {
-            return dispatch(Action::OpenSiteSwitcher, app, ui);
+        HitTarget::Button(btn) => {
+            if btn != ButtonId::FocusJql {
+                ui.issue_ui.local_filter_active = false;
+                if matches!(ui.focus, PaneFocus::JqlBar | PaneFocus::SearchBar) {
+                    ui.focus = PaneFocus::Main;
+                }
+            }
+            return dispatch(crate::ui::event::button_to_action(btn), app, ui);
         }
-        HitTarget::Button(_) | HitTarget::OverlayItem(_) => {}
+        HitTarget::OverlayItem(_) | HitTarget::OverlayBody | HitTarget::OverlayClose => {}
     }
     false
 }
@@ -1479,7 +1535,15 @@ fn open_image_preview_with(
     atts: &[crate::models::AttachmentItem],
     preferred_idx: Option<usize>,
 ) {
-    if let Some(mut ov) = ImagePreviewOverlay::from_attachments(label, atts, preferred_idx) {
+    if let Some(idx) = preferred_idx {
+        if let Some(att) = atts.get(idx) {
+            if html_preview::is_html_attachment(&att.mime_type, &att.filename) {
+                open_html_attachment_preview(app, ui, label, att.clone());
+                return;
+            }
+        }
+    }
+    if let Some(mut ov) = ImagePreviewOverlay::from_attachments(label.clone(), atts, preferred_idx) {
         ov.apply_graphics_caps(ui.graphics_caps);
         if app.config.image_protocol != ConfigImageProtocol::Auto {
             ov.protocol = ui.graphics_caps.protocol;
@@ -1487,8 +1551,94 @@ fn open_image_preview_with(
         }
         ui.push_overlay(Overlay::ImagePreview(ov));
         app.request_load_preview_image(ui);
+    } else if let Some(html_att) = atts
+        .iter()
+        .find(|att| html_preview::is_html_attachment(&att.mime_type, &att.filename))
+        .cloned()
+    {
+        open_html_attachment_preview(app, ui, label, html_att);
     } else {
         ui.info("No image attachments to preview");
+    }
+}
+
+fn open_html_preview(app: &AppState, ui: &mut UiState) {
+    let prefer_confluence = ui.active_tab == WorkspaceTab::Confluence
+        || (ui.active_tab == WorkspaceTab::MyWork && ui.my_work_ui.active_column == 1);
+
+    if prefer_confluence {
+        if let Some(page) = &app.active_page {
+            let html = html_preview::page_detail_to_html(page);
+            let mut ov = HtmlPreviewOverlay::new(page.summary.title.clone(), html);
+            ov.source_url = page.summary.web_url.clone();
+            let cmds = ov.take_pending_commands();
+            ui.push_overlay(Overlay::HtmlPreview(ov));
+            apply_html_preview_commands(cmds, app, ui);
+            return;
+        }
+    }
+
+    if let Some(issue) = &app.active_issue {
+        let html = html_preview::issue_detail_to_html(issue);
+        let title = format!("{} — {}", issue.summary.key, issue.summary.summary);
+        let mut ov = HtmlPreviewOverlay::new(title, html);
+        ov.source_url = issue.summary.web_url.clone();
+        let cmds = ov.take_pending_commands();
+        ui.push_overlay(Overlay::HtmlPreview(ov));
+        apply_html_preview_commands(cmds, app, ui);
+        return;
+    }
+
+    if let Some(page) = &app.active_page {
+        let html = html_preview::page_detail_to_html(page);
+        let mut ov = HtmlPreviewOverlay::new(page.summary.title.clone(), html);
+        ov.source_url = page.summary.web_url.clone();
+        let cmds = ov.take_pending_commands();
+        ui.push_overlay(Overlay::HtmlPreview(ov));
+        apply_html_preview_commands(cmds, app, ui);
+        return;
+    }
+
+    ui.info("Select a Confluence page or Jira issue to preview as HTML");
+}
+
+fn open_html_attachment_preview(
+    app: &AppState,
+    ui: &mut UiState,
+    owner: String,
+    att: crate::models::AttachmentItem,
+) {
+    let title = if owner.trim().is_empty() {
+        att.filename.clone()
+    } else {
+        format!("{owner} — {}", att.filename)
+    };
+    let ov = HtmlPreviewOverlay::loading(title.clone(), att.content_url.clone());
+    ui.push_overlay(Overlay::HtmlPreview(ov));
+    app.request_load_html_attachment(ui, title, att);
+}
+
+fn apply_html_preview_commands(
+    commands: Vec<HtmlPreviewCommand>,
+    app: &AppState,
+    ui: &mut UiState,
+) {
+    for cmd in commands {
+        match cmd {
+            HtmlPreviewCommand::ServeInBrowser { title, html } => {
+                app.request_serve_html_in_browser(ui, title, html);
+            }
+            HtmlPreviewCommand::OpenUrl(url) => {
+                if cfg!(test) {
+                    ui.info(format!("Open URL: {url}"));
+                } else if let Err(err) = open::that(&url) {
+                    ui.error(format!("Failed to open browser: {err}"));
+                }
+            }
+            HtmlPreviewCommand::Toast(msg) => {
+                ui.info(msg);
+            }
+        }
     }
 }
 
@@ -1827,5 +1977,176 @@ mod tests {
         assert!(matches!(ui.overlays.last(), Some(Overlay::FilePicker(_))));
         dispatch(Action::CloseOverlay, &mut app, &mut ui);
         assert!(!ui.has_overlay());
+    }
+
+    #[tokio::test]
+    async fn html_preview_entry_points_pills_attachments_and_click_outside() {
+        let (mut app, mut ui, _dir) = test_app_and_ui();
+
+        // Confluence page with storage HTML + interactive button
+        if let Some(page) = app.active_page.as_mut() {
+            page.body_representation = "storage".into();
+            page.body_raw = "<p id=\"msg\">Ready</p><button onclick=\"document.getElementById('msg').textContent='Clicked'\">Run</button>".into();
+        }
+        ui.active_tab = WorkspaceTab::Confluence;
+
+        // Render Confluence tab and verify clickable `[H: HTML]` pill is registered in HitMap
+        let backend = ratatui::backend::TestBackend::new(130, 36);
+        let mut terminal = ratatui::Terminal::new(backend).unwrap();
+        terminal
+            .draw(|f| {
+                let _ = crate::ui::draw(f, &app, &mut ui);
+            })
+            .unwrap();
+        let pill_rect = ui
+            .hitmap
+            .region_of(HitTarget::Button(ButtonId::HtmlPreview))
+            .expect("expected clickable [H: HTML] pill in Confluence view");
+        dispatch(
+            Action::MouseClick {
+                row: pill_rect.y,
+                col: pill_rect.x + 1,
+            },
+            &mut app,
+            &mut ui,
+        );
+        match ui.overlays.last() {
+            Some(Overlay::HtmlPreview(ov)) => {
+                assert!(ov.is_js_active());
+                assert!(ov.session().unwrap().raw_html().contains("Clicked"));
+            }
+            other => panic!("expected HtmlPreview overlay, got {other:?}"),
+        }
+
+        // Draw overlay so HitMap has OverlayBody, then click outside (0, 0) to close
+        terminal
+            .draw(|f| {
+                let _ = crate::ui::draw(f, &app, &mut ui);
+            })
+            .unwrap();
+        dispatch(Action::MouseClick { row: 0, col: 0 }, &mut app, &mut ui);
+        assert!(!ui.has_overlay(), "click outside should close HtmlPreview");
+
+        // Switch to Issues tab, verify `[H: HTML]` pill and `H` shortcut open HtmlPreview
+        ui.active_tab = WorkspaceTab::Issues;
+        terminal
+            .draw(|f| {
+                let _ = crate::ui::draw(f, &app, &mut ui);
+            })
+            .unwrap();
+        assert!(
+            ui.hitmap
+                .region_of(HitTarget::Button(ButtonId::HtmlPreview))
+                .is_some(),
+            "expected clickable [H: HTML] pill in Jira Issue view"
+        );
+        dispatch(Action::OpenHtmlPreview, &mut app, &mut ui);
+        assert!(matches!(ui.overlays.last(), Some(Overlay::HtmlPreview(_))));
+        dispatch(Action::CloseOverlay, &mut app, &mut ui);
+
+        // Attachments overlay `v` on `.html` attachment routes to HtmlPreview (NOT ImagePreview!)
+        if let Some(issue) = app.active_issue.as_mut() {
+            issue.attachments.push(AttachmentItem {
+                id: "att-html".into(),
+                filename: "dashboard.html".into(),
+                mime_type: "text/html".into(),
+                size: 512,
+                author_name: Some("Alice".into()),
+                created_at: String::new(),
+                content_url: "https://acme.atlassian.net/att/html".into(),
+                thumbnail_url: None,
+            });
+        }
+        dispatch(Action::OpenAttachments, &mut app, &mut ui);
+        if let Some(Overlay::Attachments(ov)) = ui.overlays.last_mut() {
+            ov.select(2);
+        }
+        dispatch(Action::Input('v'), &mut app, &mut ui);
+        assert!(
+            matches!(ui.overlays.last(), Some(Overlay::HtmlPreview(_))),
+            "pressing `v` on .html attachment must open HtmlPreview, not ImagePreview"
+        );
+    }
+
+    #[tokio::test]
+    async fn load_preview_image_sniffs_html_bytes_and_auto_routes_to_html_preview() {
+        use axum::{routing::get, Router};
+        use tokio::net::TcpListener;
+
+        let router = Router::new().route(
+            "/fake-image.png",
+            get(|| async {
+                "<!DOCTYPE html><html><body><h1>SSO Login Gate</h1><button onclick=\"alert('ok')\">Continue</button></body></html>"
+            }),
+        );
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, router).await;
+        });
+        let base_url = format!("http://{addr}");
+
+        let cfg = AppConfig {
+            site_url: base_url.clone(),
+            image_protocol: ConfigImageProtocol::Halfblock,
+            ..Default::default()
+        };
+        let auth = AuthManager::with_credentials(
+            "test",
+            crate::auth::StoredCredentials::BearerPat {
+                site_url: base_url.clone(),
+                token: "test-token".into(),
+                deployment: crate::config::DeploymentKind::Cloud,
+            },
+        );
+        let client = AtlassianClient::new(cfg.clone(), auth.clone()).unwrap();
+        let storage = Storage::open_in_memory().unwrap();
+        let (core_tx, _) = mpsc::unbounded_channel();
+        let sync_ctrl =
+            sync::spawn_sync_engine(cfg.clone(), client.clone(), storage.clone(), core_tx);
+        let (ui_tx, mut ui_rx) = mpsc::unbounded_channel();
+
+        let mut app = AppState::new_with_persona(
+            cfg.clone(),
+            Persona::Jira,
+            auth,
+            client,
+            storage,
+            sync_ctrl,
+            ui_tx,
+        );
+        let mut ui = UiState::from_config_with_persona(&cfg, Persona::Jira);
+
+        let att = AttachmentItem {
+            id: "att-sso".into(),
+            filename: "avatar.png".into(),
+            mime_type: "image/png".into(),
+            size: 128,
+            author_name: None,
+            created_at: String::new(),
+            content_url: format!("{base_url}/fake-image.png"),
+            thumbnail_url: None,
+        };
+        let mut img_ov = ImagePreviewOverlay::from_attachments("ATL-99", &[att], None).unwrap();
+        img_ov.protocol = crate::img_preview::TerminalImageProtocol::Halfblock;
+        ui.push_overlay(Overlay::ImagePreview(img_ov));
+
+        // Trigger LoadPreviewImage -> downloads HTML bytes -> sniffs ContentKind::Html
+        dispatch(Action::LoadPreviewImage, &mut app, &mut ui);
+
+        let msg = tokio::time::timeout(std::time::Duration::from_secs(5), ui_rx.recv())
+            .await
+            .expect("PreviewImageSniffedAsHtml timed out")
+            .expect("ui_rx closed");
+        app.handle_ui_msg(&mut ui, msg);
+
+        match ui.overlays.last() {
+            Some(Overlay::HtmlPreview(ov)) => {
+                assert_eq!(ov.title, "avatar.png");
+                assert!(ov.is_js_active());
+                assert!(ov.session().unwrap().raw_html().contains("SSO Login Gate"));
+            }
+            other => panic!("expected auto-routed HtmlPreview overlay, got {other:?}"),
+        }
     }
 }

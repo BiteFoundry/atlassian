@@ -17,7 +17,7 @@ use crate::{
         doc_view::truncate_width,
         hitmap::{HitMap, HitTarget},
         keymap::Action,
-        overlays::{centered_rect, modal_block, OverlayOutcome},
+        overlays::{centered_rect, html_preview, modal_block, OverlayOutcome},
     },
 };
 
@@ -30,6 +30,7 @@ pub struct AttachmentRow {
     pub size: u64,
     pub author_name: Option<String>,
     pub is_image: bool,
+    pub is_html: bool,
 }
 
 impl AttachmentRow {
@@ -40,6 +41,7 @@ impl AttachmentRow {
             item.filename.clone()
         };
         let is_image = img_preview::is_image_attachment(&item.mime_type, &filename);
+        let is_html = !is_image && html_preview::is_html_attachment(&item.mime_type, &filename);
         Self {
             index,
             id: item.id.clone(),
@@ -48,12 +50,15 @@ impl AttachmentRow {
             size: item.size,
             author_name: item.author_name.clone(),
             is_image,
+            is_html,
         }
     }
 
     pub fn icon(&self) -> &'static str {
         if self.is_image {
             "[IMG]"
+        } else if self.is_html {
+            "[HTML]"
         } else {
             "[FILE]"
         }
@@ -92,6 +97,7 @@ pub fn format_size(bytes: u64) -> String {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AttachmentCommand {
     PreviewImage(usize),
+    PreviewHtml(usize),
     Download(usize),
     Upload,
     OpenUrl(String),
@@ -171,6 +177,11 @@ impl AttachmentsOverlay {
             .is_some_and(|att| img_preview::is_image_attachment(&att.mime_type, &att.filename))
     }
 
+    pub fn is_selected_html(&self) -> bool {
+        self.selected_attachment()
+            .is_some_and(|att| html_preview::is_html_attachment(&att.mime_type, &att.filename))
+    }
+
     pub fn handle(&mut self, action: &Action) -> OverlayOutcome {
         match action {
             Action::MoveUp | Action::CursorUp | Action::PrevField => {
@@ -189,6 +200,9 @@ impl AttachmentsOverlay {
                 if self.is_selected_image() {
                     self.pending_command = Some(AttachmentCommand::PreviewImage(idx));
                     OverlayOutcome::CloseAndDispatch(Action::OpenImagePreview)
+                } else if self.is_selected_html() {
+                    self.pending_command = Some(AttachmentCommand::PreviewHtml(idx));
+                    OverlayOutcome::CloseAndDispatch(Action::OpenHtmlPreview)
                 } else {
                     self.pending_command = Some(AttachmentCommand::Download(idx));
                     OverlayOutcome::Dispatch(Action::DownloadAttachment)
@@ -201,9 +215,24 @@ impl AttachmentsOverlay {
                 if self.is_selected_image() {
                     self.pending_command = Some(AttachmentCommand::PreviewImage(idx));
                     OverlayOutcome::CloseAndDispatch(Action::OpenImagePreview)
+                } else if self.is_selected_html() {
+                    self.pending_command = Some(AttachmentCommand::PreviewHtml(idx));
+                    OverlayOutcome::CloseAndDispatch(Action::OpenHtmlPreview)
                 } else {
                     self.notice =
-                        Some("Selected file is not a raster image — press d to download".to_string());
+                        Some("Selected file is not a previewable image or HTML — press d to download".to_string());
+                    OverlayOutcome::Handled
+                }
+            }
+            Action::Input('H') | Action::OpenHtmlPreview => {
+                let Some(idx) = self.selected_index() else {
+                    return OverlayOutcome::Handled;
+                };
+                if self.is_selected_html() {
+                    self.pending_command = Some(AttachmentCommand::PreviewHtml(idx));
+                    OverlayOutcome::CloseAndDispatch(Action::OpenHtmlPreview)
+                } else {
+                    self.notice = Some("Selected attachment is not an HTML file".to_string());
                     OverlayOutcome::Handled
                 }
             }
@@ -310,6 +339,10 @@ impl AttachmentsOverlay {
                 } else if row.is_image {
                     Style::default()
                         .fg(theme.confluence_teal)
+                        .add_modifier(Modifier::BOLD)
+                } else if row.is_html {
+                    Style::default()
+                        .fg(theme.accent)
                         .add_modifier(Modifier::BOLD)
                 } else {
                     theme.muted_style()
@@ -526,5 +559,53 @@ mod tests {
         assert!(text.contains("[IMG]"));
         assert!(text.contains("[FILE]"));
         assert!(!hitmap.is_empty());
+    }
+
+    #[test]
+    fn html_attachment_routes_v_and_enter_to_html_preview_not_image() {
+        let mut items = sample_attachments();
+        items.push(AttachmentItem {
+            id: "att-3".into(),
+            filename: "report.html".into(),
+            mime_type: "text/html".into(),
+            size: 1024,
+            author_name: Some("Carol".into()),
+            created_at: "2026-11-19T02:00:00Z".into(),
+            content_url: "https://acme.atlassian.net/att/3".into(),
+            thumbnail_url: None,
+        });
+        items.push(AttachmentItem {
+            id: "att-4".into(),
+            filename: "legacy.htm".into(),
+            mime_type: "application/octet-stream".into(),
+            size: 512,
+            author_name: None,
+            created_at: "2026-11-19T03:00:00Z".into(),
+            content_url: "https://acme.atlassian.net/att/4".into(),
+            thumbnail_url: None,
+        });
+
+        let mut ov = AttachmentsOverlay::new("ENG-1", items);
+        let rows = ov.rows();
+        assert!(!rows[2].is_image);
+        assert!(rows[2].is_html);
+        assert_eq!(rows[2].icon(), "[HTML]");
+        assert!(!rows[3].is_image);
+        assert!(rows[3].is_html);
+        assert_eq!(rows[3].icon(), "[HTML]");
+
+        ov.select(2);
+        assert_eq!(
+            ov.handle(&Action::Input('v')),
+            OverlayOutcome::CloseAndDispatch(Action::OpenHtmlPreview)
+        );
+        assert_eq!(ov.pending_command, Some(AttachmentCommand::PreviewHtml(2)));
+
+        ov.select(3);
+        assert_eq!(
+            ov.handle(&Action::Activate),
+            OverlayOutcome::CloseAndDispatch(Action::OpenHtmlPreview)
+        );
+        assert_eq!(ov.pending_command, Some(AttachmentCommand::PreviewHtml(3)));
     }
 }

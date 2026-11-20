@@ -25,8 +25,10 @@ pub fn key_to_action(
 pub fn mouse_to_action(mouse: MouseEvent, hitmap: &HitMap) -> Option<Action> {
     match mouse.kind {
         MouseEventKind::Down(MouseButton::Left) => {
-            if let Some(HitTarget::Button(btn)) = hitmap.hit(mouse.row, mouse.column) {
-                return Some(button_to_action(btn));
+            match hitmap.hit(mouse.row, mouse.column) {
+                Some(HitTarget::Button(btn)) => return Some(button_to_action(btn)),
+                Some(HitTarget::OverlayClose) => return Some(Action::CloseOverlay),
+                _ => {}
             }
             Some(Action::MouseClick {
                 row: mouse.row,
@@ -57,6 +59,7 @@ pub fn button_to_action(btn: ButtonId) -> Action {
         ButtonId::UploadAttachment => Action::UploadAttachment,
         ButtonId::DownloadAttachment => Action::DownloadAttachment,
         ButtonId::ImagePreview => Action::OpenImagePreview,
+        ButtonId::HtmlPreview => Action::OpenHtmlPreview,
         ButtonId::CrossLinks => Action::OpenCrossLinks,
         ButtonId::OpenBrowser => Action::OpenInBrowser,
         ButtonId::ToggleToc => Action::ToggleDrawerOrToc,

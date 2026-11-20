@@ -312,9 +312,12 @@ pub fn draw(frame: &mut Frame, app: &AppState, ui: &mut UiState) -> Option<(u16,
     draw_status_bar(frame, rows[2], app, ui);
 
     let mut hitmap = std::mem::take(&mut ui.hitmap);
-    for overlay in &ui.overlays {
+    let mut overlays = std::mem::take(&mut ui.overlays);
+    for overlay in &mut overlays {
+        hitmap.clear();
         overlay.draw(frame, area, app, ui, &mut hitmap);
     }
+    ui.overlays = overlays;
     ui.hitmap = hitmap;
 
     None
@@ -407,10 +410,15 @@ fn draw_persona_header(frame: &mut Frame, area: Rect, app: &AppState, ui: &mut U
     let right_w = right_text.width() as u16;
     let remaining = (area.x + area.width).saturating_sub(x);
     if remaining > right_w {
-        spans.push(Span::styled(
-            " ".repeat((remaining - right_w) as usize),
-            bar_style,
-        ));
+        let pad_w = remaining - right_w;
+        spans.push(Span::styled(" ".repeat(pad_w as usize), bar_style));
+        let status_x = x.saturating_add(pad_w);
+        ui.hitmap.add_line(
+            status_x,
+            area.y,
+            right_w,
+            HitTarget::Button(ButtonId::SyncAll),
+        );
         let status_fg = if theme.no_color {
             Color::Reset
         } else if is_busy {
@@ -435,7 +443,7 @@ fn draw_persona_header(frame: &mut Frame, area: Rect, app: &AppState, ui: &mut U
     frame.render_widget(Paragraph::new(Line::from(spans)).style(bar_style), area);
 }
 
-fn draw_status_bar(frame: &mut Frame, area: Rect, app: &AppState, ui: &UiState) {
+fn draw_status_bar(frame: &mut Frame, area: Rect, app: &AppState, ui: &mut UiState) {
     let theme = &ui.theme;
     let bar_style = theme.surface_style(theme.bg_header);
     let bg = if theme.no_color {
@@ -452,7 +460,16 @@ fn draw_status_bar(frame: &mut Frame, area: Rect, app: &AppState, ui: &UiState) 
         PaneFocus::SearchBar => "[SEARCH]",
     };
 
-    let (left_msg, left_style) = if let Some(toast) = ui.toasts.current() {
+    let right_meta = format!(" {} ", app.config.density.label());
+    let right_w = right_meta.width();
+    let total_w = area.width as usize;
+    let show_right = total_w > right_w + 16;
+    let left_budget = if show_right { total_w - right_w } else { total_w };
+
+    let mut left_spans: Vec<Span<'static>> = Vec::new();
+    let mut left_used_w = 0usize;
+
+    if let Some(toast) = ui.toasts.current() {
         let fg = if theme.no_color {
             Color::Reset
         } else {
@@ -462,89 +479,108 @@ fn draw_status_bar(frame: &mut Frame, area: Rect, app: &AppState, ui: &UiState) 
                 ToastKind::Error => theme.error,
             }
         };
-        (
-            format!(" {} ", toast.message),
-            Style::default().bg(bg).fg(fg).add_modifier(Modifier::BOLD),
-        )
+        let style = Style::default().bg(bg).fg(fg).add_modifier(Modifier::BOLD);
+        let fitted = truncate_width(&format!(" {} ", toast.message), left_budget);
+        left_used_w = fitted.width();
+        left_spans.push(Span::styled(fitted, style));
     } else if let Some(task) = ui.tasks.first_running() {
-        (
-            format!(" {} {} ", spinner_glyph(), task.display()),
-            Style::default()
-                .bg(bg)
-                .fg(if theme.no_color {
-                    Color::Reset
-                } else {
-                    theme.accent_soft
-                }),
-        )
+        let style = Style::default().bg(bg).fg(if theme.no_color {
+            Color::Reset
+        } else {
+            theme.accent_soft
+        });
+        let fitted = truncate_width(
+            &format!(" {} {} ", spinner_glyph(), task.display()),
+            left_budget,
+        );
+        left_used_w = fitted.width();
+        left_spans.push(Span::styled(fitted, style));
     } else if app.syncing {
-        (
-            format!(" {} Syncing workspace… ", spinner_glyph()),
-            Style::default()
-                .bg(bg)
-                .fg(if theme.no_color {
-                    Color::Reset
-                } else {
-                    theme.accent_soft
-                }),
-        )
+        let style = Style::default().bg(bg).fg(if theme.no_color {
+            Color::Reset
+        } else {
+            theme.accent_soft
+        });
+        let fitted = truncate_width(
+            &format!(" {} Syncing workspace… ", spinner_glyph()),
+            left_budget,
+        );
+        left_used_w = fitted.width();
+        left_spans.push(Span::styled(fitted, style));
     } else {
-        let hist = if app.nav_history.is_empty() {
-            String::new()
+        let muted_style = if theme.no_color {
+            Style::default().add_modifier(Modifier::DIM)
         } else {
-            format!("[Backspace] Back ({}) · ", app.nav_history.len())
+            Style::default().bg(bg).fg(theme.fg_muted)
         };
-        let rail_hint = if !ui.show_nav_rail {
-            "Nav Hidden · "
-        } else {
-            ""
-        };
-        (
-            format!(
-                " {focus_badge} {hist}{rail_hint}[Tab] Pane · [1-6] Tabs · [Ctrl+P] Palette · [?] Help · [q] Quit "
-            ),
-            if theme.no_color {
-                Style::default().add_modifier(Modifier::DIM)
+        let mut segments: Vec<(String, Option<ButtonId>)> = vec![(format!(" {focus_badge} "), None)];
+        if !app.nav_history.is_empty() {
+            segments.push((
+                format!("[Backspace] Back ({})", app.nav_history.len()),
+                Some(ButtonId::BackHistory),
+            ));
+            segments.push((" · ".to_string(), None));
+        }
+        if !ui.show_nav_rail {
+            segments.push(("Nav Hidden · ".to_string(), None));
+        }
+        segments.push(("[Tab] Pane · [1-6] Tabs · ".to_string(), None));
+        segments.push(("[Ctrl+P] Palette".to_string(), Some(ButtonId::CommandPalette)));
+        segments.push((" · ".to_string(), None));
+        segments.push(("[?] Help".to_string(), Some(ButtonId::Help)));
+        segments.push((" · [q] Quit ".to_string(), None));
+
+        for (seg, btn) in segments {
+            let rem = left_budget.saturating_sub(left_used_w);
+            if rem == 0 {
+                break;
+            }
+            let seg_w = seg.width();
+            if seg_w <= rem {
+                if let Some(btn_id) = btn {
+                    ui.hitmap.add_line(
+                        area.x.saturating_add(left_used_w as u16),
+                        area.y,
+                        seg_w as u16,
+                        HitTarget::Button(btn_id),
+                    );
+                }
+                left_used_w += seg_w;
+                left_spans.push(Span::styled(seg, muted_style));
             } else {
-                Style::default().bg(bg).fg(theme.fg_muted)
-            },
-        )
-    };
+                let fitted = truncate_width(&seg, rem);
+                let fw = fitted.width();
+                if let Some(btn_id) = btn {
+                    if fw > 0 {
+                        ui.hitmap.add_line(
+                            area.x.saturating_add(left_used_w as u16),
+                            area.y,
+                            fw as u16,
+                            HitTarget::Button(btn_id),
+                        );
+                    }
+                }
+                left_used_w += fw;
+                left_spans.push(Span::styled(fitted, muted_style));
+                break;
+            }
+        }
+    }
 
-    let right_meta = format!(" {} ", app.config.density.label());
-    let right_w = right_meta.width();
-    let total_w = area.width as usize;
-
-    if total_w > right_w + 16 {
-        let left_budget = total_w - right_w;
-        let fitted = truncate_width(&left_msg, left_budget);
-        let pad = left_budget.saturating_sub(fitted.width());
+    let pad = left_budget.saturating_sub(left_used_w);
+    if pad > 0 {
+        left_spans.push(Span::styled(" ".repeat(pad), bar_style));
+    }
+    if show_right {
         let right_style = if theme.no_color {
             Style::default().add_modifier(Modifier::DIM)
         } else {
             Style::default().bg(bg).fg(theme.fg_secondary)
         };
-        frame.render_widget(
-            Paragraph::new(Line::from(vec![
-                Span::styled(fitted, left_style),
-                Span::styled(" ".repeat(pad), bar_style),
-                Span::styled(right_meta, right_style),
-            ]))
-            .style(bar_style),
-            area,
-        );
-    } else {
-        let fitted = truncate_width(&left_msg, total_w);
-        let pad = total_w.saturating_sub(fitted.width());
-        frame.render_widget(
-            Paragraph::new(Line::from(vec![
-                Span::styled(fitted, left_style),
-                Span::styled(" ".repeat(pad), bar_style),
-            ]))
-            .style(bar_style),
-            area,
-        );
+        left_spans.push(Span::styled(right_meta, right_style));
     }
+
+    frame.render_widget(Paragraph::new(Line::from(left_spans)).style(bar_style), area);
 }
 
 #[cfg(test)]
@@ -1039,5 +1075,180 @@ mod tests {
         assert_eq!(app.site_scope, SiteScope::Only("acme-cloud".into()));
         let scoped_screen = render_buffer_text(&app, &mut ui, 130, 36);
         assert!(scoped_screen.contains(" Acme Cloud ▾ "), "expected active site pill:\n{scoped_screen}");
+    }
+
+    #[tokio::test]
+    async fn newly_wired_buttons_register_hit_targets_and_dispatch_on_mouse_click() {
+        use crate::models::{AttachmentItem, CrossRefTarget};
+        use crate::ui::overlays::{image_preview::ImagePreviewOverlay, Overlay, OverlayKind};
+
+        let (mut app, mut ui) = test_app(Persona::Jira);
+        app.nav_history.push(CrossRefTarget::ConfluencePage {
+            page_id: "p1".into(),
+            title: Some("System Architecture".into()),
+        });
+
+        // 1. Board view: status bar has BackHistory, CommandPalette, Help; board header has ToggleDrawer
+        let _ = render_buffer_text(&app, &mut ui, 140, 36);
+
+        let palette_rect = ui
+            .hitmap
+            .region_of(HitTarget::Button(ButtonId::CommandPalette))
+            .expect("CommandPalette button must be registered in status bar");
+        let help_rect = ui
+            .hitmap
+            .region_of(HitTarget::Button(ButtonId::Help))
+            .expect("Help button must be registered in status bar");
+        let back_rect = ui
+            .hitmap
+            .region_of(HitTarget::Button(ButtonId::BackHistory))
+            .expect("BackHistory button must be registered when nav_history is non-empty");
+        let drawer_rect = ui
+            .hitmap
+            .region_of(HitTarget::Button(ButtonId::ToggleDrawer))
+            .expect("ToggleDrawer button must be registered in Board header");
+
+        // Click CommandPalette via MouseClick
+        action::dispatch(
+            Action::MouseClick {
+                row: palette_rect.y,
+                col: palette_rect.x + 1,
+            },
+            &mut app,
+            &mut ui,
+        );
+        assert_eq!(
+            ui.overlays.last().map(|o| o.kind()),
+            Some(OverlayKind::CommandPalette)
+        );
+        ui.pop_overlay();
+
+        // Click Help via MouseClick
+        let _ = render_buffer_text(&app, &mut ui, 140, 36);
+        action::dispatch(
+            Action::MouseClick {
+                row: help_rect.y,
+                col: help_rect.x + 1,
+            },
+            &mut app,
+            &mut ui,
+        );
+        assert_eq!(ui.overlays.last().map(|o| o.kind()), Some(OverlayKind::Help));
+        ui.pop_overlay();
+
+        // Click ToggleDrawer on Board header via MouseClick
+        let drawer_before = ui.board_ui.drawer_open;
+        let _ = render_buffer_text(&app, &mut ui, 140, 36);
+        action::dispatch(
+            Action::MouseClick {
+                row: drawer_rect.y,
+                col: drawer_rect.x + 1,
+            },
+            &mut app,
+            &mut ui,
+        );
+        assert_ne!(ui.board_ui.drawer_open, drawer_before);
+
+        // Click BackHistory in status bar via MouseClick -> pops nav history to Confluence
+        let _ = render_buffer_text(&app, &mut ui, 140, 36);
+        action::dispatch(
+            Action::MouseClick {
+                row: back_rect.y,
+                col: back_rect.x + 1,
+            },
+            &mut app,
+            &mut ui,
+        );
+        assert!(app.nav_history.is_empty());
+        assert_eq!(ui.active_tab, WorkspaceTab::Confluence);
+
+        // 2. Issues tab: FocusJql button in JQL bar focuses JqlBar on MouseClick
+        action::dispatch(Action::SwitchTab(WorkspaceTab::Issues.index()), &mut app, &mut ui);
+        ui.focus = PaneFocus::Main;
+        let _ = render_buffer_text(&app, &mut ui, 140, 36);
+        let jql_btn = ui
+            .hitmap
+            .region_of(HitTarget::Button(ButtonId::FocusJql))
+            .expect("FocusJql button must be registered in JQL bar");
+        action::dispatch(
+            Action::MouseClick {
+                row: jql_btn.y,
+                col: jql_btn.x + 1,
+            },
+            &mut app,
+            &mut ui,
+        );
+        assert_eq!(ui.focus, PaneFocus::JqlBar);
+        ui.focus = PaneFocus::Main;
+
+        // 3. Directory tab: ToggleInlineImages & ToggleDrawer pills work on MouseClick
+        action::dispatch(Action::SwitchTab(WorkspaceTab::Directory.index()), &mut app, &mut ui);
+        let _ = render_buffer_text(&app, &mut ui, 140, 36);
+        let img_btn = ui
+            .hitmap
+            .region_of(HitTarget::Button(ButtonId::ToggleInlineImages))
+            .expect("ToggleInlineImages pill must be registered in Directory view");
+        let dir_drawer_btn = ui
+            .hitmap
+            .region_of(HitTarget::Button(ButtonId::ToggleDrawer))
+            .expect("ToggleDrawer pill must be registered in Directory view");
+        let inline_before = ui.inline_images;
+        action::dispatch(
+            Action::MouseClick {
+                row: img_btn.y,
+                col: img_btn.x + 1,
+            },
+            &mut app,
+            &mut ui,
+        );
+        assert_ne!(ui.inline_images, inline_before);
+
+        let auto_drawer_before = ui.auto_detail_drawer;
+        let _ = render_buffer_text(&app, &mut ui, 140, 36);
+        action::dispatch(
+            Action::MouseClick {
+                row: dir_drawer_btn.y,
+                col: dir_drawer_btn.x + 1,
+            },
+            &mut app,
+            &mut ui,
+        );
+        assert_ne!(ui.auto_detail_drawer, auto_drawer_before);
+
+        // 4. ImagePreviewOverlay: click inside stays open; click outside or on [✕ Esc] closes
+        let att = AttachmentItem {
+            id: "img-1".into(),
+            filename: "diagram.png".into(),
+            mime_type: "image/png".into(),
+            size: 1024,
+            author_name: None,
+            created_at: String::new(),
+            content_url: String::new(),
+            thumbnail_url: None,
+        };
+        let ov = ImagePreviewOverlay::from_attachments("ATL-1", &[att], None).unwrap();
+        ui.push_overlay(Overlay::ImagePreview(ov));
+        let _ = render_buffer_text(&app, &mut ui, 120, 32);
+
+        let body = ui
+            .hitmap
+            .region_of(HitTarget::OverlayBody)
+            .expect("ImagePreviewOverlay must register OverlayBody");
+        // Click inside modal -> stays open
+        action::dispatch(
+            Action::MouseClick {
+                row: body.y + 3,
+                col: body.x + 5,
+            },
+            &mut app,
+            &mut ui,
+        );
+        assert_eq!(
+            ui.overlays.last().map(|o| o.kind()),
+            Some(OverlayKind::ImagePreview)
+        );
+        // Click outside modal (top-left corner 0,0) -> closes cleanly
+        action::dispatch(Action::MouseClick { row: 0, col: 0 }, &mut app, &mut ui);
+        assert!(!ui.has_overlay());
     }
 }

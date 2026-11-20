@@ -525,6 +525,45 @@ fn draw_stats_and_controls(frame: &mut Frame, area: Rect, app: &AppState, ui: &m
             .add_modifier(Modifier::BOLD)
     };
 
+    let images_pill = format!("Images: {}", if ui.inline_images { "ON" } else { "OFF" });
+    let drawer_pill = format!("Drawer: {}", if ui.auto_detail_drawer { "ON" } else { "OFF" });
+    let status_prefix_1 = " Status: ";
+    let status_prefix_2 = "  |  Version: ";
+    let status_prefix_3 = format!(
+        "  |  Theme: {}  Density: {}  ",
+        app.config.theme.label(),
+        app.config.density.label(),
+    );
+    let status_sep = "  ";
+    let status_row_y = content_rect.y + 3;
+    let img_x = content_rect.x
+        + (status_prefix_1.width()
+            + sync_lbl.width()
+            + status_prefix_2.width()
+            + update_lbl.width()
+            + status_prefix_3.width()) as u16;
+    let img_w = images_pill.width() as u16;
+    let drawer_x = img_x + img_w + status_sep.width() as u16;
+    let drawer_w = drawer_pill.width() as u16;
+    if img_x.saturating_add(img_w) <= content_rect.right() {
+        ui.hitmap.add_line(
+            img_x,
+            status_row_y,
+            img_w,
+            HitTarget::Button(ButtonId::ToggleInlineImages),
+        );
+    }
+    if drawer_x.saturating_add(drawer_w) <= content_rect.right() {
+        ui.hitmap.add_line(
+            drawer_x,
+            status_row_y,
+            drawer_w,
+            HitTarget::Button(ButtonId::ToggleDrawer),
+        );
+    }
+
+    let sync_btn_text = " [r] Sync All ";
+    let update_btn_text = " [U] Check Update ";
     let lines = vec![
         Line::from(Span::styled(
             " Sync · Cache Stats · Settings",
@@ -547,25 +586,19 @@ fn draw_stats_and_controls(frame: &mut Frame, area: Rect, app: &AppState, ui: &m
             )),
         ]),
         Line::from(vec![
-            Span::styled(" Status: ", theme.muted_style()),
+            Span::styled(status_prefix_1, theme.muted_style()),
             Span::raw(sync_lbl),
-            Span::styled("  |  Version: ", theme.muted_style()),
+            Span::styled(status_prefix_2, theme.muted_style()),
             Span::raw(update_lbl),
-            Span::styled(
-                format!(
-                    "  |  Theme: {}  Density: {}  Images: {}  Drawer: {}",
-                    app.config.theme.label(),
-                    app.config.density.label(),
-                    if ui.inline_images { "ON" } else { "OFF" },
-                    if ui.auto_detail_drawer { "ON" } else { "OFF" }
-                ),
-                theme.muted_style(),
-            ),
+            Span::styled(status_prefix_3, theme.muted_style()),
+            Span::styled(images_pill, sync_btn_style),
+            Span::styled(status_sep, theme.muted_style()),
+            Span::styled(drawer_pill, update_btn_style),
         ]),
         Line::from(vec![
-            Span::styled(" [r] Sync All ", sync_btn_style),
+            Span::styled(sync_btn_text, sync_btn_style),
             Span::raw(" "),
-            Span::styled(" [U] Check Update ", update_btn_style),
+            Span::styled(update_btn_text, update_btn_style),
             Span::raw(" "),
             Span::styled(" [p] Toggle Pin ", pin_btn_style),
             Span::raw(" "),
@@ -576,18 +609,25 @@ fn draw_stats_and_controls(frame: &mut Frame, area: Rect, app: &AppState, ui: &m
 
     if content_rect.height >= 5 {
         let row = content_rect.y + 4;
-        ui.hitmap.add_line(
-            content_rect.x + 1,
-            row,
-            12,
-            HitTarget::Button(ButtonId::SyncAll),
-        );
-        ui.hitmap.add_line(
-            content_rect.x + 16,
-            row,
-            16,
-            HitTarget::Button(ButtonId::CheckUpdate),
-        );
+        let sync_w = sync_btn_text.width() as u16;
+        let update_x = content_rect.x + sync_w + 1;
+        let update_w = update_btn_text.width() as u16;
+        if content_rect.x + sync_w <= content_rect.right() {
+            ui.hitmap.add_line(
+                content_rect.x,
+                row,
+                sync_w,
+                HitTarget::Button(ButtonId::SyncAll),
+            );
+        }
+        if update_x + update_w <= content_rect.right() {
+            ui.hitmap.add_line(
+                update_x,
+                row,
+                update_w,
+                HitTarget::Button(ButtonId::CheckUpdate),
+            );
+        }
     }
 }
 

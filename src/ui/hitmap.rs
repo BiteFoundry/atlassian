@@ -16,6 +16,7 @@ pub enum ButtonId {
     UploadAttachment,
     DownloadAttachment,
     ImagePreview,
+    HtmlPreview,
     CrossLinks,
     OpenBrowser,
     ToggleToc,
@@ -61,6 +62,10 @@ pub enum HitTarget {
     Attachment(usize),
     /// Overlay list item.
     OverlayItem(usize),
+    /// Interior body of an active modal overlay (used to detect click-outside-to-close).
+    OverlayBody,
+    /// Clickable close pill (`[✕ Esc]`) on an active modal overlay.
+    OverlayClose,
     /// Collapsible site group header in left sidebar (`index` into `UiState::site_group_keys`).
     SiteGroupHeader(usize),
     /// Toolbar / action hint button.
@@ -115,6 +120,14 @@ impl HitMap {
             .rev()
             .find(|(area, _)| area.contains(pos))
             .map(|(_, target)| *target)
+    }
+
+    pub fn region_of(&self, target: HitTarget) -> Option<Rect> {
+        self.regions
+            .iter()
+            .rev()
+            .find(|(_, t)| *t == target)
+            .map(|(area, _)| *area)
     }
 }
 

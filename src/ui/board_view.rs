@@ -15,10 +15,11 @@ use crate::{
         app::{AppState, KanbanColumn, PaneFocus, UiState},
         doc_view::{truncate_width, wrap_plain_text},
         draw_horizontal_hairline, draw_vertical_hairline, fill_surface,
-        hitmap::HitTarget,
+        hitmap::{ButtonId, HitTarget},
         issue_view::draw_issue_inspector_pane,
     },
 };
+use unicode_width::UnicodeWidthStr;
 
 const MIN_COL_WIDTH: u16 = 26;
 
@@ -304,15 +305,34 @@ fn draw_kanban_canvas(frame: &mut Frame, area: Rect, app: &AppState, ui: &mut Ui
 
     // Minimal-chrome top board bar + hairline
     let header_area = Rect::new(area.x, area.y, area.width, 1);
-    let hint = " [h/l] Col · [j/k] Card · [Enter] Detail · [m] Transition · [n] New ";
     let title_str = format!(" {board_name}");
-    let avail_hint = (area.width as usize).saturating_sub(title_str.len() + 2);
+    let title_w = title_str.width() as u16;
     let mut hdr_spans = vec![Span::styled(title_str, theme.title(focused))];
-    if avail_hint >= 12 {
-        hdr_spans.push(Span::styled(
-            truncate_width(hint, avail_hint),
-            theme.muted_style(),
-        ));
+    let mut cx = header_area.x.saturating_add(title_w);
+    let max_x = header_area.right();
+    let segments: &[(&str, Option<ButtonId>)] = &[
+        (" [h/l] Col · [j/k] Card · ", None),
+        ("[t] Drawer", Some(ButtonId::ToggleDrawer)),
+        (" · ", None),
+        ("[m] Transition", Some(ButtonId::Transition)),
+        (" · ", None),
+        ("[n] New", Some(ButtonId::NewItem)),
+        (" ", None),
+    ];
+    for &(seg, btn) in segments {
+        let seg_w = seg.width() as u16;
+        if cx.saturating_add(seg_w) > max_x {
+            let rem = max_x.saturating_sub(cx) as usize;
+            if rem > 0 {
+                hdr_spans.push(Span::styled(truncate_width(seg, rem), theme.muted_style()));
+            }
+            break;
+        }
+        if let Some(btn_id) = btn {
+            ui.hitmap.add_line(cx, header_area.y, seg_w, HitTarget::Button(btn_id));
+        }
+        hdr_spans.push(Span::styled(seg, theme.muted_style()));
+        cx = cx.saturating_add(seg_w);
     }
     frame.render_widget(Paragraph::new(Line::from(hdr_spans)), header_area);
     draw_horizontal_hairline(

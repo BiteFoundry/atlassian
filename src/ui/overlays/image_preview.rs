@@ -9,9 +9,13 @@ use ratatui::{
     layout::Rect,
     style::{Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, BorderType, Borders, Clear, Paragraph},
+    widgets::{
+        Block, BorderType, Borders, Clear, Paragraph, Scrollbar, ScrollbarOrientation,
+        ScrollbarState,
+    },
     Frame,
 };
+use unicode_width::UnicodeWidthStr;
 
 use crate::{
     img_preview::{
@@ -21,7 +25,7 @@ use crate::{
     ui::{
         app::{AppState, UiState},
         doc_view::truncate_width,
-        hitmap::HitMap,
+        hitmap::{HitMap, HitTarget},
         keymap::Action,
         overlays::{centered_rect, OverlayOutcome},
     },
@@ -42,6 +46,10 @@ pub struct ImagePreviewOverlay {
     pub index: usize,
     /// Zoom percentage (`25..=200`, default `100`).
     pub zoom_pct: u16,
+    /// Vertical viewport scroll offset (in terminal cell rows) for tall/zoomed images.
+    pub scroll_y: u16,
+    /// Horizontal viewport scroll offset (in terminal cell columns) for zoomed images.
+    pub scroll_x: u16,
     /// Whether fit-to-modal mode (`100%`) is active; `f` toggles between Fit (`100%`) and Zoom (`150%`).
     pub fit_to_window: bool,
     /// Active graphics protocol for this preview overlay (`p` cycles Kitty -> iTerm2 -> Sixel -> Halfblock).
@@ -82,6 +90,8 @@ impl ImagePreviewOverlay {
             items,
             index: start,
             zoom_pct: 100,
+            scroll_y: 0,
+            scroll_x: 0,
             fit_to_window: true,
             protocol: caps.protocol,
             protocol_overridden: false,
@@ -192,20 +202,25 @@ impl ImagePreviewOverlay {
     pub fn target_dimensions(&self, term_width: u16, term_height: u16) -> (u16, u16) {
         let area = Rect::new(0, 0, term_width.max(24), term_height.max(12));
         let (_, img_area, _) = Self::content_areas(area);
-        let max_cols = img_area.width.max(12);
-        let max_rows = img_area.height.max(6);
-        let base_cols = max_cols.saturating_sub(2).max(12).min(max_cols);
-        let base_rows = max_rows.saturating_sub(1).max(6).min(max_rows);
-        let scaled_cols =
-            ((base_cols as u32 * self.zoom_pct as u32) / 100).clamp(8, max_cols as u32) as u16;
-        let scaled_rows =
-            ((base_rows as u32 * self.zoom_pct as u32) / 100).clamp(4, max_rows as u32) as u16;
-        (scaled_cols, scaled_rows)
+        let inner_w = img_area.width.max(12);
+        let inner_h = img_area.height.max(6);
+        let base_cols = inner_w.saturating_sub(2).max(12).min(inner_w);
+        let max_cols = inner_w.saturating_mul(2).max(base_cols).min(240);
+        let scaled_cols = ((base_cols as u32 * self.zoom_pct as u32) / 100)
+            .clamp(8, max_cols as u32) as u16;
+        // Pass `scrollable_max_rows >= scaled_cols` so `img_preview` fits tall images to width
+        // and lets them scroll vertically immediately at 100% zoom.
+        let scrollable_max_rows = ((inner_h as u32 * 4 * self.zoom_pct as u32) / 100)
+            .max(scaled_cols as u32)
+            .clamp(6, 240) as u16;
+        (scaled_cols, scrollable_max_rows)
     }
 
     pub fn next_image(&mut self) {
         if !self.items.is_empty() {
             self.index = (self.index + 1) % self.items.len();
+            self.scroll_y = 0;
+            self.scroll_x = 0;
             self.error = None;
         }
     }
@@ -213,6 +228,8 @@ impl ImagePreviewOverlay {
     pub fn prev_image(&mut self) {
         if !self.items.is_empty() {
             self.index = (self.index + self.items.len() - 1) % self.items.len();
+            self.scroll_y = 0;
+            self.scroll_x = 0;
             self.error = None;
         }
     }
@@ -224,11 +241,15 @@ impl ImagePreviewOverlay {
 
     pub fn zoom_out(&mut self) {
         self.zoom_pct = self.zoom_pct.saturating_sub(25).max(25);
+        self.scroll_y = 0;
+        self.scroll_x = 0;
         self.fit_to_window = self.zoom_pct == 100;
     }
 
     pub fn reset_zoom(&mut self) {
         self.zoom_pct = 100;
+        self.scroll_y = 0;
+        self.scroll_x = 0;
         self.fit_to_window = true;
     }
 
@@ -246,6 +267,8 @@ impl ImagePreviewOverlay {
     pub fn cycle_protocol(&mut self) -> TerminalImageProtocol {
         self.protocol = self.protocol.next_manual();
         self.protocol_overridden = true;
+        self.scroll_y = 0;
+        self.scroll_x = 0;
         self.error = None;
         self.protocol
     }
@@ -271,6 +294,38 @@ impl ImagePreviewOverlay {
         None
     }
 
+    /// Computes viewport geometry `(avail_w, avail_h, show_scrollbar, max_scroll_x, max_scroll_y)` for a rendered image.
+    fn viewport_layout(
+        &self,
+        img_area: Rect,
+        rendered: &RenderedTerminalImage,
+    ) -> (u16, u16, bool, u16, u16) {
+        let is_pixel = rendered.protocol.is_pixel() && rendered.pixel_payload.is_some();
+        let total_rows = if is_pixel {
+            rendered.rows
+        } else {
+            rendered.lines.len() as u16
+        };
+        let total_cols = rendered.cols;
+        let avail_h = if is_pixel
+            && !self.cell_px_exact
+            && rendered.protocol == TerminalImageProtocol::Sixel
+        {
+            img_area.height.saturating_sub(1).max(1)
+        } else {
+            img_area.height
+        };
+        let show_scrollbar = total_rows > avail_h && img_area.width > 2;
+        let avail_w = if show_scrollbar {
+            img_area.width.saturating_sub(1)
+        } else {
+            img_area.width
+        };
+        let max_scroll_y = total_rows.saturating_sub(avail_h);
+        let max_scroll_x = total_cols.saturating_sub(avail_w);
+        (avail_w, avail_h, show_scrollbar, max_scroll_x, max_scroll_y)
+    }
+
     /// Computes the synchronized pixel placement descriptor if the active protocol is pixel-based and cached.
     pub fn pending_pixel_graphic(
         &self,
@@ -284,12 +339,36 @@ impl ImagePreviewOverlay {
         if !rendered.protocol.is_pixel() || rendered.pixel_payload.is_none() {
             return None;
         }
-        let rect = Self::placement_rect(area, rendered.cols, rendered.rows);
-        if rect.width == 0 || rect.height == 0 {
+        let (_, img_area, _) = Self::content_areas(area);
+        if img_area.width == 0 || img_area.height == 0 {
             return None;
         }
+        let (avail_w, avail_h, _, max_scroll_x, max_scroll_y) =
+            self.viewport_layout(img_area, rendered);
+        let sx = self.scroll_x.min(max_scroll_x);
+        let sy = self.scroll_y.min(max_scroll_y);
+        let draw_w = rendered.cols.saturating_sub(sx).min(avail_w);
+        let draw_h = rendered.rows.saturating_sub(sy).min(avail_h);
+        if draw_w == 0 || draw_h == 0 {
+            return None;
+        }
+        let x_pad = avail_w.saturating_sub(draw_w) / 2;
+        let y_pad = avail_h.saturating_sub(draw_h) / 2;
+        let rect = Rect::new(
+            img_area.x.saturating_add(x_pad),
+            img_area.y.saturating_add(y_pad),
+            draw_w,
+            draw_h,
+        );
+        let needs_crop =
+            sx > 0 || sy > 0 || rendered.cols > avail_w || rendered.rows > avail_h;
+        let effective_key = if needs_crop {
+            format!("{cache_key}#crop:{sx},{sy},{avail_w},{avail_h}")
+        } else {
+            cache_key
+        };
         Some(PendingPixelGraphic {
-            cache_key,
+            cache_key: effective_key,
             rect,
             protocol: rendered.protocol,
         })
@@ -302,6 +381,47 @@ impl ImagePreviewOverlay {
             | Action::Input('q')
             | Action::Input('v')
             | Action::Quit => OverlayOutcome::Close,
+            Action::MoveUp | Action::Input('k') => {
+                self.scroll_y = self.scroll_y.saturating_sub(2);
+                OverlayOutcome::Handled
+            }
+            Action::MoveDown | Action::Input('j') => {
+                self.scroll_y = self.scroll_y.saturating_add(2);
+                OverlayOutcome::Handled
+            }
+            Action::PageUp => {
+                self.scroll_y = self.scroll_y.saturating_sub(10);
+                OverlayOutcome::Handled
+            }
+            Action::PageDown => {
+                self.scroll_y = self.scroll_y.saturating_add(10);
+                OverlayOutcome::Handled
+            }
+            Action::ScrollUp => {
+                self.scroll_y = self.scroll_y.saturating_sub(3);
+                OverlayOutcome::Handled
+            }
+            Action::ScrollDown => {
+                self.scroll_y = self.scroll_y.saturating_add(3);
+                OverlayOutcome::Handled
+            }
+            Action::GoTop | Action::CursorHome | Action::Input('g') => {
+                self.scroll_y = 0;
+                self.scroll_x = 0;
+                OverlayOutcome::Handled
+            }
+            Action::GoBottom | Action::CursorEnd | Action::Input('G') => {
+                self.scroll_y = u16::MAX;
+                OverlayOutcome::Handled
+            }
+            Action::Input('h') | Action::CursorLeft => {
+                self.scroll_x = self.scroll_x.saturating_sub(4);
+                OverlayOutcome::Handled
+            }
+            Action::Input('l') | Action::CursorRight => {
+                self.scroll_x = self.scroll_x.saturating_add(4);
+                OverlayOutcome::Handled
+            }
             Action::Input('[') | Action::MoveLeft => {
                 self.prev_image();
                 OverlayOutcome::Dispatch(Action::LoadPreviewImage)
@@ -336,12 +456,13 @@ impl ImagePreviewOverlay {
             Action::Input('o') | Action::Input('O') | Action::OpenInBrowser => {
                 OverlayOutcome::Dispatch(Action::OpenInBrowser)
             }
+            Action::LoadPreviewImage => OverlayOutcome::Dispatch(Action::LoadPreviewImage),
             _ => OverlayOutcome::Handled,
         }
     }
 
     pub fn draw(
-        &self,
+        &mut self,
         frame: &mut Frame,
         area: Rect,
         app: &AppState,
@@ -353,20 +474,28 @@ impl ImagePreviewOverlay {
 
     /// Draws the image preview modal and returns any pending synchronized pixel graphic placement.
     pub fn draw_with_pending(
-        &self,
+        &mut self,
         frame: &mut Frame,
         area: Rect,
         app: &AppState,
         ui: &UiState,
-        _hitmap: &mut HitMap,
+        hitmap: &mut HitMap,
     ) -> Option<PendingPixelGraphic> {
         let theme = &ui.theme;
         let rect = Self::modal_rect(area);
         frame.render_widget(Clear, rect);
+        hitmap.add(rect, HitTarget::OverlayBody);
 
         let modal_style = Style::default().bg(theme.card_bg).fg(theme.fg);
+        let close_label = "[✕ Esc]";
+        let close_w = close_label.width() as u16;
+        let show_close_pill = rect.width > close_w + 4;
+        let title_budget = rect
+            .width
+            .saturating_sub(2 + if show_close_pill { close_w + 2 } else { 0 })
+            as usize;
 
-        let Some(cur) = self.current() else {
+        let Some(cur) = self.current().cloned() else {
             let block = Block::default()
                 .borders(Borders::ALL)
                 .border_type(BorderType::Rounded)
@@ -377,6 +506,14 @@ impl ImagePreviewOverlay {
                 Paragraph::new("No image attachments to display").block(block),
                 rect,
             );
+            if show_close_pill {
+                let close_x = rect.right().saturating_sub(close_w + 1);
+                frame.render_widget(
+                    Paragraph::new(Span::styled(close_label, modal_style)),
+                    Rect::new(close_x, rect.y, close_w, 1),
+                );
+                hitmap.add_line(close_x, rect.y, close_w, HitTarget::OverlayClose);
+            }
             return None;
         };
 
@@ -407,12 +544,22 @@ impl ImagePreviewOverlay {
             .border_type(BorderType::Rounded)
             .style(modal_style)
             .title(Line::from(Span::styled(
-                truncate_width(&title, rect.width.saturating_sub(2) as usize),
+                truncate_width(&title, title_budget),
                 theme.title(true),
             )))
             .border_style(theme.border_style(true));
         let inner = block.inner(rect);
         frame.render_widget(block, rect);
+
+        if show_close_pill {
+            let close_x = rect.right().saturating_sub(close_w + 1);
+            frame.render_widget(
+                Paragraph::new(Span::styled(close_label, modal_style)),
+                Rect::new(close_x, rect.y, close_w, 1),
+            );
+            hitmap.add_line(close_x, rect.y, close_w, HitTarget::OverlayClose);
+        }
+
         if inner.width == 0 || inner.height < 2 {
             return None;
         }
@@ -465,16 +612,46 @@ impl ImagePreviewOverlay {
         let mut pending = None;
 
         if let Some((cache_key, rendered)) = cached_entry {
-            let target_rect = Self::placement_rect(area, rendered.cols, rendered.rows);
-            if rendered.protocol.is_pixel() && rendered.pixel_payload.is_some() {
+            let (avail_w, avail_h, show_scrollbar, max_scroll_x, max_scroll_y) =
+                self.viewport_layout(img_area, rendered);
+            self.scroll_y = self.scroll_y.min(max_scroll_y);
+            self.scroll_x = self.scroll_x.min(max_scroll_x);
+            let sx = self.scroll_x;
+            let sy = self.scroll_y;
+
+            let is_pixel = rendered.protocol.is_pixel() && rendered.pixel_payload.is_some();
+            let total_rows = if is_pixel {
+                rendered.rows
+            } else {
+                rendered.lines.len() as u16
+            };
+            let draw_w = rendered.cols.saturating_sub(sx).min(avail_w);
+            let draw_h = total_rows.saturating_sub(sy).min(avail_h);
+            let x_pad = avail_w.saturating_sub(draw_w) / 2;
+            let y_pad = avail_h.saturating_sub(draw_h) / 2;
+            let target_rect = Rect::new(
+                img_area.x.saturating_add(x_pad),
+                img_area.y.saturating_add(y_pad),
+                draw_w,
+                draw_h,
+            );
+
+            if is_pixel {
                 if target_rect.width > 0 && target_rect.height > 0 {
+                    let needs_crop =
+                        sx > 0 || sy > 0 || rendered.cols > avail_w || rendered.rows > avail_h;
+                    let effective_key = if needs_crop {
+                        format!("{cache_key}#crop:{sx},{sy},{avail_w},{avail_h}")
+                    } else {
+                        cache_key
+                    };
                     pending = Some(PendingPixelGraphic {
-                        cache_key: cache_key.clone(),
+                        cache_key: effective_key.clone(),
                         rect: target_rect,
                         protocol: rendered.protocol,
                     });
                     if self.active_pixel_graphic.as_ref()
-                        == Some(&(cache_key, target_rect, rendered.protocol))
+                        == Some(&(effective_key, target_rect, rendered.protocol))
                     {
                         let buf = frame.buffer_mut();
                         for y in target_rect.top()..target_rect.bottom() {
@@ -486,8 +663,26 @@ impl ImagePreviewOverlay {
                         }
                     }
                 }
-            } else {
-                frame.render_widget(Paragraph::new(rendered.lines.clone()), target_rect);
+            } else if target_rect.width > 0 && target_rect.height > 0 {
+                frame.render_widget(
+                    Paragraph::new(rendered.lines.clone()).scroll((sy, sx)),
+                    target_rect,
+                );
+            }
+
+            if show_scrollbar {
+                let sb_area = Rect::new(
+                    img_area.right().saturating_sub(1),
+                    img_area.y,
+                    1,
+                    img_area.height,
+                );
+                let mut sb_state = ScrollbarState::new(max_scroll_y.saturating_add(1) as usize)
+                    .position(sy as usize);
+                let scrollbar = Scrollbar::new(ScrollbarOrientation::VerticalRight)
+                    .thumb_style(Style::default().fg(theme.accent))
+                    .track_style(theme.muted_style());
+                frame.render_stateful_widget(scrollbar, sb_area, &mut sb_state);
             }
         } else if let Some(err) = &self.error {
             frame.render_widget(
@@ -507,7 +702,7 @@ impl ImagePreviewOverlay {
         }
 
         let footer =
-            " [/]: Prev/Next   +/- (0/f): Zoom/Fit   p: Protocol   d: Download   o: Browser   Esc/q/v: Close ";
+            " j/k/Wheel: Scroll   [/]: Prev/Next   +/- (0/f): Zoom/Fit   p: Protocol   d: Download   o: Browser   Esc/q/v: Close ";
         frame.render_widget(
             Paragraph::new(Span::styled(
                 truncate_width(footer, footer_area.width as usize),
@@ -728,6 +923,7 @@ mod tests {
                 protocol: proto,
                 lines: Vec::new(),
                 pixel_payload: Some("\x1bP0;1;q\"1;1;10;10#0;2;100;0;0#0!10~\x1b\\".to_string()),
+                scroll_backing: None,
             },
         );
 
@@ -772,5 +968,116 @@ mod tests {
         assert_eq!(unskipped_border, 1);
 
         let _ = app.sync_ctrl.request(crate::sync::SyncCommand::Shutdown);
+    }
+
+    #[tokio::test]
+    async fn tall_image_scrolls_clamps_renders_scrollbar_and_close_pill() {
+        use image::{DynamicImage, ImageBuffer, ImageFormat, Rgba, RgbaImage};
+        use std::io::Cursor;
+
+        let img: RgbaImage = ImageBuffer::from_fn(400, 2000, |x, y| {
+            Rgba([
+                ((x * 255) / 400) as u8,
+                ((y * 255) / 2000) as u8,
+                160,
+                255,
+            ])
+        });
+        let mut buf = Cursor::new(Vec::new());
+        DynamicImage::ImageRgba8(img)
+            .write_to(&mut buf, ImageFormat::Png)
+            .unwrap();
+        let png = buf.into_inner();
+
+        let area = Rect::new(0, 0, 100, 30);
+        let atts = sample_attachments();
+
+        for proto in [TerminalImageProtocol::Halfblock, TerminalImageProtocol::Sixel] {
+            let (mut app, ui) = make_test_app_and_ui();
+            let caps = TerminalGraphicsCaps {
+                protocol: proto,
+                cell_px: (8, 16),
+                cell_px_exact: true,
+            };
+            let mut overlay = ImagePreviewOverlay::from_attachments("ATL-99", &atts, Some(1))
+                .unwrap()
+                .with_graphics_caps(caps);
+            let (cols, rows) = overlay.target_dimensions(area.width, area.height);
+            let rendered =
+                img_preview::decode_and_render_for_protocol(&png, cols, rows, (25, 25, 25), caps)
+                    .unwrap();
+            let cur = overlay.current().unwrap();
+            let base_key = img_preview::preview_cache_key(&cur.id, cols, rows, proto);
+            let total_rows = if proto == TerminalImageProtocol::Halfblock {
+                rendered.lines.len() as u16
+            } else {
+                rendered.rows
+            };
+            let (_, img_area, _) = ImagePreviewOverlay::content_areas(area);
+            let expected_max_scroll = total_rows.saturating_sub(img_area.height);
+            assert!(expected_max_scroll > 0, "expected scrollable tall image for {proto:?}");
+
+            app.image_cache.insert(base_key.clone(), rendered);
+
+            let mut terminal = Terminal::new(TestBackend::new(area.width, area.height)).unwrap();
+            let mut hitmap = HitMap::new();
+            let mut pg0 = None;
+            terminal
+                .draw(|frame| {
+                    pg0 = overlay.draw_with_pending(frame, area, &app, &ui, &mut hitmap);
+                })
+                .unwrap();
+
+            // Modal registers OverlayBody and clickable [✕ Esc] close pill
+            assert!(hitmap.region_of(HitTarget::OverlayBody).is_some());
+            assert!(hitmap.region_of(HitTarget::OverlayClose).is_some());
+
+            // Scrollbar column rendered on right-most column of img_area
+            let sb_x = img_area.right() - 1;
+            let has_sb = (img_area.top()..img_area.bottom()).any(|y| {
+                !terminal.backend().buffer()[(sb_x, y)]
+                    .symbol()
+                    .trim()
+                    .is_empty()
+            });
+            assert!(has_sb, "expected scrollbar for tall {proto:?} image");
+
+            if proto == TerminalImageProtocol::Sixel {
+                let p = pg0.expect("expected Sixel pending graphic");
+                assert!(
+                    p.cache_key.starts_with(&format!("{base_key}#crop:0,0,")),
+                    "unexpected crop key: {}",
+                    p.cache_key
+                );
+            }
+
+            // Scroll down via j / wheel / PageDown / G and clamp in-place
+            assert_eq!(overlay.handle(&Action::Input('j')), OverlayOutcome::Handled);
+            assert_eq!(overlay.handle(&Action::ScrollDown), OverlayOutcome::Handled);
+            assert_eq!(overlay.handle(&Action::GoBottom), OverlayOutcome::Handled);
+            assert_eq!(overlay.scroll_y, u16::MAX);
+
+            let mut pg_bottom = None;
+            terminal
+                .draw(|frame| {
+                    hitmap.clear();
+                    pg_bottom = overlay.draw_with_pending(frame, area, &app, &ui, &mut hitmap);
+                })
+                .unwrap();
+            assert_eq!(overlay.scroll_y, expected_max_scroll);
+
+            if proto == TerminalImageProtocol::Sixel {
+                let p = pg_bottom.expect("expected Sixel pending graphic at bottom");
+                assert!(p
+                    .cache_key
+                    .starts_with(&format!("{base_key}#crop:0,{expected_max_scroll},")));
+            }
+
+            // Wheel up responds immediately from clamped bottom
+            overlay.handle(&Action::ScrollUp);
+            assert_eq!(overlay.scroll_y, expected_max_scroll.saturating_sub(3));
+
+            let _ = app.sync_ctrl.request(crate::sync::SyncCommand::Shutdown);
+        }
     }
 }

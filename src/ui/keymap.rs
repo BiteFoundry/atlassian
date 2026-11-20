@@ -37,6 +37,7 @@ pub enum Action {
     OpenFilePicker,
     DownloadAttachment,
     OpenImagePreview,
+    OpenHtmlPreview,
     OpenCrossLinks,
     OpenLinks,
     ToggleHrefDisplay,
@@ -197,15 +198,19 @@ impl Keymap {
             };
         }
 
-        // Non-text overlay mode (e.g. TransitionOverlay, CrossLinkOverlay, ImagePreview, Confirm, Help).
+        // Non-text overlay mode (e.g. TransitionOverlay, CrossLinkOverlay, ImagePreview, HtmlPreview, Confirm, Help).
         if has_overlay {
             return match key.code {
+                KeyCode::Tab => Some(Action::NextField),
+                KeyCode::BackTab => Some(Action::PrevField),
                 KeyCode::Up | KeyCode::Char('k') => Some(Action::MoveUp),
                 KeyCode::Down | KeyCode::Char('j') => Some(Action::MoveDown),
                 KeyCode::Left | KeyCode::Char('h') => Some(Action::MoveLeft),
                 KeyCode::Right | KeyCode::Char('l') => Some(Action::MoveRight),
                 KeyCode::PageUp => Some(Action::PageUp),
                 KeyCode::PageDown => Some(Action::PageDown),
+                KeyCode::Home => Some(Action::GoTop),
+                KeyCode::End => Some(Action::GoBottom),
                 KeyCode::Enter => Some(Action::Activate),
                 KeyCode::Backspace => Some(Action::CloseOverlay),
                 KeyCode::Char('y') | KeyCode::Char('Y') => Some(Action::ConfirmYes),
@@ -287,6 +292,7 @@ impl Keymap {
             KeyCode::Char('u') => Some(Action::OpenLinks),
             KeyCode::Char('d') => Some(Action::DownloadAttachment),
             KeyCode::Char('v') => Some(Action::OpenImagePreview),
+            KeyCode::Char('H') => Some(Action::OpenHtmlPreview),
             KeyCode::Char('g') => Some(Action::OpenCrossLinks),
             KeyCode::Char('o') => Some(Action::OpenInBrowser),
             KeyCode::Char('J') => Some(Action::FocusJql),
@@ -408,6 +414,22 @@ mod tests {
         assert_eq!(
             km.resolve(key(KeyCode::Char('h')), WorkspaceTab::Confluence, PaneFocus::Nav, false, false),
             Some(Action::CollapseNode)
+        );
+        assert_eq!(
+            km.resolve(key(KeyCode::Char('H')), WorkspaceTab::Confluence, PaneFocus::Main, false, false),
+            Some(Action::OpenHtmlPreview)
+        );
+        assert_eq!(
+            km.resolve(key(KeyCode::Char('H')), WorkspaceTab::Issues, PaneFocus::Main, false, false),
+            Some(Action::OpenHtmlPreview)
+        );
+        assert_eq!(
+            km.resolve(key(KeyCode::Tab), WorkspaceTab::Confluence, PaneFocus::Main, true, false),
+            Some(Action::NextField)
+        );
+        assert_eq!(
+            km.resolve(key(KeyCode::BackTab), WorkspaceTab::Confluence, PaneFocus::Main, true, false),
+            Some(Action::PrevField)
         );
     }
 

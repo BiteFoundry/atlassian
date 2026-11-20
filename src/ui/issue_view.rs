@@ -77,15 +77,42 @@ fn draw_jql_bar(frame: &mut Frame, area: Rect, _app: &AppState, ui: &mut UiState
             Span::styled("   (Esc to close)", theme.muted_style().patch(bar_surface)),
         ])
     } else {
+        let prefix = " JQL> ";
         let mut spans = vec![
-            Span::styled(" JQL> ", theme.accent_style().patch(bar_surface)),
+            Span::styled(prefix, theme.accent_style().patch(bar_surface)),
             Span::styled(ui.issue_ui.jql.text.clone(), bar_surface),
         ];
+        let mut cx = input_rect
+            .x
+            .saturating_add(unicode_width::UnicodeWidthStr::width(prefix) as u16);
+        let prefix_w = unicode_width::UnicodeWidthStr::width(prefix) as u16;
+        if input_rect.x.saturating_add(prefix_w) <= input_rect.right() {
+            ui.hitmap.add_line(
+                input_rect.x,
+                input_rect.y,
+                prefix_w,
+                HitTarget::Button(ButtonId::FocusJql),
+            );
+        }
+        cx = cx.saturating_add(unicode_width::UnicodeWidthStr::width(ui.issue_ui.jql.text.as_str()) as u16);
         if jql_focused {
             spans.push(Span::styled("▏", theme.accent_style().patch(bar_surface)));
         } else {
+            let sep = "   ";
+            let edit_lbl = "[J] Edit";
+            let tail = " · [Enter] Run · [/] Filter";
+            let edit_x = cx.saturating_add(sep.len() as u16);
+            let edit_w = edit_lbl.len() as u16;
+            if edit_x.saturating_add(edit_w) <= input_rect.right() {
+                ui.hitmap.add_line(
+                    edit_x,
+                    input_rect.y,
+                    edit_w,
+                    HitTarget::Button(ButtonId::FocusJql),
+                );
+            }
             spans.push(Span::styled(
-                "   [J] Edit · [Enter] Run · [/] Filter",
+                format!("{sep}{edit_lbl}{tail}"),
                 theme.muted_style().patch(bar_surface),
             ));
         }
@@ -532,6 +559,7 @@ fn register_issue_action_buttons(
             ("[a]Assign", ButtonId::Assignee),
             ("[c]Comment", ButtonId::Comment),
             ("[e]Edit", ButtonId::Edit),
+            ("[H: HTML]", ButtonId::HtmlPreview),
             ("[g]Links", ButtonId::CrossLinks),
             ("[v]Img", ButtonId::ImagePreview),
             ("[o]Open", ButtonId::OpenBrowser),
@@ -544,6 +572,7 @@ fn register_issue_action_buttons(
             ("[c]Comment", ButtonId::Comment),
             ("[e]Edit", ButtonId::Edit),
             ("[n]New", ButtonId::NewItem),
+            ("[H: HTML]", ButtonId::HtmlPreview),
             ("[u]Attach", ButtonId::UploadAttachment),
             ("[v]Image", ButtonId::ImagePreview),
             ("[g]Links", ButtonId::CrossLinks),
@@ -600,9 +629,9 @@ pub fn build_issue_inspector_lines(
 
     // 3. Action hint bar
     let action_bar = if compact {
-        " [m]Move [i]Me [a]Assign [c]Comment [e]Edit [g]Links [v]Img [o]Open"
+        " [m]Move [i]Me [a]Assign [c]Comment [e]Edit [H: HTML] [g]Links [v]Img [o]Open"
     } else {
-        " [m]Transition [i]Assign Me [a]Assignee [c]Comment [e]Edit [n]New [u]Attach [v]Image [g]Links [o]Open"
+        " [m]Transition [i]Assign Me [a]Assignee [c]Comment [e]Edit [n]New [H: HTML] [u]Attach [v]Image [g]Links [o]Open"
     };
     let action_style = if theme.no_color {
         Style::default().add_modifier(Modifier::DIM)

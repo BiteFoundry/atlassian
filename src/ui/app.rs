@@ -37,6 +37,7 @@ use crate::{
         overlays::{
             assignee::AssigneeOverlay,
             comment::{CommentOverlay, CommentTarget},
+            html_preview::HtmlPreviewOverlay,
             issue_form::IssueFormOverlay,
             page_form::PageFormOverlay,
             path_input::{PathInputOverlay, UploadTarget},
@@ -304,6 +305,17 @@ pub enum UiMsg {
         cache_key: String,
         rendered: Result<RenderedTerminalImage, String>,
     },
+    HtmlAttachmentLoaded {
+        title: String,
+        source_url: String,
+        result: Result<String, String>,
+    },
+    PreviewImageSniffedAsHtml {
+        title: String,
+        source_url: String,
+        html: String,
+    },
+    HtmlServed(Result<String, String>),
     AttachmentDownloaded(Result<DownloadedFile, String>),
     AttachmentUploaded {
         issue_key: Option<String>,
@@ -467,6 +479,11 @@ pub struct AppState {
     /// Decoded image cache (`"{att_id}:{cols}x{rows}[:{protocol}]"` -> `RenderedTerminalImage`).
     pub image_cache: HashMap<String, RenderedTerminalImage>,
 
+    /// Lazy localhost Axum server for viewing HTML documents in the default browser (`0 MB` idle).
+    pub html_server: bitefoundry_html::NativeHtmlServer,
+    /// Last localhost URL returned by `html_server.serve_html`.
+    pub last_served_html_url: Option<String>,
+
     /// Persistent unsent drafts (`drafts.json`) for comments, issues, and Confluence pages.
     pub drafts: DraftStore,
 
@@ -534,6 +551,8 @@ impl AppState {
             cache_counts: CacheCounts::default(),
             nav_history: Vec::new(),
             image_cache: HashMap::new(),
+            html_server: bitefoundry_html::NativeHtmlServer::new(),
+            last_served_html_url: None,
             drafts,
             config_path_override: None,
             drafts_path_override: None,
@@ -2519,17 +2538,86 @@ impl AppState {
             _ => img_preview::DEFAULT_PREVIEW_BG_RGB,
         };
         tokio::spawn(async move {
-            let res = match client.fetch_attachment_bytes(&att).await {
+            match client.fetch_attachment_bytes(&att).await {
                 Ok(bytes) => {
-                    img_preview::decode_and_render_for_protocol(&bytes, cols, rows, bg_rgb, caps)
-                        .map_err(|e| e.to_string())
+                    let mime = (!att.mime_type.trim().is_empty()).then_some(att.mime_type.as_str());
+                    let fname = (!att.filename.trim().is_empty()).then_some(att.filename.as_str());
+                    if bitefoundry_html::sniff_content_kind(mime, fname, Some(&bytes))
+                        == bitefoundry_html::ContentKind::Html
+                    {
+                        let html = String::from_utf8_lossy(&bytes).into_owned();
+                        let _ = tx.send(UiMsg::PreviewImageSniffedAsHtml {
+                            title: att.filename.clone(),
+                            source_url: att.content_url.clone(),
+                            html,
+                        });
+                        return;
+                    }
+                    let res =
+                        img_preview::decode_and_render_for_protocol(&bytes, cols, rows, bg_rgb, caps)
+                            .map_err(|e| e.to_string());
+                    let _ = tx.send(UiMsg::ImageLoaded {
+                        cache_key,
+                        rendered: res,
+                    });
                 }
-                Err(e) => Err(e.to_string()),
+                Err(e) => {
+                    let _ = tx.send(UiMsg::ImageLoaded {
+                        cache_key,
+                        rendered: Err(e.to_string()),
+                    });
+                }
+            }
+        });
+    }
+
+    /// Downloads an `.html`/`.htm` attachment asynchronously and feeds it into `Overlay::HtmlPreview`.
+    pub fn request_load_html_attachment(
+        &self,
+        ui: &mut UiState,
+        title: String,
+        att: AttachmentItem,
+    ) {
+        if tokio::runtime::Handle::try_current().is_err() {
+            return;
+        }
+        let client = self.client.clone();
+        let tx = self.ui_tx.clone();
+        let source_url = att.content_url.clone();
+        ui.tasks.begin(format!("HTML: {}", att.filename));
+        tokio::spawn(async move {
+            let result = match client.fetch_attachment_bytes(&att).await {
+                Ok(bytes) => Ok(String::from_utf8_lossy(&bytes).into_owned()),
+                Err(err) => Err(err.to_string()),
             };
-            let _ = tx.send(UiMsg::ImageLoaded {
-                cache_key,
-                rendered: res,
+            let _ = tx.send(UiMsg::HtmlAttachmentLoaded {
+                title,
+                source_url,
+                result,
             });
+        });
+    }
+
+    /// Lazily starts `NativeHtmlServer` and serves the given HTML document for external browser viewing.
+    pub fn request_serve_html_in_browser(
+        &self,
+        ui: &mut UiState,
+        title: String,
+        html: String,
+    ) {
+        if tokio::runtime::Handle::try_current().is_err() {
+            ui.error("Async runtime unavailable for native HTML server");
+            return;
+        }
+        let server = self.html_server.clone();
+        let tx = self.ui_tx.clone();
+        ui.info("Serving HTML locally…");
+        tokio::spawn(async move {
+            let res = server
+                .serve_html(&title, &html)
+                .await
+                .map_err(|e| e.to_string());
+            let _ = tx.send(UiMsg::HtmlServed(res));
         });
     }
 
@@ -2939,6 +3027,63 @@ impl AppState {
                     if let Some(Overlay::ImagePreview(ov)) = ui.overlays.last_mut() {
                         ov.error = Some(err);
                     }
+                }
+            },
+            UiMsg::HtmlAttachmentLoaded {
+                title,
+                source_url,
+                result,
+            } => {
+                let task_name = title
+                    .rsplit(" — ")
+                    .next()
+                    .unwrap_or(&title);
+                ui.tasks.finish(&format!("HTML: {task_name}"), None);
+                if let Some(Overlay::HtmlPreview(ov)) = ui.overlays.last_mut() {
+                    if !source_url.is_empty() {
+                        ov.source_url = source_url;
+                    }
+                    ov.set_loaded(result);
+                } else if let Ok(html) = result {
+                    let mut ov = HtmlPreviewOverlay::new(title, html);
+                    ov.source_url = source_url;
+                    ui.push_overlay(Overlay::HtmlPreview(ov));
+                } else if let Err(err) = result {
+                    ui.error(format!("Failed to load HTML attachment: {err}"));
+                }
+            }
+            UiMsg::PreviewImageSniffedAsHtml {
+                title,
+                source_url,
+                html,
+            } => {
+                if matches!(ui.overlays.last(), Some(Overlay::ImagePreview(_))) {
+                    ui.pop_overlay();
+                }
+                let mut ov = HtmlPreviewOverlay::new(title, html);
+                ov.source_url = source_url;
+                ui.push_overlay(Overlay::HtmlPreview(ov));
+                ui.info("Detected HTML content — opened in interactive HTML Preview");
+            }
+            UiMsg::HtmlServed(res) => match res {
+                Ok(url) => {
+                    self.last_served_html_url = Some(url.clone());
+                    if let Some(Overlay::HtmlPreview(ov)) = ui.overlays.last_mut() {
+                        ov.last_served_url = Some(url.clone());
+                        if let Some(sess) = ov.session_mut() {
+                            sess.last_status = Some(format!("Served at {url}"));
+                        }
+                    }
+                    if !cfg!(test) {
+                        if let Err(err) = open::that(&url) {
+                            ui.error(format!("Served at {url} (browser open failed: {err})"));
+                            return;
+                        }
+                    }
+                    ui.success(format!("Opened HTML in browser: {url}"));
+                }
+                Err(err) => {
+                    ui.error(format!("Failed to serve HTML locally: {err}"));
                 }
             },
             UiMsg::AttachmentDownloaded(res) => match res {

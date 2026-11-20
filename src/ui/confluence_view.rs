@@ -362,6 +362,7 @@ fn register_wiki_action_buttons(x: u16, row: u16, width: u16, hitmap: &mut HitMa
         ("[n]Child Page", ButtonId::NewItem),
         ("[c]Comment", ButtonId::Comment),
         ("[t]TOC", ButtonId::ToggleToc),
+        ("[H: HTML]", ButtonId::HtmlPreview),
         ("[u]Upload", ButtonId::UploadAttachment),
         ("[d]Download", ButtonId::DownloadAttachment),
         ("[v]Image", ButtonId::ImagePreview),
@@ -445,7 +446,7 @@ fn build_wiki_reader_lines(
     };
     lines.push(Line::from(Span::styled(
         truncate_width(
-            " [e]Edit [n]Child Page [c]Comment [t]TOC [u]Upload [d]Download [v]Image [g]Links [o]Open",
+            " [e]Edit [n]Child Page [c]Comment [t]TOC [H: HTML] [u]Upload [d]Download [v]Image [g]Links [o]Open",
             w,
         ),
         action_style,
@@ -587,15 +588,16 @@ fn draw_toc_drawer(frame: &mut Frame, area: Rect, app: &AppState, ui: &mut UiSta
 
     let hdr_rect = Rect::new(area.x, area.y, area.width, 1);
     let focus_mark = if focused { "▸" } else { " " };
+    let hdr_text = truncate_width(
+        &format!("{focus_mark} Table of Contents [t]"),
+        area.width as usize,
+    );
+    let hdr_w = unicode_width::UnicodeWidthStr::width(hdr_text.as_str()) as u16;
+    ui.hitmap
+        .add_line(hdr_rect.x, hdr_rect.y, hdr_w, HitTarget::Button(ButtonId::ToggleToc));
     frame.render_widget(
-        Paragraph::new(Line::from(Span::styled(
-            truncate_width(
-                &format!("{focus_mark} Table of Contents [t]"),
-                area.width as usize,
-            ),
-            theme.title(focused),
-        )))
-        .style(sidebar_style),
+        Paragraph::new(Line::from(Span::styled(hdr_text, theme.title(focused))))
+            .style(sidebar_style),
         hdr_rect,
     );
     draw_horizontal_hairline(

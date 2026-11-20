@@ -8,6 +8,7 @@ pub mod confirm;
 pub mod context_menu;
 pub mod cross_link;
 pub mod file_picker;
+pub mod html_preview;
 pub mod image_preview;
 pub mod issue_form;
 pub mod links;
@@ -39,7 +40,8 @@ use crate::ui::{
         assignee::AssigneeOverlay, attachments::AttachmentsOverlay,
         command_palette::CommandPalette, comment::CommentOverlay, confirm::ConfirmDialog,
         context_menu::ContextMenuOverlay, cross_link::CrossLinkOverlay,
-        file_picker::FilePickerOverlay, image_preview::ImagePreviewOverlay,
+        file_picker::FilePickerOverlay, html_preview::HtmlPreviewOverlay,
+        image_preview::ImagePreviewOverlay,
         issue_form::IssueFormOverlay, links::LinksOverlay, page_form::PageFormOverlay,
         path_input::PathInputOverlay, settings::SettingsOverlay,
         site_switcher::SiteSwitcherOverlay, transition::TransitionOverlay,
@@ -57,6 +59,7 @@ pub enum OverlayKind {
     CrossLink,
     Links,
     ImagePreview,
+    HtmlPreview,
     PathInput,
     FilePicker,
     CommandPalette,
@@ -76,7 +79,7 @@ pub enum OverlayOutcome {
     CloseAndDispatch(Action),
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub enum Overlay {
     Transition(TransitionOverlay),
     Assignee(AssigneeOverlay),
@@ -86,6 +89,7 @@ pub enum Overlay {
     CrossLink(CrossLinkOverlay),
     Links(LinksOverlay),
     ImagePreview(ImagePreviewOverlay),
+    HtmlPreview(HtmlPreviewOverlay),
     PathInput(PathInputOverlay),
     FilePicker(FilePickerOverlay),
     CommandPalette(CommandPalette),
@@ -108,6 +112,7 @@ impl Overlay {
             Overlay::CrossLink(_) => OverlayKind::CrossLink,
             Overlay::Links(_) => OverlayKind::Links,
             Overlay::ImagePreview(_) => OverlayKind::ImagePreview,
+            Overlay::HtmlPreview(_) => OverlayKind::HtmlPreview,
             Overlay::PathInput(_) => OverlayKind::PathInput,
             Overlay::FilePicker(_) => OverlayKind::FilePicker,
             Overlay::CommandPalette(_) => OverlayKind::CommandPalette,
@@ -149,17 +154,18 @@ impl Overlay {
     }
 
     pub fn accepts_text(&self) -> bool {
-        matches!(
-            self,
+        match self {
+            Overlay::HtmlPreview(o) => o.is_editing_input(),
             Overlay::Assignee(_)
-                | Overlay::IssueForm(_)
-                | Overlay::PageForm(_)
-                | Overlay::Comment(_)
-                | Overlay::PathInput(_)
-                | Overlay::FilePicker(_)
-                | Overlay::CommandPalette(_)
-                | Overlay::SiteSwitcher(_)
-        )
+            | Overlay::IssueForm(_)
+            | Overlay::PageForm(_)
+            | Overlay::Comment(_)
+            | Overlay::PathInput(_)
+            | Overlay::FilePicker(_)
+            | Overlay::CommandPalette(_)
+            | Overlay::SiteSwitcher(_) => true,
+            _ => false,
+        }
     }
 
     /// Returns the `DraftStore` key for overlays that support local draft auto-saving.
@@ -179,6 +185,7 @@ impl Overlay {
             Overlay::IssueForm(o) => o.paste_from_clipboard(),
             Overlay::PageForm(o) => o.paste_from_clipboard(),
             Overlay::Comment(o) => o.paste_from_clipboard(),
+            Overlay::HtmlPreview(o) => o.paste_from_clipboard(),
             Overlay::PathInput(o) => o.paste_from_clipboard(),
             Overlay::FilePicker(o) => o.paste_from_clipboard(),
             Overlay::CommandPalette(o) => o.paste_from_clipboard(),
@@ -204,6 +211,7 @@ impl Overlay {
             | Overlay::PageForm(_)
             | Overlay::Comment(_)
             | Overlay::ImagePreview(_)
+            | Overlay::HtmlPreview(_)
             | Overlay::PathInput(_)
             | Overlay::Help
             | Overlay::Confirm(_) => {}
@@ -220,6 +228,7 @@ impl Overlay {
             Overlay::CrossLink(o) => o.handle(action),
             Overlay::Links(o) => o.handle(action),
             Overlay::ImagePreview(o) => o.handle(action),
+            Overlay::HtmlPreview(o) => o.handle(action),
             Overlay::PathInput(o) => o.handle(action),
             Overlay::FilePicker(o) => o.handle(action),
             Overlay::CommandPalette(o) => o.handle(action),
@@ -238,7 +247,7 @@ impl Overlay {
     }
 
     pub fn draw(
-        &self,
+        &mut self,
         frame: &mut Frame,
         area: Rect,
         app: &AppState,
@@ -254,6 +263,7 @@ impl Overlay {
             Overlay::CrossLink(o) => o.draw(frame, area, app, ui, hitmap),
             Overlay::Links(o) => o.draw(frame, area, app, ui, hitmap),
             Overlay::ImagePreview(o) => o.draw(frame, area, app, ui, hitmap),
+            Overlay::HtmlPreview(o) => o.draw(frame, area, app, ui, hitmap),
             Overlay::PathInput(o) => o.draw(frame, area, app, ui, hitmap),
             Overlay::FilePicker(o) => o.draw(frame, area, app, ui, hitmap),
             Overlay::CommandPalette(o) => o.draw(frame, area, app, ui, hitmap),
@@ -262,7 +272,7 @@ impl Overlay {
             Overlay::ContextMenu(o) => o.draw(frame, area, app, ui, hitmap),
             Overlay::Attachments(o) => o.draw(frame, area, app, ui, hitmap),
             Overlay::Confirm(o) => o.draw(frame, area, app, ui, hitmap),
-            Overlay::Help => draw_help_overlay(frame, area, ui),
+            Overlay::Help => draw_help_overlay(frame, area, ui, hitmap),
         }
     }
 }
@@ -400,7 +410,7 @@ const HELP_SECTIONS: [(&str, &[(&str, &str)]); 4] = [
         &[
             ("Space / → / ←", "Expand (lazy-load) or collapse page tree node"),
             ("t / e / n / c", "Toggle TOC / Edit page / New child page / Comment"),
-            ("A / v / h", "Attachments / Preview images / Toggle inline hrefs"),
+            ("A / v / H / h", "Attachments / Images / HTML Preview / Inline hrefs"),
             ("u / Ctrl+F / d / o", "Link extractor / File picker / Download / Browser"),
             ("p", "Pin or unpin project / space in Directory"),
         ],
@@ -418,7 +428,7 @@ const HELP_SECTIONS: [(&str, &[(&str, &str)]); 4] = [
     ),
 ];
 
-fn draw_help_overlay(frame: &mut Frame, area: Rect, ui: &UiState) {
+fn draw_help_overlay(frame: &mut Frame, area: Rect, ui: &UiState, hitmap: &mut HitMap) {
     let theme = &ui.theme;
     let wide = area.width >= 92;
     let rect = centered_rect(
@@ -431,6 +441,7 @@ fn draw_help_overlay(frame: &mut Frame, area: Rect, ui: &UiState) {
         area.height.saturating_sub(2).min(if wide { 22 } else { 28 }).max(12),
     );
     frame.render_widget(Clear, rect);
+    hitmap.add(rect, crate::ui::hitmap::HitTarget::OverlayBody);
 
     let block = modal_block(" Atlassian TUI Keyboard Shortcuts (?) ", theme, true);
     let inner = block.inner(rect);

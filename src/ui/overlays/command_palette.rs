@@ -78,6 +78,7 @@ impl CommandPalette {
             PaletteEntry { label: "Toggle Inline Link URLs (href)", shortcut: "h", action: Action::ToggleHrefDisplay },
             PaletteEntry { label: "Navigate Back in History", shortcut: "Backspace", action: Action::PopNavHistory },
             PaletteEntry { label: "Preview Image Attachments", shortcut: "v", action: Action::OpenImagePreview },
+            PaletteEntry { label: "Open Interactive HTML Preview", shortcut: "H", action: Action::OpenHtmlPreview },
             PaletteEntry { label: "Browse Attachments", shortcut: "A", action: Action::OpenAttachments },
             PaletteEntry { label: "Pick File to Upload (File Picker)", shortcut: "Ctrl+F", action: Action::OpenFilePicker },
             PaletteEntry { label: "Upload Attachment by Path", shortcut: "", action: Action::UploadAttachment },
