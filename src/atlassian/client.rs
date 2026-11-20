@@ -59,6 +59,7 @@ pub struct AtlassianClient {
     pub(crate) config: AppConfig,
     pub(crate) auth: AuthManager,
     pub(crate) me_cache: Arc<RwLock<Option<UserSummary>>>,
+    pub(crate) space_id_cache: Arc<RwLock<HashMap<String, (String, String)>>>,
     pub(crate) site_id: String,
     pub(crate) cloud_id: Option<String>,
     pub(crate) api_gateway_base: String,
@@ -78,6 +79,7 @@ impl AtlassianClient {
             config,
             auth,
             me_cache: Arc::new(RwLock::new(None)),
+            space_id_cache: Arc::new(RwLock::new(HashMap::new())),
             site_id,
             cloud_id: None,
             api_gateway_base: DEFAULT_OAUTH_API_BASE.to_string(),
@@ -133,6 +135,7 @@ impl AtlassianClient {
             config,
             auth,
             me_cache: Arc::new(RwLock::new(None)),
+            space_id_cache: Arc::new(RwLock::new(HashMap::new())),
             site_id: if site.id.trim().is_empty() {
                 "default".to_string()
             } else {

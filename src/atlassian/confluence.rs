@@ -50,10 +50,18 @@ impl AtlassianClient {
             .map(Vec::as_slice)
             .unwrap_or(&[]);
 
-        Ok(arr
+        let spaces: Vec<SpaceSummary> = arr
             .iter()
             .map(|s| parse_space_summary(s, &conf_root))
-            .collect())
+            .collect();
+        if let Ok(mut cache) = self.space_id_cache.write() {
+            for s in &spaces {
+                if !s.key.trim().is_empty() && !s.id.trim().is_empty() {
+                    cache.insert(s.key.to_ascii_lowercase(), (s.id.clone(), s.key.clone()));
+                }
+            }
+        }
+        Ok(spaces)
     }
 
     pub async fn list_space_root_pages(
@@ -156,6 +164,52 @@ impl AtlassianClient {
                     .collect())
             }
         }
+    }
+
+    /// Lightweight single-request Confluence page revision probe (version, title, updated_at;
+    /// excludes body, labels, attachments, and comments).
+    pub async fn get_page_revision(&self, page_id: &str) -> Result<PageSummary> {
+        let conf_root = self.require_confluence_root()?;
+        let encoded_id = urlencoding::encode(page_id.trim());
+        match self.deployment() {
+            DeploymentKind::Cloud => {
+                let url = format!("{conf_root}/api/v2/pages/{encoded_id}");
+                let val: Value = self.get_json(&url).await?;
+                Ok(parse_cloud_page_summary(&val, &conf_root))
+            }
+            DeploymentKind::DataCenter => {
+                let url = format!(
+                    "{conf_root}/rest/api/content/{encoded_id}?expand=version,space,ancestors"
+                );
+                let val: Value = self.get_json(&url).await?;
+                Ok(parse_dc_page_summary(&val, &conf_root))
+            }
+        }
+    }
+
+    /// Lightweight single-request Confluence page attachments query for panel refresh.
+    pub async fn list_page_attachments(
+        &self,
+        page_id: &str,
+    ) -> Result<Vec<crate::models::AttachmentItem>> {
+        let conf_root = self.require_confluence_root()?;
+        let encoded_id = urlencoding::encode(page_id.trim());
+        let url = match self.deployment() {
+            DeploymentKind::Cloud => format!("{conf_root}/api/v2/pages/{encoded_id}/attachments"),
+            DeploymentKind::DataCenter => {
+                format!("{conf_root}/rest/api/content/{encoded_id}/child/attachment")
+            }
+        };
+        let val: Value = self.get_json(&url).await?;
+        let arr = val
+            .get("results")
+            .and_then(|v| v.as_array())
+            .map(Vec::as_slice)
+            .unwrap_or(&[]);
+        Ok(arr
+            .iter()
+            .map(|a| parse_attachment_item(a, &conf_root))
+            .collect())
     }
 
     pub async fn get_page(&self, page_id: &str) -> Result<PageDetail> {
@@ -675,6 +729,11 @@ impl AtlassianClient {
         let trimmed = space_id_or_key.trim();
         if !trimmed.is_empty() && trimmed.chars().all(|c| c.is_ascii_digit()) {
             return Ok((trimmed.to_string(), None));
+        }
+        if let Ok(cache) = self.space_id_cache.read() {
+            if let Some((id, key)) = cache.get(&trimmed.to_ascii_lowercase()) {
+                return Ok((id.clone(), Some(key.clone())));
+            }
         }
         let spaces = self.list_spaces(250).await?;
         let found = spaces

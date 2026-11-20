@@ -514,6 +514,27 @@ pub struct UpdateCheckResult {
     pub binary_path: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum OpenItemTarget {
+    JiraIssue {
+        site_id: String,
+        key: String,
+    },
+    ConfluencePage {
+        site_id: String,
+        page_id: String,
+    },
+}
+
+impl OpenItemTarget {
+    pub fn site_id(&self) -> &str {
+        match self {
+            Self::JiraIssue { site_id, .. } | Self::ConfluencePage { site_id, .. } => site_id,
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub enum CoreEvent {
     SyncStarted,
@@ -523,15 +544,28 @@ pub enum CoreEvent {
     ProjectsUpdated(Vec<ProjectSummary>),
     BoardsUpdated(Vec<BoardSummary>),
     BoardIssuesUpdated {
+        site_id: String,
         board_id: i64,
         sprint: Option<SprintSummary>,
         issues: Vec<IssueSummary>,
     },
-    IssuesUpdated(Vec<IssueSummary>),
+    IssuesUpdated {
+        site_id: String,
+        issues: Vec<IssueSummary>,
+    },
     SpacesUpdated(Vec<SpaceSummary>),
     SpacePagesUpdated {
+        site_id: String,
         space_key: String,
         pages: Vec<PageSummary>,
+    },
+    OpenIssueRevision {
+        site_id: String,
+        summary: IssueSummary,
+    },
+    OpenPageRevision {
+        site_id: String,
+        summary: PageSummary,
     },
     SyncError(String),
 }

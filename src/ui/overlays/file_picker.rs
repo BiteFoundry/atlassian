@@ -643,7 +643,9 @@ mod tests {
         assert_eq!(ov.mode, FilePickerMode::Zoxide);
         assert_eq!(ov.visible_zoxide_dirs().len(), 2);
 
-        ov.handle(&Action::Input('b'));
+        for ch in d2.to_string_lossy().chars() {
+            ov.handle(&Action::Input(ch));
+        }
         assert_eq!(ov.visible_zoxide_dirs().len(), 1);
         assert_eq!(ov.handle(&Action::Submit), OverlayOutcome::Handled);
         assert_eq!(ov.mode, FilePickerMode::Browse);

@@ -578,6 +578,9 @@ fn dispatch_active_overlay(action: Action, app: &mut AppState, ui: &mut UiState)
                     ui.pop_overlay();
                     open_upload_attachment(app, ui);
                 }
+                AttachmentCommand::Refresh => {
+                    app.request_attachments_refresh(ui);
+                }
                 AttachmentCommand::OpenUrl(url) => {
                     if let Err(err) = open::that(&url) {
                         ui.error(format!("Failed to open browser: {err}"));
@@ -891,17 +894,18 @@ fn handle_mouse_right_click(row: u16, col: u16, app: &mut AppState, ui: &mut UiS
                 ui.focus = PaneFocus::Main;
                 ui.board_ui.selected_col = c;
                 ui.board_ui.selected_row = r;
+                let site_id = app.active_board_site_id(ui).map(str::to_string);
                 if let Some(issue) = app.selected_board_issue(ui) {
-                    app.request_issue_detail(ui, &issue.key);
+                    app.request_issue_detail_for_site(ui, site_id.as_deref(), &issue.key);
                 }
             }
             HitTarget::IssueRow(idx) => {
                 ui.focus = PaneFocus::Nav;
                 ui.issue_ui.nav_section = 1;
                 ui.issue_ui.selected_issue = idx;
-                let list = app.filtered_issues(ui);
-                if let Some(it) = list.get(idx) {
-                    app.request_issue_detail(ui, &it.key);
+                let list = app.filtered_issues_with_sites(ui);
+                if let Some((sid, it)) = list.get(idx) {
+                    app.request_issue_detail_for_site(ui, Some(sid.as_str()), &it.key);
                 }
             }
             HitTarget::MyWorkIssue(idx) => {
@@ -916,10 +920,11 @@ fn handle_mouse_right_click(row: u16, col: u16, app: &mut AppState, ui: &mut UiS
                 ui.focus = PaneFocus::Nav;
                 ui.confluence_ui.nav_section = 1;
                 ui.confluence_ui.selected_tree_row = idx;
+                let site_id = app.active_space_site_id(ui).map(str::to_string);
                 let tree = app.current_confluence_tree(ui);
                 if let Some(row_item) = tree.get(idx) {
                     let page_id = row_item.page.id.clone();
-                    app.request_page_detail(ui, &page_id);
+                    app.request_page_detail_for_site(ui, site_id.as_deref(), &page_id);
                 }
             }
             _ => {}
@@ -934,12 +939,13 @@ fn open_context_menu_at(anchor: (u16, u16), app: &AppState, ui: &mut UiState) {
     ui.push_overlay(Overlay::ContextMenu(menu));
 }
 
-fn open_attachments(app: &AppState, ui: &mut UiState, preferred_idx: Option<usize>) {
+fn open_attachments(app: &mut AppState, ui: &mut UiState, preferred_idx: Option<usize>) {
     let mut ov = AttachmentsOverlay::from_app(app, ui);
     if let Some(idx) = preferred_idx {
         ov.select(idx);
     }
     ui.push_overlay(Overlay::Attachments(ov));
+    app.request_attachments_refresh(ui);
 }
 
 fn handle_mouse_click(row: u16, col: u16, app: &mut AppState, ui: &mut UiState) -> bool {
@@ -969,8 +975,9 @@ fn handle_mouse_click(row: u16, col: u16, app: &mut AppState, ui: &mut UiState) 
             ui.board_ui.selected_col = c;
             ui.board_ui.selected_row = r;
             ui.board_ui.drawer_open = true;
+            let site_id = app.active_board_site_id(ui).map(str::to_string);
             if let Some(issue) = app.selected_board_issue(ui) {
-                app.request_issue_detail(ui, &issue.key);
+                app.request_issue_detail_for_site(ui, site_id.as_deref(), &issue.key);
             }
         }
         HitTarget::FilterItem(idx) => {
@@ -986,17 +993,19 @@ fn handle_mouse_click(row: u16, col: u16, app: &mut AppState, ui: &mut UiState) 
             ui.focus = PaneFocus::Nav;
             ui.issue_ui.nav_section = 1;
             ui.issue_ui.selected_issue = idx;
-            let list = app.filtered_issues(ui);
-            if let Some(it) = list.get(idx) {
-                app.request_issue_detail(ui, &it.key);
+            let list = app.filtered_issues_with_sites(ui);
+            if let Some((sid, it)) = list.get(idx) {
+                app.request_issue_detail_for_site(ui, Some(sid.as_str()), &it.key);
             }
         }
         HitTarget::MyWorkIssue(idx) => {
             ui.my_work_ui.active_column = 0;
             ui.my_work_ui.selected_issue = idx;
+            let site_id = app.my_issue_site_ids.get(idx).cloned();
             if let Some(it) = app.my_issues.get(idx).cloned() {
-                app.jump_to_cross_ref(
+                app.jump_to_cross_ref_for_site(
                     ui,
+                    site_id.as_deref(),
                     CrossRefTarget::JiraIssue {
                         key: it.key,
                         label: Some(it.summary),
@@ -1007,9 +1016,11 @@ fn handle_mouse_click(row: u16, col: u16, app: &mut AppState, ui: &mut UiState) 
         HitTarget::MyWorkPage(idx) => {
             ui.my_work_ui.active_column = 1;
             ui.my_work_ui.selected_page = idx;
+            let site_id = app.my_page_site_ids.get(idx).cloned();
             if let Some(pg) = app.my_pages.get(idx).cloned() {
-                app.jump_to_cross_ref(
+                app.jump_to_cross_ref_for_site(
                     ui,
+                    site_id.as_deref(),
                     CrossRefTarget::ConfluencePage {
                         page_id: pg.id,
                         title: Some(pg.title),
@@ -1022,18 +1033,20 @@ fn handle_mouse_click(row: u16, col: u16, app: &mut AppState, ui: &mut UiState) 
             ui.confluence_ui.nav_section = 0;
             ui.confluence_ui.selected_space = idx;
             ui.confluence_ui.selected_tree_row = 0;
+            let site_id = app.space_site_ids.get(idx).cloned();
             if let Some(sp) = app.spaces.get(idx).cloned() {
-                app.request_space_root_pages(ui, &sp.key);
+                app.request_space_root_pages_for_site(ui, site_id.as_deref(), &sp.key);
             }
         }
         HitTarget::TreeRow(idx) => {
             ui.focus = PaneFocus::Nav;
             ui.confluence_ui.nav_section = 1;
             ui.confluence_ui.selected_tree_row = idx;
+            let site_id = app.active_space_site_id(ui).map(str::to_string);
             let tree = app.current_confluence_tree(ui);
             if let Some(row) = tree.get(idx) {
                 let page = row.page.clone();
-                app.request_page_detail(ui, &page.id);
+                app.request_page_detail_for_site(ui, site_id.as_deref(), &page.id);
                 if row.has_children {
                     app.toggle_expand_page(ui, &page);
                 }
@@ -1310,8 +1323,9 @@ fn activate_selection(app: &mut AppState, ui: &mut UiState) {
             }
             _ => {
                 ui.board_ui.drawer_open = true;
+                let site_id = app.active_board_site_id(ui).map(str::to_string);
                 if let Some(issue) = app.selected_board_issue(ui) {
-                    app.request_issue_detail(ui, &issue.key);
+                    app.request_issue_detail_for_site(ui, site_id.as_deref(), &issue.key);
                 }
             }
         },
@@ -1322,46 +1336,54 @@ fn activate_selection(app: &mut AppState, ui: &mut UiState) {
                     app.request_jql_search(ui, f.jql, f.name);
                 }
             } else {
-                let list = app.filtered_issues(ui);
-                if let Some(it) = list.get(ui.issue_ui.selected_issue) {
-                    app.request_issue_detail(ui, &it.key);
+                let list = app.filtered_issues_with_sites(ui);
+                if let Some((sid, it)) = list.get(ui.issue_ui.selected_issue) {
+                    app.request_issue_detail_for_site(ui, Some(sid.as_str()), &it.key);
                     ui.focus = PaneFocus::Main;
                 }
             }
         }
         WorkspaceTab::MyWork => {
             if ui.my_work_ui.active_column == 0 {
+                let site_id = app.my_issue_site_ids.get(ui.my_work_ui.selected_issue).cloned();
                 if let Some(it) = app.my_issues.get(ui.my_work_ui.selected_issue).cloned() {
-                    app.jump_to_cross_ref(
+                    app.jump_to_cross_ref_for_site(
                         ui,
+                        site_id.as_deref(),
                         CrossRefTarget::JiraIssue {
                             key: it.key,
                             label: Some(it.summary),
                         },
                     );
                 }
-            } else if let Some(pg) = app.my_pages.get(ui.my_work_ui.selected_page).cloned() {
-                app.jump_to_cross_ref(
-                    ui,
-                    CrossRefTarget::ConfluencePage {
-                        page_id: pg.id,
-                        title: Some(pg.title),
-                    },
-                );
+            } else {
+                let site_id = app.my_page_site_ids.get(ui.my_work_ui.selected_page).cloned();
+                if let Some(pg) = app.my_pages.get(ui.my_work_ui.selected_page).cloned() {
+                    app.jump_to_cross_ref_for_site(
+                        ui,
+                        site_id.as_deref(),
+                        CrossRefTarget::ConfluencePage {
+                            page_id: pg.id,
+                            title: Some(pg.title),
+                        },
+                    );
+                }
             }
         }
         WorkspaceTab::Confluence => match ui.focus {
             PaneFocus::Nav => {
                 if ui.confluence_ui.nav_section == 0 {
+                    let site_id = app.space_site_ids.get(ui.confluence_ui.selected_space).cloned();
                     if let Some(sp) = app.spaces.get(ui.confluence_ui.selected_space).cloned() {
                         ui.confluence_ui.selected_tree_row = 0;
-                        app.request_space_root_pages(ui, &sp.key);
+                        app.request_space_root_pages_for_site(ui, site_id.as_deref(), &sp.key);
                     }
                 } else {
+                    let site_id = app.active_space_site_id(ui).map(str::to_string);
                     let tree = app.current_confluence_tree(ui);
                     if let Some(row) = tree.get(ui.confluence_ui.selected_tree_row) {
                         let page = row.page.clone();
-                        app.request_page_detail(ui, &page.id);
+                        app.request_page_detail_for_site(ui, site_id.as_deref(), &page.id);
                         if row.has_children {
                             app.toggle_expand_page(ui, &page);
                         }
@@ -1384,6 +1406,7 @@ fn activate_selection(app: &mut AppState, ui: &mut UiState) {
             _ => {}
         },
         WorkspaceTab::Search => {
+            let site_id = app.search_hit_site_ids.get(ui.search_ui.selected_hit).cloned();
             if let Some(hit) = app.search_hits.get(ui.search_ui.selected_hit).cloned() {
                 let target = match hit.kind {
                     SearchHitKind::JiraIssue => CrossRefTarget::JiraIssue {
@@ -1395,7 +1418,7 @@ fn activate_selection(app: &mut AppState, ui: &mut UiState) {
                         title: Some(hit.title),
                     },
                 };
-                app.jump_to_cross_ref(ui, target);
+                app.jump_to_cross_ref_for_site(ui, site_id.as_deref(), target);
             }
         }
         WorkspaceTab::Directory => {
@@ -1425,7 +1448,7 @@ fn open_transition(app: &AppState, ui: &mut UiState) {
     }
 }
 
-fn open_comment(app: &AppState, ui: &mut UiState) {
+fn open_comment(app: &mut AppState, ui: &mut UiState) {
     if ui.active_tab == WorkspaceTab::Confluence {
         if let Some(page) = &app.active_page {
             let target = CommentTarget::Page {
@@ -1439,6 +1462,7 @@ fn open_comment(app: &AppState, ui: &mut UiState) {
                 CommentOverlay::new(target)
             };
             ui.push_overlay(Overlay::Comment(overlay));
+            app.request_comments_refresh(ui);
             return;
         }
     }
@@ -1451,6 +1475,7 @@ fn open_comment(app: &AppState, ui: &mut UiState) {
             CommentOverlay::new(target)
         };
         ui.push_overlay(Overlay::Comment(overlay));
+        app.request_comments_refresh(ui);
     } else {
         ui.info("Select an issue or page to comment on first");
     }
@@ -1981,6 +2006,7 @@ mod tests {
         app.handle_ui_msg(
             &mut ui,
             UiMsg::CommentAdded {
+                site_id: "default".into(),
                 issue_key: Some("ATL-42".into()),
                 page_id: None,
                 optimistic_id: None,
@@ -1997,6 +2023,7 @@ mod tests {
         app.handle_ui_msg(
             &mut ui,
             UiMsg::CommentAdded {
+                site_id: "default".into(),
                 issue_key: Some("ATL-42".into()),
                 page_id: None,
                 optimistic_id: None,
@@ -2026,6 +2053,7 @@ mod tests {
         app.handle_ui_msg(
             &mut ui,
             UiMsg::IssueMutated {
+                site_id: "default".into(),
                 detail: created_issue,
                 toast: "Created".into(),
                 clear_draft_key: Some("issue:new:ATL".into()),
@@ -2053,6 +2081,7 @@ mod tests {
         app.handle_ui_msg(
             &mut ui,
             UiMsg::PageMutated {
+                site_id: "default".into(),
                 detail: created_page,
                 toast: "Saved".into(),
                 clear_draft_key: Some("page:new:ENG:900".into()),

@@ -6,7 +6,7 @@ use std::{
     collections::HashMap,
     sync::{
         atomic::{AtomicU64, Ordering},
-        Arc,
+        Arc, Mutex, MutexGuard,
     },
     time::{Duration, Instant},
 };
@@ -16,14 +16,14 @@ use rand::Rng;
 use reqwest::StatusCode;
 use serde::{Deserialize, Serialize};
 use tokio::{
-    sync::{mpsc, Mutex as AsyncMutex, Semaphore},
+    sync::{mpsc, watch, Mutex as AsyncMutex, Semaphore},
     time::{interval_at, Instant as TokioInstant, MissedTickBehavior},
 };
 
 use crate::{
     atlassian::{client::HttpStatusError, AtlassianClient},
     config::AppConfig,
-    models::{BoardSummary, CoreEvent, IssueSummary, SpaceSummary, SprintSummary},
+    models::{BoardSummary, CoreEvent, IssueSummary, OpenItemTarget, SpaceSummary, SprintSummary},
     storage::Storage,
 };
 
@@ -35,6 +35,9 @@ pub const DEFAULT_SITE_ID: &str = "default";
 
 /// Default bounded concurrency for parallel multi-site synchronization.
 pub const DEFAULT_MULTI_SITE_CONCURRENCY: usize = 4;
+
+/// Lightweight open-item revision check cadence (separate from the 45s full workspace sweep).
+pub const OPEN_ITEM_POLL_SECS: u64 = 5;
 
 const AUTH_EXPIRY_PAUSE_SECS: u64 = 60;
 const FORBIDDEN_COOLDOWN_SECS: u64 = 300;
@@ -377,6 +380,11 @@ impl SiteEndpointKey {
 /// Manages per-site, per-endpoint circuit breakers and per-site auth-expiry cooldown state.
 #[derive(Debug, Default, Clone)]
 pub struct CircuitBreakerRegistry {
+    state: Arc<Mutex<CircuitBreakerState>>,
+}
+
+#[derive(Debug, Default)]
+struct CircuitBreakerState {
     breakers: HashMap<SiteEndpointKey, EndpointCircuitBreaker>,
     auth_pause_until: HashMap<String, Instant>,
     degraded: HashMap<String, bool>,
@@ -385,11 +393,7 @@ pub struct CircuitBreakerRegistry {
 /// Type alias for multi-site circuit breaker tracking keyed by `(site_id, endpoint)`.
 pub type CircuitBreakerMap = CircuitBreakerRegistry;
 
-impl CircuitBreakerRegistry {
-    pub fn new() -> Self {
-        Self::default()
-    }
-
+impl CircuitBreakerState {
     fn breaker_mut_key(&mut self, key: SiteEndpointKey) -> &mut EndpointCircuitBreaker {
         let endpoint = key.endpoint;
         self.breakers
@@ -397,11 +401,23 @@ impl CircuitBreakerRegistry {
             .or_insert_with(|| EndpointCircuitBreaker::new(endpoint))
     }
 
+    fn is_auth_paused(&self, site: &str, now: Instant) -> bool {
+        self.auth_pause_until.get(site).is_some_and(|until| now < *until)
+    }
+}
+
+impl CircuitBreakerRegistry {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    fn state(&self) -> MutexGuard<'_, CircuitBreakerState> {
+        self.state.lock().expect("circuit breaker state poisoned")
+    }
+
     pub fn is_auth_paused_for_site(&self, site_id: &str, now: Instant) -> bool {
         let site = normalize_site_id(site_id);
-        self.auth_pause_until
-            .get(&site)
-            .is_some_and(|until| now < *until)
+        self.state().is_auth_paused(&site, now)
     }
 
     pub fn is_auth_paused(&self, now: Instant) -> bool {
@@ -410,7 +426,7 @@ impl CircuitBreakerRegistry {
 
     pub fn is_degraded_for_site(&self, site_id: &str) -> bool {
         let site = normalize_site_id(site_id);
-        self.degraded.get(&site).copied().unwrap_or(false)
+        self.state().degraded.get(&site).copied().unwrap_or(false)
     }
 
     pub fn is_degraded(&self) -> bool {
@@ -419,7 +435,8 @@ impl CircuitBreakerRegistry {
 
     pub fn mark_degraded_for_site(&mut self, site_id: &str) -> bool {
         let site = normalize_site_id(site_id);
-        let entry = self.degraded.entry(site).or_insert(false);
+        let mut state = self.state();
+        let entry = state.degraded.entry(site).or_insert(false);
         if !*entry {
             *entry = true;
             true
@@ -434,7 +451,7 @@ impl CircuitBreakerRegistry {
 
     pub fn clear_degraded_for_site(&mut self, site_id: &str) -> bool {
         let site = normalize_site_id(site_id);
-        if let Some(flag) = self.degraded.get_mut(&site) {
+        if let Some(flag) = self.state().degraded.get_mut(&site) {
             if *flag {
                 *flag = false;
                 return true;
@@ -449,7 +466,8 @@ impl CircuitBreakerRegistry {
 
     pub fn state_at_key(&self, key: &SiteEndpointKey, now: Instant) -> CircuitState {
         let site = normalize_site_id(&key.site_id);
-        if let Some(&until) = self.auth_pause_until.get(&site) {
+        let state = self.state();
+        if let Some(&until) = state.auth_pause_until.get(&site) {
             if now < until {
                 return CircuitState::Open {
                     reason: CircuitOpenReason::Unauthorized401,
@@ -461,7 +479,7 @@ impl CircuitBreakerRegistry {
             site_id: site,
             endpoint: key.endpoint,
         };
-        self.breakers
+        state.breakers
             .get(&normalized_key)
             .map(|b| b.state_at(now))
             .unwrap_or(CircuitState::Closed)
@@ -483,10 +501,11 @@ impl CircuitBreakerRegistry {
 
     pub fn should_allow_key(&mut self, key: &SiteEndpointKey, now: Instant) -> bool {
         let normalized = SiteEndpointKey::new(&key.site_id, key.endpoint);
-        if self.is_auth_paused_for_site(&normalized.site_id, now) {
+        let mut state = self.state();
+        if state.is_auth_paused(&normalized.site_id, now) {
             return false;
         }
-        self.breaker_mut_key(normalized).should_allow(now)
+        state.breaker_mut_key(normalized).should_allow(now)
     }
 
     pub fn should_allow_site(
@@ -505,8 +524,18 @@ impl CircuitBreakerRegistry {
 
     pub fn record_success_key(&mut self, key: &SiteEndpointKey) -> bool {
         let normalized = SiteEndpointKey::new(&key.site_id, key.endpoint);
-        self.auth_pause_until.remove(&normalized.site_id);
-        self.breaker_mut_key(normalized).record_success()
+        let mut state = self.state();
+        let now = Instant::now();
+        // A request admitted earlier can complete after a concurrent auth failure or 429.
+        if state.is_auth_paused(&normalized.site_id, now) {
+            return false;
+        }
+        state.auth_pause_until.remove(&normalized.site_id);
+        let breaker = state.breaker_mut_key(normalized);
+        if matches!(breaker.state_at(now), CircuitState::Open { .. }) {
+            return false;
+        }
+        breaker.record_success()
     }
 
     pub fn record_success_site(&mut self, site_id: &str, endpoint: SyncEndpoint) -> bool {
@@ -557,9 +586,10 @@ impl CircuitBreakerRegistry {
     ) -> CircuitTripResult {
         let normalized = SiteEndpointKey::new(&key.site_id, key.endpoint);
         let site_id = normalized.site_id.clone();
-        let trip = self.breaker_mut_key(normalized).record_failure(kind, now);
+        let mut state = self.state();
+        let trip = state.breaker_mut_key(normalized).record_failure(kind, now);
         if kind == SyncErrorKind::Unauthorized401 {
-            self.auth_pause_until.insert(site_id, now + trip.cooldown);
+            state.auth_pause_until.insert(site_id, now + trip.cooldown);
         }
         trip
     }
@@ -586,8 +616,9 @@ impl CircuitBreakerRegistry {
 
     pub fn reset_site_endpoint(&mut self, site_id: &str, endpoint: SyncEndpoint) {
         let key = SiteEndpointKey::new(site_id, endpoint);
-        self.auth_pause_until.remove(&key.site_id);
-        if let Some(breaker) = self.breakers.get_mut(&key) {
+        let mut state = self.state();
+        state.auth_pause_until.remove(&key.site_id);
+        if let Some(breaker) = state.breakers.get_mut(&key) {
             breaker.reset();
         }
     }
@@ -598,9 +629,10 @@ impl CircuitBreakerRegistry {
 
     pub fn reset_site(&mut self, site_id: &str) {
         let site = normalize_site_id(site_id);
-        self.auth_pause_until.remove(&site);
-        self.degraded.remove(&site);
-        for (key, breaker) in &mut self.breakers {
+        let mut state = self.state();
+        state.auth_pause_until.remove(&site);
+        state.degraded.remove(&site);
+        for (key, breaker) in &mut state.breakers {
             if key.site_id == site {
                 breaker.reset();
             }
@@ -608,16 +640,17 @@ impl CircuitBreakerRegistry {
     }
 
     pub fn reset_all(&mut self) {
-        self.auth_pause_until.clear();
-        self.degraded.clear();
-        for breaker in self.breakers.values_mut() {
+        let mut state = self.state();
+        state.auth_pause_until.clear();
+        state.degraded.clear();
+        for breaker in state.breakers.values_mut() {
             breaker.reset();
         }
     }
 
     pub fn open_count_for_site(&self, site_id: &str, now: Instant) -> usize {
         let site = normalize_site_id(site_id);
-        self.breakers
+        self.state().breakers
             .iter()
             .filter(|(k, b)| {
                 k.site_id == site && matches!(b.state_at(now), CircuitState::Open { .. })
@@ -630,54 +663,13 @@ impl CircuitBreakerRegistry {
     }
 
     pub fn open_count(&self, now: Instant) -> usize {
-        self.breakers
+        self.state().breakers
             .values()
             .filter(|b| matches!(b.state_at(now), CircuitState::Open { .. }))
             .count()
     }
 
-    fn extract_site(&self, site_id: &str) -> Self {
-        let site = normalize_site_id(site_id);
-        let breakers = self
-            .breakers
-            .iter()
-            .filter(|(k, _)| k.site_id == site)
-            .map(|(k, v)| (k.clone(), v.clone()))
-            .collect();
-        let mut auth_pause_until = HashMap::new();
-        if let Some(&until) = self.auth_pause_until.get(&site) {
-            auth_pause_until.insert(site.clone(), until);
-        }
-        let mut degraded = HashMap::new();
-        if let Some(&flag) = self.degraded.get(&site) {
-            degraded.insert(site, flag);
-        }
-        Self {
-            breakers,
-            auth_pause_until,
-            degraded,
-        }
-    }
 
-    fn merge_site(&mut self, site_id: &str, other: Self) {
-        let site = normalize_site_id(site_id);
-        self.breakers.retain(|k, _| k.site_id != site);
-        for (k, v) in other.breakers {
-            if k.site_id == site {
-                self.breakers.insert(k, v);
-            }
-        }
-        if let Some(&until) = other.auth_pause_until.get(&site) {
-            self.auth_pause_until.insert(site.clone(), until);
-        } else {
-            self.auth_pause_until.remove(&site);
-        }
-        if let Some(&flag) = other.degraded.get(&site) {
-            self.degraded.insert(site, flag);
-        } else {
-            self.degraded.remove(&site);
-        }
-    }
 }
 
 struct SyncSharedActivity {
@@ -715,6 +707,12 @@ pub enum SyncCommand {
     },
     RefreshSpace {
         space_key: String,
+    },
+    WatchOpenItem {
+        target: Option<OpenItemTarget>,
+    },
+    CheckOpenItemNow {
+        target: OpenItemTarget,
     },
     NotifyUserActivity,
     Shutdown,
@@ -756,9 +754,18 @@ pub struct MultiSiteSyncOutcome {
     pub summary: String,
 }
 
+#[derive(Clone, Default)]
+struct OpenItemWatch {
+    target: Option<OpenItemTarget>,
+    immediate: bool,
+    check_sequence: u64,
+    stopped: bool,
+}
+
 #[derive(Clone)]
 pub struct SyncController {
     tx: mpsc::UnboundedSender<SyncCommand>,
+    open_item_tx: Option<watch::Sender<OpenItemWatch>>,
     activity: Arc<SyncSharedActivity>,
 }
 
@@ -766,6 +773,7 @@ impl SyncController {
     pub fn from_channels(tx: mpsc::UnboundedSender<SyncCommand>) -> Self {
         Self {
             tx,
+            open_item_tx: None,
             activity: Arc::new(SyncSharedActivity::new()),
         }
     }
@@ -773,6 +781,31 @@ impl SyncController {
     pub fn request(&self, cmd: SyncCommand) -> bool {
         if !matches!(cmd, SyncCommand::Shutdown) {
             self.activity.record_activity(Instant::now());
+        }
+        if let Some(open_item_tx) = &self.open_item_tx {
+            match cmd {
+                SyncCommand::WatchOpenItem { target } => {
+                    open_item_tx.send_if_modified(|current| {
+                        if current.target == target {
+                            return false;
+                        }
+                        current.target = target;
+                        current.immediate = false;
+                        true
+                    });
+                    return !open_item_tx.is_closed();
+                }
+                SyncCommand::CheckOpenItemNow { target } => {
+                    open_item_tx.send_modify(|current| {
+                        current.target = Some(target);
+                        current.immediate = true;
+                        current.check_sequence = current.check_sequence.wrapping_add(1);
+                    });
+                    return !open_item_tx.is_closed();
+                }
+                SyncCommand::Shutdown => open_item_tx.send_modify(|current| current.stopped = true),
+                _ => {}
+            }
         }
         self.tx.send(cmd).is_ok()
     }
@@ -815,13 +848,22 @@ pub fn spawn_sync_engine(
     let (tx, mut rx) = mpsc::unbounded_channel();
     let activity = Arc::new(SyncSharedActivity::new());
     let engine_activity = Arc::clone(&activity);
+    let mut breakers = CircuitBreakerRegistry::new();
+    let open_item_tx = spawn_open_item_lane(
+        vec![SiteSyncTarget {
+            site_id: client.site_id().to_string(),
+            site_name: String::new(),
+            client: client.clone(),
+        }],
+        breakers.clone(),
+        core_tx.clone(),
+    );
 
     tokio::spawn(async move {
         let secs = config.sync_interval_secs.max(5);
         let period = Duration::from_secs(secs);
         let mut ticker = interval_at(TokioInstant::now() + period, period);
         ticker.set_missed_tick_behavior(MissedTickBehavior::Delay);
-        let mut breakers = CircuitBreakerRegistry::new();
 
         loop {
             tokio::select! {
@@ -834,6 +876,7 @@ pub fn spawn_sync_engine(
                         SyncCommand::NotifyUserActivity => {
                             engine_activity.record_activity(Instant::now());
                         }
+                        SyncCommand::WatchOpenItem { .. } | SyncCommand::CheckOpenItemNow { .. } => {}
                         SyncCommand::RefreshAll => {
                             breakers.reset_all();
                             let _ = core_tx.send(CoreEvent::SyncStarted);
@@ -958,7 +1001,11 @@ pub fn spawn_sync_engine(
         }
     });
 
-    SyncController { tx, activity }
+    SyncController {
+        tx,
+        open_item_tx: Some(open_item_tx),
+        activity,
+    }
 }
 
 /// Synchronizes multiple Atlassian sites in parallel with bounded concurrency (`Semaphore`)
@@ -986,13 +1033,11 @@ pub async fn run_multi_site_sync(
     };
     let semaphore = Arc::new(Semaphore::new(concurrency));
 
-    let mut per_site_breakers: HashMap<String, Arc<AsyncMutex<CircuitBreakerMap>>> =
-        HashMap::new();
+    let mut site_locks = HashMap::new();
     for target in targets {
-        let site_id = normalize_site_id(&target.site_id);
-        per_site_breakers.entry(site_id.clone()).or_insert_with(|| {
-            Arc::new(AsyncMutex::new(breakers.extract_site(&site_id)))
-        });
+        site_locks
+            .entry(normalize_site_id(&target.site_id))
+            .or_insert_with(|| Arc::new(AsyncMutex::new(())));
     }
 
     let mut futs = Vec::with_capacity(targets.len());
@@ -1005,15 +1050,12 @@ pub async fn run_multi_site_sync(
         };
         let site_url = target.client.site_url().to_string();
         let sem = Arc::clone(&semaphore);
-        let site_breaker_lock = Arc::clone(
-            per_site_breakers
-                .get(&site_id)
-                .expect("per-site breaker map initialized"),
-        );
+        let site_lock = Arc::clone(&site_locks[&site_id]);
+        let mut site_breakers = breakers.clone();
 
         futs.push(async move {
             let _permit = sem.acquire_owned().await.expect("sync semaphore closed");
-            let mut site_breakers = site_breaker_lock.lock().await;
+            let _site_guard = site_lock.lock().await;
             let outcome = run_full_sync_for_site(
                 &site_id,
                 &target.client,
@@ -1056,14 +1098,6 @@ pub async fn run_multi_site_sync(
     }
 
     let per_site = futures::future::join_all(futs).await;
-
-    for (site_id, lock) in per_site_breakers {
-        let updated = match Arc::try_unwrap(lock) {
-            Ok(mutex) => mutex.into_inner(),
-            Err(arc) => arc.lock().await.clone(),
-        };
-        breakers.merge_site(&site_id, updated);
-    }
 
     let total_sites = per_site.len();
     let succeeded_sites = per_site.iter().filter(|r| r.succeeded).count();
@@ -1115,13 +1149,14 @@ pub fn spawn_multi_site_sync_engine_with_status(
     let (tx, mut rx) = mpsc::unbounded_channel();
     let activity = Arc::new(SyncSharedActivity::new());
     let engine_activity = Arc::clone(&activity);
+    let mut breakers = CircuitBreakerRegistry::new();
+    let open_item_tx = spawn_open_item_lane(targets.clone(), breakers.clone(), core_tx.clone());
 
     tokio::spawn(async move {
         let secs = config.sync_interval_secs.max(5);
         let period = Duration::from_secs(secs);
         let mut ticker = interval_at(TokioInstant::now() + period, period);
         ticker.set_missed_tick_behavior(MissedTickBehavior::Delay);
-        let mut breakers = CircuitBreakerMap::new();
         let concurrency = if max_concurrency == 0 {
             DEFAULT_MULTI_SITE_CONCURRENCY
         } else {
@@ -1139,6 +1174,7 @@ pub fn spawn_multi_site_sync_engine_with_status(
                         SyncCommand::NotifyUserActivity => {
                             engine_activity.record_activity(Instant::now());
                         }
+                        SyncCommand::WatchOpenItem { .. } | SyncCommand::CheckOpenItemNow { .. } => {}
                         SyncCommand::RefreshAll => {
                             breakers.reset_all();
                             let _ = core_tx.send(CoreEvent::SyncStarted);
@@ -1365,7 +1401,167 @@ pub fn spawn_multi_site_sync_engine_with_status(
         }
     });
 
-    SyncController { tx, activity }
+    SyncController {
+        tx,
+        open_item_tx: Some(open_item_tx),
+        activity,
+    }
+}
+
+fn spawn_open_item_lane(
+    sites: Vec<SiteSyncTarget>,
+    mut breakers: CircuitBreakerRegistry,
+    core_tx: mpsc::UnboundedSender<CoreEvent>,
+) -> watch::Sender<OpenItemWatch> {
+    let (tx, mut rx) = watch::channel(OpenItemWatch::default());
+    tokio::spawn(async move {
+        let period = Duration::from_secs(OPEN_ITEM_POLL_SECS);
+        let mut ticker = interval_at(TokioInstant::now() + period, period);
+        ticker.set_missed_tick_behavior(MissedTickBehavior::Delay);
+        let mut current = OpenItemWatch::default();
+        let mut check_now = false;
+
+        'schedule: loop {
+            if !check_now {
+                tokio::select! {
+                    changed = rx.changed() => {
+                        if changed.is_err() { break; }
+                        let next = rx.borrow_and_update().clone();
+                        if next.stopped { break; }
+                        check_now = next.immediate && next.check_sequence != current.check_sequence;
+                        if next.target != current.target || check_now {
+                            ticker.reset();
+                        }
+                        current = next;
+                    }
+                    _ = ticker.tick() => check_now = true,
+                }
+            }
+            if !check_now {
+                continue;
+            }
+            check_now = false;
+            let Some(target) = current.target.clone() else {
+                continue;
+            };
+            let Some(site) = find_site_target(&sites, target.site_id()) else {
+                continue;
+            };
+
+            let probe = run_open_item_revision_check(&target, site, &mut breakers, &core_tx);
+            tokio::pin!(probe);
+            loop {
+                tokio::select! {
+                    biased;
+                    changed = rx.changed() => {
+                        if changed.is_err() { break 'schedule; }
+                        let next = rx.borrow_and_update().clone();
+                        if next.stopped { break 'schedule; }
+                        let target_changed = next.target != current.target;
+                        check_now = target_changed
+                            && next.immediate
+                            && next.check_sequence != current.check_sequence;
+                        current = next;
+                        if target_changed {
+                            // Drop the old probe when the user leaves its target. Focus and
+                            // timer requests for the current target share the in-flight probe.
+                            ticker.reset();
+                            continue 'schedule;
+                        }
+                    }
+                    _ = &mut probe => {
+                        ticker.reset();
+                        continue 'schedule;
+                    }
+                }
+            }
+        }
+    });
+    tx
+}
+
+fn find_site_target<'a>(
+    targets: &'a [SiteSyncTarget],
+    site_id: &str,
+) -> Option<&'a SiteSyncTarget> {
+    let target = site_id.trim();
+    targets
+        .iter()
+        .find(|t| t.site_id.eq_ignore_ascii_case(target))
+        .or_else(|| {
+            if (target.is_empty() || target.eq_ignore_ascii_case(DEFAULT_SITE_ID))
+                && targets.len() == 1
+            {
+                targets.first()
+            } else {
+                None
+            }
+        })
+}
+
+async fn run_open_item_revision_check(
+    target: &OpenItemTarget,
+    site: &SiteSyncTarget,
+    breakers: &mut CircuitBreakerRegistry,
+    core_tx: &mpsc::UnboundedSender<CoreEvent>,
+) {
+    let now = Instant::now();
+    let client = &site.client;
+    let breaker_site = &site.site_id;
+    match target {
+        OpenItemTarget::JiraIssue { site_id, key } => {
+            if !breakers.should_allow_site(breaker_site, SyncEndpoint::JiraIssues, now) {
+                return;
+            }
+            match client.get_issue_revision(key).await {
+                Ok(summary) => {
+                    breakers.record_success_site(breaker_site, SyncEndpoint::JiraIssues);
+                    let _ = core_tx.send(CoreEvent::OpenIssueRevision {
+                        site_id: site_id.clone(),
+                        summary,
+                    });
+                }
+                Err(err) => {
+                    let kind = classify_sync_error(&err);
+                    // A deleted/inaccessible single issue (404) should not trip the site-wide Jira breaker.
+                    if kind != SyncErrorKind::NotFound404 {
+                        breakers.record_failure_kind_site(
+                            breaker_site,
+                            SyncEndpoint::JiraIssues,
+                            kind,
+                            Instant::now(),
+                        );
+                    }
+                }
+            }
+        }
+        OpenItemTarget::ConfluencePage { site_id, page_id } => {
+            if !breakers.should_allow_site(breaker_site, SyncEndpoint::ConfluencePages, now) {
+                return;
+            }
+            match client.get_page_revision(page_id).await {
+                Ok(summary) => {
+                    breakers.record_success_site(breaker_site, SyncEndpoint::ConfluencePages);
+                    let _ = core_tx.send(CoreEvent::OpenPageRevision {
+                        site_id: site_id.clone(),
+                        summary,
+                    });
+                }
+                Err(err) => {
+                    let kind = classify_sync_error(&err);
+                    // A deleted/inaccessible single page (404) should not trip the site-wide Confluence breaker.
+                    if kind != SyncErrorKind::NotFound404 {
+                        breakers.record_failure_kind_site(
+                            breaker_site,
+                            SyncEndpoint::ConfluencePages,
+                            kind,
+                            Instant::now(),
+                        );
+                    }
+                }
+            }
+        }
+    }
 }
 
 fn emit_multi_site_sync_events(
@@ -1574,7 +1770,10 @@ async fn run_full_sync_for_site(
                 if let Err(err) = storage.upsert_issues_for_site(site_id, &page.issues) {
                     record_err(err, SyncErrorKind::Transient);
                 } else if let Some(tx) = core_tx {
-                    let _ = tx.send(CoreEvent::IssuesUpdated(page.issues));
+                    let _ = tx.send(CoreEvent::IssuesUpdated {
+                        site_id: site_id.to_string(),
+                        issues: page.issues,
+                    });
                 }
             }
             Err(err) => {
@@ -1731,6 +1930,7 @@ async fn sync_board_details_for_site(
 
     if let Some(tx) = core_tx {
         let _ = tx.send(CoreEvent::BoardIssuesUpdated {
+            site_id: site_id.to_string(),
             board_id,
             sprint: active_sprint.clone(),
             issues,
@@ -1750,7 +1950,10 @@ async fn sync_project_issues(
     let count = page.issues.len();
     storage.upsert_issues_for_site(client.site_id(), &page.issues)?;
     if let Some(tx) = core_tx {
-        let _ = tx.send(CoreEvent::IssuesUpdated(page.issues));
+        let _ = tx.send(CoreEvent::IssuesUpdated {
+            site_id: client.site_id().to_string(),
+            issues: page.issues,
+        });
     }
     Ok(count)
 }
@@ -1781,6 +1984,7 @@ async fn sync_space_pages_for_site(
     }
     if let Some(tx) = core_tx {
         let _ = tx.send(CoreEvent::SpacePagesUpdated {
+            site_id: site_id.to_string(),
             space_key: space_key.to_string(),
             pages,
         });
@@ -2677,5 +2881,427 @@ mod tests {
         assert!(ctrl.request(SyncCommand::Shutdown));
         srv_a.abort();
         srv_b.abort();
+    }
+
+    #[tokio::test]
+    async fn open_item_focus_and_timer_share_one_probe_while_board_is_held() {
+        use tokio::sync::Notify;
+
+        for multi_site in [false, true] {
+            let board_started = Arc::new(Notify::new());
+            let board_release = Arc::new(Notify::new());
+            let issue_started = Arc::new(Notify::new());
+            let issue_release = Arc::new(Notify::new());
+            let issue_hits = Arc::new(AtomicUsize::new(0));
+
+            let app = Router::new()
+                .route(
+                    "/rest/agile/1.0/board",
+                    get({
+                        let started = board_started.clone();
+                        let release = board_release.clone();
+                        move || {
+                            let started = started.clone();
+                            let release = release.clone();
+                            async move {
+                                started.notify_one();
+                                release.notified().await;
+                                Json(json!({"values": [], "isLast": true}))
+                            }
+                        }
+                    }),
+                )
+                .route(
+                    "/rest/api/3/issue/OFF-42",
+                    get({
+                        let started = issue_started.clone();
+                        let release = issue_release.clone();
+                        let hits = issue_hits.clone();
+                        move || {
+                            let started = started.clone();
+                            let release = release.clone();
+                            let hits = hits.clone();
+                            async move {
+                                let attempt = hits.fetch_add(1, Ordering::SeqCst);
+                                started.notify_one();
+                                if attempt == 0 {
+                                    release.notified().await;
+                                }
+                                Json(json!({
+                                    "id": "42",
+                                    "key": "OFF-42",
+                                    "fields": {
+                                        "project": {"key": "OFF"},
+                                        "summary": "Off-board issue",
+                                        "status": {"name": "Done"},
+                                        "updated": "2026-11-20T12:30:00.000+0000"
+                                    }
+                                }))
+                            }
+                        }
+                    }),
+                );
+
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let url = format!("http://{}", listener.local_addr().unwrap());
+            let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+            let client = make_mock_client(&url).with_site_id("focus-site");
+            let config = AppConfig {
+                sync_interval_secs: 300,
+                ..Default::default()
+            };
+            let storage = Storage::open_in_memory().unwrap();
+            let (core_tx, mut core_rx) = mpsc::unbounded_channel();
+            let ctrl = if multi_site {
+                spawn_multi_site_sync_engine(
+                    config,
+                    vec![SiteSyncTarget {
+                        site_id: "focus-site".into(),
+                        site_name: "Focus Site".into(),
+                        client,
+                    }],
+                    storage,
+                    1,
+                    core_tx,
+                )
+            } else {
+                spawn_sync_engine(config, client, storage, core_tx)
+            };
+            assert!(ctrl.request(SyncCommand::RefreshAll));
+            tokio::time::timeout(Duration::from_secs(2), board_started.notified())
+                .await
+                .expect("board request should be held");
+
+            let target = OpenItemTarget::JiraIssue {
+                site_id: "focus-site".into(),
+                key: "OFF-42".into(),
+            };
+            assert!(ctrl.request(SyncCommand::WatchOpenItem {
+                target: Some(target.clone()),
+            }));
+            assert!(ctrl.request(SyncCommand::CheckOpenItemNow { target: target.clone() }));
+            tokio::time::timeout(Duration::from_millis(500), issue_started.notified())
+                .await
+                .expect("focused issue must start before the board responds");
+
+            // Rapid focus messages for the same target must fold into the active request.
+            for _ in 0..16 {
+                assert!(ctrl.request(SyncCommand::CheckOpenItemNow { target: target.clone() }));
+            }
+            issue_release.notify_one();
+            tokio::time::timeout(Duration::from_millis(500), async {
+                while let Some(event) = core_rx.recv().await {
+                    if let CoreEvent::OpenIssueRevision { site_id, summary } = event {
+                        assert_eq!(site_id, "focus-site");
+                        assert_eq!(summary.key, "OFF-42");
+                        break;
+                    }
+                }
+            })
+            .await
+            .expect("revision should arrive before the board responds");
+            assert!(tokio::time::timeout(Duration::from_millis(70), issue_started.notified())
+                .await
+                .is_err());
+            assert_eq!(issue_hits.load(Ordering::SeqCst), 1);
+
+            // The watched item keeps polling while there is no further input and the board
+            // is still waiting. Repeated focus messages did not leave pending network work.
+            tokio::time::timeout(
+                Duration::from_secs(OPEN_ITEM_POLL_SECS) + Duration::from_millis(500),
+                issue_started.notified(),
+            )
+            .await
+            .expect("the open item timer must ignore the held board");
+            assert_eq!(issue_hits.load(Ordering::SeqCst), 2);
+
+            assert!(ctrl.request(SyncCommand::Shutdown));
+            board_release.notify_one();
+            server.abort();
+        }
+    }
+
+    #[test]
+    fn concurrent_success_does_not_cancel_an_active_provider_backoff() {
+        let now = Instant::now();
+        let mut background = CircuitBreakerRegistry::new();
+        let mut open_item = background.clone();
+        background.record_failure_kind_site(
+            "selected", SyncEndpoint::JiraIssues,
+            SyncErrorKind::RateLimited429 { retry_after_secs: Some(30) }, now,
+        );
+        assert!(!open_item.record_success_site("selected", SyncEndpoint::JiraIssues));
+        assert!(!open_item.should_allow_site("selected", SyncEndpoint::JiraIssues, now));
+        assert!(open_item.should_allow_site("other", SyncEndpoint::JiraIssues, now));
+
+        open_item.record_failure_kind_site(
+            "selected", SyncEndpoint::ConfluencePages, SyncErrorKind::Unauthorized401, now,
+        );
+        assert!(!background.record_success_site("selected", SyncEndpoint::JiraAgileBoards));
+        assert!(!background.should_allow_site("selected", SyncEndpoint::JiraAgileBoards, now));
+    }
+
+    #[tokio::test]
+    async fn test_open_item_revision_check_cloud_and_dc_isolated_from_full_sweep() {
+        use axum::extract::Query;
+        use std::sync::Mutex;
+
+        let cloud_paths: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+        let dc_paths: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+
+        let cloud_log = cloud_paths.clone();
+        let cloud_app = Router::new()
+            .route(
+                "/rest/api/3/issue/{key}",
+                get({
+                    let log = cloud_log.clone();
+                    move |axum::extract::Path(key): axum::extract::Path<String>,
+                          Query(q): Query<HashMap<String, String>>| async move {
+                        let fields = q.get("fields").cloned().unwrap_or_default();
+                        log.lock()
+                            .unwrap()
+                            .push(format!("/rest/api/3/issue/{key}?fields={fields}"));
+                        Json(json!({
+                            "id": "999",
+                            "key": key,
+                            "fields": {
+                                "project": { "key": "OFF" },
+                                "summary": "Off-board Cloud Issue v2",
+                                "issuetype": { "name": "Task" },
+                                "status": { "id": "3", "name": "Done", "statusCategory": { "key": "done" } },
+                                "updated": "2026-11-20T12:30:00.000+0000"
+                            }
+                        }))
+                    }
+                }),
+            )
+            .route(
+                "/wiki/api/v2/pages/{id}",
+                get({
+                    let log = cloud_log.clone();
+                    move |axum::extract::Path(id): axum::extract::Path<String>,
+                          Query(q): Query<HashMap<String, String>>| async move {
+                        let bf = q.get("body-format").cloned().unwrap_or_default();
+                        log.lock()
+                            .unwrap()
+                            .push(format!("/wiki/api/v2/pages/{id}?body-format={bf}"));
+                        Json(json!({
+                            "id": id,
+                            "spaceId": "5002",
+                            "spaceKey": "OPS",
+                            "parentId": "2001",
+                            "title": "Nested Cloud Page v2",
+                            "status": "current",
+                            "version": { "number": 2, "createdAt": "2026-11-20T12:31:00.000Z" },
+                            "_links": { "webui": "/spaces/OPS/pages/2002" }
+                        }))
+                    }
+                }),
+            );
+
+        let dc_log = dc_paths.clone();
+        let dc_app = Router::new()
+            .route(
+                "/rest/api/2/issue/{key}",
+                get({
+                    let log = dc_log.clone();
+                    move |axum::extract::Path(key): axum::extract::Path<String>,
+                          Query(q): Query<HashMap<String, String>>| async move {
+                        let fields = q.get("fields").cloned().unwrap_or_default();
+                        log.lock()
+                            .unwrap()
+                            .push(format!("/rest/api/2/issue/{key}?fields={fields}"));
+                        Json(json!({
+                            "id": "888",
+                            "key": key,
+                            "fields": {
+                                "project": { "key": "DC" },
+                                "summary": "Off-board DC Issue v2",
+                                "issuetype": { "name": "Bug" },
+                                "status": { "id": "2", "name": "In Progress", "statusCategory": { "key": "indeterminate" } },
+                                "updated": "2026-11-20T12:32:00.000+0000"
+                            }
+                        }))
+                    }
+                }),
+            )
+            .route(
+                "/rest/api/content/{id}",
+                get({
+                    let log = dc_log.clone();
+                    move |axum::extract::Path(id): axum::extract::Path<String>,
+                          Query(q): Query<HashMap<String, String>>| async move {
+                        let expand = q.get("expand").cloned().unwrap_or_default();
+                        log.lock()
+                            .unwrap()
+                            .push(format!("/rest/api/content/{id}?expand={expand}"));
+                        Json(json!({
+                            "id": id,
+                            "type": "page",
+                            "title": "Nested DC Page v3",
+                            "status": "current",
+                            "space": { "id": "77", "key": "OPS" },
+                            "ancestors": [{ "id": "2001", "title": "Parent" }],
+                            "version": { "number": 3, "when": "2026-11-20T12:33:00.000Z" },
+                            "_links": { "webui": "/display/OPS/Nested" }
+                        }))
+                    }
+                }),
+            );
+
+        let cloud_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let cloud_url = format!("http://{}", cloud_listener.local_addr().unwrap());
+        let cloud_srv = tokio::spawn(async move {
+            let _ = axum::serve(cloud_listener, cloud_app).await;
+        });
+
+        let dc_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let dc_url = format!("http://{}", dc_listener.local_addr().unwrap());
+        let dc_srv = tokio::spawn(async move {
+            let _ = axum::serve(dc_listener, dc_app).await;
+        });
+
+        let cloud_client = make_mock_client(&cloud_url).with_site_id("cloud-site");
+        let dc_dir = tempfile::tempdir().unwrap();
+        let dc_auth = AuthManager::new("dc-test")
+            .with_fallback_path(dc_dir.path().join("creds.json"));
+        dc_auth
+            .save_credentials(&StoredCredentials::BearerPat {
+                site_url: dc_url.clone(),
+                token: "dc-pat".into(),
+                deployment: DeploymentKind::DataCenter,
+            })
+            .unwrap();
+        let dc_client = AtlassianClient::with_base_urls(
+            dc_url.clone(),
+            dc_url.clone(),
+            DeploymentKind::DataCenter,
+            dc_auth,
+        )
+        .unwrap()
+        .with_site_id("dc-site");
+
+        let targets = vec![
+            SiteSyncTarget {
+                site_id: "cloud-site".into(),
+                site_name: "Cloud Site".into(),
+                client: cloud_client,
+            },
+            SiteSyncTarget {
+                site_id: "dc-site".into(),
+                site_name: "DC Site".into(),
+                client: dc_client,
+            },
+        ];
+
+        let cfg = AppConfig {
+            sync_interval_secs: 300,
+            ..Default::default()
+        };
+        let storage = Storage::open_in_memory().unwrap();
+        let (core_tx, mut core_rx) = mpsc::unbounded_channel();
+        let ctrl = spawn_multi_site_sync_engine(cfg, targets, storage, 2, core_tx);
+
+        // 1) Check Cloud off-board Jira issue -> only 1 Cloud revision call, 0 DC calls, 0 board/space calls
+        assert!(ctrl.request(SyncCommand::CheckOpenItemNow {
+            target: OpenItemTarget::JiraIssue {
+                site_id: "cloud-site".into(),
+                key: "OFF-42".into(),
+            },
+        }));
+        let ev1 = tokio::time::timeout(Duration::from_secs(2), core_rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        match ev1 {
+            CoreEvent::OpenIssueRevision { site_id, summary } => {
+                assert_eq!(site_id, "cloud-site");
+                assert_eq!(summary.key, "OFF-42");
+                assert_eq!(summary.status.name, "Done");
+            }
+            other => panic!("expected OpenIssueRevision, got {other:?}"),
+        }
+        assert_eq!(cloud_paths.lock().unwrap().len(), 1);
+        assert!(cloud_paths.lock().unwrap()[0].contains("/rest/api/3/issue/OFF-42?fields="));
+        assert!(!cloud_paths.lock().unwrap()[0].contains("description"));
+        assert!(dc_paths.lock().unwrap().is_empty());
+
+        // 2) Check Cloud nested Confluence page -> 1 lightweight GET without body-format
+        assert!(ctrl.request(SyncCommand::CheckOpenItemNow {
+            target: OpenItemTarget::ConfluencePage {
+                site_id: "cloud-site".into(),
+                page_id: "2002".into(),
+            },
+        }));
+        let ev2 = tokio::time::timeout(Duration::from_secs(2), core_rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        match ev2 {
+            CoreEvent::OpenPageRevision { site_id, summary } => {
+                assert_eq!(site_id, "cloud-site");
+                assert_eq!(summary.id, "2002");
+                assert_eq!(summary.version_number, 2);
+                assert_eq!(summary.parent_id.as_deref(), Some("2001"));
+            }
+            other => panic!("expected OpenPageRevision, got {other:?}"),
+        }
+        assert_eq!(cloud_paths.lock().unwrap().len(), 2);
+        assert_eq!(
+            cloud_paths.lock().unwrap()[1],
+            "/wiki/api/v2/pages/2002?body-format="
+        );
+
+        // 3) Check Data Center Jira issue + nested Confluence page
+        assert!(ctrl.request(SyncCommand::CheckOpenItemNow {
+            target: OpenItemTarget::JiraIssue {
+                site_id: "dc-site".into(),
+                key: "DC-7".into(),
+            },
+        }));
+        let ev3 = tokio::time::timeout(Duration::from_secs(2), core_rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        match ev3 {
+            CoreEvent::OpenIssueRevision { site_id, summary } => {
+                assert_eq!(site_id, "dc-site");
+                assert_eq!(summary.key, "DC-7");
+                assert_eq!(summary.status.name, "In Progress");
+            }
+            other => panic!("expected OpenIssueRevision for DC, got {other:?}"),
+        }
+
+        assert!(ctrl.request(SyncCommand::CheckOpenItemNow {
+            target: OpenItemTarget::ConfluencePage {
+                site_id: "dc-site".into(),
+                page_id: "2002".into(),
+            },
+        }));
+        let ev4 = tokio::time::timeout(Duration::from_secs(2), core_rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        match ev4 {
+            CoreEvent::OpenPageRevision { site_id, summary } => {
+                assert_eq!(site_id, "dc-site");
+                assert_eq!(summary.id, "2002");
+                assert_eq!(summary.version_number, 3);
+                assert_eq!(summary.parent_id.as_deref(), Some("2001"));
+            }
+            other => panic!("expected OpenPageRevision for DC, got {other:?}"),
+        }
+        assert_eq!(dc_paths.lock().unwrap().len(), 2);
+        assert!(dc_paths.lock().unwrap()[0].starts_with("/rest/api/2/issue/DC-7?fields="));
+        assert_eq!(
+            dc_paths.lock().unwrap()[1],
+            "/rest/api/content/2002?expand=version,space,ancestors"
+        );
+        // Cloud was NOT touched during DC checks.
+        assert_eq!(cloud_paths.lock().unwrap().len(), 2);
+
+        assert!(ctrl.request(SyncCommand::Shutdown));
+        cloud_srv.abort();
+        dc_srv.abort();
     }
 }

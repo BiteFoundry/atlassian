@@ -1,6 +1,6 @@
 [package]
 name = "atlassian-cli"
-version = "0.3.2"
+version = "0.3.3"
 edition = "2021"
 description = "Unified Atlassian Jira & Confluence native terminal client & AI agent toolkit (CLI, TUI, HTTP API, MCP)"
 license = "MIT"

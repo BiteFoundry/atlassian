@@ -100,6 +100,7 @@ pub enum AttachmentCommand {
     PreviewHtml(usize),
     Download(usize),
     Upload,
+    Refresh,
     OpenUrl(String),
 }
 
@@ -246,6 +247,10 @@ impl AttachmentsOverlay {
             Action::Input('u') | Action::UploadAttachment => {
                 self.pending_command = Some(AttachmentCommand::Upload);
                 OverlayOutcome::CloseAndDispatch(Action::UploadAttachment)
+            }
+            Action::Input('r') | Action::SyncAll => {
+                self.pending_command = Some(AttachmentCommand::Refresh);
+                OverlayOutcome::Handled
             }
             Action::Input('o') | Action::OpenInBrowser => {
                 if let Some(att) = self.selected_attachment() {

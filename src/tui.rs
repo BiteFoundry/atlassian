@@ -19,8 +19,9 @@ use crossterm::event::{DisableBracketedPaste, EnableBracketedPaste};
 use crossterm::{
     cursor::MoveTo,
     event::{
-        DisableMouseCapture, EnableMouseCapture, Event as CrosstermEvent, EventStream,
-        KeyboardEnhancementFlags, PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
+        DisableFocusChange, DisableMouseCapture, EnableFocusChange, EnableMouseCapture,
+        Event as CrosstermEvent, EventStream, KeyboardEnhancementFlags,
+        PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
     },
     execute, queue,
     terminal::{
@@ -328,11 +329,17 @@ impl TerminalGuard {
             stdout,
             EnterAlternateScreen,
             EnableMouseCapture,
+            EnableFocusChange,
             EnableBracketedPaste
         )?;
         #[cfg(windows)]
         {
-            execute!(stdout, EnterAlternateScreen, EnableMouseCapture)?;
+            execute!(
+                stdout,
+                EnterAlternateScreen,
+                EnableMouseCapture,
+                EnableFocusChange
+            )?;
             write_vt_mouse_enable(&mut stdout)?;
         }
 
@@ -387,13 +394,19 @@ impl TerminalGuard {
         let _ = execute!(
             stdout,
             DisableBracketedPaste,
+            DisableFocusChange,
             DisableMouseCapture,
             LeaveAlternateScreen
         );
         #[cfg(windows)]
         {
             let _ = write_vt_mouse_disable(&mut stdout);
-            let _ = execute!(stdout, DisableMouseCapture, LeaveAlternateScreen);
+            let _ = execute!(
+                stdout,
+                DisableFocusChange,
+                DisableMouseCapture,
+                LeaveAlternateScreen
+            );
         }
         let _ = disable_raw_mode();
         #[cfg(windows)]
@@ -408,11 +421,17 @@ impl TerminalGuard {
             stdout,
             EnterAlternateScreen,
             EnableMouseCapture,
+            EnableFocusChange,
             EnableBracketedPaste
         )?;
         #[cfg(windows)]
         {
-            execute!(stdout, EnterAlternateScreen, EnableMouseCapture)?;
+            execute!(
+                stdout,
+                EnterAlternateScreen,
+                EnableMouseCapture,
+                EnableFocusChange
+            )?;
             write_vt_mouse_enable(&mut stdout)?;
         }
         if self.keyboard_enhanced {
@@ -457,13 +476,19 @@ fn install_panic_hook(keyboard_enhanced: bool, orig_conin_mode: Option<u32>) {
         let _ = execute!(
             stdout,
             DisableBracketedPaste,
+            DisableFocusChange,
             DisableMouseCapture,
             LeaveAlternateScreen
         );
         #[cfg(windows)]
         {
             let _ = write_vt_mouse_disable(&mut stdout);
-            let _ = execute!(stdout, DisableMouseCapture, LeaveAlternateScreen);
+            let _ = execute!(
+                stdout,
+                DisableFocusChange,
+                DisableMouseCapture,
+                LeaveAlternateScreen
+            );
         }
         let _ = disable_raw_mode();
         #[cfg(windows)]
@@ -935,6 +960,9 @@ fn handle_terminal_event(
                 pixel_rt.sync_overlay_state(app, ui);
             }
         }
+        CrosstermEvent::FocusGained => {
+            app.handle_focus_gained(ui);
+        }
         _ => {}
     }
     false
@@ -993,6 +1021,7 @@ pub async fn run_with_persona(
     );
     app.load_cached_initial();
     app.spawn_bootstrap(&mut ui);
+    app.sync_open_item_watch(&ui);
 
     let img_pref = ui::app::config_protocol_to_img_pref(app.config.image_protocol);
     let (mut guard, mut terminal, graphics_caps) = TerminalGuard::enter(img_pref)?;
@@ -1031,6 +1060,7 @@ pub async fn run_with_persona(
         }
 
         if dirty {
+            app.sync_open_item_watch(&ui);
             draw_frame(&mut terminal, &mut app, &mut ui, &mut guard, &mut pixel_rt)?;
             dirty = false;
         }

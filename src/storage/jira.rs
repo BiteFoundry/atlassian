@@ -8,9 +8,9 @@ use rusqlite::{params, Connection, OptionalExtension, Row, ToSql};
 use crate::{
     adf,
     models::{
-        BoardColumn, BoardSummary, IssueDetail, IssuePriority, IssueStatus, IssueSummary,
-        IssueType, ProjectSummary, SavedFilter, SearchHitKind, SprintSummary, UnifiedSearchHit,
-        UserSummary,
+        AttachmentItem, BoardColumn, BoardSummary, IssueComment, IssueDetail, IssuePriority,
+        IssueStatus, IssueSummary, IssueType, ProjectSummary, SavedFilter, SearchHitKind,
+        SprintSummary, UnifiedSearchHit, UserSummary,
     },
     storage::{
         db::{build_contextual_snippet, build_fts_query, escape_like, DEFAULT_SITE_ID},
@@ -522,16 +522,193 @@ impl Storage {
         let Some((row_updated, detail_updated, detail_json)) = row_opt else {
             return Ok(false);
         };
-        if detail_json.as_deref().map(str::trim).unwrap_or("").is_empty() {
+        let Some(raw_json) = detail_json.as_deref().map(str::trim).filter(|s| !s.is_empty()) else {
             return Ok(false);
-        }
-        let Some(du) = detail_updated.as_deref().map(str::trim).filter(|s| !s.is_empty()) else {
+        };
+        let effective_detail_updated = detail_updated
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string)
+            .or_else(|| {
+                serde_json::from_str::<IssueDetail>(raw_json)
+                    .ok()
+                    .map(|d| d.summary.updated_at)
+                    .filter(|s| !s.trim().is_empty())
+            });
+        let Some(du) = effective_detail_updated else {
             return Ok(false);
         };
         if row_updated.trim().is_empty() {
             return Ok(false);
         }
-        Ok(compare_updated_at(du, &row_updated) == std::cmp::Ordering::Less)
+        Ok(compare_updated_at(&du, &row_updated) == std::cmp::Ordering::Less)
+    }
+
+    /// Returns the `updated_at` timestamp captured when `detail_json` was actually fetched
+    /// (independent of any newer list/sync summary row reconciled on read).
+    pub fn get_issue_detail_updated_at_for_site(
+        &self,
+        site_id: &str,
+        key: &str,
+    ) -> Result<Option<String>> {
+        let conn = self.lock_conn()?;
+        let row_opt: Option<(Option<String>, Option<String>)> = conn
+            .query_row(
+                "SELECT detail_updated_at, detail_json FROM issues WHERE site_id = ?1 AND key = ?2",
+                params![site_id, key],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()?;
+        let Some((detail_updated, detail_json)) = row_opt else {
+            return Ok(None);
+        };
+        let Some(raw_json) = detail_json.as_deref().map(str::trim).filter(|s| !s.is_empty()) else {
+            return Ok(None);
+        };
+        Ok(detail_updated
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string)
+            .or_else(|| {
+                serde_json::from_str::<IssueDetail>(raw_json)
+                    .ok()
+                    .map(|d| d.summary.updated_at)
+                    .filter(|s| !s.trim().is_empty())
+            }))
+    }
+
+    /// Returns the latest summary row `updated_at` stored for `(site_id, key)`.
+    pub fn get_issue_row_updated_at_for_site(
+        &self,
+        site_id: &str,
+        key: &str,
+    ) -> Result<Option<String>> {
+        let conn = self.lock_conn()?;
+        let updated: Option<String> = conn
+            .query_row(
+                "SELECT updated_at FROM issues WHERE site_id = ?1 AND key = ?2",
+                params![site_id, key],
+                |row| row.get(0),
+            )
+            .optional()?;
+        Ok(updated.filter(|s| !s.trim().is_empty()))
+    }
+
+    /// Upserts a lightweight revision `IssueSummary` for `site_id`, preserving previously cached
+    /// `comment_count` and `attachment_count` when the revision payload omitted those collections.
+    pub fn upsert_issue_revision_for_site(
+        &self,
+        site_id: &str,
+        issue: &IssueSummary,
+    ) -> Result<bool> {
+        let mut conn = self.lock_conn()?;
+        let tx = conn.transaction()?;
+        let applied = {
+            let mut merged = issue.clone();
+            if let Some((prev_comments, prev_atts)) = tx
+                .query_row(
+                    "SELECT comment_count, attachment_count FROM issues WHERE site_id = ?1 AND key = ?2",
+                    params![site_id, &issue.key],
+                    |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?)),
+                )
+                .optional()?
+            {
+                if merged.comment_count == 0 && prev_comments > 0 {
+                    merged.comment_count = prev_comments as usize;
+                }
+                if merged.attachment_count == 0 && prev_atts > 0 {
+                    merged.attachment_count = prev_atts as usize;
+                }
+            }
+            let ok = upsert_issue_row(&tx, site_id, &merged, None, merged.sprint_id)?;
+            if ok {
+                let existing_desc: String = tx
+                    .query_row(
+                        "SELECT description_markdown FROM issues WHERE site_id = ?1 AND key = ?2",
+                        params![site_id, &merged.key],
+                        |r| r.get(0),
+                    )
+                    .unwrap_or_default();
+                refresh_issue_fts(
+                    &tx,
+                    site_id,
+                    &merged.key,
+                    &merged.project_key,
+                    &merged.summary,
+                    &existing_desc,
+                    &merged.labels.join(" "),
+                )?;
+            }
+            ok
+        };
+        tx.commit()?;
+        Ok(applied)
+    }
+
+    /// Updates cached `comments` inside `detail_json` and `comment_count` for `(site_id, key)`.
+    pub fn update_issue_comments_for_site(
+        &self,
+        site_id: &str,
+        key: &str,
+        comments: &[IssueComment],
+    ) -> Result<()> {
+        let mut conn = self.lock_conn()?;
+        let tx = conn.transaction()?;
+        if let Some(raw) = tx
+            .query_row(
+                "SELECT detail_json FROM issues WHERE site_id = ?1 AND key = ?2",
+                params![site_id, key],
+                |row| row.get::<_, Option<String>>(0),
+            )
+            .optional()?
+            .flatten()
+        {
+            if let Ok(mut detail) = serde_json::from_str::<IssueDetail>(&raw) {
+                detail.comments = comments.to_vec();
+                detail.summary.comment_count = comments.len();
+                let updated_json = serde_json::to_string(&detail)?;
+                tx.execute(
+                    "UPDATE issues SET detail_json = ?1, comment_count = ?2 WHERE site_id = ?3 AND key = ?4",
+                    params![updated_json, comments.len() as i64, site_id, key],
+                )?;
+            }
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Updates cached `attachments` inside `detail_json` and `attachment_count` for `(site_id, key)`.
+    pub fn update_issue_attachments_for_site(
+        &self,
+        site_id: &str,
+        key: &str,
+        attachments: &[AttachmentItem],
+    ) -> Result<()> {
+        let mut conn = self.lock_conn()?;
+        let tx = conn.transaction()?;
+        if let Some(raw) = tx
+            .query_row(
+                "SELECT detail_json FROM issues WHERE site_id = ?1 AND key = ?2",
+                params![site_id, key],
+                |row| row.get::<_, Option<String>>(0),
+            )
+            .optional()?
+            .flatten()
+        {
+            if let Ok(mut detail) = serde_json::from_str::<IssueDetail>(&raw) {
+                detail.attachments = attachments.to_vec();
+                detail.summary.attachment_count = attachments.len();
+                let updated_json = serde_json::to_string(&detail)?;
+                tx.execute(
+                    "UPDATE issues SET detail_json = ?1, attachment_count = ?2 WHERE site_id = ?3 AND key = ?4",
+                    params![updated_json, attachments.len() as i64, site_id, key],
+                )?;
+            }
+        }
+        tx.commit()?;
+        Ok(())
     }
 
     /// Removes cached issues belonging to `(site_id, board_id, sprint_id)` that are absent from

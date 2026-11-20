@@ -7,7 +7,10 @@ use rusqlite::{params, Connection, OptionalExtension, Row, ToSql};
 
 use crate::{
     adf,
-    models::{PageDetail, PageSummary, SearchHitKind, SpaceSummary, UnifiedSearchHit},
+    models::{
+        AttachmentItem, ConfluenceComment, PageDetail, PageSummary, SearchHitKind, SpaceSummary,
+        UnifiedSearchHit,
+    },
     storage::{
         db::{build_contextual_snippet, build_fts_query, escape_like, DEFAULT_SITE_ID},
         Storage,
@@ -293,10 +296,122 @@ impl Storage {
         let Some((row_ver, detail_ver, detail_json)) = row_opt else {
             return Ok(false);
         };
-        if detail_json.as_deref().map(str::trim).unwrap_or("").is_empty() {
+        let Some(raw_json) = detail_json.as_deref().map(str::trim).filter(|s| !s.is_empty()) else {
             return Ok(false);
+        };
+        let effective_detail_ver = detail_ver.or_else(|| {
+            serde_json::from_str::<PageDetail>(raw_json)
+                .ok()
+                .map(|d| d.summary.version_number)
+        });
+        Ok(effective_detail_ver.is_some_and(|dv| dv < row_ver))
+    }
+
+    /// Returns the `version_number` captured when `detail_json` was actually fetched
+    /// (independent of any newer list/sync summary row reconciled on read).
+    pub fn get_page_detail_version_for_site(
+        &self,
+        site_id: &str,
+        page_id: &str,
+    ) -> Result<Option<i32>> {
+        let conn = self.lock_conn()?;
+        let row_opt: Option<(Option<i32>, Option<String>)> = conn
+            .query_row(
+                "SELECT detail_version, detail_json FROM pages WHERE site_id = ?1 AND id = ?2",
+                params![site_id, page_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()?;
+        let Some((detail_ver, detail_json)) = row_opt else {
+            return Ok(None);
+        };
+        let Some(raw_json) = detail_json.as_deref().map(str::trim).filter(|s| !s.is_empty()) else {
+            return Ok(None);
+        };
+        Ok(detail_ver.or_else(|| {
+            serde_json::from_str::<PageDetail>(raw_json)
+                .ok()
+                .map(|d| d.summary.version_number)
+        }))
+    }
+
+    /// Returns the latest summary row `version_number` stored for `(site_id, page_id)`.
+    pub fn get_page_row_version_for_site(
+        &self,
+        site_id: &str,
+        page_id: &str,
+    ) -> Result<Option<i32>> {
+        let conn = self.lock_conn()?;
+        let ver: Option<i32> = conn
+            .query_row(
+                "SELECT version_number FROM pages WHERE site_id = ?1 AND id = ?2",
+                params![site_id, page_id],
+                |row| row.get(0),
+            )
+            .optional()?;
+        Ok(ver)
+    }
+
+    /// Updates cached `comments` inside `detail_json` for `(site_id, page_id)`.
+    pub fn update_page_comments_for_site(
+        &self,
+        site_id: &str,
+        page_id: &str,
+        comments: &[ConfluenceComment],
+    ) -> Result<()> {
+        let mut conn = self.lock_conn()?;
+        let tx = conn.transaction()?;
+        if let Some(raw) = tx
+            .query_row(
+                "SELECT detail_json FROM pages WHERE site_id = ?1 AND id = ?2",
+                params![site_id, page_id],
+                |row| row.get::<_, Option<String>>(0),
+            )
+            .optional()?
+            .flatten()
+        {
+            if let Ok(mut detail) = serde_json::from_str::<PageDetail>(&raw) {
+                detail.comments = comments.to_vec();
+                let updated_json = serde_json::to_string(&detail)?;
+                tx.execute(
+                    "UPDATE pages SET detail_json = ?1 WHERE site_id = ?2 AND id = ?3",
+                    params![updated_json, site_id, page_id],
+                )?;
+            }
         }
-        Ok(detail_ver.is_some_and(|dv| dv < row_ver))
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Updates cached `attachments` inside `detail_json` for `(site_id, page_id)`.
+    pub fn update_page_attachments_for_site(
+        &self,
+        site_id: &str,
+        page_id: &str,
+        attachments: &[AttachmentItem],
+    ) -> Result<()> {
+        let mut conn = self.lock_conn()?;
+        let tx = conn.transaction()?;
+        if let Some(raw) = tx
+            .query_row(
+                "SELECT detail_json FROM pages WHERE site_id = ?1 AND id = ?2",
+                params![site_id, page_id],
+                |row| row.get::<_, Option<String>>(0),
+            )
+            .optional()?
+            .flatten()
+        {
+            if let Ok(mut detail) = serde_json::from_str::<PageDetail>(&raw) {
+                detail.attachments = attachments.to_vec();
+                let updated_json = serde_json::to_string(&detail)?;
+                tx.execute(
+                    "UPDATE pages SET detail_json = ?1 WHERE site_id = ?2 AND id = ?3",
+                    params![updated_json, site_id, page_id],
+                )?;
+            }
+        }
+        tx.commit()?;
+        Ok(())
     }
 
     /// Removes cached root pages in `(site_id, space_key)` that are absent from a complete
@@ -675,7 +790,7 @@ fn upsert_page_row(conn: &Connection, site_id: &str, page: &PageSummary) -> Resu
             author_name = COALESCE(excluded.author_name, pages.author_name),
             updated_at = excluded.updated_at,
             position = excluded.position,
-            has_children = excluded.has_children,
+            has_children = CASE WHEN excluded.has_children != 0 THEN 1 ELSE pages.has_children END,
             web_url = excluded.web_url
         ",
         params![

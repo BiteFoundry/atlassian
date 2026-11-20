@@ -45,6 +45,10 @@ const SEARCH_FIELDS: &[&str] = &[
     "customfield_10020",
 ];
 
+/// Focused summary + `updated` fields for lightweight open-issue revision checks
+/// (excludes description, comments, attachments, renderedFields, and remote links).
+const ISSUE_REVISION_FIELDS: &str = "summary,status,priority,issuetype,assignee,reporter,parent,labels,created,updated,customfield_10016,customfield_10020";
+
 /// Subresource fetch health flags returned alongside [`IssueDetail`] so callers can
 /// preserve previously cached collections on transient 503/429/403 subresource errors.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -207,6 +211,34 @@ impl AtlassianClient {
                 })
             }
         }
+    }
+
+    pub async fn get_issue_revision(&self, key: &str) -> Result<IssueSummary> {
+        let base = self.require_site_url()?;
+        let ver = self.jira_api_version();
+        let encoded_key = urlencoding::encode(key.trim());
+        let url = format!("{base}/rest/api/{ver}/issue/{encoded_key}?fields={ISSUE_REVISION_FIELDS}");
+        let val: Value = self.get_json(&url).await?;
+        Ok(normalize_issue_summary(&val, &base, self.deployment()))
+    }
+
+    pub async fn list_issue_attachments(&self, key: &str) -> Result<Vec<crate::models::AttachmentItem>> {
+        let base = self.require_site_url()?;
+        let ver = self.jira_api_version();
+        let encoded_key = urlencoding::encode(key.trim());
+        let url = format!("{base}/rest/api/{ver}/issue/{encoded_key}?fields=attachment");
+        let val: Value = self.get_json(&url).await?;
+        let attachments = val
+            .get("fields")
+            .and_then(|f| f.get("attachment"))
+            .and_then(|v| v.as_array())
+            .map(|arr| {
+                arr.iter()
+                    .map(|a| parse_attachment_item(a, &base))
+                    .collect()
+            })
+            .unwrap_or_default();
+        Ok(attachments)
     }
 
     pub async fn get_issue(&self, key: &str) -> Result<IssueDetail> {

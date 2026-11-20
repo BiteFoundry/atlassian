@@ -165,15 +165,33 @@ enum WireCoreEvent {
     ProjectsUpdated(Vec<ProjectSummary>),
     BoardsUpdated(Vec<BoardSummary>),
     BoardIssuesUpdated {
+        #[serde(default)]
+        site_id: String,
         board_id: i64,
         sprint: Option<SprintSummary>,
         issues: Vec<IssueSummary>,
     },
-    IssuesUpdated(Vec<IssueSummary>),
+    IssuesUpdated {
+        #[serde(default)]
+        site_id: String,
+        issues: Vec<IssueSummary>,
+    },
     SpacesUpdated(Vec<SpaceSummary>),
     SpacePagesUpdated {
+        #[serde(default)]
+        site_id: String,
         space_key: String,
         pages: Vec<PageSummary>,
+    },
+    OpenIssueRevision {
+        #[serde(default)]
+        site_id: String,
+        summary: IssueSummary,
+    },
+    OpenPageRevision {
+        #[serde(default)]
+        site_id: String,
+        summary: PageSummary,
     },
     SyncError(String),
 }
@@ -186,18 +204,34 @@ impl From<CoreEvent> for WireCoreEvent {
             CoreEvent::ProjectsUpdated(v) => Self::ProjectsUpdated(v),
             CoreEvent::BoardsUpdated(v) => Self::BoardsUpdated(v),
             CoreEvent::BoardIssuesUpdated {
+                site_id,
                 board_id,
                 sprint,
                 issues,
             } => Self::BoardIssuesUpdated {
+                site_id,
                 board_id,
                 sprint,
                 issues,
             },
-            CoreEvent::IssuesUpdated(v) => Self::IssuesUpdated(v),
+            CoreEvent::IssuesUpdated { site_id, issues } => {
+                Self::IssuesUpdated { site_id, issues }
+            }
             CoreEvent::SpacesUpdated(v) => Self::SpacesUpdated(v),
-            CoreEvent::SpacePagesUpdated { space_key, pages } => {
-                Self::SpacePagesUpdated { space_key, pages }
+            CoreEvent::SpacePagesUpdated {
+                site_id,
+                space_key,
+                pages,
+            } => Self::SpacePagesUpdated {
+                site_id,
+                space_key,
+                pages,
+            },
+            CoreEvent::OpenIssueRevision { site_id, summary } => {
+                Self::OpenIssueRevision { site_id, summary }
+            }
+            CoreEvent::OpenPageRevision { site_id, summary } => {
+                Self::OpenPageRevision { site_id, summary }
             }
             CoreEvent::SyncError(err) => Self::SyncError(err),
         }
@@ -212,18 +246,34 @@ impl From<WireCoreEvent> for CoreEvent {
             WireCoreEvent::ProjectsUpdated(v) => Self::ProjectsUpdated(v),
             WireCoreEvent::BoardsUpdated(v) => Self::BoardsUpdated(v),
             WireCoreEvent::BoardIssuesUpdated {
+                site_id,
                 board_id,
                 sprint,
                 issues,
             } => Self::BoardIssuesUpdated {
+                site_id,
                 board_id,
                 sprint,
                 issues,
             },
-            WireCoreEvent::IssuesUpdated(v) => Self::IssuesUpdated(v),
+            WireCoreEvent::IssuesUpdated { site_id, issues } => {
+                Self::IssuesUpdated { site_id, issues }
+            }
             WireCoreEvent::SpacesUpdated(v) => Self::SpacesUpdated(v),
-            WireCoreEvent::SpacePagesUpdated { space_key, pages } => {
-                Self::SpacePagesUpdated { space_key, pages }
+            WireCoreEvent::SpacePagesUpdated {
+                site_id,
+                space_key,
+                pages,
+            } => Self::SpacePagesUpdated {
+                site_id,
+                space_key,
+                pages,
+            },
+            WireCoreEvent::OpenIssueRevision { site_id, summary } => {
+                Self::OpenIssueRevision { site_id, summary }
+            }
+            WireCoreEvent::OpenPageRevision { site_id, summary } => {
+                Self::OpenPageRevision { site_id, summary }
             }
             WireCoreEvent::SyncError(err) => Self::SyncError(err),
         }
@@ -405,9 +455,11 @@ impl DaemonSharedState {
             CoreEvent::ProjectsUpdated(_)
             | CoreEvent::BoardsUpdated(_)
             | CoreEvent::BoardIssuesUpdated { .. }
-            | CoreEvent::IssuesUpdated(_)
+            | CoreEvent::IssuesUpdated { .. }
             | CoreEvent::SpacesUpdated(_)
-            | CoreEvent::SpacePagesUpdated { .. } => {
+            | CoreEvent::SpacePagesUpdated { .. }
+            | CoreEvent::OpenIssueRevision { .. }
+            | CoreEvent::OpenPageRevision { .. } => {
                 guard.last_sync_at = Some(chrono::Utc::now().to_rfc3339());
                 guard.last_error = None;
             }
@@ -1947,6 +1999,7 @@ mod tests {
                 ..Default::default()
             }]),
             CoreEvent::BoardIssuesUpdated {
+                site_id: "default".into(),
                 board_id: 10,
                 sprint: Some(SprintSummary {
                     id: 5,
@@ -1957,7 +2010,10 @@ mod tests {
                 }),
                 issues: vec![],
             },
-            CoreEvent::IssuesUpdated(vec![]),
+            CoreEvent::IssuesUpdated {
+                site_id: "default".into(),
+                issues: vec![],
+            },
             CoreEvent::SpacesUpdated(vec![SpaceSummary {
                 id: "sp-1".into(),
                 key: "ENG".into(),
@@ -1965,6 +2021,7 @@ mod tests {
                 ..Default::default()
             }]),
             CoreEvent::SpacePagesUpdated {
+                site_id: "default".into(),
                 space_key: "ENG".into(),
                 pages: vec![],
             },
