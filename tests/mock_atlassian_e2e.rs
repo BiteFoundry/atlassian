@@ -9,7 +9,10 @@
 use std::{
     collections::HashMap,
     io::Cursor,
-    sync::{Arc, Once, OnceLock, RwLock},
+    sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc, Once, OnceLock, RwLock,
+    },
 };
 
 use axum::{
@@ -167,6 +170,7 @@ struct MockAtlassianState {
     captured_dc_search_requests: RwLock<Vec<Value>>,
     captured_dc_create_issue_bodies: RwLock<Vec<Value>>,
     captured_dc_create_page_bodies: RwLock<Vec<Value>>,
+    remotelink_requests: AtomicUsize,
 }
 
 impl MockAtlassianState {
@@ -342,6 +346,7 @@ impl MockAtlassianState {
             captured_dc_search_requests: RwLock::new(Vec::new()),
             captured_dc_create_issue_bodies: RwLock::new(Vec::new()),
             captured_dc_create_page_bodies: RwLock::new(Vec::new()),
+            remotelink_requests: AtomicUsize::new(0),
         })
     }
 
@@ -732,6 +737,7 @@ fn build_mock_atlassian_router(state: Arc<MockAtlassianState>) -> Router {
                 if let Err(resp) = check_basic_auth(&headers, &st.cloud_email, &st.cloud_token) {
                     return resp;
                 }
+                st.remotelink_requests.fetch_add(1, Ordering::SeqCst);
                 let guard = st.issues.read().unwrap();
                 let links = guard
                     .get(&key)
@@ -1172,6 +1178,7 @@ fn build_mock_atlassian_router(state: Arc<MockAtlassianState>) -> Router {
                 if let Err(resp) = check_bearer_auth(&headers, &st.dc_pat) {
                     return resp;
                 }
+                st.remotelink_requests.fetch_add(1, Ordering::SeqCst);
                 Json(json!([])).into_response()
             }),
         )
@@ -2542,4 +2549,139 @@ async fn e2e_multi_site_oauth_3lo_refresh_collision_free_sync_and_federation() {
     assert_eq!(mcp_hits.len(), 1);
     assert_eq!(mcp_hits[0]["site_id"], "acme-cloud");
     assert_eq!(mcp_hits[0]["id_or_key"], "ENG-1");
+}
+
+#[tokio::test]
+async fn e2e_tui_request_issue_detail_fetches_remotelink_once_across_cache_miss_and_reopen() {
+    use atlassian_cli::{
+        config::Persona,
+        sync,
+        ui::app::{AppState, UiMsg, UiState},
+    };
+
+    ensure_isolated_env();
+    let state = MockAtlassianState::new("alice@acme.com", "cloud-api-tok-123", "dc-pat");
+    {
+        let mut issues = state.issues.write().unwrap();
+        let rec = issues.get_mut("PROJ-101").unwrap();
+        rec.description_cloud_adf = json!({
+            "type": "doc",
+            "version": 1,
+            "content": [{
+                "type": "paragraph",
+                "content": [{
+                    "type": "text",
+                    "text": "Cached v1 body — see https://acme.atlassian.net/wiki/spaces/ENG/pages/2002/Rollback"
+                }]
+            }]
+        });
+    }
+    let base_url = spawn_server(build_mock_atlassian_router(state.clone())).await;
+    *state.base_url.write().unwrap() = base_url.clone();
+
+    let cfg = AppConfig {
+        site_url: base_url.clone(),
+        deployment: DeploymentKind::Cloud,
+        ..Default::default()
+    };
+    let auth = AuthManager::with_credentials(
+        "tui-detail-e2e",
+        StoredCredentials::ApiToken {
+            site_url: base_url.clone(),
+            email: "alice@acme.com".into(),
+            api_token: "cloud-api-tok-123".into(),
+            deployment: DeploymentKind::Cloud,
+        },
+    );
+    let client = AtlassianClient::with_base_urls(&base_url, "", DeploymentKind::Cloud, auth.clone())
+        .expect("build cloud client");
+    let storage = Storage::open_in_memory().expect("open in-memory storage");
+    let (core_tx, _) = tokio::sync::mpsc::unbounded_channel();
+    let sync_ctrl = sync::spawn_sync_engine(cfg.clone(), client.clone(), storage.clone(), core_tx);
+    let (ui_tx, mut ui_rx) = tokio::sync::mpsc::unbounded_channel();
+
+    let mut app = AppState::new_with_persona(
+        cfg.clone(),
+        Persona::Jira,
+        auth,
+        client,
+        storage.clone(),
+        sync_ctrl,
+        ui_tx,
+    );
+    let mut ui = UiState::from_config_with_persona(&cfg, Persona::Jira);
+
+    async fn next_issue_detail(
+        rx: &mut tokio::sync::mpsc::UnboundedReceiver<UiMsg>,
+    ) -> UiMsg {
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                match rx.recv().await {
+                    Some(msg @ UiMsg::IssueDetailLoaded { .. }) => return msg,
+                    Some(_) => continue,
+                    None => panic!("ui_rx closed before IssueDetailLoaded"),
+                }
+            }
+        })
+        .await
+        .expect("timed out waiting for IssueDetailLoaded")
+    }
+
+    // 1. Cache miss: active_issue stays empty until network load finishes with 1 /remotelink call.
+    app.request_issue_detail(&mut ui, "PROJ-101");
+    assert!(app.active_issue.is_none());
+
+    let msg = next_issue_detail(&mut ui_rx).await;
+    app.handle_ui_msg(&mut ui, msg);
+
+    assert_eq!(state.remotelink_requests.load(Ordering::SeqCst), 1);
+    let active = app.active_issue.as_ref().expect("active_issue populated");
+    assert!(active.description_markdown.contains("Cached v1 body"));
+    assert!(active.linked_pages.iter().any(|p| p.page_id == "2001" && p.title == "Release Guide"));
+    assert!(active.linked_pages.iter().any(|p| p.page_id == "2002"));
+    let cached = storage.get_issue_detail("PROJ-101").unwrap().expect("cached detail");
+    assert_eq!(cached.linked_pages.len(), 2);
+
+    // 2. Cache hit reopen: cached v1 shows immediately, then fresh v2 replaces it with 1 more /remotelink call.
+    {
+        let mut issues = state.issues.write().unwrap();
+        let rec = issues.get_mut("PROJ-101").unwrap();
+        rec.description_cloud_adf = json!({
+            "type": "doc",
+            "version": 1,
+            "content": [{
+                "type": "paragraph",
+                "content": [{
+                    "type": "text",
+                    "text": "Fresh v2 body — see https://acme.atlassian.net/wiki/spaces/ENG/pages/2002/Rollback"
+                }]
+            }]
+        });
+    }
+    app.active_issue = None;
+    app.request_issue_detail(&mut ui, "PROJ-101");
+    assert!(
+        app.active_issue
+            .as_ref()
+            .expect("cached detail shown immediately")
+            .description_markdown
+            .contains("Cached v1 body")
+    );
+
+    let msg2 = next_issue_detail(&mut ui_rx).await;
+    app.handle_ui_msg(&mut ui, msg2);
+
+    assert_eq!(state.remotelink_requests.load(Ordering::SeqCst), 2);
+    let refreshed = app.active_issue.as_ref().expect("refreshed active_issue");
+    assert!(refreshed.description_markdown.contains("Fresh v2 body"));
+    assert!(refreshed.linked_pages.iter().any(|p| p.page_id == "2001"));
+    assert!(refreshed.linked_pages.iter().any(|p| p.page_id == "2002"));
+    assert!(
+        storage
+            .get_issue_detail("PROJ-101")
+            .unwrap()
+            .expect("updated cache")
+            .description_markdown
+            .contains("Fresh v2 body")
+    );
 }

@@ -1598,14 +1598,7 @@ impl AppState {
         let key_owned = key.to_string();
         tokio::spawn(async move {
             match client.get_issue(&key_owned).await {
-                Ok(mut detail) => {
-                    if let Ok(remote_links) = client.get_issue_remote_confluence_links(&key_owned).await {
-                        for rl in remote_links {
-                            if !detail.linked_pages.iter().any(|p| p.page_id == rl.page_id) {
-                                detail.linked_pages.push(rl);
-                            }
-                        }
-                    }
+                Ok(detail) => {
                     let _ = storage.upsert_issue_detail(&detail);
                     let _ = tx.send(UiMsg::IssueDetailLoaded {
                         key: key_owned,
