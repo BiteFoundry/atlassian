@@ -39,15 +39,63 @@ const PARSE_ERROR: i64 = -32700;
 const INVALID_REQUEST: i64 = -32600;
 const METHOD_NOT_FOUND: i64 = -32601;
 
-/// Run the stdio MCP server until stdin reaches EOF.
-pub async fn run(config: AppConfig, client: AtlassianClient, storage: Storage) -> Result<()> {
-    run_with_storage(&config, &client, |_| Ok(&storage)).await
+/// Exact set of read-only query tools exposed when `--read-only` is active.
+/// Shared by both `tools/list` and `tools/call`.
+pub const READ_ONLY_TOOLS: &[&str] = &[
+    "get_myself",
+    "list_projects",
+    "list_boards",
+    "list_sprints",
+    "get_board_issues",
+    "search_jira_issues",
+    "get_jira_issue",
+    "list_jira_transitions",
+    "list_confluence_spaces",
+    "list_space_pages",
+    "list_child_pages",
+    "get_confluence_page",
+    "search_confluence_pages",
+    "list_sites",
+    "search_all",
+];
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct McpOptions {
+    pub read_only: bool,
 }
 
-pub(crate) async fn run_deferred(config: AppConfig, client: AtlassianClient) -> Result<()> {
+impl McpOptions {
+    pub const FULL: Self = Self { read_only: false };
+    pub const READ_ONLY: Self = Self { read_only: true };
+
+    pub fn allows_tool(self, name: &str) -> bool {
+        !self.read_only || READ_ONLY_TOOLS.contains(&name)
+    }
+}
+
+/// Run the stdio MCP server until stdin reaches EOF.
+pub async fn run(config: AppConfig, client: AtlassianClient, storage: Storage) -> Result<()> {
+    run_with_options(config, client, storage, McpOptions::FULL).await
+}
+
+/// Run the stdio MCP server with explicit options until stdin reaches EOF.
+pub async fn run_with_options(
+    config: AppConfig,
+    client: AtlassianClient,
+    storage: Storage,
+    options: McpOptions,
+) -> Result<()> {
+    run_with_storage(&config, &client, options, |_| Ok(&storage)).await
+}
+
+pub(crate) async fn run_deferred(
+    config: AppConfig,
+    client: AtlassianClient,
+    options: McpOptions,
+) -> Result<()> {
     let cache = LazyLock::new(|| Storage::open(&config::cache_db_path(&config.profile)));
     let preview = LazyLock::new(Storage::open_in_memory);
-    run_with_storage(&config, &client, |dry_run| {
+    run_with_storage(&config, &client, options, |dry_run| {
         let storage = if dry_run { &*preview } else { &*cache };
         storage.as_ref().map_err(|error| error.to_string())
     })
@@ -57,10 +105,12 @@ pub(crate) async fn run_deferred(config: AppConfig, client: AtlassianClient) -> 
 async fn run_with_storage<'a>(
     config: &AppConfig,
     client: &AtlassianClient,
+    options: McpOptions,
     mut get_storage: impl FnMut(bool) -> Result<&'a Storage, String>,
 ) -> Result<()> {
     eprintln!(
-        "{SERVER_NAME} MCP server ready (protocol {LATEST_PROTOCOL_VERSION}, deployment={}, site={})",
+        "{SERVER_NAME} MCP server ready (protocol {LATEST_PROTOCOL_VERSION}, mode={}, deployment={}, site={})",
+        if options.read_only { "read-only" } else { "full" },
         config.deployment.as_str(),
         if config.site_url.is_empty() {
             "unconfigured"
@@ -83,6 +133,7 @@ async fn run_with_storage<'a>(
         if let Some(response) = handle_rpc_line_with_bootstrap(
             config,
             client,
+            options,
             &mut get_storage,
             trimmed,
             &mut bootstrap_pending,
@@ -150,12 +201,24 @@ pub async fn handle_rpc_line(
     storage: &Storage,
     line: &str,
 ) -> Option<Value> {
-    handle_rpc_line_with_bootstrap(config, client, |_| Ok(storage), line, &mut false).await
+    handle_rpc_line_with_options(config, client, storage, line, McpOptions::FULL).await
+}
+
+/// Single-line JSON-RPC handler with explicit server options (e.g. read-only mode).
+pub async fn handle_rpc_line_with_options(
+    config: &AppConfig,
+    client: &AtlassianClient,
+    storage: &Storage,
+    line: &str,
+    options: McpOptions,
+) -> Option<Value> {
+    handle_rpc_line_with_bootstrap(config, client, options, |_| Ok(storage), line, &mut false).await
 }
 
 async fn handle_rpc_line_with_bootstrap<'a>(
     config: &AppConfig,
     client: &AtlassianClient,
+    options: McpOptions,
     get_storage: impl FnOnce(bool) -> Result<&'a Storage, String>,
     line: &str,
     bootstrap_pending: &mut bool,
@@ -178,9 +241,12 @@ async fn handle_rpc_line_with_bootstrap<'a>(
     }
 
     match method {
-        "initialize" => Some(success_response(id, initialize_result(&message))),
+        "initialize" => Some(success_response(id, initialize_result(&message, options))),
         "ping" => Some(success_response(id, json!({}))),
-        "tools/list" => Some(success_response(id, json!({ "tools": tool_catalog() }))),
+        "tools/list" => Some(success_response(
+            id,
+            json!({ "tools": tool_catalog_for(options) }),
+        )),
         "tools/call" => {
             let name = message
                 .pointer("/params/name")
@@ -191,22 +257,26 @@ async fn handle_rpc_line_with_bootstrap<'a>(
                 .cloned()
                 .unwrap_or_else(|| json!({}));
 
-            let outcome = match validate_tool_args(name, &arguments).and_then(|()| {
-                let is_edit_preview =
-                    matches!(name, "update_jira_issue" | "update_confluence_page")
-                        && arguments.get("dry_run").and_then(Value::as_bool) == Some(true);
-                get_storage(is_edit_preview)
-            }) {
-                Ok(storage) => {
-                    if *bootstrap_pending
-                        && tool_uses_current_site_cache(config, client, name, &arguments)
-                    {
-                        *bootstrap_pending = false;
-                        bootstrap_if_empty(config, client, storage).await;
+            let outcome = if !options.allows_tool(name) {
+                Err(format!("tool '{name}' is not available in --read-only mode"))
+            } else {
+                match validate_tool_args(name, &arguments).and_then(|()| {
+                    let is_edit_preview =
+                        matches!(name, "update_jira_issue" | "update_confluence_page")
+                            && arguments.get("dry_run").and_then(Value::as_bool) == Some(true);
+                    get_storage(is_edit_preview)
+                }) {
+                    Ok(storage) => {
+                        if *bootstrap_pending
+                            && tool_uses_current_site_cache(config, client, name, &arguments)
+                        {
+                            *bootstrap_pending = false;
+                            bootstrap_if_empty(config, client, storage).await;
+                        }
+                        call_tool(config, client, storage, name, &arguments).await
                     }
-                    call_tool(config, client, storage, name, &arguments).await
+                    Err(error) => Err(error),
                 }
-                Err(error) => Err(error),
             };
 
             Some(success_response(id, tool_result(outcome)))
@@ -2015,13 +2085,19 @@ impl<'a> Args<'a> {
     }
 }
 
-fn initialize_result(message: &Value) -> Value {
+fn initialize_result(message: &Value, options: McpOptions) -> Value {
     let requested = message
         .pointer("/params/protocolVersion")
         .and_then(Value::as_str);
     let protocol_version = requested
         .filter(|version| SUPPORTED_PROTOCOL_VERSIONS.contains(version))
         .unwrap_or(LATEST_PROTOCOL_VERSION);
+
+    let instructions = if options.read_only {
+        "Atlassian Jira & Confluence read-only tools supporting both Atlassian Cloud and Data Center. Use offline=true for local SQLite cache reads. Write, sync, and attachment download tools are disabled in --read-only mode."
+    } else {
+        "Atlassian Jira & Confluence tools supporting both Atlassian Cloud and Data Center. Use offline=true for local SQLite cache reads. Destructive operations (delete_jira_issue, delete_confluence_page) require confirm: true."
+    };
 
     json!({
         "protocolVersion": protocol_version,
@@ -2032,13 +2108,25 @@ fn initialize_result(message: &Value) -> Value {
             "name": SERVER_NAME,
             "version": env!("CARGO_PKG_VERSION")
         },
-        "instructions": "Atlassian Jira & Confluence tools supporting both Atlassian Cloud and Data Center. Use offline=true for local SQLite cache reads. Destructive operations (delete_jira_issue, delete_confluence_page) require confirm: true."
+        "instructions": instructions
     })
 }
 
 // ---------------------------------------------------------------------------
 // Tool catalog
 // ---------------------------------------------------------------------------
+
+fn tool_catalog_for(options: McpOptions) -> Vec<Value> {
+    let mut tools = tool_catalog();
+    if options.read_only {
+        tools.retain(|tool| {
+            tool.get("name")
+                .and_then(Value::as_str)
+                .is_some_and(|name| options.allows_tool(name))
+        });
+    }
+    tools
+}
 
 fn workflow_tool(name: &str, description: &str, properties: Value, required: &[&str]) -> Value {
     json!({
@@ -2379,7 +2467,7 @@ fn tool_catalog() -> Vec<Value> {
                     "replace_text": text_replacement.clone(),
                     "replace_section": {
                         "type": "object",
-                        "description": "Replace content under an exact top-level heading on a Confluence Cloud ADF page.",
+                        "description": "Replace content under an exact top-level or layout-column heading on a Confluence Cloud ADF page.",
                         "properties": {
                             "heading": { "type": "string", "minLength": 1 },
                             "markdown": { "type": "string" }
@@ -2579,6 +2667,7 @@ mod tests {
             assert!(handle_rpc_line_with_bootstrap(
                 &cfg,
                 &client,
+                McpOptions::FULL,
                 |_| Ok(&storage),
                 &line.to_string(),
                 &mut pending,
@@ -2603,6 +2692,7 @@ mod tests {
         let response = handle_rpc_line_with_bootstrap(
             &cfg,
             &client,
+            McpOptions::FULL,
             |_| Ok(&storage),
             r#"{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"list_projects"}}"#,
             &mut pending,
@@ -2940,5 +3030,153 @@ mod tests {
                 _ => {}
             }
         }
+    }
+
+    #[tokio::test]
+    async fn read_only_mode_exposes_exact_15_tools_and_blocks_all_other_tools_before_storage() {
+        let (cfg, client, storage) = test_ctx();
+        let list_req = json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "tools/list"
+        })
+        .to_string();
+
+        let full_resp = handle_rpc_line_with_options(
+            &cfg,
+            &client,
+            &storage,
+            &list_req,
+            McpOptions::FULL,
+        )
+        .await
+        .unwrap();
+        let ro_resp = handle_rpc_line_with_options(
+            &cfg,
+            &client,
+            &storage,
+            &list_req,
+            McpOptions::READ_ONLY,
+        )
+        .await
+        .unwrap();
+
+        let full_names: std::collections::BTreeSet<String> = full_resp["result"]["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|t| t["name"].as_str().unwrap().to_string())
+            .collect();
+        let ro_names: std::collections::BTreeSet<String> = ro_resp["result"]["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|t| t["name"].as_str().unwrap().to_string())
+            .collect();
+        let expected_ro: std::collections::BTreeSet<String> = READ_ONLY_TOOLS
+            .iter()
+            .map(|name| (*name).to_string())
+            .collect();
+
+        assert_eq!(full_names.len(), 37);
+        assert_eq!(ro_names.len(), 15);
+        assert_eq!(ro_names, expected_ro);
+
+        // Every excluded tool (all 22) must be rejected before storage or network access.
+        let excluded: Vec<String> = full_names.difference(&ro_names).cloned().collect();
+        assert_eq!(excluded.len(), 22);
+        for tool in &excluded {
+            let arguments = match tool.as_str() {
+                "update_jira_issue" => json!({ "key": "ENG-1", "summary": "x", "dry_run": true }),
+                "update_confluence_page" => json!({ "page_id": "501", "title": "x", "dry_run": true }),
+                "download_attachment" => json!({ "issue_key": "ENG-1", "dest_dir": "C:/nonexistent" }),
+                _ => json!({}),
+            };
+            let call = json!({
+                "jsonrpc": "2.0",
+                "id": 42,
+                "method": "tools/call",
+                "params": { "name": tool, "arguments": arguments }
+            })
+            .to_string();
+            let mut pending = true;
+            let resp = handle_rpc_line_with_bootstrap(
+                &cfg,
+                &client,
+                McpOptions::READ_ONLY,
+                |_| panic!("storage must not be accessed for blocked tool {tool}"),
+                &call,
+                &mut pending,
+            )
+            .await
+            .unwrap();
+            assert!(pending, "bootstrap must not run for blocked tool {tool}");
+            assert_eq!(resp["result"]["isError"], true, "{tool}: {resp}");
+            let msg = resp["result"]["content"][0]["text"].as_str().unwrap();
+            assert!(
+                msg.contains("--read-only"),
+                "expected read-only rejection for {tool}, got: {msg}"
+            );
+        }
+
+        // Unavailable/unknown tool in read-only mode is rejected without touching storage;
+        // full mode keeps reporting "unknown tool".
+        let unknown_call = json!({
+            "jsonrpc": "2.0",
+            "id": 43,
+            "method": "tools/call",
+            "params": { "name": "nonexistent_tool", "arguments": {} }
+        })
+        .to_string();
+        let mut pending = true;
+        let unknown_ro = handle_rpc_line_with_bootstrap(
+            &cfg,
+            &client,
+            McpOptions::READ_ONLY,
+            |_| panic!("storage must not be accessed for unavailable tool"),
+            &unknown_call,
+            &mut pending,
+        )
+        .await
+        .unwrap();
+        assert_eq!(unknown_ro["result"]["isError"], true);
+        assert!(unknown_ro["result"]["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .contains("--read-only"));
+
+        let unknown_full = handle_rpc_line_with_options(
+            &cfg,
+            &client,
+            &storage,
+            &unknown_call,
+            McpOptions::FULL,
+        )
+        .await
+        .unwrap();
+        assert_eq!(unknown_full["result"]["isError"], true);
+        assert!(unknown_full["result"]["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .contains("unknown tool"));
+
+        // Allowed read-only tools execute normally.
+        let list_sites_call = json!({
+            "jsonrpc": "2.0",
+            "id": 44,
+            "method": "tools/call",
+            "params": { "name": "list_sites", "arguments": {} }
+        })
+        .to_string();
+        let list_sites_resp = handle_rpc_line_with_options(
+            &cfg,
+            &client,
+            &storage,
+            &list_sites_call,
+            McpOptions::READ_ONLY,
+        )
+        .await
+        .unwrap();
+        assert_eq!(list_sites_resp["result"]["isError"], false, "{list_sites_resp}");
     }
 }

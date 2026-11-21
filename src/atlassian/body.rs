@@ -116,15 +116,28 @@ impl<'a> BodyEdit<'a> {
             }
             Self::Section(edit) => {
                 let content = original["content"].as_array_mut().unwrap();
-                let range = section_body_range(content, &edit.heading)?;
+                let target = section_body_range(content, &edit.heading)?;
                 let mut fragment = markdown_to_adf(&edit.markdown);
                 let replacement = fragment["content"]
                     .as_array_mut()
                     .context("invalid ADF fragment")?;
-                if content[range.clone()] == replacement[..] {
+                let (container, range) = match target {
+                    SectionTarget::TopLevel(range) => (content, range),
+                    SectionTarget::LayoutColumn {
+                        section_index,
+                        column_index,
+                        range,
+                    } => (
+                        content[section_index]["content"][column_index]["content"]
+                            .as_array_mut()
+                            .unwrap(),
+                        range,
+                    ),
+                };
+                if container[range.clone()] == replacement[..] {
                     return Ok(None);
                 }
-                content.splice(range, replacement.drain(..));
+                container.splice(range, replacement.drain(..));
             }
             Self::Full(_) => unreachable!(),
         }
@@ -170,39 +183,94 @@ impl<'a> BodyEdit<'a> {
     }
 }
 
+enum SectionTarget {
+    TopLevel(Range<usize>),
+    LayoutColumn {
+        section_index: usize,
+        column_index: usize,
+        range: Range<usize>,
+    },
+}
+
 fn heading_level(node: &Value) -> Option<u64> {
     (node["type"] == "heading")
         .then(|| node.pointer("/attrs/level").and_then(Value::as_u64))
         .flatten()
 }
 
-fn section_body_range(content: &[Value], heading: &str) -> Result<Range<usize>> {
-    let mut matches = content.iter().enumerate().filter_map(|(index, node)| {
-        let level = heading_level(node)?;
-        let text: String = node["content"]
-            .as_array()?
-            .iter()
-            .map(|inline| match inline["type"].as_str() {
-                Some("text") => inline["text"].as_str(),
-                Some("hardBreak") => Some("\n"),
-                Some("mention" | "emoji") => inline.pointer("/attrs/text").and_then(Value::as_str),
-                _ => None,
-            })
-            .collect::<Option<_>>()?;
-        (text == heading).then_some((index, level))
-    });
-    let (index, level) = matches
-        .next()
-        .ok_or(BodyEditError("top-level heading was not found"))?;
-    if matches.next().is_some() {
-        return Err(BodyEditError("top-level heading matches more than one section").into());
-    }
-    let start = index + 1;
+fn heading_text(node: &Value) -> Option<String> {
+    node["content"]
+        .as_array()?
+        .iter()
+        .map(|inline| match inline["type"].as_str() {
+            Some("text") => inline["text"].as_str(),
+            Some("hardBreak") => Some("\n"),
+            Some("mention" | "emoji") => inline.pointer("/attrs/text").and_then(Value::as_str),
+            _ => None,
+        })
+        .collect()
+}
+
+fn section_range_in_container(
+    content: &[Value],
+    heading_index: usize,
+    level: u64,
+) -> Range<usize> {
+    let start = heading_index + 1;
     let end = content[start..]
         .iter()
         .position(|node| heading_level(node).is_some_and(|next| next <= level))
         .map_or(content.len(), |next| start + next);
-    Ok(start..end)
+    start..end
+}
+
+fn section_body_range(content: &[Value], heading: &str) -> Result<SectionTarget> {
+    let mut matched: Option<SectionTarget> = None;
+    let mut record = |candidate: SectionTarget| -> Result<()> {
+        if matched.is_some() {
+            return Err(BodyEditError("heading matches more than one section").into());
+        }
+        matched = Some(candidate);
+        Ok(())
+    };
+
+    for (index, node) in content.iter().enumerate() {
+        if let Some(level) = heading_level(node) {
+            if heading_text(node).as_deref() == Some(heading) {
+                record(SectionTarget::TopLevel(section_range_in_container(
+                    content, index, level,
+                )))?;
+            }
+        } else if node["type"] == "layoutSection" {
+            if let Some(columns) = node["content"].as_array() {
+                for (column_index, column) in columns.iter().enumerate() {
+                    if column["type"] != "layoutColumn" {
+                        continue;
+                    }
+                    let Some(column_content) = column["content"].as_array() else {
+                        continue;
+                    };
+                    for (node_index, child) in column_content.iter().enumerate() {
+                        if let Some(level) = heading_level(child) {
+                            if heading_text(child).as_deref() == Some(heading) {
+                                record(SectionTarget::LayoutColumn {
+                                    section_index: index,
+                                    column_index,
+                                    range: section_range_in_container(
+                                        column_content,
+                                        node_index,
+                                        level,
+                                    ),
+                                })?;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    matched.ok_or_else(|| BodyEditError("heading was not found").into())
 }
 
 /// Return the contiguous portion of the native body replaced by a write.
@@ -589,5 +657,165 @@ mod tests {
             format!("{source}\n\nConfirmed.")
         );
         assert!(BodyEdit::Append("\n ").wiki(source).unwrap().is_none());
+    }
+
+    #[test]
+    fn adf_section_edit_supports_layout_columns_and_rejects_duplicates() {
+        let heading = |text: &str, level: u64| {
+            json!({
+                "type": "heading",
+                "attrs": { "level": level },
+                "content": [{ "type": "text", "text": text }]
+            })
+        };
+        let paragraph = |text: &str| {
+            json!({
+                "type": "paragraph",
+                "content": [{ "type": "text", "text": text }]
+            })
+        };
+        let panel = json!({
+            "type": "panel",
+            "attrs": { "panelType": "info", "localId": "p-1" },
+            "content": [heading("Hidden In Panel", 2), paragraph("Keep panel")]
+        });
+        let table = json!({
+            "type": "table",
+            "attrs": { "localId": "t-1" },
+            "content": [{
+                "type": "tableRow",
+                "content": [{ "type": "tableCell", "content": [paragraph("Cell")] }]
+            }]
+        });
+        let doc = json!({
+            "version": 1,
+            "type": "doc",
+            "extra": "keep-root",
+            "content": [
+                panel,
+                {
+                    "type": "layoutSection",
+                    "attrs": { "localId": "ls-1" },
+                    "content": [
+                        {
+                            "type": "layoutColumn",
+                            "attrs": { "width": 50 },
+                            "content": [
+                                paragraph("Before heading"),
+                                heading("Column Target", 2),
+                                paragraph("Old column body"),
+                                heading("Nested Sub", 3),
+                                paragraph("Old sub body"),
+                                heading("Next Column Section", 2),
+                                paragraph("Keep after next")
+                            ]
+                        },
+                        {
+                            "type": "layoutColumn",
+                            "attrs": { "width": 50 },
+                            "content": [
+                                heading("Side Column", 2),
+                                paragraph("Side body")
+                            ]
+                        }
+                    ]
+                },
+                table
+            ]
+        });
+
+        let edit = SectionReplacement {
+            heading: "Column Target".into(),
+            markdown: "- item 1\n- item 2".into(),
+        };
+        let updated = BodyEdit::Section(&edit).adf(doc.clone()).unwrap().unwrap();
+        assert_eq!(updated["extra"], "keep-root");
+        assert_eq!(updated["content"][0], doc["content"][0]);
+        assert_eq!(updated["content"][2], doc["content"][2]);
+        assert_eq!(updated["content"][1]["attrs"], doc["content"][1]["attrs"]);
+        assert_eq!(
+            updated["content"][1]["content"][1],
+            doc["content"][1]["content"][1]
+        );
+        let col0 = updated["content"][1]["content"][0]["content"]
+            .as_array()
+            .unwrap();
+        assert_eq!(col0[0], paragraph("Before heading"));
+        assert_eq!(col0[1], heading("Column Target", 2));
+        assert_eq!(col0[2]["type"], "bulletList");
+        assert_eq!(col0[3], heading("Next Column Section", 2));
+        assert_eq!(col0[4], paragraph("Keep after next"));
+        assert_eq!(col0.len(), 5);
+
+        // No-op edit returns None.
+        assert!(BodyEdit::Section(&edit).adf(updated).unwrap().is_none());
+
+        // Column-end boundary: heading with no following heading stops at end of column.
+        let side_edit = SectionReplacement {
+            heading: "Side Column".into(),
+            markdown: "Updated side".into(),
+        };
+        let side_updated = BodyEdit::Section(&side_edit)
+            .adf(doc.clone())
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            side_updated["content"][1]["content"][0],
+            doc["content"][1]["content"][0]
+        );
+        assert_eq!(
+            side_updated["content"][1]["content"][1]["content"],
+            json!([heading("Side Column", 2), paragraph("Updated side")])
+        );
+        assert_eq!(side_updated["content"][2], doc["content"][2]);
+
+        // Empty markdown removes section content while keeping heading and sibling nodes.
+        let clear_edit = SectionReplacement {
+            heading: "Side Column".into(),
+            markdown: "".into(),
+        };
+        let cleared = BodyEdit::Section(&clear_edit)
+            .adf(doc.clone())
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            cleared["content"][1]["content"][1]["content"],
+            json!([heading("Side Column", 2)])
+        );
+
+        // Heading inside a panel is NOT matched.
+        let panel_err = BodyEdit::Section(&SectionReplacement {
+            heading: "Hidden In Panel".into(),
+            markdown: "x".into(),
+        })
+        .adf(doc.clone())
+        .unwrap_err();
+        assert!(panel_err.to_string().contains("was not found"), "{panel_err:#}");
+
+        // Same heading at top-level and inside a layout column is rejected as ambiguous.
+        let mut dup_top_and_col = doc.clone();
+        dup_top_and_col["content"]
+            .as_array_mut()
+            .unwrap()
+            .push(heading("Column Target", 2));
+        let dup_err = BodyEdit::Section(&edit)
+            .adf(dup_top_and_col)
+            .unwrap_err();
+        assert!(
+            dup_err.to_string().contains("more than one section"),
+            "{dup_err:#}"
+        );
+
+        // Same heading in two different layout columns is also rejected as ambiguous.
+        let mut dup_two_cols = doc;
+        dup_two_cols["content"][1]["content"][1]["content"]
+            .as_array_mut()
+            .unwrap()
+            .push(heading("Column Target", 3));
+        let dup_col_err = BodyEdit::Section(&edit).adf(dup_two_cols).unwrap_err();
+        assert!(
+            dup_col_err.to_string().contains("more than one section"),
+            "{dup_col_err:#}"
+        );
     }
 }

@@ -1,6 +1,7 @@
 //! Dual-persona (`atlassian` / `confluence` / `conf`) CLI parser and command dispatcher.
 
 use std::{
+    ffi::{OsStr, OsString},
     io::{self, IsTerminal, Write},
     path::{Path, PathBuf},
 };
@@ -85,19 +86,29 @@ pub struct ConfluenceCli {
 #[derive(clap::Args, Debug)]
 pub struct EditBodyArgs {
     /// Replace the entire body with Markdown
-    #[arg(long, conflicts_with = "body_file")]
+    #[arg(long, allow_hyphen_values = true, conflicts_with = "body_file")]
     body: Option<String>,
     /// Replace the entire body from a Markdown file
     #[arg(long = "body-file")]
     body_file: Option<PathBuf>,
     /// Append Markdown while preserving the existing body
-    #[arg(long, conflicts_with_all = ["body", "body_file", "append_file"])]
+    #[arg(
+        long,
+        allow_hyphen_values = true,
+        conflicts_with_all = ["body", "body_file", "append_file"]
+    )]
     append: Option<String>,
     /// Append a Markdown file while preserving the existing body
     #[arg(long = "append-file", conflicts_with_all = ["body", "body_file"])]
     append_file: Option<PathBuf>,
     /// Replace one unique text occurrence in place
-    #[arg(long, num_args = 2, value_names = ["OLD", "NEW"], conflicts_with_all = ["body", "body_file", "append", "append_file"])]
+    #[arg(
+        long,
+        num_args = 2,
+        value_names = ["OLD", "NEW"],
+        allow_hyphen_values = true,
+        conflicts_with_all = ["body", "body_file", "append", "append_file"]
+    )]
     replace: Option<Vec<String>>,
     /// Preview the computed changes without saving
     #[arg(long)]
@@ -108,11 +119,12 @@ pub struct EditBodyArgs {
 pub struct PageBodyArgs {
     #[command(flatten)]
     body: EditBodyArgs,
-    /// Replace the section under an exact top-level heading on a Confluence Cloud ADF page
+    /// Replace the section under an exact top-level or layout-column heading on a Confluence Cloud ADF page
     #[arg(
         long,
         num_args = 2,
         value_names = ["HEADING", "MARKDOWN"],
+        allow_hyphen_values = true,
         conflicts_with_all = ["body", "body_file", "append", "append_file", "replace"]
     )]
     replace_section: Option<Vec<String>>,
@@ -371,9 +383,9 @@ pub enum Command {
         project: Option<String>,
         #[arg(long = "type", default_value = "Task")]
         issue_type: String,
-        #[arg(long)]
+        #[arg(long, allow_hyphen_values = true)]
         summary: String,
-        #[arg(long)]
+        #[arg(long, allow_hyphen_values = true)]
         body: Option<String>,
         #[arg(long = "body-file")]
         body_file: Option<PathBuf>,
@@ -391,7 +403,7 @@ pub enum Command {
     /// Edit fields of an existing Jira issue
     Edit {
         key: String,
-        #[arg(long)]
+        #[arg(long, allow_hyphen_values = true)]
         summary: Option<String>,
         #[command(flatten)]
         body: EditBodyArgs,
@@ -409,7 +421,7 @@ pub enum Command {
     Transition {
         key: String,
         status: Option<String>,
-        #[arg(long)]
+        #[arg(long, allow_hyphen_values = true)]
         comment: Option<String>,
         #[arg(long)]
         list: bool,
@@ -429,6 +441,7 @@ pub enum Command {
     /// Add a Markdown comment to a Jira issue
     Comment {
         key: String,
+        #[arg(allow_hyphen_values = true)]
         body: String,
         #[arg(long)]
         json: bool,
@@ -461,6 +474,7 @@ pub enum Command {
     },
     /// Search Jira issues in local SQLite cache or via remote JQL
     Search {
+        #[arg(allow_hyphen_values = true)]
         query: String,
         #[arg(long)]
         jql: bool,
@@ -533,7 +547,11 @@ pub enum Command {
     },
     /// Run the stdio MCP (JSON-RPC 2.0) server for AI agents
     #[command(visible_alias = "mcp-server")]
-    Mcp,
+    Mcp {
+        /// Expose only read-only query tools and reject write, sync, and download calls
+        #[arg(long = "read-only")]
+        read_only: bool,
+    },
     #[command(flatten)]
     Workflow(JiraWorkflow),
 }
@@ -642,9 +660,9 @@ pub enum ConfluenceCommand {
         space: Option<String>,
         #[arg(long)]
         parent: Option<String>,
-        #[arg(long)]
+        #[arg(long, allow_hyphen_values = true)]
         title: String,
-        #[arg(long)]
+        #[arg(long, allow_hyphen_values = true)]
         body: Option<String>,
         #[arg(long = "body-file")]
         body_file: Option<PathBuf>,
@@ -654,14 +672,14 @@ pub enum ConfluenceCommand {
     /// Edit a Confluence page
     Edit {
         page_id: String,
-        #[arg(long)]
+        #[arg(long, allow_hyphen_values = true)]
         title: Option<String>,
         #[command(flatten)]
         body: PageBodyArgs,
         /// Current page version from view (required for body edits)
         #[arg(long = "prev-version")]
         prev_version: Option<i32>,
-        #[arg(long)]
+        #[arg(long, allow_hyphen_values = true)]
         message: Option<String>,
         #[arg(long)]
         json: bool,
@@ -669,6 +687,7 @@ pub enum ConfluenceCommand {
     /// Add a Markdown comment to a Confluence page
     Comment {
         page_id: String,
+        #[arg(allow_hyphen_values = true)]
         body: String,
         #[arg(long)]
         json: bool,
@@ -701,6 +720,7 @@ pub enum ConfluenceCommand {
     },
     /// Search Confluence pages in local SQLite cache or via remote CQL
     Search {
+        #[arg(allow_hyphen_values = true)]
         query: String,
         #[arg(long)]
         cql: bool,
@@ -772,7 +792,11 @@ pub enum ConfluenceCommand {
     },
     /// Run the stdio MCP (JSON-RPC 2.0) server for AI agents
     #[command(visible_alias = "mcp-server")]
-    Mcp,
+    Mcp {
+        /// Expose only read-only query tools and reject write, sync, and download calls
+        #[arg(long = "read-only")]
+        read_only: bool,
+    },
     #[command(flatten)]
     Workflow(ConfluenceWorkflow),
 }
@@ -822,9 +846,9 @@ pub enum WikiCommand {
         space: Option<String>,
         #[arg(long)]
         parent: Option<String>,
-        #[arg(long)]
+        #[arg(long, allow_hyphen_values = true)]
         title: String,
-        #[arg(long)]
+        #[arg(long, allow_hyphen_values = true)]
         body: Option<String>,
         #[arg(long = "body-file")]
         body_file: Option<PathBuf>,
@@ -834,14 +858,14 @@ pub enum WikiCommand {
     /// Edit a Confluence page
     Edit {
         page_id: String,
-        #[arg(long)]
+        #[arg(long, allow_hyphen_values = true)]
         title: Option<String>,
         #[command(flatten)]
         body: PageBodyArgs,
         /// Current page version from view (required for body edits)
         #[arg(long = "prev-version")]
         prev_version: Option<i32>,
-        #[arg(long)]
+        #[arg(long, allow_hyphen_values = true)]
         message: Option<String>,
         #[arg(long)]
         json: bool,
@@ -849,6 +873,7 @@ pub enum WikiCommand {
     /// Add a comment to a Confluence page
     Comment {
         page_id: String,
+        #[arg(allow_hyphen_values = true)]
         body: String,
         #[arg(long)]
         json: bool,
@@ -881,6 +906,7 @@ pub enum WikiCommand {
     },
     /// Search Confluence pages
     Search {
+        #[arg(allow_hyphen_values = true)]
         query: String,
         #[arg(long)]
         cql: bool,
@@ -968,9 +994,9 @@ pub enum JiraSubcommand {
         project: Option<String>,
         #[arg(long = "type", default_value = "Task")]
         issue_type: String,
-        #[arg(long)]
+        #[arg(long, allow_hyphen_values = true)]
         summary: String,
-        #[arg(long)]
+        #[arg(long, allow_hyphen_values = true)]
         body: Option<String>,
         #[arg(long = "body-file")]
         body_file: Option<PathBuf>,
@@ -988,7 +1014,7 @@ pub enum JiraSubcommand {
     /// Edit a Jira issue
     Edit {
         key: String,
-        #[arg(long)]
+        #[arg(long, allow_hyphen_values = true)]
         summary: Option<String>,
         #[command(flatten)]
         body: EditBodyArgs,
@@ -1006,7 +1032,7 @@ pub enum JiraSubcommand {
     Transition {
         key: String,
         status: Option<String>,
-        #[arg(long)]
+        #[arg(long, allow_hyphen_values = true)]
         comment: Option<String>,
         #[arg(long)]
         list: bool,
@@ -1026,6 +1052,7 @@ pub enum JiraSubcommand {
     /// Add a comment to a Jira issue
     Comment {
         key: String,
+        #[arg(allow_hyphen_values = true)]
         body: String,
         #[arg(long)]
         json: bool,
@@ -1058,6 +1085,7 @@ pub enum JiraSubcommand {
     },
     /// Search Jira issues
     Search {
+        #[arg(allow_hyphen_values = true)]
         query: String,
         #[arg(long)]
         jql: bool,
@@ -1125,7 +1153,7 @@ pub enum JiraWorkflow {
         #[arg(long)]
         started: Option<String>,
         /// Markdown worklog comment
-        #[arg(long)]
+        #[arg(long, allow_hyphen_values = true)]
         comment: Option<String>,
         #[arg(long)]
         json: bool,
@@ -1156,10 +1184,256 @@ pub enum ConfluenceWorkflow {
     },
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum KnownFlagToken {
+    Help,
+    Other,
+}
+
+fn find_matching_option<'a>(
+    active: &'a clap::Command,
+    root: &'a clap::Command,
+    flag: &str,
+) -> Option<&'a clap::Arg> {
+    if let Some(long_name) = flag.strip_prefix("--") {
+        if long_name.is_empty() {
+            return None;
+        }
+        let matches_long = |arg: &&clap::Arg| {
+            !arg.is_positional()
+                && (arg.get_long() == Some(long_name)
+                    || arg
+                        .get_all_aliases()
+                        .is_some_and(|aliases| aliases.contains(&long_name)))
+        };
+        active
+            .get_arguments()
+            .find(matches_long)
+            .or_else(|| {
+                root.get_arguments()
+                    .filter(|arg| arg.is_global_set())
+                    .find(matches_long)
+            })
+    } else if flag.starts_with('-') && flag.len() == 2 {
+        let ch = flag.as_bytes()[1] as char;
+        let matches_short = |arg: &&clap::Arg| {
+            !arg.is_positional()
+                && (arg.get_short() == Some(ch)
+                    || arg
+                        .get_all_short_aliases()
+                        .is_some_and(|aliases| aliases.contains(&ch)))
+        };
+        active
+            .get_arguments()
+            .find(matches_short)
+            .or_else(|| {
+                root.get_arguments()
+                    .filter(|arg| arg.is_global_set())
+                    .find(matches_short)
+            })
+    } else {
+        None
+    }
+}
+
+fn classify_known_flag_or_terminator(
+    active: &clap::Command,
+    root: &clap::Command,
+    token: &OsStr,
+) -> Option<KnownFlagToken> {
+    let text = token.to_str()?;
+    if text == "--" {
+        return Some(KnownFlagToken::Other);
+    }
+    if (text == "-h" || text == "--help") && !active.is_disable_help_flag_set() {
+        return Some(KnownFlagToken::Help);
+    }
+    if (text == "-V" || text == "--version")
+        && active.get_version().is_some()
+        && !active.is_disable_version_flag_set()
+    {
+        return Some(KnownFlagToken::Other);
+    }
+    if text.starts_with("--") {
+        let flag = text.split_once('=').map_or(text, |(left, _)| left);
+        return find_matching_option(active, root, flag).map(|_| KnownFlagToken::Other);
+    }
+    if text.starts_with('-') && text.len() == 2 {
+        return find_matching_option(active, root, text).map(|_| KnownFlagToken::Other);
+    }
+    None
+}
+
+fn disable_hyphen_values_on_arg(
+    cmd: clap::Command,
+    subcmd_path: &[String],
+    arg_id: &str,
+) -> clap::Command {
+    if let Some((first, rest)) = subcmd_path.split_first() {
+        cmd.mut_subcommand(first, |sub| {
+            disable_hyphen_values_on_arg(sub, rest, arg_id)
+        })
+    } else {
+        cmd.mut_arg(arg_id, |arg| arg.allow_hyphen_values(false))
+    }
+}
+
+enum OptionFlagViolation {
+    Help(Vec<OsString>),
+    FlagInValue {
+        subcmd_path: Vec<String>,
+        arg_id: String,
+        err_argv: Vec<OsString>,
+    },
+}
+
+fn has_potential_flag_in_option_value(argv: &[OsString]) -> bool {
+    let mut dash_tokens = 0usize;
+    for token in argv.iter().skip(1) {
+        let Some(text) = token.to_str() else {
+            continue;
+        };
+        if text.starts_with('-') && text != "-" {
+            dash_tokens += 1;
+            if dash_tokens >= 2 {
+                return true;
+            }
+            if text == "--" {
+                break;
+            }
+        }
+    }
+    false
+}
+
+fn find_option_flag_violation(
+    cmd: &clap::Command,
+    argv: &[OsString],
+) -> Option<OptionFlagViolation> {
+    let mut active = cmd;
+    let mut subcmd_path: Vec<String> = Vec::new();
+    let mut i = 1;
+    while i < argv.len() {
+        let token = &argv[i];
+        if token == "--" {
+            break;
+        }
+        if let Some(text) = token.to_str() {
+            if (text == "-h" || text == "--help") && !active.is_disable_help_flag_set() {
+                return None;
+            }
+            if let Some((flag, _)) = text.split_once('=') {
+                if flag.starts_with("--") && find_matching_option(active, cmd, flag).is_some() {
+                    i += 1;
+                    continue;
+                }
+            }
+            if let Some(opt) = find_matching_option(active, cmd, text) {
+                let takes = opt
+                    .get_num_args()
+                    .map(|range| range.min_values())
+                    .unwrap_or_else(|| usize::from(opt.get_action().takes_values()));
+                if takes == 0 {
+                    i += 1;
+                    continue;
+                }
+                if opt.is_allow_hyphen_values_set() {
+                    for k in 0..takes {
+                        let Some(next_tok) = argv.get(i + 1 + k) else {
+                            break;
+                        };
+                        if let Some(kind) =
+                            classify_known_flag_or_terminator(active, cmd, next_tok)
+                        {
+                            if kind == KnownFlagToken::Help {
+                                let mut help_argv = vec![argv[0].clone()];
+                                help_argv.extend(subcmd_path.iter().map(OsString::from));
+                                help_argv.push(next_tok.clone());
+                                return Some(OptionFlagViolation::Help(help_argv));
+                            }
+                            let mut err_argv = argv.to_vec();
+                            for prev in 0..k {
+                                err_argv[i + 1 + prev] = OsString::from("placeholder");
+                            }
+                            return Some(OptionFlagViolation::FlagInValue {
+                                subcmd_path,
+                                arg_id: opt.get_id().as_str().to_string(),
+                                err_argv,
+                            });
+                        }
+                    }
+                    i += 1 + takes;
+                    continue;
+                }
+                let mut consumed = 0;
+                while consumed < takes {
+                    let Some(next_tok) = argv.get(i + 1 + consumed) else {
+                        break;
+                    };
+                    if next_tok
+                        .to_str()
+                        .is_some_and(|s| s.starts_with('-') && s != "-")
+                    {
+                        break;
+                    }
+                    consumed += 1;
+                }
+                i += 1 + consumed;
+                continue;
+            }
+            if active.has_subcommands() {
+                if let Some(sub) = active.get_subcommands().find(|sub| {
+                    sub.get_name() == text
+                        || sub.get_all_aliases().any(|alias| alias == text)
+                }) {
+                    subcmd_path.push(sub.get_name().to_string());
+                    active = sub;
+                    i += 1;
+                    continue;
+                }
+            }
+        }
+        i += 1;
+    }
+    None
+}
+
+pub(crate) fn try_parse_cli_from<T: Parser>(
+    name: &'static str,
+    args: impl IntoIterator<Item = impl Into<OsString>>,
+) -> Result<T, clap::Error> {
+    let argv: Vec<OsString> = args.into_iter().map(Into::into).collect();
+    let cmd = T::command().name(name).bin_name(name);
+
+    if has_potential_flag_in_option_value(&argv) {
+        if let Some(violation) = find_option_flag_violation(&cmd, &argv) {
+            let parsed = match violation {
+                OptionFlagViolation::Help(help_argv) => cmd.try_get_matches_from(help_argv),
+                OptionFlagViolation::FlagInValue {
+                    subcmd_path,
+                    arg_id,
+                    err_argv,
+                } => {
+                    let err_cmd = disable_hyphen_values_on_arg(cmd, &subcmd_path, &arg_id);
+                    err_cmd.try_get_matches_from(err_argv)
+                }
+            };
+            return Err(parsed.err().unwrap_or_else(|| {
+                clap::Error::raw(
+                    clap::error::ErrorKind::InvalidValue,
+                    "expected a value before the next option",
+                )
+            }));
+        }
+    }
+
+    let mut matches = cmd.try_get_matches_from(argv)?;
+    T::from_arg_matches_mut(&mut matches)
+}
+
 fn parse_cli_with_stack<T: Parser + Send + 'static>(name: &'static str) -> T {
     let parse = move || {
-        let mut matches = T::command().name(name).bin_name(name).get_matches();
-        T::from_arg_matches_mut(&mut matches).unwrap_or_else(|error| error.exit())
+        try_parse_cli_from::<T>(name, std::env::args_os()).unwrap_or_else(|error| error.exit())
     };
     std::thread::Builder::new()
         .name("atlassian-cli-parse".to_string())
@@ -1523,10 +1797,15 @@ async fn dispatch_jira_cli(
             ))
             .await
         }
-        Some(Command::Mcp) => {
+        Some(Command::Mcp { read_only }) => {
             let scoped = apply_site_override(cfg, site_override.as_deref())?;
             let (_auth, client) = open_client(&scoped, false)?;
-            Box::pin(crate::mcp::run_deferred(scoped, client)).await
+            Box::pin(crate::mcp::run_deferred(
+                scoped,
+                client,
+                crate::mcp::McpOptions { read_only },
+            ))
+            .await
         }
     }
 }
@@ -1776,10 +2055,15 @@ async fn dispatch_confluence_cli(
             ))
             .await
         }
-        Some(ConfluenceCommand::Mcp) => {
+        Some(ConfluenceCommand::Mcp { read_only }) => {
             let scoped = apply_site_override(cfg, site_override.as_deref())?;
             let (_auth, client) = open_client(&scoped, false)?;
-            Box::pin(crate::mcp::run_deferred(scoped, client)).await
+            Box::pin(crate::mcp::run_deferred(
+                scoped,
+                client,
+                crate::mcp::McpOptions { read_only },
+            ))
+            .await
         }
     }
 }
@@ -5257,7 +5541,10 @@ mod tests {
             other => panic!("unexpected: {other:?}"),
         }
         let cli = Cli::try_parse_from(["jira", "mcp-server"]).unwrap();
-        assert!(matches!(cli.command.unwrap(), Command::Mcp));
+        assert!(matches!(
+            cli.command.unwrap(),
+            Command::Mcp { read_only: false }
+        ));
 
         // Daemon subcommands for both Jira & Confluence personas
         let cli = Cli::try_parse_from(["jira", "daemon", "start", "--json"]).unwrap();
@@ -5557,5 +5844,445 @@ mod tests {
         assert!(rendered.contains("Core Scrum"));
         assert!(rendered.contains("ENG-1"));
         assert!(rendered.contains("To Do (1)"));
+    }
+
+    #[test]
+    fn parses_hyphen_leading_free_text_and_preserves_flags_missing_values_and_help() {
+        use clap::error::ErrorKind;
+
+        let bullet = "- 목록 항목";
+        let multiline = "- 첫째 항목\n- 둘째 항목";
+
+        // 1. All 15 audited CLI templates parse exact values.
+        let cli: Cli =
+            try_parse_cli_from("atlassian", ["atlassian", "edit", "FLS-14", "--append", bullet, "--dry-run", "--json"])
+                .unwrap();
+        match cli.command.unwrap() {
+            Command::Edit { key, body, json, .. } => {
+                assert_eq!(key, "FLS-14");
+                assert_eq!(body.append.as_deref(), Some(bullet));
+                assert!(body.dry_run);
+                assert!(json);
+            }
+            other => panic!("unexpected: {other:?}"),
+        }
+
+        let cli: Cli =
+            try_parse_cli_from("atlassian", ["atlassian", "edit", "FLS-14", "--body", multiline, "--json"])
+                .unwrap();
+        match cli.command.unwrap() {
+            Command::Edit { body, json, .. } => {
+                assert_eq!(body.body.as_deref(), Some(multiline));
+                assert!(json);
+            }
+            other => panic!("unexpected: {other:?}"),
+        }
+
+        let cli: Cli = try_parse_cli_from(
+            "atlassian",
+            ["atlassian", "edit", "FLS-14", "--replace", "old", bullet, "--dry-run"],
+        )
+        .unwrap();
+        match cli.command.unwrap() {
+            Command::Edit { body, .. } => {
+                assert_eq!(body.replace, Some(vec!["old".into(), bullet.into()]));
+                assert!(body.dry_run);
+            }
+            other => panic!("unexpected: {other:?}"),
+        }
+
+        let cli: Cli = try_parse_cli_from(
+            "atlassian",
+            ["atlassian", "edit", "FLS-14", "--replace", bullet, "new"],
+        )
+        .unwrap();
+        match cli.command.unwrap() {
+            Command::Edit { body, .. } => {
+                assert_eq!(body.replace, Some(vec![bullet.into(), "new".into()]));
+            }
+            other => panic!("unexpected: {other:?}"),
+        }
+
+        let cli: Cli = try_parse_cli_from(
+            "atlassian",
+            ["atlassian", "edit", "FLS-14", "--replace", "- old", "- new", "--json"],
+        )
+        .unwrap();
+        match cli.command.unwrap() {
+            Command::Edit { body, json, .. } => {
+                assert_eq!(body.replace, Some(vec!["- old".into(), "- new".into()]));
+                assert!(json);
+            }
+            other => panic!("unexpected: {other:?}"),
+        }
+
+        let cli: Cli = try_parse_cli_from(
+            "atlassian",
+            ["atlassian", "create", "--summary", bullet, "--body", multiline, "--json"],
+        )
+        .unwrap();
+        match cli.command.unwrap() {
+            Command::Create { summary, body, json, .. } => {
+                assert_eq!(summary, bullet);
+                assert_eq!(body.as_deref(), Some(multiline));
+                assert!(json);
+            }
+            other => panic!("unexpected: {other:?}"),
+        }
+
+        let cli: Cli =
+            try_parse_cli_from("atlassian", ["atlassian", "comment", "FLS-14", bullet, "--json"])
+                .unwrap();
+        match cli.command.unwrap() {
+            Command::Comment { key, body, json } => {
+                assert_eq!(key, "FLS-14");
+                assert_eq!(body, bullet);
+                assert!(json);
+            }
+            other => panic!("unexpected: {other:?}"),
+        }
+
+        let cli: Cli = try_parse_cli_from(
+            "atlassian",
+            ["atlassian", "wiki", "create", "--title", bullet, "--body", multiline, "--json"],
+        )
+        .unwrap();
+        match cli.command.unwrap() {
+            Command::Wiki {
+                command: WikiCommand::Create { title, body, json, .. },
+            } => {
+                assert_eq!(title, bullet);
+                assert_eq!(body.as_deref(), Some(multiline));
+                assert!(json);
+            }
+            other => panic!("unexpected: {other:?}"),
+        }
+
+        let cli: Cli = try_parse_cli_from(
+            "atlassian",
+            ["atlassian", "wiki", "edit", "502", "--append", bullet, "--dry-run"],
+        )
+        .unwrap();
+        match cli.command.unwrap() {
+            Command::Wiki {
+                command: WikiCommand::Edit { body, .. },
+            } => {
+                assert_eq!(body.body.append.as_deref(), Some(bullet));
+                assert!(body.body.dry_run);
+            }
+            other => panic!("unexpected: {other:?}"),
+        }
+
+        let cli: Cli = try_parse_cli_from(
+            "atlassian",
+            [
+                "atlassian",
+                "wiki",
+                "edit",
+                "502",
+                "--replace-section",
+                "- 제목",
+                multiline,
+                "--prev-version",
+                "7",
+                "--dry-run",
+                "--json",
+            ],
+        )
+        .unwrap();
+        match cli.command.unwrap() {
+            Command::Wiki {
+                command: WikiCommand::Edit { body, prev_version, json, .. },
+            } => {
+                assert_eq!(
+                    body.replace_section,
+                    Some(vec!["- 제목".into(), multiline.into()])
+                );
+                assert_eq!(prev_version, Some(7));
+                assert!(body.body.dry_run);
+                assert!(json);
+            }
+            other => panic!("unexpected: {other:?}"),
+        }
+
+        let cli: Cli = try_parse_cli_from(
+            "atlassian",
+            ["atlassian", "wiki", "edit", "502", "--body", bullet, "--title", "- 제목", "--message", "- 메모"],
+        )
+        .unwrap();
+        match cli.command.unwrap() {
+            Command::Wiki {
+                command: WikiCommand::Edit { title, body, message, .. },
+            } => {
+                assert_eq!(title.as_deref(), Some("- 제목"));
+                assert_eq!(body.body.body.as_deref(), Some(bullet));
+                assert_eq!(message.as_deref(), Some("- 메모"));
+            }
+            other => panic!("unexpected: {other:?}"),
+        }
+
+        let cli: Cli = try_parse_cli_from(
+            "atlassian",
+            ["atlassian", "wiki", "comment", "502", bullet, "--json"],
+        )
+        .unwrap();
+        match cli.command.unwrap() {
+            Command::Wiki {
+                command: WikiCommand::Comment { page_id, body, json },
+            } => {
+                assert_eq!(page_id, "502");
+                assert_eq!(body, bullet);
+                assert!(json);
+            }
+            other => panic!("unexpected: {other:?}"),
+        }
+
+        let cli: Cli = try_parse_cli_from(
+            "atlassian",
+            ["atlassian", "log-work", "FLS-14", "--seconds", "60", "--comment", bullet, "--json"],
+        )
+        .unwrap();
+        match cli.command.unwrap() {
+            Command::Workflow(JiraWorkflow::LogWork { seconds, comment, json, .. }) => {
+                assert_eq!(seconds, 60);
+                assert_eq!(comment.as_deref(), Some(bullet));
+                assert!(json);
+            }
+            other => panic!("unexpected: {other:?}"),
+        }
+
+        let cli: Cli = try_parse_cli_from(
+            "atlassian",
+            ["atlassian", "transition", "FLS-14", "Done", "--comment", bullet, "--json"],
+        )
+        .unwrap();
+        match cli.command.unwrap() {
+            Command::Transition { comment, json, .. } => {
+                assert_eq!(comment.as_deref(), Some(bullet));
+                assert!(json);
+            }
+            other => panic!("unexpected: {other:?}"),
+        }
+
+        let cli: Cli =
+            try_parse_cli_from("atlassian", ["atlassian", "edit", "FLS-14", "--summary", bullet])
+                .unwrap();
+        match cli.command.unwrap() {
+            Command::Edit { summary, .. } => assert_eq!(summary.as_deref(), Some(bullet)),
+            other => panic!("unexpected: {other:?}"),
+        }
+
+        let cli: Cli =
+            try_parse_cli_from("atlassian", ["atlassian", "search", bullet, "--remote", "--json"])
+                .unwrap();
+        match cli.command.unwrap() {
+            Command::Search { query, remote, json, .. } => {
+                assert_eq!(query, bullet);
+                assert!(remote);
+                assert!(json);
+            }
+            other => panic!("unexpected: {other:?}"),
+        }
+
+        // 2. Confluence persona (`confluence` / `conf`) and `confluence jira` subcommands.
+        let conf: ConfluenceCli = try_parse_cli_from(
+            "confluence",
+            ["confluence", "edit", "502", "--title", bullet, "--replace-section", "Title", multiline, "--dry-run"],
+        )
+        .unwrap();
+        match conf.command.unwrap() {
+            ConfluenceCommand::Edit { title, body, .. } => {
+                assert_eq!(title.as_deref(), Some(bullet));
+                assert_eq!(
+                    body.replace_section,
+                    Some(vec!["Title".into(), multiline.into()])
+                );
+                assert!(body.body.dry_run);
+            }
+            other => panic!("unexpected: {other:?}"),
+        }
+
+        let conf: ConfluenceCli = try_parse_cli_from(
+            "confluence",
+            ["confluence", "comment", "502", bullet, "--json"],
+        )
+        .unwrap();
+        match conf.command.unwrap() {
+            ConfluenceCommand::Comment { page_id, body, json } => {
+                assert_eq!(page_id, "502");
+                assert_eq!(body, bullet);
+                assert!(json);
+            }
+            other => panic!("unexpected: {other:?}"),
+        }
+
+        let conf: ConfluenceCli = try_parse_cli_from(
+            "confluence",
+            ["confluence", "search", bullet, "--remote", "--json"],
+        )
+        .unwrap();
+        match conf.command.unwrap() {
+            ConfluenceCommand::Search { query, remote, json, .. } => {
+                assert_eq!(query, bullet);
+                assert!(remote);
+                assert!(json);
+            }
+            other => panic!("unexpected: {other:?}"),
+        }
+
+        let conf: ConfluenceCli = try_parse_cli_from(
+            "confluence",
+            ["confluence", "jira", "edit", "FLS-14", "--append", bullet, "--dry-run"],
+        )
+        .unwrap();
+        match conf.command.unwrap() {
+            ConfluenceCommand::Jira {
+                command: JiraSubcommand::Edit { body, .. },
+            } => {
+                assert_eq!(body.append.as_deref(), Some(bullet));
+                assert!(body.dry_run);
+            }
+            other => panic!("unexpected: {other:?}"),
+        }
+
+        // 3. Equals syntax for explicit flag-looking text and `--` for positional text.
+        let cli: Cli = try_parse_cli_from(
+            "atlassian",
+            ["atlassian", "edit", "FLS-14", "--append=--dry-run", "--json"],
+        )
+        .unwrap();
+        match cli.command.unwrap() {
+            Command::Edit { body, json, .. } => {
+                assert_eq!(body.append.as_deref(), Some("--dry-run"));
+                assert!(!body.dry_run);
+                assert!(json);
+            }
+            other => panic!("unexpected: {other:?}"),
+        }
+
+        let cli: Cli = try_parse_cli_from(
+            "atlassian",
+            ["atlassian", "edit", "FLS-14", "--append=--help"],
+        )
+        .unwrap();
+        match cli.command.unwrap() {
+            Command::Edit { body, .. } => assert_eq!(body.append.as_deref(), Some("--help")),
+            other => panic!("unexpected: {other:?}"),
+        }
+
+        let cli: Cli = try_parse_cli_from(
+            "atlassian",
+            ["atlassian", "comment", "FLS-14", "--", "--json"],
+        )
+        .unwrap();
+        match cli.command.unwrap() {
+            Command::Comment { body, json, .. } => {
+                assert_eq!(body, "--json");
+                assert!(!json);
+            }
+            other => panic!("unexpected: {other:?}"),
+        }
+
+        let cli: Cli =
+            try_parse_cli_from("atlassian", ["atlassian", "search", "--", "--help"]).unwrap();
+        match cli.command.unwrap() {
+            Command::Search { query, .. } => assert_eq!(query, "--help"),
+            other => panic!("unexpected: {other:?}"),
+        }
+
+        // 4. Missing values before known flags MUST fail instead of swallowing the flag.
+        for missing_case in [
+            vec!["atlassian", "edit", "FLS-14", "--append", "--dry-run"],
+            vec!["atlassian", "edit", "FLS-14", "--append", "--json"],
+            vec!["atlassian", "edit", "FLS-14", "--append", "--site", "acme"],
+            vec!["atlassian", "edit", "FLS-14", "--append", "--"],
+            vec!["atlassian", "edit", "FLS-14", "--body", "--dry-run"],
+            vec!["atlassian", "edit", "FLS-14", "--summary", "--json"],
+            vec!["atlassian", "edit", "FLS-14", "--replace", "old", "--dry-run"],
+            vec!["atlassian", "edit", "FLS-14", "--replace", "- old", "--dry-run"],
+            vec!["atlassian", "edit", "FLS-14", "--replace", "--dry-run", "new"],
+            vec!["atlassian", "wiki", "edit", "502", "--replace-section", "Title", "--dry-run"],
+            vec!["atlassian", "wiki", "edit", "502", "--replace-section", "- 제목", "--json"],
+            vec!["atlassian", "wiki", "edit", "502", "--append", "--dry-run"],
+            vec!["atlassian", "conf", "edit", "502", "--append", "--dry-run"],
+            vec!["atlassian", "--site", "acme", "edit", "FLS-14", "--append", "--dry-run"],
+            vec!["atlassian", "wiki", "edit", "502", "--title", "--json"],
+            vec!["atlassian", "create", "--summary", "Test", "--body", "--json"],
+            vec!["atlassian", "new", "--summary", "Test", "--body", "--json"],
+            vec!["atlassian", "log-work", "FLS-14", "--seconds", "60", "--comment", "--json"],
+            vec!["atlassian", "comment", "FLS-14", "--json"],
+            vec!["atlassian", "search", "--remote"],
+        ] {
+            let err = try_parse_cli_from::<Cli>("atlassian", missing_case.clone()).unwrap_err();
+            assert_ne!(
+                err.kind(),
+                ErrorKind::DisplayHelp,
+                "expected parse error, got help for {missing_case:?}: {err}"
+            );
+        }
+
+        for conf_missing_case in [
+            vec!["confluence", "edit", "502", "--append", "--dry-run"],
+            vec!["confluence", "edit", "502", "--replace-section", "Title", "--dry-run"],
+            vec!["confluence", "jira", "edit", "FLS-14", "--append", "--dry-run"],
+            vec!["confluence", "comment", "502", "--json"],
+            vec!["confluence", "search", "--remote"],
+        ] {
+            let err =
+                try_parse_cli_from::<ConfluenceCli>("confluence", conf_missing_case.clone())
+                    .unwrap_err();
+            assert_ne!(
+                err.kind(),
+                ErrorKind::DisplayHelp,
+                "expected parse error, got help for {conf_missing_case:?}: {err}"
+            );
+        }
+
+        // 5. Actual help invocations still display help.
+        for help_case in [
+            vec!["atlassian", "edit", "--help"],
+            vec!["atlassian", "edit", "FLS-14", "--append", "--help"],
+            vec!["atlassian", "edit", "FLS-14", "--append", "-h"],
+            vec!["atlassian", "edit", "FLS-14", "--replace", "- old", "--help"],
+            vec!["atlassian", "wiki", "edit", "502", "--replace-section", "Title", "-h"],
+            vec!["atlassian", "comment", "FLS-14", "--help"],
+            vec!["atlassian", "comment", "FLS-14", "-h"],
+            vec!["atlassian", "search", "--help"],
+            vec!["atlassian", "search", "-h"],
+            vec!["atlassian", "mcp", "--help"],
+        ] {
+            let err = try_parse_cli_from::<Cli>("atlassian", help_case.clone()).unwrap_err();
+            assert_eq!(
+                err.kind(),
+                ErrorKind::DisplayHelp,
+                "expected help for {help_case:?}, got: {err}"
+            );
+        }
+
+        // 6. IDs, numbers, and enums keep existing parser behavior.
+        for unchanged_case in [
+            vec!["atlassian", "log-work", "FLS-14", "--seconds", "-60"],
+            vec!["atlassian", "wiki", "edit", "502", "--prev-version", "-1"],
+            vec!["atlassian", "login", "--deployment", "-cloud"],
+            vec!["atlassian", "edit", "-FLS-14", "--summary", "Test"],
+        ] {
+            assert!(
+                try_parse_cli_from::<Cli>("atlassian", unchanged_case.clone()).is_err(),
+                "expected rejection for {unchanged_case:?}"
+            );
+        }
+
+        // 7. MCP `--read-only` flag on both entrypoints.
+        let cli: Cli = try_parse_cli_from("atlassian", ["atlassian", "mcp", "--read-only"]).unwrap();
+        assert!(matches!(
+            cli.command.unwrap(),
+            Command::Mcp { read_only: true }
+        ));
+        let conf: ConfluenceCli =
+            try_parse_cli_from("confluence", ["confluence", "mcp", "--read-only"]).unwrap();
+        assert!(matches!(
+            conf.command.unwrap(),
+            ConfluenceCommand::Mcp { read_only: true }
+        ));
     }
 }

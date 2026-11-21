@@ -19,10 +19,14 @@
 ## Starting manually
 
 ```bash
-atlassian mcp            # stdio: one JSON-RPC 2.0 object per line
-confluence mcp      # same tool catalog under the confluence persona
-atlassian mcp-server     # alias
+atlassian mcp              # stdio: one JSON-RPC 2.0 object per line (all 37 tools)
+atlassian mcp --read-only  # read-only session (15 query tools; write, sync, and download calls rejected)
+confluence mcp             # same tool catalog under the confluence persona
+confluence mcp --read-only # read-only session under the confluence persona
+atlassian mcp-server       # alias
 ```
+
+Passing `--read-only` exposes only the 15 read-only query tools (`get_myself`, `list_sites`, `list_projects`, `list_boards`, `list_sprints`, `get_board_issues`, `search_jira_issues`, `get_jira_issue`, `list_jira_transitions`, `list_confluence_spaces`, `list_space_pages`, `list_child_pages`, `get_confluence_page`, `search_confluence_pages`, and `search_all`) in `tools/list` and rejects direct `tools/call` invocations of any other tool before remote writes, workspace syncs, or attachment downloads occur.
 
 `stdout` strictly carries single-line JSON-RPC 2.0 messages; diagnostics and startup warnings are written to `stderr` only.
 
@@ -153,7 +157,7 @@ args = ["mcp"]
 - `get_jira_issue` and `get_confluence_page` default to `compact: true` for live and offline reads. Both return full Markdown. An issue includes its key, summary, and status, and a page includes its ID, title, space, and version. Set `compact: false` to keep the full response shape used by earlier versions.
 - Pass one of the body fields when editing. Use `description_markdown` for a full Jira description or `body_markdown` for a full Confluence body. `append_markdown` adds a fragment to the native body. `replace_text` accepts an object with `old_text` and `new_text` and requires one match in a single source text node.
 - Pass the current `page.version_number` from a compact read or `page.summary.version_number` from a full read as `prev_version` for any Confluence body edit.
-- Use `replace_section: {"heading":"Rollout","markdown":"Verify the canary."}` on a Confluence Cloud ADF page. The heading text needs an exact, unique match among top-level headings. The edit keeps that heading and replaces the content up to the next heading at the same or a higher level, or the end of the page. An empty Markdown string removes that content.
+- Use `replace_section: {"heading":"Rollout","markdown":"Verify the canary."}` on a Confluence Cloud ADF page. The heading text needs an exact, unique match among top-level headings and direct headings inside layout columns. The edit keeps that heading and replaces the content up to the next heading at the same or a higher level in the same container (or the end of that container). An empty Markdown string removes that content.
 - Set `dry_run: true` on either update tool to compute the pending edit against the live item. The response includes `preview.changed` and `preview.changes`. Confluence also returns the current and proposed version numbers. Body changes include the native `representation`, `before`, and `after`. When present, `start` is a zero-based top-level ADF node index or UTF-8 byte offset into a wiki or storage string. The preview performs zero remote writes and leaves the detail cache untouched.
 
 Preview a section edit on page `40211` at version 7 with `update_confluence_page`.

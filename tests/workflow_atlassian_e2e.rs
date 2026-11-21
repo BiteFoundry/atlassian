@@ -25,6 +25,7 @@ struct Fixture {
     cloud: bool,
     fields: Value,
     parent: &'static str,
+    page_title: String,
     page_body: String,
     version: i32,
     sprint: i32,
@@ -32,6 +33,7 @@ struct Fixture {
     labels: Vec<String>,
     attachments: Vec<Value>,
     worklogs: Vec<Value>,
+    requests: Vec<(String, String)>,
     writes: Vec<(String, String, Value)>,
 }
 
@@ -47,6 +49,7 @@ impl Fixture {
                 "customfield_10009": "unrelated"
             }),
             parent: "702",
+            page_title: "Page 701".into(),
             page_body: if cloud { ADF } else { XHTML }.into(),
             version: 7,
             sprint: 4,
@@ -54,6 +57,7 @@ impl Fixture {
             labels: vec!["keep".into(), "legacy/ops".into()],
             attachments: Vec::new(),
             worklogs: Vec::new(),
+            requests: Vec::new(),
             writes: Vec::new(),
         }
     }
@@ -61,14 +65,19 @@ impl Fixture {
     fn page(&self, id: &str) -> Value {
         let parent = (id == "701").then_some(self.parent);
         let version = if id == "701" { self.version } else { 1 };
+        let title = if id == "701" {
+            self.page_title.clone()
+        } else {
+            format!("Page {id}")
+        };
         if self.cloud {
             json!({"id": id, "spaceId": "77", "spaceKey": "ENG", "parentId": parent,
-                "title": format!("Page {id}"), "status": "current", "version": {"number": version},
+                "title": title, "status": "current", "version": {"number": version},
                 "body": {"atlas_doc_format": {"value": self.page_body}}})
         } else {
             let ancestors: Vec<_> = parent.into_iter().map(|p| json!({"id": p})).collect();
             json!({"id": id, "space": {"id": 77, "key": if id == "704" {"OTHER"} else {"ENG"}},
-                "title": format!("Page {id}"), "type": "page", "version": {"number": version},
+                "title": title, "type": "page", "version": {"number": version},
                 "ancestors": ancestors, "body": {"storage": {"value": self.page_body}},
                 "metadata": {"labels": {"results": self.label_entries()}},
                 "children": {"attachment": {"results": self.attachments}}})
@@ -105,12 +114,23 @@ async fn upstream(
     let body: Value = serde_json::from_slice(&bytes).unwrap_or(Value::Null);
     let query: std::collections::HashMap<_, _> =
         url::form_urlencoded::parse(path.query().unwrap_or("").as_bytes()).collect();
+    state.requests.push((method.to_string(), path.to_string()));
     if method != Method::GET {
         state
             .writes
             .push((method.to_string(), path.to_string(), body.clone()));
     }
     let get = method == Method::GET;
+
+    if route == format!("{jira}/myself") && get {
+        return Json(json!({
+            "accountId": "acc-test",
+            "displayName": "Test User",
+            "emailAddress": "test@example.invalid",
+            "active": true
+        }))
+        .into_response();
+    }
 
     if route == format!("{jira}/issueLink") && method == Method::POST {
         assert_eq!(
@@ -161,7 +181,7 @@ async fn upstream(
             let fields = body["fields"].as_object().unwrap();
             assert!(fields
                 .keys()
-                .all(|name| matches!(name.as_str(), "parent" | "description")
+                .all(|name| matches!(name.as_str(), "parent" | "description" | "summary")
                     || name.starts_with("customfield_")));
             for (name, value) in fields {
                 state.fields[name] = value.clone();
@@ -251,6 +271,9 @@ async fn upstream(
                     "storage"
                 }
             );
+            if let Some(title) = body["title"].as_str() {
+                state.page_title = title.to_owned();
+            }
             state.page_body = native["value"].as_str().unwrap().to_owned();
             state.version += 1;
             return Json(state.page(page)).into_response();
@@ -334,12 +357,13 @@ impl Harness {
         cmd
     }
 
-    async fn cli(&self, args: &[&str], success: bool) -> Value {
-        let result =
-            tokio::time::timeout(Duration::from_secs(20), self.process().args(args).output())
-                .await
-                .expect("CLI timed out")
-                .unwrap();
+    async fn cli_with_persona(&self, persona: &str, args: &[&str], success: bool) -> Value {
+        let mut cmd = self.process();
+        cmd.env("ATLASSIAN_PERSONA", persona);
+        let result = tokio::time::timeout(Duration::from_secs(20), cmd.args(args).output())
+            .await
+            .expect("CLI timed out")
+            .unwrap();
         let stderr = String::from_utf8_lossy(&result.stderr);
         assert_eq!(result.status.success(), success, "{args:?} {stderr}");
         if success {
@@ -349,21 +373,32 @@ impl Harness {
         }
     }
 
-    async fn mcp(&self, name: &str, args: Value, success: bool) -> Value {
+    async fn cli(&self, args: &[&str], success: bool) -> Value {
+        self.cli_with_persona("jira", args, success).await
+    }
+
+    async fn mcp_rpc(&self, persona: &str, mcp_args: &[&str], request: Value) -> (Value, String) {
         let mut cmd = self.process();
+        cmd.env("ATLASSIAN_PERSONA", persona);
         let mut child = cmd
             .arg("mcp")
+            .args(mcp_args)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .spawn()
             .unwrap();
-        let call = json!({"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":name,"arguments":args}});
         let mut stdin = child.stdin.take().unwrap();
-        stdin.write_all(format!(
-            "{{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\",\"params\":{{\"protocolVersion\":\"2024-11-05\"}}}}\n\
-             {{\"jsonrpc\":\"2.0\",\"method\":\"notifications/initialized\"}}\n{call}\n"
-        ).as_bytes()).await.unwrap();
+        stdin
+            .write_all(
+                format!(
+                    "{{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\",\"params\":{{\"protocolVersion\":\"2024-11-05\"}}}}\n\
+                     {{\"jsonrpc\":\"2.0\",\"method\":\"notifications/initialized\"}}\n{request}\n"
+                )
+                .as_bytes(),
+            )
+            .await
+            .unwrap();
         drop(stdin);
         let output = tokio::time::timeout(Duration::from_secs(20), child.wait_with_output())
             .await
@@ -374,12 +409,35 @@ impl Harness {
             "{}",
             String::from_utf8_lossy(&output.stderr)
         );
-        let response = std::str::from_utf8(&output.stdout)
+        let line = std::str::from_utf8(&output.stdout)
             .unwrap()
             .lines()
-            .map(|line| serde_json::from_str::<Value>(line).unwrap())
-            .find(|result| result["id"] == 2)
-            .unwrap();
+            .find(|line| {
+                serde_json::from_str::<Value>(line)
+                    .map(|val| val["id"] == request["id"])
+                    .unwrap_or(false)
+            })
+            .unwrap()
+            .to_string();
+        let response: Value = serde_json::from_str(&line).unwrap();
+        (response, line)
+    }
+
+    async fn mcp(&self, name: &str, args: Value, success: bool) -> Value {
+        self.mcp_with_options("jira", &[], name, args, success)
+            .await
+    }
+
+    async fn mcp_with_options(
+        &self,
+        persona: &str,
+        mcp_args: &[&str],
+        name: &str,
+        args: Value,
+        success: bool,
+    ) -> Value {
+        let call = json!({"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":name,"arguments":args}});
+        let (response, _) = self.mcp_rpc(persona, mcp_args, call).await;
         assert_eq!(
             response["result"]["isError"], !success,
             "{name}: {response}"
@@ -902,11 +960,18 @@ async fn confluence_cloud_section_edit_preserves_native_nodes_and_checks_heading
     let media = json!({"type":"mediaSingle","attrs":{"layout":"center"},"content":[
         {"type":"media","attrs":{"type":"file","id":"image-id","collection":"fixture"}}
     ]});
-    let layout = json!({"type":"layoutSection","content":[{"type":"layoutColumn","attrs":{"width":50},
-        "content":[heading("Deploy safely", 2), paragraph("Nested heading stays")]}]});
+    let table = json!({"type":"table","attrs":{"localId":"table-01"},"content":[
+        {"type":"tableRow","content":[{"type":"tableCell","content":[paragraph("Keep cell")]}]}
+    ]});
+    let layout_distinct = json!({"type":"layoutSection","attrs":{"localId":"layout-01"},"content":[
+        {"type":"layoutColumn","attrs":{"width":50},
+            "content":[heading("Column notes", 2), paragraph("Nested heading stays")]},
+        {"type":"layoutColumn","attrs":{"width":50},
+            "content":[paragraph("Right column stays")]}
+    ]});
     let original = json!({"type":"doc","version":1,"content":[panel, heading("Deploy safely", 2),
         paragraph("Old body"), heading("Old subsection", 3), paragraph("More old body"),
-        heading("Next section", 2), media, layout]});
+        heading("Next section", 2), media, table, layout_distinct]});
     mock.state.lock().unwrap().page_body = original.to_string();
     for (name, version, error) in [
         ("Missing", 7, "was not found"),
@@ -923,6 +988,8 @@ async fn confluence_cloud_section_edit_preserves_native_nodes_and_checks_heading
             .await;
         assert!(response.as_str().unwrap().contains(error), "{response}");
     }
+
+    // Duplicate across two top-level headings -> PUT 0.
     let mut duplicate = original.clone();
     duplicate["content"]
         .as_array_mut()
@@ -941,8 +1008,41 @@ async fn confluence_cloud_section_edit_preserves_native_nodes_and_checks_heading
         .as_str()
         .unwrap()
         .contains("more than one section"));
-    mock.state.lock().unwrap().page_body = original.to_string();
 
+    // Duplicate across top-level AND layout column -> PUT 0 for both CLI and MCP.
+    let mut dup_top_and_col = original.clone();
+    dup_top_and_col["content"][8]["content"][0]["content"][0] = heading("Deploy safely", 2);
+    mock.state.lock().unwrap().page_body = dup_top_and_col.to_string();
+    let dup_mcp = mock
+        .mcp(
+            "update_confluence_page",
+            json!({"page_id":"701","prev_version":7,
+        "replace_section":{"heading":"Deploy safely","markdown":"Replacement"}}),
+            false,
+        )
+        .await;
+    assert!(dup_mcp.as_str().unwrap().contains("more than one section"));
+    let dup_cli = mock
+        .cli(
+            &[
+                "wiki",
+                "edit",
+                "701",
+                "--prev-version",
+                "7",
+                "--replace-section",
+                "Deploy safely",
+                "Replacement",
+                "--json",
+            ],
+            false,
+        )
+        .await;
+    assert!(dup_cli.as_str().unwrap().contains("more than one section"));
+    assert!(mock.state.lock().unwrap().writes.is_empty());
+
+    // Case 1: unique top-level heading succeeds and preserves surrounding nodes including layout.
+    mock.state.lock().unwrap().page_body = original.to_string();
     let inputs = json!({"page_id":"701","prev_version":7,"dry_run":true,
         "replace_section":{"heading":"Deploy safely","markdown":"Replacement"}});
     let preview = mock.mcp("update_confluence_page", inputs, true).await;
@@ -1015,4 +1115,409 @@ async fn confluence_cloud_section_edit_preserves_native_nodes_and_checks_heading
         .unwrap()
         .contains("requires a Confluence Cloud ADF page"));
     assert!(dc.state.lock().unwrap().writes.is_empty());
+}
+
+#[tokio::test]
+async fn confluence_cloud_layout_column_section_edit_previews_saves_and_rejects_errors() {
+    let mock = Harness::new(true).await;
+    let heading = |text, level| {
+        json!({"type":"heading","attrs":{"level":level},
+        "content":[{"type":"text","text":text,"marks":[{"type":"strong"}]}]})
+    };
+    let paragraph = |text| json!({"type":"paragraph","content":[{"type":"text","text":text}]});
+    let panel = json!({"type":"panel","attrs":{"panelType":"info","localId":"panel-col"},"content":[paragraph("Top panel stays")]});
+    let media = json!({"type":"mediaSingle","attrs":{"layout":"center"},"content":[
+        {"type":"media","attrs":{"type":"file","id":"img-col","collection":"fixture"}}
+    ]});
+    let table = json!({"type":"table","attrs":{"localId":"tbl-col"},"content":[
+        {"type":"tableRow","content":[{"type":"tableCell","content":[paragraph("Table stays")]}]}
+    ]});
+    let original = json!({
+        "type": "doc",
+        "version": 1,
+        "content": [
+            panel,
+            {
+                "type": "layoutSection",
+                "attrs": { "localId": "ls-main" },
+                "content": [
+                    {
+                        "type": "layoutColumn",
+                        "attrs": { "width": 50 },
+                        "content": [
+                            heading("Column rollout", 2),
+                            paragraph("Old left body"),
+                            heading("Old detail", 3),
+                            paragraph("Old detail body"),
+                            heading("Column after", 2),
+                            paragraph("Keep after")
+                        ]
+                    },
+                    {
+                        "type": "layoutColumn",
+                        "attrs": { "width": 50 },
+                        "content": [
+                            heading("Right notes", 2),
+                            paragraph("Right column untouched")
+                        ]
+                    }
+                ]
+            },
+            media,
+            table
+        ]
+    });
+    mock.state.lock().unwrap().page_body = original.to_string();
+
+    // Missing heading, stale version, and duplicate across two columns all perform 0 writes.
+    for (name, version, expected_err) in [
+        ("Missing column heading", 7, "was not found"),
+        ("Column rollout", 6, "version"),
+    ] {
+        let err = mock
+            .mcp(
+                "update_confluence_page",
+                json!({"page_id":"701","prev_version":version,
+                    "replace_section":{"heading":name,"markdown":"Updated"},"dry_run":true}),
+                false,
+            )
+            .await;
+        assert!(err.as_str().unwrap().contains(expected_err), "{err}");
+    }
+    let mut dup_cols = original.clone();
+    dup_cols["content"][1]["content"][1]["content"]
+        .as_array_mut()
+        .unwrap()
+        .push(heading("Column rollout", 2));
+    mock.state.lock().unwrap().page_body = dup_cols.to_string();
+    let dup_err = mock
+        .cli(
+            &[
+                "wiki",
+                "edit",
+                "701",
+                "--prev-version",
+                "7",
+                "--replace-section",
+                "Column rollout",
+                "Updated",
+                "--json",
+            ],
+            false,
+        )
+        .await;
+    assert!(dup_err.as_str().unwrap().contains("more than one section"));
+    assert!(mock.state.lock().unwrap().writes.is_empty());
+
+    // Restore unique layout-column heading; CLI and MCP dry-run match with PUT 0.
+    mock.state.lock().unwrap().page_body = original.to_string();
+    let mcp_preview = mock
+        .mcp(
+            "update_confluence_page",
+            json!({"page_id":"701","prev_version":7,"dry_run":true,
+                "replace_section":{"heading":"Column rollout","markdown":"- updated item"}}),
+            true,
+        )
+        .await;
+    let cli_preview = mock
+        .cli(
+            &[
+                "wiki",
+                "edit",
+                "701",
+                "--prev-version",
+                "7",
+                "--replace-section",
+                "Column rollout",
+                "- updated item",
+                "--dry-run",
+                "--json",
+            ],
+            true,
+        )
+        .await;
+    assert_eq!(mcp_preview, cli_preview);
+    assert_eq!(mcp_preview["preview"]["changed"], true);
+    assert_eq!(mcp_preview["preview"]["prev_version"], 7);
+    assert_eq!(mcp_preview["preview"]["next_version"], 8);
+    assert!(mock.state.lock().unwrap().writes.is_empty());
+    let change = &mcp_preview["preview"]["changes"]["body"];
+    assert_eq!(change["start"], 1);
+    let after_col0 = &change["after"][0]["content"][0]["content"];
+    assert_eq!(after_col0[0], heading("Column rollout", 2));
+    assert_eq!(after_col0[1]["type"], "bulletList");
+    assert_eq!(after_col0[2], heading("Column after", 2));
+    assert_eq!(after_col0[3], paragraph("Keep after"));
+
+    // Actual edit performs PUT 1, bumps version 7 -> 8, and preserves sibling column & surrounding nodes.
+    let saved = mock
+        .cli_with_persona(
+            "confluence",
+            &[
+                "edit",
+                "701",
+                "--prev-version",
+                "7",
+                "--replace-section",
+                "Column rollout",
+                "- updated item",
+                "--json",
+            ],
+            true,
+        )
+        .await;
+    assert_eq!(saved["page"]["summary"]["version_number"], 8);
+    let restored = native_body(true, saved["page"]["body_raw"].as_str().unwrap());
+    assert_eq!(restored, apply_body_preview(&original, change));
+    assert_eq!(restored["content"][0], original["content"][0]);
+    assert_eq!(restored["content"][2], original["content"][2]);
+    assert_eq!(restored["content"][3], original["content"][3]);
+    assert_eq!(
+        restored["content"][1]["attrs"],
+        original["content"][1]["attrs"]
+    );
+    assert_eq!(
+        restored["content"][1]["content"][1],
+        original["content"][1]["content"][1]
+    );
+    assert_eq!(mock.state.lock().unwrap().writes.len(), 1);
+
+    // Column-end edit (no next heading in right column) stops at column end and leaves left column intact.
+    let saved_right = mock
+        .mcp(
+            "update_confluence_page",
+            json!({"page_id":"701","prev_version":8,
+                "replace_section":{"heading":"Right notes","markdown":"Right updated"}}),
+            true,
+        )
+        .await;
+    assert_eq!(saved_right["page"]["summary"]["version_number"], 9);
+    let right_doc = native_body(true, saved_right["page"]["body_raw"].as_str().unwrap());
+    assert_eq!(
+        right_doc["content"][1]["content"][0],
+        restored["content"][1]["content"][0]
+    );
+    assert_eq!(
+        right_doc["content"][1]["content"][1]["content"],
+        json!([heading("Right notes", 2), paragraph("Right updated")])
+    );
+    assert_eq!(mock.state.lock().unwrap().writes.len(), 2);
+}
+
+#[tokio::test]
+async fn built_cli_handles_hyphen_text_payloads_and_rejects_missing_value_before_dry_run() {
+    let mock = Harness::new(true).await;
+
+    // Missing value before --dry-run MUST fail with 0 writes.
+    mock.cli(&["edit", "ATL-1", "--append", "--dry-run"], false)
+        .await;
+    mock.cli(&["edit", "ATL-1", "--replace", "Fixture", "--dry-run"], false)
+        .await;
+    mock.cli(
+        &[
+            "wiki",
+            "edit",
+            "701",
+            "--prev-version",
+            "7",
+            "--replace-section",
+            "Title",
+            "--dry-run",
+        ],
+        false,
+    )
+    .await;
+    assert!(mock.state.lock().unwrap().writes.is_empty());
+
+    // Jira edit --append with two-line Korean Markdown list + --summary with leading hyphen.
+    let updated_issue = mock
+        .cli(
+            &[
+                "edit",
+                "ATL-1",
+                "--summary",
+                "- 요약 제목",
+                "--append",
+                "- 첫째 항목\n- 둘째 항목",
+                "--json",
+            ],
+            true,
+        )
+        .await;
+    assert_eq!(updated_issue["issue"]["summary"]["summary"], "- 요약 제목");
+    let desc = mock.state.lock().unwrap().fields["description"].clone();
+    let last_node = desc["content"].as_array().unwrap().last().unwrap();
+    assert_eq!(last_node["type"], "bulletList");
+    assert_eq!(last_node["content"].as_array().unwrap().len(), 2);
+    assert_eq!(
+        last_node["content"][0]["content"][0]["content"][0]["text"],
+        "첫째 항목"
+    );
+    assert_eq!(
+        last_node["content"][1]["content"][0]["content"][0]["text"],
+        "둘째 항목"
+    );
+
+    // Jira --replace with hyphen-leading OLD and NEW values in order.
+    mock.cli(
+        &["edit", "ATL-1", "--replace", "첫째 항목", "- 바뀐 항목", "--json"],
+        true,
+    )
+    .await;
+    mock.cli(
+        &["edit", "ATL-1", "--replace", "- 바뀐 항목", "- 최종 항목", "--json"],
+        true,
+    )
+    .await;
+    let desc_after = mock.state.lock().unwrap().fields["description"].clone();
+    assert_eq!(
+        desc_after["content"].as_array().unwrap().last().unwrap()["content"][0]["content"][0]
+            ["content"][0]["text"],
+        "- 최종 항목"
+    );
+
+    // Jira log-work --comment with leading hyphen.
+    let worklog = mock
+        .cli(
+            &[
+                "log-work",
+                "ATL-1",
+                "--seconds",
+                "60",
+                "--comment",
+                "- 작업 기록",
+                "--json",
+            ],
+            true,
+        )
+        .await;
+    assert_eq!(worklog["worklog"]["timeSpentSeconds"], 60);
+    assert_eq!(worklog["worklog"]["comment"]["content"][0]["type"], "bulletList");
+
+    // Confluence wiki edit with hyphen title and two-line list append.
+    let updated_page = mock
+        .cli(
+            &[
+                "wiki",
+                "edit",
+                "701",
+                "--prev-version",
+                "7",
+                "--title",
+                "- 목록 제목",
+                "--append",
+                "- 항목 A\n- 항목 B",
+                "--json",
+            ],
+            true,
+        )
+        .await;
+    assert_eq!(updated_page["page"]["summary"]["title"], "- 목록 제목");
+    assert_eq!(updated_page["page"]["summary"]["version_number"], 8);
+    let page_doc = native_body(true, updated_page["page"]["body_raw"].as_str().unwrap());
+    let page_list = page_doc["content"].as_array().unwrap().last().unwrap();
+    assert_eq!(page_list["type"], "bulletList");
+    assert_eq!(page_list["content"].as_array().unwrap().len(), 2);
+
+    // Exact write count: 3 Jira PUTs + 1 worklog POST + 1 Confluence PUT = 5.
+    assert_eq!(mock.state.lock().unwrap().writes.len(), 5);
+}
+
+#[tokio::test]
+async fn mcp_read_only_filters_catalog_blocks_writes_and_keeps_default_mode_working() {
+    let mock = Harness::new(true).await;
+    let list_req = json!({"jsonrpc":"2.0","id":2,"method":"tools/list"});
+
+    let (full_resp, full_line) = mock.mcp_rpc("jira", &[], list_req.clone()).await;
+    let (ro_jira_resp, ro_jira_line) = mock
+        .mcp_rpc("jira", &["--read-only"], list_req.clone())
+        .await;
+    let (ro_conf_resp, ro_conf_line) = mock
+        .mcp_rpc("confluence", &["--read-only"], list_req)
+        .await;
+
+    let full_tools = full_resp["result"]["tools"].as_array().unwrap();
+    let ro_jira_tools = ro_jira_resp["result"]["tools"].as_array().unwrap();
+    let ro_conf_tools = ro_conf_resp["result"]["tools"].as_array().unwrap();
+    assert_eq!(full_tools.len(), 37);
+    assert_eq!(ro_jira_tools.len(), 15);
+    assert_eq!(ro_conf_tools.len(), 15);
+    assert_eq!(ro_jira_line, ro_conf_line);
+    assert!(ro_jira_line.len() < full_line.len() / 2);
+
+    // Allowed read tools succeed in --read-only mode against the loopback mock.
+    let myself = mock
+        .mcp_with_options("jira", &["--read-only"], "get_myself", json!({}), true)
+        .await;
+    assert_eq!(myself["user"]["id"], "acc-test");
+    assert_eq!(myself["user"]["display_name"], "Test User");
+    let issue = mock
+        .mcp_with_options(
+            "jira",
+            &["--read-only"],
+            "get_jira_issue",
+            json!({"key": "ATL-1"}),
+            true,
+        )
+        .await;
+    assert_eq!(issue["issue"]["key"], "ATL-1");
+    let page = mock
+        .mcp_with_options(
+            "confluence",
+            &["--read-only"],
+            "get_confluence_page",
+            json!({"page_id": "701"}),
+            true,
+        )
+        .await;
+    assert_eq!(page["page"]["id"], "701");
+
+    // Direct calls to hidden write, sync, and download tools are rejected BEFORE any HTTP request or file write.
+    let dl_dir = tempfile::tempdir().unwrap();
+    let requests_before = mock.state.lock().unwrap().requests.len();
+    for (persona, tool, args) in [
+        (
+            "jira",
+            "update_jira_issue",
+            json!({"key": "ATL-1", "summary": "Blocked"}),
+        ),
+        (
+            "jira",
+            "add_jira_worklog",
+            json!({"key": "ATL-1", "seconds": 60}),
+        ),
+        (
+            "confluence",
+            "update_confluence_page",
+            json!({"page_id": "701", "title": "Blocked"}),
+        ),
+        ("jira", "sync_workspace", json!({})),
+        (
+            "jira",
+            "download_attachment",
+            json!({"issue_key": "ATL-1", "dest_dir": dl_dir.path()}),
+        ),
+    ] {
+        let err = mock
+            .mcp_with_options(persona, &["--read-only"], tool, args, false)
+            .await;
+        assert!(
+            err.as_str().unwrap().contains("--read-only"),
+            "{tool}: {err}"
+        );
+    }
+    assert_eq!(mock.state.lock().unwrap().requests.len(), requests_before);
+    assert!(mock.state.lock().unwrap().writes.is_empty());
+    assert_eq!(std::fs::read_dir(dl_dir.path()).unwrap().count(), 0);
+
+    // Default full mode still allows existing write calls.
+    let updated = mock
+        .mcp(
+            "update_jira_issue",
+            json!({"key": "ATL-1", "summary": "Allowed in full mode"}),
+            true,
+        )
+        .await;
+    assert_eq!(updated["issue"]["summary"]["summary"], "Allowed in full mode");
+    assert_eq!(mock.state.lock().unwrap().writes.len(), 1);
 }
