@@ -3,8 +3,6 @@
 //! with prev/next cycling (`[`/`]`, `←`/`→`), zoom/fit (`+`/`-`/`0`/`f`), protocol cycle (`p`),
 //! download (`d`), browser open (`o`), and close (`Esc`/`q`/`v`).
 
-use std::collections::HashMap;
-
 use ratatui::{
     layout::Rect,
     style::{Modifier, Style},
@@ -277,17 +275,23 @@ impl ImagePreviewOverlay {
     pub fn lookup_cached<'a>(
         &self,
         area: Rect,
-        image_cache: &'a HashMap<String, RenderedTerminalImage>,
+        app: &'a AppState,
     ) -> Option<(String, &'a RenderedTerminalImage)> {
         let cur = self.current()?;
         let (cols, rows) = self.target_dimensions(area.width, area.height);
         let proto_key = img_preview::preview_cache_key(&cur.id, cols, rows, self.protocol);
-        if let Some(rendered) = image_cache.get(&proto_key) {
+        if self.protocol.is_pixel() {
+            return app
+                .pixel_image_cache
+                .get(&proto_key)
+                .map(|image| (proto_key, image));
+        }
+        if let Some(rendered) = app.image_cache.get(&proto_key) {
             return Some((proto_key, rendered));
         }
         if self.protocol == TerminalImageProtocol::Halfblock {
             let legacy_key = AppState::image_cache_key(&cur.id, cols, rows);
-            if let Some(rendered) = image_cache.get(&legacy_key) {
+            if let Some(rendered) = app.image_cache.get(&legacy_key) {
                 return Some((legacy_key, rendered));
             }
         }
@@ -330,12 +334,12 @@ impl ImagePreviewOverlay {
     pub fn pending_pixel_graphic(
         &self,
         area: Rect,
-        image_cache: &HashMap<String, RenderedTerminalImage>,
+        app: &AppState,
     ) -> Option<PendingPixelGraphic> {
         if !self.protocol.is_pixel() {
             return None;
         }
-        let (cache_key, rendered) = self.lookup_cached(area, image_cache)?;
+        let (cache_key, rendered) = self.lookup_cached(area, app)?;
         if !rendered.protocol.is_pixel() || rendered.pixel_payload.is_none() {
             return None;
         }
@@ -517,7 +521,7 @@ impl ImagePreviewOverlay {
             return None;
         };
 
-        let cached_entry = self.lookup_cached(area, &app.image_cache);
+        let cached_entry = self.lookup_cached(area, app);
         let dim_info = match cached_entry {
             Some((_, img)) => format!(" · {}x{} {}", img.width_px, img.height_px, img.format_label),
             None => String::new(),
@@ -735,6 +739,7 @@ mod tests {
         atlassian::AtlassianClient,
         auth::AuthManager,
         config::{AppConfig, Persona},
+        img_preview::DecodedImageCache,
         storage::Storage,
         sync,
     };
@@ -795,6 +800,58 @@ mod tests {
         );
         let ui = UiState::from_config_with_persona(&cfg, Persona::Jira);
         (app, ui)
+    }
+
+    #[tokio::test]
+    async fn halfblock_loads_use_the_rendered_image_budget() {
+        use crate::ui::app::UiMsg;
+
+        let (mut app, mut ui) = make_test_app_and_ui();
+        let image = |size| RenderedTerminalImage {
+            width_px: 384,
+            height_px: 192,
+            cols: 1,
+            rows: 1,
+            format_label: "PNG".into(),
+            protocol: TerminalImageProtocol::Halfblock,
+            lines: vec![Line::raw("▀".repeat(size))],
+            pixel_payload: None,
+            scroll_backing: None,
+        };
+        let size = image(128).approx_heap_bytes();
+        app.image_cache = DecodedImageCache::with_limits(size * 2, 64);
+        let overlay =
+            ImagePreviewOverlay::from_attachments("ATL-1", &sample_attachments(), None).unwrap();
+        let area = Rect::new(0, 0, 140, 40);
+        let (cols, rows) = overlay.target_dimensions(area.width, area.height);
+        let key = |id| {
+            img_preview::preview_cache_key(id, cols, rows, TerminalImageProtocol::Halfblock)
+        };
+        for id in ["1", "2", "3"] {
+            app.handle_ui_msg(
+                &mut ui,
+                UiMsg::ImageLoaded {
+                    cache_key: key(id),
+                    rendered: Ok(image(128)),
+                },
+            );
+        }
+        assert_eq!(app.image_cache.total_bytes(), size * 2);
+        assert!(!app.image_cache.contains_key(&key("1")));
+        assert!(app.image_cache.contains_key(&key("3")));
+
+        app.handle_ui_msg(
+            &mut ui,
+            UiMsg::ImageLoaded {
+                cache_key: key("2"),
+                rendered: Ok(image(4096)),
+            },
+        );
+        assert_eq!(app.image_cache.len(), 1);
+        assert!(app.image_cache.total_bytes() > app.image_cache.max_bytes());
+        let mut overlay = overlay;
+        overlay.protocol = TerminalImageProtocol::Halfblock;
+        assert_eq!(overlay.lookup_cached(area, &app).unwrap().0, key("2"));
     }
 
     #[test]
@@ -912,7 +969,7 @@ mod tests {
         overlay.protocol = proto;
         let cur = overlay.current().unwrap();
         let cache_key = img_preview::preview_cache_key(&cur.id, cols, rows, proto);
-        app.image_cache.insert(
+        app.pixel_image_cache.insert(
             cache_key.clone(),
             RenderedTerminalImage {
                 width_px: 320,
@@ -928,7 +985,7 @@ mod tests {
         );
 
         let pending = overlay
-            .pending_pixel_graphic(area, &app.image_cache)
+            .pending_pixel_graphic(area, &app)
             .expect("pending pixel graphic must be computed for cached Sixel image");
         assert_eq!(pending.cache_key, cache_key);
         assert_eq!(pending.protocol, proto);
@@ -1017,7 +1074,11 @@ mod tests {
             let expected_max_scroll = total_rows.saturating_sub(img_area.height);
             assert!(expected_max_scroll > 0, "expected scrollable tall image for {proto:?}");
 
-            app.image_cache.insert(base_key.clone(), rendered);
+            if proto.is_pixel() {
+                app.pixel_image_cache.insert(base_key.clone(), rendered);
+            } else {
+                app.image_cache.insert(base_key.clone(), rendered);
+            }
 
             let mut terminal = Terminal::new(TestBackend::new(area.width, area.height)).unwrap();
             let mut hitmap = HitMap::new();

@@ -40,22 +40,6 @@ pub async fn run(
     client: AtlassianClient,
     storage: Storage,
 ) -> Result<()> {
-    let projects_empty = storage
-        .list_projects_for_site(client.site_id())
-        .unwrap_or_default()
-        .is_empty();
-    let spaces_empty = storage
-        .list_spaces_for_site(client.site_id())
-        .unwrap_or_default()
-        .is_empty();
-    if projects_empty && spaces_empty && !config.site_url.trim().is_empty() {
-        if let Err(err) =
-            sync::bootstrap_workspace_for_site(client.site_id(), &client, &storage).await
-        {
-            eprintln!("{SERVER_NAME} MCP warning: initial workspace bootstrap failed: {err:#}");
-        }
-    }
-
     eprintln!(
         "{SERVER_NAME} MCP server ready (protocol {LATEST_PROTOCOL_VERSION}, deployment={}, site={})",
         config.deployment.as_str(),
@@ -69,6 +53,7 @@ pub async fn run(
     let stdin = tokio::io::stdin();
     let mut lines = BufReader::new(stdin).lines();
     let mut stdout = std::io::stdout();
+    let mut bootstrap_pending = true;
 
     while let Some(line) = lines.next_line().await? {
         let trimmed = line.trim();
@@ -76,7 +61,10 @@ pub async fn run(
             continue;
         }
 
-        if let Some(response) = handle_rpc_line(&config, &client, &storage, trimmed).await {
+        if let Some(response) =
+            handle_rpc_line_with_bootstrap(&config, &client, &storage, trimmed, &mut bootstrap_pending)
+                .await
+        {
             stdout.write_all(encode_message(&response).as_bytes())?;
             stdout.flush()?;
         }
@@ -86,12 +74,67 @@ pub async fn run(
     Ok(())
 }
 
+async fn bootstrap_if_empty(config: &AppConfig, client: &AtlassianClient, storage: &Storage) {
+    let site = client.site_id();
+    let projects_empty = storage
+        .list_projects_for_site(site)
+        .unwrap_or_default()
+        .is_empty();
+    let spaces_empty = storage
+        .list_spaces_for_site(site)
+        .unwrap_or_default()
+        .is_empty();
+    if projects_empty && spaces_empty && !config.site_url.trim().is_empty() {
+        if let Err(err) = sync::bootstrap_workspace_for_site(site, client, storage).await {
+            eprintln!("{SERVER_NAME} MCP warning: initial workspace bootstrap failed: {err:#}");
+        }
+    }
+}
+
+fn tool_uses_current_site_cache(
+    config: &AppConfig,
+    client: &AtlassianClient,
+    name: &str,
+    arguments: &Value,
+) -> bool {
+    let enabled = |key| arguments.get(key).and_then(Value::as_bool) == Some(true);
+    let reads_cache = match name {
+        "list_sites" => return true,
+        "list_projects" | "list_boards" | "list_confluence_spaces" => !enabled("refresh"),
+        "list_sprints"
+        | "get_board_issues"
+        | "search_jira_issues"
+        | "get_jira_issue"
+        | "list_space_pages"
+        | "list_child_pages"
+        | "get_confluence_page" => enabled("offline"),
+        "search_confluence_pages" => {
+            !enabled("remote") && Args::new(arguments).optional_str("cql").ok().flatten().is_none()
+        }
+        "search_all" => !enabled("remote"),
+        _ => false,
+    };
+    reads_cache
+        && resolve_mcp_site_id(config, client, arguments.get("site").and_then(Value::as_str))
+            .map_or(true, |site| site.eq_ignore_ascii_case(client.site_id()))
+}
+
 /// Single-line JSON-RPC handler exposed for deterministic unit & integration testing.
 pub async fn handle_rpc_line(
     config: &AppConfig,
     client: &AtlassianClient,
     storage: &Storage,
     line: &str,
+) -> Option<Value> {
+    handle_rpc_line_with_bootstrap(config, client, storage, line, &mut false).await
+}
+
+async fn handle_rpc_line_with_bootstrap(
+    config: &AppConfig,
+    client: &AtlassianClient,
+    storage: &Storage,
+    line: &str,
+    bootstrap_pending: &mut bool,
 ) -> Option<Value> {
     let message = match parse_message(line) {
         Ok(msg) => msg,
@@ -125,7 +168,15 @@ pub async fn handle_rpc_line(
                 .unwrap_or_else(|| json!({}));
 
             let outcome = match validate_tool_args(name, &arguments) {
-                Ok(()) => call_tool(config, client, storage, name, &arguments).await,
+                Ok(()) => {
+                    if *bootstrap_pending
+                        && tool_uses_current_site_cache(config, client, name, &arguments)
+                    {
+                        *bootstrap_pending = false;
+                        bootstrap_if_empty(config, client, storage).await;
+                    }
+                    call_tool(config, client, storage, name, &arguments).await
+                }
                 Err(error) => Err(error),
             };
 
@@ -2123,6 +2174,76 @@ mod tests {
         let client = AtlassianClient::new(cfg.clone(), auth).unwrap();
         let storage = Storage::open_in_memory().unwrap();
         (cfg, client, storage)
+    }
+
+    #[tokio::test]
+    async fn bootstrap_is_deferred_until_a_valid_current_site_cache_request() {
+        use crate::models::ProjectSummary;
+
+        let (cfg, client, storage) = test_ctx();
+        storage
+            .upsert_projects_for_site(
+                client.site_id(),
+                &[ProjectSummary {
+                    id: "1".into(),
+                    key: "ATL".into(),
+                    name: "Atlassian".into(),
+                    ..Default::default()
+                }],
+            )
+            .unwrap();
+
+        let mut pending = true;
+        for (method, params) in [
+            ("initialize", json!({ "protocolVersion": "2025-03-26" })),
+            ("tools/list", json!({})),
+            ("tools/call", json!({ "name": "search_all" })),
+            (
+                "tools/call",
+                json!({
+                    "name": "search_all",
+                    "arguments": { "query": "ATL", "site": "another-site" }
+                }),
+            ),
+        ] {
+            let line = json!({ "jsonrpc": "2.0", "id": 1, "method": method, "params": params });
+            assert!(handle_rpc_line_with_bootstrap(
+                &cfg,
+                &client,
+                &storage,
+                &line.to_string(),
+                &mut pending,
+            )
+            .await
+            .is_some());
+            assert!(pending, "bootstrap was consumed by {line}");
+        }
+        assert!(!tool_uses_current_site_cache(
+            &cfg,
+            &client,
+            "list_projects",
+            &json!({ "refresh": true }),
+        ));
+        assert!(!tool_uses_current_site_cache(
+            &cfg,
+            &client,
+            "search_confluence_pages",
+            &json!({ "cql": "type = page" }),
+        ));
+
+        let response = handle_rpc_line_with_bootstrap(
+            &cfg,
+            &client,
+            &storage,
+            r#"{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"list_projects"}}"#,
+            &mut pending,
+        )
+        .await
+        .unwrap();
+        assert!(!pending);
+        let payload: Value =
+            serde_json::from_str(response["result"]["content"][0]["text"].as_str().unwrap()).unwrap();
+        assert_eq!(payload["projects"][0]["key"], "ATL");
     }
 
     #[tokio::test]

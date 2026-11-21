@@ -1,6 +1,6 @@
 //! Rich `DocBlock` -> styled `Vec<Line<'static>>` renderer (Unicode width-aware).
 
-use std::collections::HashMap;
+use std::borrow::Cow;
 
 use ratatui::{
     style::{Modifier, Style},
@@ -9,7 +9,7 @@ use ratatui::{
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use crate::{
-    img_preview::RenderedTerminalImage,
+    img_preview::DecodedImageCache,
     models::{DocBlock, InlineNode, InlineStyle, TaskItem},
     ui::theme::Theme,
 };
@@ -84,12 +84,27 @@ pub fn wrap_plain_text(text: &str, max_width: usize) -> Vec<String> {
     lines
 }
 
+pub(crate) fn blocks_or_markdown<'a>(
+    blocks: &'a [DocBlock],
+    markdown: Option<&str>,
+) -> Cow<'a, [DocBlock]> {
+    match markdown {
+        Some(text) if blocks.is_empty() => Cow::Owned(vec![DocBlock::Paragraph {
+            spans: vec![InlineNode::Text {
+                text: text.to_owned(),
+                style: InlineStyle::default(),
+            }],
+        }]),
+        _ => Cow::Borrowed(blocks),
+    }
+}
+
 /// Renders a slice of `DocBlock`s into styled ratatui `Line`s wrapped to `width`.
 pub fn render_blocks(
     blocks: &[DocBlock],
     width: u16,
     theme: &Theme,
-    image_cache: Option<&HashMap<String, RenderedTerminalImage>>,
+    image_cache: Option<&DecodedImageCache>,
     inline_images: bool,
 ) -> Vec<Line<'static>> {
     render_blocks_with_options(blocks, width, theme, image_cache, inline_images, false)
@@ -100,7 +115,7 @@ pub fn render_blocks_with_options(
     blocks: &[DocBlock],
     width: u16,
     theme: &Theme,
-    image_cache: Option<&HashMap<String, RenderedTerminalImage>>,
+    image_cache: Option<&DecodedImageCache>,
     inline_images: bool,
     show_hrefs: bool,
 ) -> Vec<Line<'static>> {
@@ -291,7 +306,7 @@ fn render_block_list(
     blocks: &[DocBlock],
     width: usize,
     theme: &Theme,
-    image_cache: Option<&HashMap<String, RenderedTerminalImage>>,
+    image_cache: Option<&DecodedImageCache>,
     inline_images: bool,
     show_hrefs: bool,
     prefix: &[Span<'static>],
@@ -568,7 +583,7 @@ fn render_list_item(
     marker_style: Style,
     inner_w: usize,
     theme: &Theme,
-    image_cache: Option<&HashMap<String, RenderedTerminalImage>>,
+    image_cache: Option<&DecodedImageCache>,
     inline_images: bool,
     show_hrefs: bool,
     prefix: &[Span<'static>],
@@ -879,6 +894,18 @@ mod tests {
             .iter()
             .map(|l| l.spans.iter().map(|s| s.content.as_ref()).collect::<String>())
             .collect()
+    }
+
+    #[test]
+    fn reader_uses_stored_blocks_and_keeps_markdown_fallback() {
+        let fallback = blocks_or_markdown(&[], Some("Cached **plain** text"));
+        assert!(matches!(&fallback, Cow::Owned(_)));
+        let blocks = blocks_or_markdown(&fallback, Some("unused markdown"));
+        assert!(matches!(&blocks, Cow::Borrowed(_)));
+        assert_eq!(blocks.as_ptr(), fallback.as_ptr());
+        let lines = render_blocks(&blocks, 80, &Theme::default(), None, false);
+        assert_eq!(lines_to_strings(&lines), ["Cached **plain** text"]);
+        assert!(blocks_or_markdown(&[], None).is_empty());
     }
 
     #[test]

@@ -10,11 +10,12 @@ use ratatui::{
 
 use crate::{
     config::DensityMode,
-    models::{DocBlock, InlineNode, InlineStyle, IssueDetail, StatusCategory},
+    models::{IssueDetail, StatusCategory},
     ui::{
         app::{AppState, PaneFocus, UiState},
         doc_view::{
-            pad_right_width, render_blocks_with_options, truncate_width, wrap_plain_text,
+            blocks_or_markdown, pad_right_width, render_blocks_with_options, truncate_width,
+            wrap_plain_text,
         },
         draw_horizontal_hairline, fill_surface,
         hitmap::{ButtonId, HitMap, HitTarget},
@@ -734,18 +735,11 @@ pub fn build_issue_inspector_lines(
         " ▾ Description",
         theme.accent_style(),
     )));
-    let desc_blocks = if !detail.description_blocks.is_empty() {
-        detail.description_blocks.clone()
-    } else if !detail.description_markdown.trim().is_empty() {
-        vec![DocBlock::Paragraph {
-            spans: vec![InlineNode::Text {
-                text: detail.description_markdown.clone(),
-                style: InlineStyle::default(),
-            }],
-        }]
-    } else {
-        Vec::new()
-    };
+    let desc_blocks = blocks_or_markdown(
+        &detail.description_blocks,
+        (!detail.description_markdown.trim().is_empty())
+            .then_some(detail.description_markdown.as_str()),
+    );
     if desc_blocks.is_empty() {
         lines.push(Line::from(Span::styled(
             "  (no description)",
@@ -883,16 +877,7 @@ pub fn build_issue_inspector_lines(
                 Span::styled(format!("  {} ", c.author.display_name), author_style),
                 Span::styled(c.created_at.clone(), theme.muted_style()),
             ]));
-            let c_blocks = if !c.blocks.is_empty() {
-                c.blocks.clone()
-            } else {
-                vec![DocBlock::Paragraph {
-                    spans: vec![InlineNode::Text {
-                        text: c.body_markdown.clone(),
-                        style: InlineStyle::default(),
-                    }],
-                }]
-            };
+            let c_blocks = blocks_or_markdown(&c.blocks, Some(&c.body_markdown));
             for mut l in render_blocks_with_options(
                 &c_blocks,
                 w.saturating_sub(4) as u16,

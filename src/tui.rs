@@ -588,13 +588,13 @@ impl PixelPreviewRuntime {
         let cache_key = img_preview::preview_cache_key(&att.id, cols, rows, ov.protocol);
 
         if let Some(cached) = self.decoded_cache.get(&cache_key) {
-            if !app.image_cache.contains_key(&cache_key) {
-                app.image_cache.insert(cache_key, cached.clone());
+            if !app.pixel_image_cache.contains_key(&cache_key) {
+                app.pixel_image_cache.insert(cache_key, cached.clone());
             }
             return;
         }
 
-        if app.image_cache.contains_key(&cache_key)
+        if app.pixel_image_cache.contains_key(&cache_key)
             || self.in_flight.contains(&cache_key)
             || tokio::runtime::Handle::try_current().is_err()
         {
@@ -668,9 +668,9 @@ impl PixelPreviewRuntime {
             Ok(img) => {
                 let evicted = self.decoded_cache.insert(msg.cache_key.clone(), img.clone());
                 for old_key in evicted {
-                    app.image_cache.remove(&old_key);
+                    app.pixel_image_cache.remove(&old_key);
                 }
-                app.image_cache.insert(msg.cache_key, img);
+                app.pixel_image_cache.insert(msg.cache_key, img);
             }
             Err(err) => {
                 if let Some(Overlay::ImagePreview(ov)) = ui.overlays.last_mut() {
@@ -748,7 +748,7 @@ fn current_pending_pixel_graphic(
     let Some(Overlay::ImagePreview(ov)) = ui.overlays.last() else {
         return None;
     };
-    ov.pending_pixel_graphic(frame_area, &app.image_cache)
+    ov.pending_pixel_graphic(frame_area, app)
 }
 
 fn resolve_pixel_payload<'a>(
@@ -760,7 +760,7 @@ fn resolve_pixel_payload<'a>(
     let rendered = pixel_rt
         .decoded_cache
         .get(base_key)
-        .or_else(|| app.image_cache.get(base_key))?;
+        .or_else(|| app.pixel_image_cache.get(base_key))?;
     if let Some((sx, sy, vw, vh)) = crop {
         rendered
             .viewport_pixel_payload(sx, sy, vw, vh)

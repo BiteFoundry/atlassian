@@ -10,10 +10,10 @@ use ratatui::{
 
 use crate::{
     config::DensityMode,
-    models::{DocBlock, InlineNode, InlineStyle, PageDetail},
+    models::PageDetail,
     ui::{
         app::{AppState, PaneFocus, UiState},
-        doc_view::{render_blocks_with_options, truncate_width},
+        doc_view::{blocks_or_markdown, render_blocks_with_options, truncate_width},
         draw_horizontal_hairline, fill_surface,
         hitmap::{ButtonId, HitMap, HitTarget},
     },
@@ -457,18 +457,10 @@ fn build_wiki_reader_lines(
     )));
 
     // 5. Wiki body
-    let body_blocks = if !page.blocks.is_empty() {
-        page.blocks.clone()
-    } else if !page.body_markdown.trim().is_empty() {
-        vec![DocBlock::Paragraph {
-            spans: vec![InlineNode::Text {
-                text: page.body_markdown.clone(),
-                style: InlineStyle::default(),
-            }],
-        }]
-    } else {
-        Vec::new()
-    };
+    let body_blocks = blocks_or_markdown(
+        &page.blocks,
+        (!page.body_markdown.trim().is_empty()).then_some(page.body_markdown.as_str()),
+    );
     if body_blocks.is_empty() {
         lines.push(Line::from(Span::styled(
             " (empty page body)",
@@ -547,16 +539,7 @@ fn build_wiki_reader_lines(
                 Span::styled(format!("  {} ", c.author_name), author_style),
                 Span::styled(c.created_at.clone(), theme.muted_style()),
             ]));
-            let c_blocks = if !c.blocks.is_empty() {
-                c.blocks.clone()
-            } else {
-                vec![DocBlock::Paragraph {
-                    spans: vec![InlineNode::Text {
-                        text: c.body_markdown.clone(),
-                        style: InlineStyle::default(),
-                    }],
-                }]
-            };
+            let c_blocks = blocks_or_markdown(&c.blocks, Some(&c.body_markdown));
             for mut l in render_blocks_with_options(
                 &c_blocks,
                 w.saturating_sub(4) as u16,

@@ -20,7 +20,7 @@ use crate::{
         AppConfig, DensityMode, DeploymentKind, DraftStore,
         ImageProtocolPreference as ConfigImageProtocol, Persona, SiteProfile,
     },
-    img_preview::{self, RenderedTerminalImage, TerminalGraphicsCaps},
+    img_preview::{self, DecodedImageCache, RenderedTerminalImage, TerminalGraphicsCaps},
     models::{
         AttachmentItem, BoardColumn, BoardSummary, ConfluenceComment, CoreEvent, CrossRefTarget,
         DownloadedFile, IssueComment, IssueDetail, IssueStatus, IssueSummary, IssueTransition,
@@ -531,7 +531,8 @@ pub struct AppState {
     pub nav_history: Vec<CrossRefTarget>,
 
     /// Decoded image cache (`"{att_id}:{cols}x{rows}[:{protocol}]"` -> `RenderedTerminalImage`).
-    pub image_cache: HashMap<String, RenderedTerminalImage>,
+    pub image_cache: DecodedImageCache,
+    pub pixel_image_cache: HashMap<String, RenderedTerminalImage>,
 
     /// Lazy localhost Axum server for viewing HTML documents in the default browser (`0 MB` idle).
     pub html_server: bitefoundry_html::NativeHtmlServer,
@@ -628,7 +629,8 @@ impl AppState {
             search_hit_site_labels: Vec::new(),
             cache_counts: CacheCounts::default(),
             nav_history: Vec::new(),
-            image_cache: HashMap::new(),
+            image_cache: DecodedImageCache::new(),
+            pixel_image_cache: HashMap::new(),
             html_server: bitefoundry_html::NativeHtmlServer::new(),
             last_served_html_url: None,
             drafts,
@@ -4811,7 +4813,18 @@ impl AppState {
                 rendered,
             } => match rendered {
                 Ok(img) => {
-                    self.image_cache.insert(cache_key, img);
+                    let visible_key = match ui.overlays.last() {
+                        Some(Overlay::ImagePreview(ov)) if !ov.protocol.is_pixel() => {
+                            let area = ratatui::layout::Rect::new(0, 0, ui.term_width, ui.term_height);
+                            ov.lookup_cached(area, self).map(|(key, _)| key)
+                        }
+                        _ => None,
+                    };
+                    let evicted = self.image_cache.insert(cache_key, img);
+                    // A fetch started before navigation can complete after the visible image.
+                    if visible_key.is_some_and(|key| evicted.contains(&key)) {
+                        self.request_load_preview_image(ui);
+                    }
                 }
                 Err(err) => {
                     if let Some(Overlay::ImagePreview(ov)) = ui.overlays.last_mut() {
