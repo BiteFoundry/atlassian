@@ -18,13 +18,14 @@ use tower_http::cors::CorsLayer;
 
 use crate::{
     atlassian::{
+        body::{BodyEdit, BodyEditError, TextReplacement},
         client::{http_status_code, is_not_found_error},
         AtlassianClient, SiteClientPool,
     },
     config::AppConfig,
     models::{
         FederatedSearchHit, IssueSummary, IssueUpdate, OutgoingIssue, OutgoingPage, PageSummary,
-        PageUpdate, SearchHitKind, UnifiedSearchHit,
+        SearchHitKind, UnifiedSearchHit,
     },
     storage::Storage,
     sync::{self, SiteSyncTarget, SyncCommand},
@@ -88,6 +89,9 @@ impl IntoResponse for ApiError {
 
 impl From<anyhow::Error> for ApiError {
     fn from(err: anyhow::Error) -> Self {
+        if let Some(invalid) = err.downcast_ref::<BodyEditError>() {
+            return Self::bad_request(invalid.to_string());
+        }
         let status = match http_status_code(&err) {
             Some(reqwest::StatusCode::BAD_REQUEST) => StatusCode::BAD_REQUEST,
             Some(reqwest::StatusCode::UNAUTHORIZED) => StatusCode::UNAUTHORIZED,
@@ -177,6 +181,16 @@ pub struct OfflineQuery {
     pub site: Option<String>,
 }
 
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct DetailQuery {
+    #[serde(default)]
+    offline: bool,
+    #[serde(default)]
+    compact: bool,
+    site: Option<String>,
+}
+
 #[derive(Debug, Deserialize)]
 pub struct CreateIssueBody {
     pub project_key: String,
@@ -201,8 +215,27 @@ pub struct CreateIssueBody {
 pub struct PatchIssueBody {
     #[serde(flatten)]
     pub update: IssueUpdate,
+    pub append_markdown: Option<String>,
+    pub replace_text: Option<TextReplacement>,
     #[serde(default)]
     pub site: Option<String>,
+}
+
+#[cfg(test)]
+#[test]
+fn issue_patch_distinguishes_omitted_null_and_assignee_id() {
+    for (input, expected) in [
+        (json!({"summary": "new"}), None),
+        (json!({"summary": "new", "assignee_id": null}), Some(None)),
+        (
+            json!({"summary": "new", "assignee_id": "account-01"}),
+            Some(Some("account-01".to_owned())),
+        ),
+    ] {
+        let patch: PatchIssueBody = serde_json::from_value(input).unwrap();
+        assert_eq!(patch.update.summary.as_deref(), Some("new"));
+        assert_eq!(patch.update.assignee_id, expected);
+    }
 }
 
 fn default_task_type() -> String {
@@ -271,6 +304,8 @@ pub struct UpdatePageBody {
     pub title: Option<String>,
     #[serde(default)]
     pub body_markdown: Option<String>,
+    pub append_markdown: Option<String>,
+    pub replace_text: Option<TextReplacement>,
     #[serde(default)]
     pub prev_version: i32,
     #[serde(default)]
@@ -809,7 +844,7 @@ async fn create_issue(
 async fn get_issue(
     State(state): State<Arc<AppState>>,
     Path(key): Path<String>,
-    Query(query): Query<OfflineQuery>,
+    Query(query): Query<DetailQuery>,
 ) -> Result<Json<Value>, ApiError> {
     let key = key.trim();
     if key.is_empty() {
@@ -829,7 +864,7 @@ async fn get_issue(
         return Ok(Json(json!({
             "site_id": target_site,
             "detail_stale": stale,
-            "issue": detail,
+            "issue": detail.output(query.compact),
         })));
     }
 
@@ -849,7 +884,9 @@ async fn get_issue(
         !meta.remote_links_ok,
     );
 
-    Ok(Json(json!({ "site_id": target_site, "detail_stale": false, "issue": fetched })))
+    Ok(Json(
+        json!({ "site_id": target_site, "detail_stale": false, "issue": fetched.output(query.compact) }),
+    ))
 }
 
 async fn patch_issue(
@@ -863,8 +900,14 @@ async fn patch_issue(
         return Err(ApiError::bad_request("issue key must not be empty"));
     }
     let patch = body.update;
+    let edit = BodyEdit::from_inputs(
+        patch.description_markdown.as_deref(),
+        body.append_markdown.as_deref(),
+        body.replace_text.as_ref(),
+    )
+    .map_err(anyhow::Error::from)?;
     if patch.summary.is_none()
-        && patch.description_markdown.is_none()
+        && edit.is_none()
         && patch.priority.is_none()
         && patch.assignee_id.is_none()
         && patch.labels.is_none()
@@ -876,8 +919,10 @@ async fn patch_issue(
 
     let (target_site, client) =
         resolve_site_client(&state, query.site.as_deref().or(body.site.as_deref()))?;
-    let detail = client.update_issue(key, &patch).await?;
-    let _ = state.storage.upsert_issue_detail_for_site(&target_site, &detail);
+    let detail = client.edit_issue(key, &patch, edit).await?;
+    let _ = state
+        .storage
+        .upsert_issue_detail_for_site(&target_site, &detail);
 
     Ok(Json(json!({ "ok": true, "site_id": target_site, "issue": detail })))
 }
@@ -1058,7 +1103,7 @@ async fn list_space_pages(
 async fn get_page(
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,
-    Query(query): Query<OfflineQuery>,
+    Query(query): Query<DetailQuery>,
 ) -> Result<Json<Value>, ApiError> {
     let id = id.trim();
     if query.offline {
@@ -1074,7 +1119,7 @@ async fn get_page(
         return Ok(Json(json!({
             "site_id": target_site,
             "detail_stale": stale,
-            "page": detail,
+            "page": detail.output(query.compact),
         })));
     }
 
@@ -1095,7 +1140,9 @@ async fn get_page(
         !meta.attachments_ok,
         !meta.comments_ok,
     );
-    Ok(Json(json!({ "site_id": target_site, "detail_stale": false, "page": fetched })))
+    Ok(Json(
+        json!({ "site_id": target_site, "detail_stale": false, "page": fetched.output(query.compact) }),
+    ))
 }
 
 async fn list_child_pages(
@@ -1155,66 +1202,30 @@ async fn update_page(
     Json(body): Json<UpdatePageBody>,
 ) -> Result<Json<Value>, ApiError> {
     let id = id.trim();
-    if body.title.is_none() && body.body_markdown.is_none() {
-        return Err(ApiError::bad_request(
-            "at least one of title or body_markdown must be provided",
-        ));
-    }
-    if body.body_markdown.is_some() && body.prev_version <= 0 {
-        return Err(ApiError::bad_request(
-            "prev_version (>= 1) is required when replacing body_markdown; read GET /pages/{id} first and pass summary.version_number as prev_version",
-        ));
-    }
+    let edit = BodyEdit::from_inputs(
+        body.body_markdown.as_deref(),
+        body.append_markdown.as_deref(),
+        body.replace_text.as_ref(),
+    )
+    .map_err(anyhow::Error::from)?;
     let (target_site, client) =
         resolve_site_client(&state, query.site.as_deref().or(body.site.as_deref()))?;
 
-    let need_current = body.title.is_none() || body.body_markdown.is_none();
-    let current = if need_current {
-        Some(client.get_page(id).await?)
-    } else {
-        None
-    };
-
-    let title = match body.title {
-        Some(t) if !t.trim().is_empty() => t,
-        Some(_) => return Err(ApiError::bad_request("title must not be empty")),
-        None => current
-            .as_ref()
-            .map(|c| c.summary.title.clone())
-            .unwrap_or_default(),
-    };
-    let (body_markdown, body_raw_passthrough, body_representation) = match body.body_markdown {
-        Some(b) => (b, None, None),
-        None => {
-            let cur = current.as_ref();
-            let raw = cur
-                .map(|c| c.body_raw.clone())
-                .filter(|s| !s.trim().is_empty());
-            let repr = cur.map(|c| c.body_representation.clone());
-            let md = cur.map(|c| c.body_markdown.clone()).unwrap_or_default();
-            (md, raw, repr)
-        }
-    };
-    let prev_version = if body.prev_version > 0 {
-        body.prev_version
-    } else {
-        current
-            .as_ref()
-            .map(|c| c.summary.version_number)
-            .unwrap_or(1)
-    };
-
-    let patch = PageUpdate {
-        title,
-        body_markdown,
-        body_raw_passthrough,
-        body_representation,
-        prev_version,
-        version_message: body.version_message,
-    };
-    let detail = client.update_page(id, &patch).await?;
-    let _ = state.storage.upsert_page_detail_for_site(&target_site, &detail);
-    Ok(Json(json!({ "ok": true, "site_id": target_site, "page": detail })))
+    let detail = client
+        .edit_page(
+            id,
+            body.title,
+            edit,
+            Some(body.prev_version),
+            body.version_message,
+        )
+        .await?;
+    let _ = state
+        .storage
+        .upsert_page_detail_for_site(&target_site, &detail);
+    Ok(Json(
+        json!({ "ok": true, "site_id": target_site, "page": detail }),
+    ))
 }
 
 async fn delete_page(

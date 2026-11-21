@@ -2922,7 +2922,7 @@ fn inlines_to_adf(spans: &[InlineNode]) -> Vec<Value> {
         .collect()
 }
 
-fn xml_escape(s: &str) -> String {
+pub(crate) fn xml_escape(s: &str) -> String {
     s.replace('&', "&amp;")
         .replace('<', "&lt;")
         .replace('>', "&gt;")

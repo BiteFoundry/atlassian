@@ -30,7 +30,7 @@ impl AtlassianClient {
 
         let (file_name, mime_type, bytes) = read_upload_file(file_path).await?;
         let val = self
-            .post_multipart(&url, "file", &file_name, &mime_type, bytes)
+            .post_multipart(&url, "file", &file_name, &mime_type, bytes, None)
             .await?;
 
         Ok(parse_attachment_list(&val, &base))
@@ -46,8 +46,10 @@ impl AtlassianClient {
         let url = format!("{conf_root}/rest/api/content/{encoded_id}/child/attachment");
 
         let (file_name, mime_type, bytes) = read_upload_file(file_path).await?;
+        let minor_edit =
+            (self.deployment() == DeploymentKind::Cloud).then_some(("minorEdit", "true"));
         let val = self
-            .post_multipart(&url, "file", &file_name, &mime_type, bytes)
+            .post_multipart(&url, "file", &file_name, &mime_type, bytes, minor_edit)
             .await?;
 
         Ok(parse_attachment_list(&val, &conf_root))

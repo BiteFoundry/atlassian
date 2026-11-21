@@ -1,8 +1,10 @@
 //! Jira Agile REST API v1 (`/rest/agile/1.0/board`, `/configuration`, `/sprint`, `/issue`).
 
-use anyhow::Result;
+use std::collections::HashSet;
+
+use anyhow::{bail, Context, Result};
 use reqwest::StatusCode;
-use serde_json::Value;
+use serde_json::{json, Value};
 
 use crate::{
     atlassian::{
@@ -14,6 +16,56 @@ use crate::{
 };
 
 impl AtlassianClient {
+    pub(crate) async fn get_agile_issue_fields(&self, key: &str, fields: &str) -> Result<Value> {
+        let base = self.require_site_url()?;
+        let key = urlencoding::encode(key);
+        let fields = urlencoding::encode(fields);
+        self.get_json(&format!(
+            "{base}/rest/agile/1.0/issue/{key}?fields={fields}"
+        ))
+        .await
+    }
+
+    pub async fn move_issues_to_sprint(
+        &self,
+        sprint_id: i64,
+        issues: &[String],
+    ) -> Result<Vec<String>> {
+        let keys: Vec<_> = issues.iter().map(|key| key.trim()).collect();
+        let mut seen = HashSet::new();
+        if sprint_id <= 0
+            || !(1..=50).contains(&keys.len())
+            || !keys
+                .iter()
+                .all(|key| !key.is_empty() && seen.insert(key.to_ascii_uppercase()))
+        {
+            bail!("provide a positive sprint ID and 1 to 50 distinct issue keys");
+        }
+        let base = self.require_site_url()?;
+        let url = format!("{base}/rest/agile/1.0/sprint/{sprint_id}/issue");
+        self.post_json_empty(&url, &json!({"issues": keys})).await?;
+        let mut confirmed = Vec::with_capacity(keys.len());
+        for key in keys {
+            let issue = self
+                .get_agile_issue_fields(key, "sprint")
+                .await
+                .with_context(|| {
+                    format!("Jira accepted the move to sprint {sprint_id}. Reading {key} failed")
+                })?;
+            if issue.pointer("/fields/sprint/id").and_then(Value::as_i64) != Some(sprint_id) {
+                bail!("Jira accepted the move to sprint {sprint_id}. The read did not confirm membership for {key}");
+            }
+            confirmed.push(
+                issue
+                    .get("key")
+                    .and_then(Value::as_str)
+                    .unwrap_or(key)
+                    .to_owned(),
+            );
+        }
+        Ok(confirmed)
+    }
+
     pub async fn list_boards(&self, project_key: Option<&str>) -> Result<Vec<BoardSummary>> {
         let base = self.require_site_url()?;
         let mut url = format!("{base}/rest/agile/1.0/board?maxResults=50");

@@ -298,6 +298,12 @@ paths:
           schema:
             type: boolean
             default: false
+        - name: compact
+          in: query
+          schema:
+            type: boolean
+            default: false
+          description: Return identifying fields and the full Markdown body.
       responses:
         "200":
           description: Issue detail
@@ -308,7 +314,11 @@ paths:
                 required: [issue]
                 properties:
                   issue:
-                    $ref: "#/components/schemas/IssueDetail"
+                    oneOf:
+                      - $ref: "#/components/schemas/IssueDetail"
+                      - $ref: "#/components/schemas/CompactIssueDetail"
+        "400":
+          $ref: "#/components/responses/BadRequest"
         "401":
           $ref: "#/components/responses/Unauthorized"
         "404":
@@ -654,6 +664,12 @@ paths:
           schema:
             type: boolean
             default: false
+        - name: compact
+          in: query
+          schema:
+            type: boolean
+            default: false
+          description: Return identifying fields and the full Markdown body.
       responses:
         "200":
           description: Page detail
@@ -664,7 +680,11 @@ paths:
                 required: [page]
                 properties:
                   page:
-                    $ref: "#/components/schemas/PageDetail"
+                    oneOf:
+                      - $ref: "#/components/schemas/PageDetail"
+                      - $ref: "#/components/schemas/CompactPageDetail"
+        "400":
+          $ref: "#/components/responses/BadRequest"
         "401":
           $ref: "#/components/responses/Unauthorized"
         "404":
@@ -701,6 +721,8 @@ paths:
           $ref: "#/components/responses/BadRequest"
         "401":
           $ref: "#/components/responses/Unauthorized"
+        "409":
+          description: The page changed since the supplied prev_version
     delete:
       tags: [confluence]
       summary: Delete a Confluence page
@@ -1129,6 +1151,45 @@ components:
             type: string
         parent_key:
           type: [string, "null"]
+    TextReplacement:
+      type: object
+      additionalProperties: false
+      required: [old_text, new_text]
+      properties:
+        old_text:
+          type: string
+          minLength: 1
+          description: Unique case-sensitive text within a single source node.
+        new_text:
+          type: string
+    CompactIssueDetail:
+      type: object
+      required: [key, summary, status, description_markdown]
+      properties:
+        key:
+          type: string
+        summary:
+          type: string
+        status:
+          $ref: "#/components/schemas/IssueStatus"
+        description_markdown:
+          type: string
+    CompactPageDetail:
+      type: object
+      required: [id, title, space_id, space_key, version_number, body_markdown]
+      properties:
+        id:
+          type: string
+        title:
+          type: string
+        space_id:
+          type: string
+        space_key:
+          type: string
+        version_number:
+          type: integer
+        body_markdown:
+          type: string
     IssueUpdate:
       type: object
       properties:
@@ -1136,10 +1197,17 @@ components:
           type: [string, "null"]
         description_markdown:
           type: [string, "null"]
+          description: Replace the entire body from Markdown.
+        append_markdown:
+          type: string
+          description: Append Markdown while preserving the native body.
+        replace_text:
+          $ref: "#/components/schemas/TextReplacement"
         priority:
           type: [string, "null"]
         assignee_id:
           type: [string, "null"]
+          description: Omit to keep the current assignee, set null to unassign, or pass the account ID to assign.
         labels:
           type: [array, "null"]
           items:
@@ -1273,9 +1341,16 @@ components:
           type: [string, "null"]
         body_markdown:
           type: [string, "null"]
+          description: Replace the entire body from Markdown.
+        append_markdown:
+          type: string
+          description: Append Markdown while preserving the native body.
+        replace_text:
+          $ref: "#/components/schemas/TextReplacement"
         prev_version:
           type: integer
-          default: 0
+          minimum: 1
+          description: Current version from a page read. Required for all body edits.
         version_message:
           type: [string, "null"]
     ConfluenceComment:

@@ -77,6 +77,7 @@ function launch(commandName = 'jira', persona = process.env.ATLASSIAN_PERSONA ||
     env: {
       ...process.env,
       ATLASSIAN_PERSONA: persona,
+      ATLASSIAN_COMMAND_NAME: commandName,
     },
   });
 

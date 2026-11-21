@@ -13,14 +13,18 @@ use std::{
 };
 
 use anyhow::Result;
-use serde_json::{json, Value};
+use serde_json::{json, Map, Value};
 use tokio::io::{AsyncBufReadExt, BufReader};
 
 use crate::{
-    atlassian::{client::is_not_found_error, AtlassianClient, SiteClientPool},
+    atlassian::{
+        body::{BodyEdit, TextReplacement},
+        client::is_not_found_error,
+        AtlassianClient, SiteClientPool,
+    },
     config::AppConfig,
     img_preview,
-    models::{FederatedSearchHit, IssueUpdate, OutgoingIssue, OutgoingPage, PageUpdate},
+    models::{FederatedSearchHit, IssueUpdate, OutgoingIssue, OutgoingPage},
     serve::{clamp_limit, escape_jql_str, issue_to_hit, looks_like_query_expr, page_to_hit},
     storage::Storage,
     sync::{self, SiteSyncTarget},
@@ -365,7 +369,7 @@ async fn call_tool(
         }
 
         // -------------------------------------------------------------------
-        // Jira (15)
+        // Jira
         // -------------------------------------------------------------------
         "get_myself" => {
             let (site_id, target_client) =
@@ -585,6 +589,7 @@ async fn call_tool(
         "get_jira_issue" => {
             let key = args.required_str("key")?;
             let offline = args.optional_bool("offline")?.unwrap_or(false);
+            let compact = args.optional_bool("compact")?.unwrap_or(false);
             if offline {
                 let target_site =
                     resolve_mcp_single_site_id(config, client, site_arg.as_deref())?;
@@ -598,7 +603,7 @@ async fn call_tool(
                 return Ok(json!({
                     "site_id": target_site,
                     "detail_stale": stale,
-                    "issue": detail,
+                    "issue": detail.output(compact),
                 }));
             }
             let (target_site, target_client) =
@@ -620,7 +625,7 @@ async fn call_tool(
             Ok(json!({
                 "site_id": target_site,
                 "detail_stale": false,
-                "issue": fetched,
+                "issue": fetched.output(compact),
             }))
         }
 
@@ -659,7 +664,10 @@ async fn call_tool(
         "update_jira_issue" => {
             let key = args.required_str("key")?;
             let summary = args.optional_str("summary")?;
-            let description_markdown = args.optional_text("description_markdown")?;
+            let (full, append, replacement) = args.body_inputs("description_markdown")?;
+            let edit =
+                BodyEdit::from_inputs(full.as_deref(), append.as_deref(), replacement.as_ref())
+                    .map_err(|e| e.to_string())?;
             let priority = args.optional_str("priority")?;
             let assignee_id = args.optional_nullable_str("assignee_id")?;
             let labels = args.optional_str_array_opt("labels")?;
@@ -668,13 +676,13 @@ async fn call_tool(
                 resolve_mcp_client(config, client, site_arg.as_deref())?;
             let patch = IssueUpdate {
                 summary,
-                description_markdown,
+                description_markdown: None,
                 priority,
                 assignee_id,
                 labels,
             };
             let detail = target_client
-                .update_issue(&key, &patch)
+                .edit_issue(&key, &patch, edit)
                 .await
                 .map_err(format_error)?;
             let _ = storage.upsert_issue_detail_for_site(&target_site, &detail);
@@ -750,6 +758,73 @@ async fn call_tool(
             Ok(json!({ "ok": true, "site_id": target_site, "comment": comment }))
         }
 
+        "set_jira_parent" => {
+            let key = args.required_str("key")?;
+            let parent = args.required_str("parent_key")?;
+            let (site, client) = resolve_mcp_client(config, client, site_arg.as_deref())?;
+            let parent = client
+                .set_issue_parent(&key, &parent)
+                .await
+                .map_err(format_error)?;
+            refresh_mcp_issue_cache(&client, storage, &site, &key).await;
+            Ok(json!({"ok": true, "site_id": site, "key": key, "parent_key": parent}))
+        }
+
+        "update_jira_custom_fields" => {
+            let key = args.required_str("key")?;
+            let fields = args.custom_fields()?;
+            let (site, client) = resolve_mcp_client(config, client, site_arg.as_deref())?;
+            let updated = client
+                .edit_issue_custom_fields(&key, fields)
+                .await
+                .map_err(format_error)?;
+            refresh_mcp_issue_cache(&client, storage, &site, &key).await;
+            Ok(json!({"ok": true, "site_id": site, "key": key, "custom_fields": updated}))
+        }
+
+        "create_jira_issue_link" => {
+            let inward = args.required_str("inward_key")?;
+            let outward = args.required_str("outward_key")?;
+            let link_type = args.required_str("link_type")?;
+            let (site, client) = resolve_mcp_client(config, client, site_arg.as_deref())?;
+            let link = client
+                .create_issue_link(&inward, &outward, &link_type)
+                .await
+                .map_err(format_error)?;
+            refresh_mcp_issue_cache(&client, storage, &site, &inward).await;
+            refresh_mcp_issue_cache(&client, storage, &site, &outward).await;
+            Ok(json!({"ok": true, "site_id": site, "link": link}))
+        }
+
+        "move_jira_issues_to_sprint" => {
+            let sprint_id = args.required_i64("sprint_id")?;
+            let keys = args.required_str_array("issue_keys")?;
+            let (site, client) = resolve_mcp_client(config, client, site_arg.as_deref())?;
+            let confirmed = client
+                .move_issues_to_sprint(sprint_id, &keys)
+                .await
+                .map_err(format_error)?;
+            for key in &confirmed {
+                refresh_mcp_issue_cache(&client, storage, &site, key).await;
+            }
+            Ok(
+                json!({"ok": true, "site_id": site, "sprint_id": sprint_id, "issue_keys": confirmed}),
+            )
+        }
+
+        "add_jira_worklog" => {
+            let key = args.required_str("key")?;
+            let seconds = args.worklog_seconds()?;
+            let started = args.optional_str("started")?;
+            let comment = args.optional_text("comment_markdown")?;
+            let (site, client) = resolve_mcp_client(config, client, site_arg.as_deref())?;
+            let worklog = client
+                .log_issue_work(&key, seconds, started.as_deref(), comment.as_deref())
+                .await
+                .map_err(format_error)?;
+            Ok(json!({"ok": true, "site_id": site, "key": key, "worklog": worklog}))
+        }
+
         "upload_jira_attachment" => {
             let key = args.required_str("key")?;
             let path = args.required_str("path")?;
@@ -776,7 +851,7 @@ async fn call_tool(
         }
 
         // -------------------------------------------------------------------
-        // Confluence (9)
+        // Confluence
         // -------------------------------------------------------------------
         "list_confluence_spaces" => {
             let refresh = args.optional_bool("refresh")?.unwrap_or(false);
@@ -868,6 +943,7 @@ async fn call_tool(
         "get_confluence_page" => {
             let page_id = args.required_str("page_id")?;
             let offline = args.optional_bool("offline")?.unwrap_or(false);
+            let compact = args.optional_bool("compact")?.unwrap_or(false);
             if offline {
                 let target_site =
                     resolve_mcp_single_site_id(config, client, site_arg.as_deref())?;
@@ -881,7 +957,7 @@ async fn call_tool(
                 return Ok(json!({
                     "site_id": target_site,
                     "detail_stale": stale,
-                    "page": detail,
+                    "page": detail.output(compact),
                 }));
             }
             let (target_site, target_client) =
@@ -905,7 +981,7 @@ async fn call_tool(
             Ok(json!({
                 "site_id": target_site,
                 "detail_stale": false,
-                "page": fetched,
+                "page": fetched.output(compact),
             }))
         }
 
@@ -933,68 +1009,18 @@ async fn call_tool(
 
         "update_confluence_page" => {
             let page_id = args.required_str("page_id")?;
-            let title_opt = args.optional_str("title")?;
-            let body_opt = args.optional_text("body_markdown")?;
-            let prev_version_opt = args.optional_i64("prev_version")?;
+            let title = args.optional_str("title")?;
+            let (full, append, replacement) = args.body_inputs("body_markdown")?;
+            let edit =
+                BodyEdit::from_inputs(full.as_deref(), append.as_deref(), replacement.as_ref())
+                    .map_err(|e| e.to_string())?;
+            let prev_version = args.page_version()?;
             let version_message = args.optional_str("version_message")?;
-
-            if body_opt.is_some() && prev_version_opt.unwrap_or(0) <= 0 {
-                return Err(
-                    "prev_version (>= 1) is required when replacing body_markdown in update_confluence_page; call get_confluence_page first and pass summary.version_number as prev_version so concurrent edits are not overwritten"
-                        .to_string(),
-                );
-            }
 
             let (target_site, target_client) =
                 resolve_mcp_client(config, client, site_arg.as_deref())?;
-            let need_current = title_opt.is_none() || body_opt.is_none();
-            let current = if need_current {
-                Some(
-                    target_client
-                        .get_page(&page_id)
-                        .await
-                        .map_err(format_error)?,
-                )
-            } else {
-                None
-            };
-
-            let title = title_opt.unwrap_or_else(|| {
-                current
-                    .as_ref()
-                    .map(|c| c.summary.title.clone())
-                    .unwrap_or_default()
-            });
-            let (body_markdown, body_raw_passthrough, body_representation) = match body_opt {
-                Some(b) => (b, None, None),
-                None => {
-                    let cur = current.as_ref();
-                    let raw = cur
-                        .map(|c| c.body_raw.clone())
-                        .filter(|s| !s.trim().is_empty());
-                    let repr = cur.map(|c| c.body_representation.clone());
-                    let md = cur.map(|c| c.body_markdown.clone()).unwrap_or_default();
-                    (md, raw, repr)
-                }
-            };
-            let prev_version = match prev_version_opt {
-                Some(v) if v > 0 => v as i32,
-                _ => current
-                    .as_ref()
-                    .map(|c| c.summary.version_number)
-                    .unwrap_or(1),
-            };
-
-            let patch = PageUpdate {
-                title,
-                body_markdown,
-                body_raw_passthrough,
-                body_representation,
-                prev_version,
-                version_message,
-            };
             let detail = target_client
-                .update_page(&page_id, &patch)
+                .edit_page(&page_id, title, edit, prev_version, version_message)
                 .await
                 .map_err(format_error)?;
             let _ = storage.upsert_page_detail_for_site(&target_site, &detail);
@@ -1067,6 +1093,55 @@ async fn call_tool(
             }))
         }
 
+        "upload_confluence_attachment" => {
+            let page_id = args.required_str("page_id")?;
+            let path = args.required_str("path")?;
+            let (site, client) = resolve_mcp_client(config, client, site_arg.as_deref())?;
+            let attachments = client
+                .upload_page_attachment(&page_id, Path::new(&path))
+                .await
+                .map_err(format_error)?;
+            refresh_mcp_page_cache(&client, storage, &site, &page_id).await;
+            Ok(json!({"ok": true, "site_id": site, "page_id": page_id, "attachments": attachments}))
+        }
+
+        "move_confluence_page" => {
+            let page_id = args.required_str("page_id")?;
+            let parent_id = args.required_str("parent_id")?;
+            let version = args.page_version()?;
+            let (site, client) = resolve_mcp_client(config, client, site_arg.as_deref())?;
+            let page = client
+                .move_page(&page_id, &parent_id, version)
+                .await
+                .map_err(format_error)?;
+            refresh_mcp_page_cache(&client, storage, &site, &page_id).await;
+            Ok(json!({"ok": true, "site_id": site, "page": page}))
+        }
+
+        "add_confluence_labels" => {
+            let page_id = args.required_str("page_id")?;
+            let labels = args.required_str_array("labels")?;
+            let (site, client) = resolve_mcp_client(config, client, site_arg.as_deref())?;
+            let added = client
+                .add_page_labels(&page_id, &labels)
+                .await
+                .map_err(format_error)?;
+            refresh_mcp_page_cache(&client, storage, &site, &page_id).await;
+            Ok(json!({"ok": true, "site_id": site, "page_id": page_id, "added": added}))
+        }
+
+        "remove_confluence_label" => {
+            let page_id = args.required_str("page_id")?;
+            let label = args.required_str("label")?;
+            let (site, client) = resolve_mcp_client(config, client, site_arg.as_deref())?;
+            client
+                .remove_page_label(&page_id, &label)
+                .await
+                .map_err(format_error)?;
+            refresh_mcp_page_cache(&client, storage, &site, &page_id).await;
+            Ok(json!({"ok": true, "site_id": site, "page_id": page_id, "removed": label}))
+        }
+
         "delete_confluence_page" => {
             let page_id = args.required_str("page_id")?;
             let (target_site, target_client) =
@@ -1080,7 +1155,7 @@ async fn call_tool(
         }
 
         // -------------------------------------------------------------------
-        // Unified (2)
+        // Unified
         // -------------------------------------------------------------------
         "search_all" => {
             let query = args.required_str("query")?;
@@ -1314,7 +1389,7 @@ pub(crate) fn validate_tool_args(name: &str, arguments: &Value) -> Result<(), St
         "get_jira_issue" | "list_jira_transitions" => {
             let _ = args.required_str("key")?;
             if name == "get_jira_issue" {
-                let _ = args.optional_bool("offline")?;
+                args.validate_detail("key")?;
             }
             Ok(())
         }
@@ -1332,20 +1407,20 @@ pub(crate) fn validate_tool_args(name: &str, arguments: &Value) -> Result<(), St
         "update_jira_issue" => {
             let _ = args.required_str("key")?;
             let summary = args.optional_str("summary")?;
-            let desc = args.optional_text("description_markdown")?;
+            let (full, append, replacement) = args.body_inputs("description_markdown")?;
+            let edit =
+                BodyEdit::from_inputs(full.as_deref(), append.as_deref(), replacement.as_ref())
+                    .map_err(|e| e.to_string())?;
             let priority = args.optional_str("priority")?;
             let assignee = args.optional_nullable_str("assignee_id")?;
             let labels = args.optional_str_array_opt("labels")?;
             if summary.is_none()
-                && desc.is_none()
+                && edit.is_none()
                 && priority.is_none()
                 && assignee.is_none()
                 && labels.is_none()
             {
-                return Err(
-                    "at least one of summary, description_markdown, priority, assignee_id, or labels is required"
-                        .to_string(),
-                );
+                return Err("at least one Jira issue change is required".to_string());
             }
             Ok(())
         }
@@ -1390,7 +1465,11 @@ pub(crate) fn validate_tool_args(name: &str, arguments: &Value) -> Result<(), St
             let _ = args.optional_bool("offline")?;
             Ok(())
         }
-        "list_child_pages" | "get_confluence_page" => {
+        "get_confluence_page" => {
+            let _ = args.required_str("page_id")?;
+            args.validate_detail("page_id")
+        }
+        "list_child_pages" => {
             let _ = args.required_str("page_id")?;
             let _ = args.optional_bool("offline")?;
             Ok(())
@@ -1405,11 +1484,17 @@ pub(crate) fn validate_tool_args(name: &str, arguments: &Value) -> Result<(), St
         "update_confluence_page" => {
             let _ = args.required_str("page_id")?;
             let title = args.optional_str("title")?;
-            let body = args.optional_text("body_markdown")?;
-            let _ = args.optional_i64("prev_version")?;
-            let _ = args.optional_str("version_message")?;
-            if title.is_none() && body.is_none() {
-                return Err("at least one of title or body_markdown is required".to_string());
+            let (full, append, replacement) = args.body_inputs("body_markdown")?;
+            let edit =
+                BodyEdit::from_inputs(full.as_deref(), append.as_deref(), replacement.as_ref())
+                    .map_err(|e| e.to_string())?;
+            let version = args.page_version()?;
+            let message = args.optional_str("version_message")?;
+            if title.is_none() && edit.is_none() && message.is_none() {
+                return Err("at least one Confluence page change is required".to_string());
+            }
+            if edit.is_some() && version.unwrap_or(0) <= 0 {
+                return Err("prev_version (>= 1) is required for body edits. Read the current page and use its version_number.".to_string());
             }
             Ok(())
         }
@@ -1448,6 +1533,55 @@ pub(crate) fn validate_tool_args(name: &str, arguments: &Value) -> Result<(), St
             if let Some(l) = args.optional_usize("limit")? {
                 validate_range("limit", l, 1, 1_000)?;
             }
+            Ok(())
+        }
+        "set_jira_parent" => {
+            let _ = args.required_str("key")?;
+            let _ = args.required_str("parent_key")?;
+            Ok(())
+        }
+        "update_jira_custom_fields" => {
+            let _ = args.required_str("key")?;
+            let _ = args.custom_fields()?;
+            Ok(())
+        }
+        "create_jira_issue_link" => {
+            let _ = args.required_str("inward_key")?;
+            let _ = args.required_str("outward_key")?;
+            let _ = args.required_str("link_type")?;
+            Ok(())
+        }
+        "move_jira_issues_to_sprint" => {
+            let _ = args.required_i64("sprint_id")?;
+            let _ = args.required_str_array("issue_keys")?;
+            Ok(())
+        }
+        "add_jira_worklog" => {
+            let _ = args.required_str("key")?;
+            let _ = args.worklog_seconds()?;
+            let _ = args.optional_str("started")?;
+            let _ = args.optional_text("comment_markdown")?;
+            Ok(())
+        }
+        "upload_confluence_attachment" => {
+            let _ = args.required_str("page_id")?;
+            let _ = args.required_str("path")?;
+            Ok(())
+        }
+        "move_confluence_page" => {
+            let _ = args.required_str("page_id")?;
+            let _ = args.required_str("parent_id")?;
+            let _ = args.page_version()?;
+            Ok(())
+        }
+        "add_confluence_labels" => {
+            let _ = args.required_str("page_id")?;
+            let _ = args.required_str_array("labels")?;
+            Ok(())
+        }
+        "remove_confluence_label" => {
+            let _ = args.required_str("page_id")?;
+            let _ = args.required_str("label")?;
             Ok(())
         }
         "download_attachment" => {
@@ -1657,6 +1791,49 @@ impl<'a> Args<'a> {
         }
     }
 
+    fn validate_detail(&self, id: &str) -> Result<(), String> {
+        let _ = self.optional_bool("offline")?;
+        let _ = self.optional_bool("compact")?;
+        let object = self
+            .value
+            .as_object()
+            .ok_or("arguments must be a JSON object")?;
+        if let Some(key) = object
+            .keys()
+            .find(|key| ![id, "site", "offline", "compact"].contains(&key.as_str()))
+        {
+            return Err(format!("unsupported detail argument '{key}'"));
+        }
+        Ok(())
+    }
+
+    fn body_inputs(
+        &self,
+        full: &str,
+    ) -> Result<(Option<String>, Option<String>, Option<TextReplacement>), String> {
+        let replacement = self
+            .get("replace_text")?
+            .map(|value| {
+                serde_json::from_value(value.clone())
+                    .map_err(|e| format!("invalid replace_text: {e}"))
+            })
+            .transpose()?;
+        Ok((
+            self.optional_text(full)?,
+            self.optional_text("append_markdown")?,
+            replacement,
+        ))
+    }
+
+    fn page_version(&self) -> Result<Option<i32>, String> {
+        self.optional_i64("prev_version")?
+            .map(|version| {
+                i32::try_from(version)
+                    .map_err(|_| "prev_version is outside the supported version range".to_string())
+            })
+            .transpose()
+    }
+
     fn optional_bool(&self, key: &str) -> Result<Option<bool>, String> {
         match self.get(key)? {
             None | Some(Value::Null) => Ok(None),
@@ -1721,6 +1898,40 @@ impl<'a> Args<'a> {
         }
     }
 
+    fn custom_fields(&self) -> Result<&'a Map<String, Value>, String> {
+        self.get("fields")?
+            .and_then(Value::as_object)
+            .filter(|fields| !fields.is_empty())
+            .ok_or_else(|| {
+                "fields must be a nonempty JSON object keyed by custom field ID".to_string()
+            })
+    }
+
+    fn worklog_seconds(&self) -> Result<i32, String> {
+        i32::try_from(self.required_i64("seconds")?)
+            .ok()
+            .filter(|&seconds| seconds > 0)
+            .ok_or_else(|| "seconds must be a positive 32-bit integer".to_string())
+    }
+
+    fn required_str_array(&self, key: &str) -> Result<Vec<String>, String> {
+        let items = self
+            .get(key)?
+            .and_then(Value::as_array)
+            .filter(|items| !items.is_empty())
+            .ok_or_else(|| format!("'{key}' must be a nonempty array of strings"))?;
+        items
+            .iter()
+            .map(|item| {
+                item.as_str()
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty())
+                    .map(str::to_owned)
+                    .ok_or_else(|| format!("'{key}' items must be nonempty strings"))
+            })
+            .collect()
+    }
+
     fn require_confirm_true(&self) -> Result<(), String> {
         match self.get("confirm")? {
             Some(Value::Bool(true)) => Ok(()),
@@ -1751,12 +1962,35 @@ fn initialize_result(message: &Value) -> Value {
 }
 
 // ---------------------------------------------------------------------------
-// Tool catalog (28 tools: 15 Jira + 9 Confluence + 4 Unified / Multi-Site & Media)
+// Tool catalog
 // ---------------------------------------------------------------------------
 
+fn workflow_tool(name: &str, description: &str, properties: Value, required: &[&str]) -> Value {
+    json!({
+        "name": name,
+        "description": description,
+        "inputSchema": {
+            "type": "object",
+            "properties": properties,
+            "required": required,
+            "additionalProperties": false,
+        },
+    })
+}
+
 fn tool_catalog() -> Vec<Value> {
+    let text_replacement = json!({
+        "type": "object",
+        "description": "Replace one unique occurrence within a single source text node.",
+        "properties": {
+            "old_text": { "type": "string", "minLength": 1 },
+            "new_text": { "type": "string" }
+        },
+        "required": ["old_text", "new_text"],
+        "additionalProperties": false
+    });
     let mut tools = vec![
-        // --- Jira (15) ---
+        // --- Jira ---
         json!({
             "name": "get_myself",
             "description": "Return the currently authenticated Atlassian user profile.",
@@ -1840,7 +2074,8 @@ fn tool_catalog() -> Vec<Value> {
                 "type": "object",
                 "properties": {
                     "key": { "type": "string", "minLength": 1 },
-                    "offline": { "type": "boolean", "default": false }
+                    "offline": { "type": "boolean", "default": false },
+                    "compact": { "type": "boolean", "default": false, "description": "Return identifying fields and the full Markdown body." }
                 },
                 "required": ["key"],
                 "additionalProperties": false
@@ -1867,13 +2102,15 @@ fn tool_catalog() -> Vec<Value> {
         }),
         json!({
             "name": "update_jira_issue",
-            "description": "Update fields on an existing Jira issue.",
+            "description": "Update issue fields. Choose at most one body operation: full Markdown replacement, append, or unique text replacement.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
                     "key": { "type": "string", "minLength": 1 },
                     "summary": { "type": "string" },
-                    "description_markdown": { "type": "string" },
+                    "description_markdown": { "type": "string", "description": "Replace the entire body." },
+                    "append_markdown": { "type": "string", "description": "Append without converting the original body." },
+                    "replace_text": text_replacement.clone(),
                     "priority": { "type": "string" },
                     "assignee_id": { "type": ["string", "null"] },
                     "labels": { "type": "array", "items": { "type": "string" } }
@@ -1960,7 +2197,31 @@ fn tool_catalog() -> Vec<Value> {
                 "additionalProperties": false
             }
         }),
-        // --- Confluence (9) ---
+        workflow_tool("set_jira_parent",
+            "Set the parent of an existing Jira Cloud issue. On Data Center, assign an eligible non-subtask issue to an epic.",
+            json!({"key": {"type": "string"}, "parent_key": {"type": "string"}}),
+            &["key", "parent_key"]),
+        workflow_tool("update_jira_custom_fields",
+            "Set explicit customfield_<digits> values and return the values read back from Jira.",
+            json!({"key": {"type": "string"}, "fields": {"type": "object", "minProperties": 1,
+                "propertyNames": {"pattern": "^customfield_[0-9]+$"}}}),
+            &["key", "fields"]),
+        workflow_tool("create_jira_issue_link",
+            "Link two existing issues with a configured Jira link type name and return the link ID.",
+            json!({"inward_key": {"type": "string"}, "outward_key": {"type": "string"},
+                "link_type": {"type": "string"}}),
+            &["inward_key", "outward_key", "link_type"]),
+        workflow_tool("move_jira_issues_to_sprint",
+            "Move existing issues to an open or active sprint and confirm membership.",
+            json!({"sprint_id": {"type": "integer", "minimum": 1}, "issue_keys": {
+                "type": "array", "minItems": 1, "maxItems": 50, "items": {"type": "string"}}}),
+            &["sprint_id", "issue_keys"]),
+        workflow_tool("add_jira_worklog",
+            "Log work in positive seconds and retain the remaining time estimate. Start time is RFC 3339 when supplied.",
+            json!({"key": {"type": "string"}, "seconds": {"type": "integer", "minimum": 1, "maximum": i32::MAX},
+                "started": {"type": "string", "format": "date-time"}, "comment_markdown": {"type": "string"}}),
+            &["key", "seconds"]),
+        // --- Confluence ---
         json!({
             "name": "list_confluence_spaces",
             "description": "List accessible Confluence spaces from cache or refresh from Confluence API.",
@@ -2007,7 +2268,8 @@ fn tool_catalog() -> Vec<Value> {
                 "type": "object",
                 "properties": {
                     "page_id": { "type": "string", "minLength": 1 },
-                    "offline": { "type": "boolean", "default": false }
+                    "offline": { "type": "boolean", "default": false },
+                    "compact": { "type": "boolean", "default": false, "description": "Return identifying fields and the full Markdown body." }
                 },
                 "required": ["page_id"],
                 "additionalProperties": false
@@ -2030,13 +2292,15 @@ fn tool_catalog() -> Vec<Value> {
         }),
         json!({
             "name": "update_confluence_page",
-            "description": "Update a Confluence page. Pass prev_version from get_confluence_page when replacing body_markdown; title-only updates preserve original rich ADF/XHTML body.",
+            "description": "Update a Confluence page. Choose at most one body operation and pass prev_version from get_confluence_page for any body edit.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
                     "page_id": { "type": "string", "minLength": 1 },
                     "title": { "type": "string" },
-                    "body_markdown": { "type": "string" },
+                    "body_markdown": { "type": "string", "description": "Replace the entire body." },
+                    "append_markdown": { "type": "string", "description": "Append without converting the original body." },
+                    "replace_text": text_replacement.clone(),
                     "prev_version": { "type": "integer", "minimum": 1 },
                     "version_message": { "type": "string" }
                 },
@@ -2084,7 +2348,25 @@ fn tool_catalog() -> Vec<Value> {
                 "additionalProperties": false
             }
         }),
-        // --- Unified & Multi-Site (3) ---
+        workflow_tool("upload_confluence_attachment",
+            "Create an attachment from a local file using the same upload as the CLI attach command.",
+            json!({"page_id": {"type": "string"}, "path": {"type": "string"}}),
+            &["page_id", "path"]),
+        workflow_tool("move_confluence_page",
+            "Move a page under a parent. Data Center requires the current version and a parent in the same space.",
+            json!({"page_id": {"type": "string"}, "parent_id": {"type": "string"},
+                "prev_version": {"type": "integer", "minimum": 1}}),
+            &["page_id", "parent_id"]),
+        workflow_tool("add_confluence_labels",
+            "Add global labels to an existing page and keep its other labels.",
+            json!({"page_id": {"type": "string"}, "labels": {"type": "array", "minItems": 1,
+                "items": {"type": "string"}}}),
+            &["page_id", "labels"]),
+        workflow_tool("remove_confluence_label",
+            "Remove one named label from an existing page.",
+            json!({"page_id": {"type": "string"}, "label": {"type": "string"}}),
+            &["page_id", "label"]),
+        // --- Unified & Multi-Site ---
         json!({
             "name": "list_sites",
             "description": "List all registered Atlassian Cloud and Data Center sites with deployment, enabled state, and SQLite cache counts.",
@@ -2325,7 +2607,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn tools_list_has_exact_28_tools() {
+    async fn tools_list_includes_workflows_and_matches_documentation() {
         let (cfg, client, storage) = test_ctx();
         let line = json!({
             "jsonrpc": "2.0",
@@ -2337,7 +2619,18 @@ mod tests {
             .await
             .unwrap();
         let tools = resp["result"]["tools"].as_array().unwrap();
-        assert_eq!(tools.len(), 28, "expected exactly 28 MCP tools");
+        let docs = include_str!("../docs/MCP.md");
+        let documented: std::collections::BTreeSet<_> = docs
+            .lines()
+            .filter_map(|line| line.strip_prefix("| `"))
+            .filter_map(|line| line.split_once("` |").map(|(name, _)| name))
+            .collect();
+        let catalog: std::collections::BTreeSet<_> = tools
+            .iter()
+            .map(|tool| tool["name"].as_str().expect("tool name"))
+            .collect();
+        assert_eq!(catalog.len(), tools.len(), "duplicate MCP tool name");
+        assert_eq!(catalog, documented);
         assert!(
             tools.iter().any(|t| t["name"] == "list_sites"),
             "expected list_sites in MCP tool catalog"

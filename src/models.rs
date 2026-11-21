@@ -344,6 +344,21 @@ pub struct IssueDetail {
     pub comments: Vec<IssueComment>,
 }
 
+impl IssueDetail {
+    pub(crate) fn output(&self, compact: bool) -> serde_json::Value {
+        if compact {
+            serde_json::json!({
+                "key": self.summary.key,
+                "summary": self.summary.summary,
+                "status": self.summary.status,
+                "description_markdown": self.description_markdown,
+            })
+        } else {
+            serde_json::json!(self)
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub struct OutgoingIssue {
     pub project_key: String,
@@ -362,8 +377,20 @@ pub struct IssueUpdate {
     pub description_markdown: Option<String>,
     pub priority: Option<String>,
     /// `Some(Some(id))` assigns user, `Some(None)` unassigns, `None` leaves unchanged.
+    #[serde(
+        default,
+        deserialize_with = "deserialize_assignee_patch",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub assignee_id: Option<Option<String>>,
     pub labels: Option<Vec<String>>,
+}
+
+fn deserialize_assignee_patch<'de, D>(deserializer: D) -> Result<Option<Option<String>>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Option::<String>::deserialize(deserializer).map(Some)
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
@@ -455,6 +482,22 @@ pub struct PageDetail {
     pub linked_issue_keys: Vec<String>,
 }
 
+impl PageDetail {
+    pub(crate) fn output(&self, compact: bool) -> serde_json::Value {
+        if compact {
+            serde_json::json!({
+                "id": self.summary.id,
+                "title": self.summary.title,
+                "space_id": self.summary.space_id,
+                "space_key": self.summary.space_key,
+                "version_number": self.summary.version_number,
+                "body_markdown": self.body_markdown,
+            })
+        } else {
+            serde_json::json!(self)
+        }
+    }
+}
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub struct OutgoingPage {
     pub space_id_or_key: String,

@@ -3228,8 +3228,14 @@ impl AppState {
         let storage = self.storage.clone();
         let tx = self.ui_tx.clone();
         if let Some(pid) = form.edit_page_id.clone() {
-            ui.tasks.begin("Update page");
             let body_unchanged = form.body.text == form.initial_body;
+            if form.title.text.trim() == form.initial_title.trim() && body_unchanged {
+                if let Some(key) = draft_key.as_deref() {
+                    self.clear_draft_and_save(key);
+                }
+                return;
+            }
+            ui.tasks.begin("Update page");
             let patch = PageUpdate {
                 title: form.title.text.trim().to_string(),
                 body_markdown: form.body.text.clone(),

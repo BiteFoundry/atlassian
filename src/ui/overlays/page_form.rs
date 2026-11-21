@@ -47,6 +47,7 @@ pub struct PageFormOverlay {
     pub parent_id: Option<String>,
     pub title: TextBuffer,
     pub body: TextBuffer,
+    pub initial_title: String,
     pub initial_body: String,
     pub initial_body_raw: Option<String>,
     pub initial_body_representation: Option<String>,
@@ -63,6 +64,7 @@ impl PageFormOverlay {
             parent_id,
             title: TextBuffer::new(),
             body: TextBuffer::new(),
+            initial_title: String::new(),
             initial_body: String::new(),
             initial_body_raw: None,
             initial_body_representation: None,
@@ -79,9 +81,11 @@ impl PageFormOverlay {
             parent_id: detail.summary.parent_id.clone(),
             title: TextBuffer::from_text(detail.summary.title.clone()),
             body: TextBuffer::from_text(detail.body_markdown.clone()),
+            initial_title: detail.summary.title.clone(),
             initial_body: detail.body_markdown.clone(),
-            initial_body_raw: (!detail.body_raw.trim().is_empty())
-                .then(|| detail.body_raw.clone()),
+            initial_body_raw: (detail.body_representation == "storage"
+                || !detail.body_raw.trim().is_empty())
+            .then(|| detail.body_raw.clone()),
             initial_body_representation: (!detail.body_representation.trim().is_empty())
                 .then(|| detail.body_representation.clone()),
             field: PageFormField::Body,

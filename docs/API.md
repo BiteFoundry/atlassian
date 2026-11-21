@@ -194,19 +194,24 @@ curl -X POST http://127.0.0.1:8789/issues \
 }
 ```
 
-### `GET /issues/{key}?offline=false`
+### `GET /issues/{key}?offline=false&compact=false`
 
 Fetches full issue details (`IssueDetail`: metadata, Markdown description, subtasks, linked issues, linked Confluence pages, attachments, comments).
 
+`compact=true` returns `key`, `summary`, `status`, and the full `description_markdown` inside the `issue` envelope. It works for live and offline reads.
+
 ### `PATCH /issues/{key}`
 
-Updates fields on an issue (`IssueUpdate`). Requires at least one field (`summary`, `description_markdown`, `priority`, `assignee_id`, `labels`).
+Updates at least one issue field. Omit `assignee_id` to keep the current assignee, pass `null` to unassign, or pass an account ID to assign.
+
+Choose one body operation. `description_markdown` replaces the full description, `append_markdown` adds a fragment to the native description, and `replace_text: {"old_text":"…","new_text":"…"}` replaces one unique occurrence inside a single text node. The latter two preserve surrounding native content. Blank appends and unchanged Markdown skip the description write. Missing, ambiguous, and cross-node replacements return HTTP 400.
 
 ```json
 {
   "summary": "Updated summary",
   "priority": "Medium",
-  "assignee_id": "557058:..."
+  "assignee_id": null,
+  "append_markdown": "Confirm monitoring before rollout."
 }
 ```
 
@@ -281,9 +286,11 @@ Creates a new Confluence page (`OutgoingPage`). `space_id_or_key` and `title` ar
 }
 ```
 
-### `GET /pages/{id}?offline=false`
+### `GET /pages/{id}?offline=false&compact=false`
 
 Fetches full Confluence page detail (`PageDetail`: summary, ancestors, labels, `body_markdown`, `blocks`, `toc`, `attachments`, `comments`, `linked_issue_keys`).
+
+`compact=true` returns `id`, `title`, `space_id`, `space_key`, `version_number`, and the full `body_markdown` inside the `page` envelope. It works for live and offline reads. Detail endpoints reject unsupported query arguments.
 
 ### `GET /pages/{id}/children?offline=false`
 
@@ -291,13 +298,15 @@ Lists direct child pages of page `{id}`.
 
 ### `PUT /pages/{id}`
 
-Updates a Confluence page. If `prev_version` is `0`/omitted or `title`/`body_markdown` is omitted, the server automatically fetches the current page first to resolve `version_number` and unchanged fields.
+Choose one body operation. `body_markdown` replaces the full body, `append_markdown` adds a fragment to the native body, and `replace_text: {"old_text":"…","new_text":"…"}` replaces one unique occurrence inside a single text node.
+
+For body edits, read `GET /pages/{id}?compact=true` and pass the returned `page.version_number` as `prev_version`. A stale version returns HTTP 409. Title and version-message edits preserve the native body. This example uses version 7.
 
 ```json
 {
   "title": "Runbook (v2)",
-  "body_markdown": "# Updated",
-  "prev_version": 0,
+  "replace_text": {"old_text": "canary", "new_text": "canary-verified"},
+  "prev_version": 7,
   "version_message": "Clarified rollback steps"
 }
 ```

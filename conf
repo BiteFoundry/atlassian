@@ -4,4 +4,5 @@ set -eu
 
 ROOT=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 export ATLASSIAN_PERSONA=confluence
+export ATLASSIAN_COMMAND_NAME=conf
 exec "$ROOT/jira" "$@"

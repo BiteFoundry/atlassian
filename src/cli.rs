@@ -7,11 +7,15 @@ use std::{
 
 use anyhow::{bail, Context, Result};
 use clap::{Parser, Subcommand, ValueEnum};
-use serde_json::json;
+use serde_json::{json, Map, Value};
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use crate::{
-    atlassian::{client::is_not_found_error, AtlassianClient, SiteClientPool},
+    atlassian::{
+        body::{BodyEdit, TextReplacement},
+        client::is_not_found_error,
+        AtlassianClient, SiteClientPool,
+    },
     auth::{
         fetch_accessible_resources, run_oauth_loopback_login, AuthManager, OAuthLoopbackOptions,
         StoredCredentials, DEFAULT_OAUTH_API_BASE, DEFAULT_OAUTH_AUTH_BASE,
@@ -22,7 +26,7 @@ use crate::{
     daemon, img_preview,
     models::{
         AttachmentItem, BoardSummary, IssueDetail, IssueSummary, IssueUpdate, OutgoingIssue,
-        OutgoingPage, PageDetail, PageUpdate, SprintSummary, StatusCategory,
+        OutgoingPage, PageDetail, SprintSummary, StatusCategory,
     },
     serve::{self, ServeOptions},
     storage::{SiteRecord, Storage},
@@ -76,6 +80,40 @@ pub struct ConfluenceCli {
     pub site: Option<String>,
     #[command(subcommand)]
     pub command: Option<ConfluenceCommand>,
+}
+
+#[derive(clap::Args, Debug)]
+pub struct EditBodyArgs {
+    /// Replace the entire body with Markdown
+    #[arg(long, conflicts_with = "body_file")]
+    body: Option<String>,
+    /// Replace the entire body from a Markdown file
+    #[arg(long = "body-file")]
+    body_file: Option<PathBuf>,
+    /// Append Markdown while preserving the existing body
+    #[arg(long, conflicts_with_all = ["body", "body_file", "append_file"])]
+    append: Option<String>,
+    /// Append a Markdown file while preserving the existing body
+    #[arg(long = "append-file", conflicts_with_all = ["body", "body_file"])]
+    append_file: Option<PathBuf>,
+    /// Replace one unique text occurrence in place
+    #[arg(long, num_args = 2, value_names = ["OLD", "NEW"], conflicts_with_all = ["body", "body_file", "append", "append_file"])]
+    replace: Option<Vec<String>>,
+}
+
+impl EditBodyArgs {
+    fn read(self) -> Result<(Option<String>, Option<String>, Option<TextReplacement>)> {
+        let full = read_body_arg(self.body.as_deref(), self.body_file.as_deref())?;
+        let append = read_body_arg(self.append.as_deref(), self.append_file.as_deref())?;
+        let replacement = self.replace.map(|values| {
+            let mut values = values.into_iter();
+            TextReplacement {
+                old_text: values.next().expect("clap requires OLD"),
+                new_text: values.next().expect("clap requires NEW"),
+            }
+        });
+        Ok((full, append, replacement))
+    }
 }
 
 #[derive(clap::Args, Debug, Clone)]
@@ -305,6 +343,9 @@ pub enum Command {
         offline: bool,
         #[arg(long)]
         json: bool,
+        /// Return only identifying fields and the full Markdown body
+        #[arg(long, requires = "json")]
+        compact: bool,
     },
     /// Create a new Jira issue
     #[command(visible_alias = "new")]
@@ -335,10 +376,8 @@ pub enum Command {
         key: String,
         #[arg(long)]
         summary: Option<String>,
-        #[arg(long)]
-        body: Option<String>,
-        #[arg(long = "body-file")]
-        body_file: Option<PathBuf>,
+        #[command(flatten)]
+        body: EditBodyArgs,
         #[arg(long)]
         priority: Option<String>,
         #[arg(long)]
@@ -478,6 +517,8 @@ pub enum Command {
     /// Run the stdio MCP (JSON-RPC 2.0) server for AI agents
     #[command(visible_alias = "mcp-server")]
     Mcp,
+    #[command(flatten)]
+    Workflow(JiraWorkflow),
 }
 
 #[derive(Subcommand, Debug)]
@@ -573,6 +614,9 @@ pub enum ConfluenceCommand {
         offline: bool,
         #[arg(long)]
         json: bool,
+        /// Return only identifying fields and the full Markdown body
+        #[arg(long, requires = "json")]
+        compact: bool,
     },
     /// Create a new Confluence page
     #[command(visible_alias = "new")]
@@ -595,11 +639,9 @@ pub enum ConfluenceCommand {
         page_id: String,
         #[arg(long)]
         title: Option<String>,
-        #[arg(long)]
-        body: Option<String>,
-        #[arg(long = "body-file")]
-        body_file: Option<PathBuf>,
-        /// Base version number read before editing (required when replacing body)
+        #[command(flatten)]
+        body: EditBodyArgs,
+        /// Current page version from view (required for body edits)
         #[arg(long = "prev-version")]
         prev_version: Option<i32>,
         #[arg(long)]
@@ -714,6 +756,8 @@ pub enum ConfluenceCommand {
     /// Run the stdio MCP (JSON-RPC 2.0) server for AI agents
     #[command(visible_alias = "mcp-server")]
     Mcp,
+    #[command(flatten)]
+    Workflow(ConfluenceWorkflow),
 }
 
 #[derive(Subcommand, Debug)]
@@ -750,6 +794,9 @@ pub enum WikiCommand {
         offline: bool,
         #[arg(long)]
         json: bool,
+        /// Return only identifying fields and the full Markdown body
+        #[arg(long, requires = "json")]
+        compact: bool,
     },
     /// Create a new Confluence page
     #[command(visible_alias = "new")]
@@ -772,11 +819,9 @@ pub enum WikiCommand {
         page_id: String,
         #[arg(long)]
         title: Option<String>,
-        #[arg(long)]
-        body: Option<String>,
-        #[arg(long = "body-file")]
-        body_file: Option<PathBuf>,
-        /// Base version number read before editing (required when replacing body)
+        #[command(flatten)]
+        body: EditBodyArgs,
+        /// Current page version from view (required for body edits)
         #[arg(long = "prev-version")]
         prev_version: Option<i32>,
         #[arg(long)]
@@ -831,6 +876,8 @@ pub enum WikiCommand {
     },
     /// Open a Confluence page web URL
     Open { page_id: String },
+    #[command(flatten)]
+    Workflow(ConfluenceWorkflow),
 }
 
 #[derive(Subcommand, Debug)]
@@ -893,6 +940,9 @@ pub enum JiraSubcommand {
         offline: bool,
         #[arg(long)]
         json: bool,
+        /// Return only identifying fields and the full Markdown body
+        #[arg(long, requires = "json")]
+        compact: bool,
     },
     /// Create a new Jira issue
     #[command(visible_alias = "new")]
@@ -923,10 +973,8 @@ pub enum JiraSubcommand {
         key: String,
         #[arg(long)]
         summary: Option<String>,
-        #[arg(long)]
-        body: Option<String>,
-        #[arg(long = "body-file")]
-        body_file: Option<PathBuf>,
+        #[command(flatten)]
+        body: EditBodyArgs,
         #[arg(long)]
         priority: Option<String>,
         #[arg(long)]
@@ -1005,16 +1053,104 @@ pub enum JiraSubcommand {
     },
     /// Open a Jira issue web URL
     Open { key: String },
+    #[command(flatten)]
+    Workflow(JiraWorkflow),
 }
 
-fn parse_cli_with_stack<T: Parser + Send + 'static>() -> T {
+#[derive(Subcommand, Debug)]
+pub enum JiraWorkflow {
+    /// Set a Cloud parent or assign an eligible Data Center issue to an epic
+    Parent {
+        key: String,
+        parent_key: String,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Update explicit custom field IDs with native JSON values
+    CustomFields {
+        key: String,
+        /// JSON object mapping customfield_<digits> to Jira API values
+        #[arg(
+            long,
+            required_unless_present = "fields_file",
+            conflicts_with = "fields_file"
+        )]
+        fields_json: Option<String>,
+        /// Read the JSON object from a UTF-8 file
+        #[arg(long)]
+        fields_file: Option<PathBuf>,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Create a Jira link using its named type and explicit link ends
+    Link {
+        inward_key: String,
+        outward_key: String,
+        #[arg(long = "type")]
+        link_type: String,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Move 1 to 50 existing issues to an open or active sprint
+    MoveToSprint {
+        sprint_id: i64,
+        #[arg(required = true, num_args = 1..=50)]
+        keys: Vec<String>,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Record positive seconds while keeping the remaining estimate
+    LogWork {
+        key: String,
+        #[arg(long)]
+        seconds: i32,
+        /// RFC 3339 start time with a timezone
+        #[arg(long)]
+        started: Option<String>,
+        /// Markdown worklog comment
+        #[arg(long)]
+        comment: Option<String>,
+        #[arg(long)]
+        json: bool,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+pub enum ConfluenceWorkflow {
+    /// Move a page under a parent page
+    Move {
+        page_id: String,
+        parent_id: String,
+        /// Current page version required on Data Center
+        #[arg(long)]
+        prev_version: Option<i32>,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Add global labels or remove one label by name
+    Labels {
+        page_id: String,
+        #[arg(long, required_unless_present = "remove", conflicts_with = "remove")]
+        add: Vec<String>,
+        #[arg(long)]
+        remove: Option<String>,
+        #[arg(long)]
+        json: bool,
+    },
+}
+
+fn parse_cli_with_stack<T: Parser + Send + 'static>(name: &'static str) -> T {
+    let parse = move || {
+        let mut matches = T::command().name(name).bin_name(name).get_matches();
+        T::from_arg_matches_mut(&mut matches).unwrap_or_else(|error| error.exit())
+    };
     std::thread::Builder::new()
         .name("atlassian-cli-parse".to_string())
         .stack_size(8 * 1024 * 1024)
-        .spawn(T::parse)
+        .spawn(parse)
         .ok()
         .and_then(|handle| handle.join().ok())
-        .unwrap_or_else(T::parse)
+        .unwrap_or_else(parse)
 }
 
 pub async fn run() -> Result<()> {
@@ -1022,12 +1158,24 @@ pub async fn run() -> Result<()> {
     let persona = Persona::detect();
     match persona {
         Persona::Jira => {
-            let cli: Cli = parse_cli_with_stack();
+            let cli: Cli = parse_cli_with_stack("jira");
             let site_override = cli.site.clone();
             Box::pin(dispatch_jira_cli(&mut cfg, persona, site_override, cli.command)).await
         }
         Persona::Confluence => {
-            let cli: ConfluenceCli = parse_cli_with_stack();
+            let launcher = std::env::var("ATLASSIAN_COMMAND_NAME").ok();
+            let invoked_as_conf = std::env::args_os().next().is_some_and(|arg| {
+                Path::new(&arg)
+                    .file_stem()
+                    .is_some_and(|stem| stem.eq_ignore_ascii_case("conf"))
+            });
+            let name =
+                if launcher.as_deref() == Some("conf") || (launcher.is_none() && invoked_as_conf) {
+                    "conf"
+                } else {
+                    "confluence"
+                };
+            let cli: ConfluenceCli = parse_cli_with_stack(name);
             let site_override = cli.site.clone();
             Box::pin(dispatch_confluence_cli(
                 &mut cfg,
@@ -1178,14 +1326,27 @@ async fn dispatch_jira_cli(
             ))
             .await
         }
+        Some(Command::Workflow(command)) => {
+            let scoped = apply_site_override(cfg, site_override.as_deref())?;
+            Box::pin(dispatch_jira_workflow(&scoped, command)).await
+        }
         Some(Command::View {
             key,
             preview_images,
             offline,
             json,
+            compact,
         }) => {
             let scoped = apply_site_override(cfg, site_override.as_deref())?;
-            Box::pin(cmd_issue_view(&scoped, &key, preview_images, offline, json)).await
+            Box::pin(cmd_issue_view(
+                &scoped,
+                &key,
+                preview_images,
+                offline,
+                json,
+                compact,
+            ))
+            .await
         }
         Some(Command::Create {
             project,
@@ -1219,7 +1380,6 @@ async fn dispatch_jira_cli(
             key,
             summary,
             body,
-            body_file,
             priority,
             assignee,
             label,
@@ -1227,15 +1387,7 @@ async fn dispatch_jira_cli(
         }) => {
             let scoped = apply_site_override(cfg, site_override.as_deref())?;
             Box::pin(cmd_issue_edit(
-                &scoped,
-                &key,
-                summary,
-                body.as_deref(),
-                body_file.as_deref(),
-                priority,
-                assignee,
-                label,
-                json,
+                &scoped, &key, summary, body, priority, assignee, label, json,
             ))
             .await
         }
@@ -1447,14 +1599,27 @@ async fn dispatch_confluence_cli(
             ))
             .await
         }
+        Some(ConfluenceCommand::Workflow(command)) => {
+            let scoped = apply_site_override(cfg, site_override.as_deref())?;
+            Box::pin(dispatch_confluence_workflow(&scoped, command)).await
+        }
         Some(ConfluenceCommand::View {
             page_id,
             preview_images,
             offline,
             json,
+            compact,
         }) => {
             let scoped = apply_site_override(cfg, site_override.as_deref())?;
-            Box::pin(cmd_page_view(&scoped, &page_id, preview_images, offline, json)).await
+            Box::pin(cmd_page_view(
+                &scoped,
+                &page_id,
+                preview_images,
+                offline,
+                json,
+                compact,
+            ))
+            .await
         }
         Some(ConfluenceCommand::Create {
             space,
@@ -1480,7 +1645,6 @@ async fn dispatch_confluence_cli(
             page_id,
             title,
             body,
-            body_file,
             prev_version,
             message,
             json,
@@ -1490,8 +1654,7 @@ async fn dispatch_confluence_cli(
                 &scoped,
                 &page_id,
                 title,
-                body.as_deref(),
-                body_file.as_deref(),
+                body,
                 prev_version,
                 message,
                 json,
@@ -1628,12 +1791,26 @@ async fn dispatch_wiki_subcommand(cfg: &AppConfig, command: WikiCommand) -> Resu
             ))
             .await
         }
+        WikiCommand::Workflow(command) => {
+            Box::pin(dispatch_confluence_workflow(cfg, command)).await
+        }
         WikiCommand::View {
             page_id,
             preview_images,
             offline,
             json,
-        } => Box::pin(cmd_page_view(cfg, &page_id, preview_images, offline, json)).await,
+            compact,
+        } => {
+            Box::pin(cmd_page_view(
+                cfg,
+                &page_id,
+                preview_images,
+                offline,
+                json,
+                compact,
+            ))
+            .await
+        }
         WikiCommand::Create {
             space,
             parent,
@@ -1657,7 +1834,6 @@ async fn dispatch_wiki_subcommand(cfg: &AppConfig, command: WikiCommand) -> Resu
             page_id,
             title,
             body,
-            body_file,
             prev_version,
             message,
             json,
@@ -1666,8 +1842,7 @@ async fn dispatch_wiki_subcommand(cfg: &AppConfig, command: WikiCommand) -> Resu
                 cfg,
                 &page_id,
                 title,
-                body.as_deref(),
-                body_file.as_deref(),
+                body,
                 prev_version,
                 message,
                 json,
@@ -1750,12 +1925,24 @@ async fn dispatch_jira_subcommand(cfg: &AppConfig, command: JiraSubcommand) -> R
             ))
             .await
         }
+        JiraSubcommand::Workflow(command) => Box::pin(dispatch_jira_workflow(cfg, command)).await,
         JiraSubcommand::View {
             key,
             preview_images,
             offline,
             json,
-        } => Box::pin(cmd_issue_view(cfg, &key, preview_images, offline, json)).await,
+            compact,
+        } => {
+            Box::pin(cmd_issue_view(
+                cfg,
+                &key,
+                preview_images,
+                offline,
+                json,
+                compact,
+            ))
+            .await
+        }
         JiraSubcommand::Create {
             project,
             issue_type,
@@ -1787,22 +1974,13 @@ async fn dispatch_jira_subcommand(cfg: &AppConfig, command: JiraSubcommand) -> R
             key,
             summary,
             body,
-            body_file,
             priority,
             assignee,
             label,
             json,
         } => {
             Box::pin(cmd_issue_edit(
-                cfg,
-                &key,
-                summary,
-                body.as_deref(),
-                body_file.as_deref(),
-                priority,
-                assignee,
-                label,
-                json,
+                cfg, &key, summary, body, priority, assignee, label, json,
             ))
             .await
         }
@@ -3292,6 +3470,7 @@ async fn cmd_issue_view(
     preview_images: bool,
     offline: bool,
     json_out: bool,
+    compact: bool,
 ) -> Result<()> {
     let (_auth, client, storage) = open_runtime(cfg, !offline)?;
     let site_id = client.site_id();
@@ -3327,7 +3506,7 @@ async fn cmd_issue_view(
             serde_json::to_string_pretty(&json!({
                 "site_id": site_id,
                 "detail_stale": detail_stale,
-                "issue": detail,
+                "issue": detail.output(compact),
             }))?
         );
         return Ok(());
@@ -3401,25 +3580,120 @@ async fn cmd_issue_create(
 }
 
 #[allow(clippy::too_many_arguments)]
+async fn dispatch_jira_workflow(cfg: &AppConfig, command: JiraWorkflow) -> Result<()> {
+    let (_, client, storage) = open_runtime(cfg, true)?;
+    let site_id = client.site_id();
+    let (result, json_out, message) = match command {
+        JiraWorkflow::Parent {
+            key,
+            parent_key,
+            json,
+        } => {
+            let parent = client.set_issue_parent(&key, &parent_key).await?;
+            refresh_cli_issue_cache(&client, &storage, &key).await;
+            (
+                json!({"ok": true, "site_id": site_id, "key": key, "parent_key": parent}),
+                json,
+                format!("{key}: 상위 이슈 {parent} 지정 완료"),
+            )
+        }
+        JiraWorkflow::CustomFields {
+            key,
+            fields_json,
+            fields_file,
+            json,
+        } => {
+            let text = read_body_arg(fields_json.as_deref(), fields_file.as_deref())?
+                .context("provide --fields-json or --fields-file")?;
+            let fields: Map<String, Value> =
+                serde_json::from_str(&text).context("custom fields must be a JSON object")?;
+            let updated = client.edit_issue_custom_fields(&key, &fields).await?;
+            refresh_cli_issue_cache(&client, &storage, &key).await;
+            (
+                json!({"ok": true, "site_id": site_id, "key": key, "custom_fields": updated}),
+                json,
+                format!("{key}: 사용자 정의 필드 {}개 수정 완료", updated.len()),
+            )
+        }
+        JiraWorkflow::Link {
+            inward_key,
+            outward_key,
+            link_type,
+            json,
+        } => {
+            let link = client
+                .create_issue_link(&inward_key, &outward_key, &link_type)
+                .await?;
+            refresh_cli_issue_cache(&client, &storage, &inward_key).await;
+            refresh_cli_issue_cache(&client, &storage, &outward_key).await;
+            (
+                json!({"ok": true, "site_id": site_id, "link": link}),
+                json,
+                format!(
+                    "{inward_key} ↔ {outward_key}: 링크 생성 완료 ({})",
+                    link["id"]
+                ),
+            )
+        }
+        JiraWorkflow::MoveToSprint {
+            sprint_id,
+            keys,
+            json,
+        } => {
+            let confirmed = client.move_issues_to_sprint(sprint_id, &keys).await?;
+            for key in &confirmed {
+                refresh_cli_issue_cache(&client, &storage, key).await;
+            }
+            (
+                json!({"ok": true, "site_id": site_id, "sprint_id": sprint_id, "issue_keys": confirmed}),
+                json,
+                format!("스프린트 {sprint_id}: 이슈 {}개 이동 완료", confirmed.len()),
+            )
+        }
+        JiraWorkflow::LogWork {
+            key,
+            seconds,
+            started,
+            comment,
+            json,
+        } => {
+            let log = client
+                .log_issue_work(&key, seconds, started.as_deref(), comment.as_deref())
+                .await?;
+            (
+                json!({"ok": true, "site_id": site_id, "key": key, "worklog": log}),
+                json,
+                format!("{key}: 작업 시간 {seconds}초 기록 완료 ({})", log["id"]),
+            )
+        }
+    };
+    if json_out {
+        println!("{}", serde_json::to_string_pretty(&result)?);
+    } else {
+        println!("{message}");
+    }
+    Ok(())
+}
+
 async fn cmd_issue_edit(
     cfg: &AppConfig,
     key: &str,
     summary: Option<String>,
-    body: Option<&str>,
-    body_file: Option<&Path>,
+    body: EditBodyArgs,
     priority: Option<String>,
     assignee: Option<String>,
     labels: Option<Vec<String>>,
     json_out: bool,
 ) -> Result<()> {
-    let description_markdown = read_body_arg(body, body_file)?;
+    let (full, append, replacement) = body.read()?;
+    let edit = BodyEdit::from_inputs(full.as_deref(), append.as_deref(), replacement.as_ref())?;
     if summary.is_none()
-        && description_markdown.is_none()
+        && edit.is_none()
         && priority.is_none()
         && assignee.is_none()
         && labels.is_none()
     {
-        bail!("수정할 필드를 하나 이상 지정하세요 (`--summary`, `--body`, `--priority`, `--assignee`, `--label`).");
+        bail!("수정할 필드를 하나 이상 지정하세요 (`--summary`, `--body`, `--append`, `--replace` 등).");
     }
 
     let (_auth, client, storage) = open_runtime(cfg, true)?;
@@ -3433,12 +3707,12 @@ async fn cmd_issue_edit(
 
     let patch = IssueUpdate {
         summary,
-        description_markdown,
+        description_markdown: None,
         priority,
         assignee_id,
         labels,
     };
-    let updated = client.update_issue(key, &patch).await?;
+    let updated = client.edit_issue(key, &patch, edit).await?;
     let _ = storage.upsert_issue_detail_for_site(site_id, &updated);
 
     if json_out {
@@ -3835,6 +4109,7 @@ async fn cmd_page_view(
     preview_images: bool,
     offline: bool,
     json_out: bool,
+    compact: bool,
 ) -> Result<()> {
     let (_auth, client, storage) = open_runtime(cfg, !offline)?;
     let site_id = client.site_id();
@@ -3872,7 +4147,7 @@ async fn cmd_page_view(
             serde_json::to_string_pretty(&json!({
                 "site_id": site_id,
                 "detail_stale": detail_stale,
-                "page": detail,
+                "page": detail.output(compact),
             }))?
         );
         return Ok(());
@@ -3931,70 +4206,65 @@ async fn cmd_page_create(
 }
 
 #[allow(clippy::too_many_arguments)]
+async fn dispatch_confluence_workflow(cfg: &AppConfig, command: ConfluenceWorkflow) -> Result<()> {
+    let (_, client, storage) = open_runtime(cfg, true)?;
+    let site_id = client.site_id();
+    let (result, json_out, message) = match command {
+        ConfluenceWorkflow::Move {
+            page_id,
+            parent_id,
+            prev_version,
+            json,
+        } => {
+            let page = client.move_page(&page_id, &parent_id, prev_version).await?;
+            refresh_cli_page_cache(&client, &storage, &page_id).await;
+            (
+                json!({"ok": true, "site_id": site_id, "page": page}),
+                json,
+                format!("페이지 {page_id}: 상위 페이지 {parent_id}로 이동 완료"),
+            )
+        }
+        ConfluenceWorkflow::Labels {
+            page_id,
+            add,
+            remove,
+            json,
+        } => {
+            let result = if let Some(label) = remove {
+                client.remove_page_label(&page_id, &label).await?;
+                json!({"ok": true, "site_id": site_id, "page_id": page_id, "removed": label.trim()})
+            } else {
+                let added = client.add_page_labels(&page_id, &add).await?;
+                json!({"ok": true, "site_id": site_id, "page_id": page_id, "added": added})
+            };
+            refresh_cli_page_cache(&client, &storage, &page_id).await;
+            (result, json, format!("페이지 {page_id}: 라벨 수정 완료"))
+        }
+    };
+    if json_out {
+        println!("{}", serde_json::to_string_pretty(&result)?);
+    } else {
+        println!("{message}");
+    }
+    Ok(())
+}
+
 async fn cmd_page_edit(
     cfg: &AppConfig,
     page_id: &str,
     title: Option<String>,
-    body: Option<&str>,
-    body_file: Option<&Path>,
+    body: EditBodyArgs,
     prev_version: Option<i32>,
     message: Option<String>,
     json_out: bool,
 ) -> Result<()> {
-    let body_opt = read_body_arg(body, body_file)?;
-    if title.is_none() && body_opt.is_none() {
-        bail!("수정할 제목(`--title`) 또는 본문(`--body` / `--body-file`)을 지정하세요.");
-    }
-    if body_opt.is_some() && prev_version.unwrap_or(0) <= 0 {
-        bail!(
-            "Confluence 본문을 교체하려면 읽을 때 확인한 기준 버전을 `--prev-version <N>`으로 지정해야 합니다 (예: `jira wiki view {page_id}`로 버전을 확인한 뒤 `jira wiki edit {page_id} --prev-version <N> --body ...`). 기준 버전 없이 최신 버전으로 자동 덮어쓰기하지 않습니다."
-        );
-    }
-
+    let (full, append, replacement) = body.read()?;
+    let edit = BodyEdit::from_inputs(full.as_deref(), append.as_deref(), replacement.as_ref())?;
     let (_auth, client, storage) = open_runtime(cfg, true)?;
     let site_id = client.site_id();
-    let need_current = title.is_none() || body_opt.is_none();
-    let current = if need_current {
-        Some(client.get_page(page_id).await?)
-    } else {
-        None
-    };
-
-    let resolved_title = title.unwrap_or_else(|| {
-        current
-            .as_ref()
-            .map(|c| c.summary.title.clone())
-            .unwrap_or_default()
-    });
-    let (body_markdown, body_raw_passthrough, body_representation) = match body_opt {
-        Some(b) => (b, None, None),
-        None => {
-            let cur = current.as_ref();
-            let raw = cur
-                .map(|c| c.body_raw.clone())
-                .filter(|s| !s.trim().is_empty());
-            let repr = cur.map(|c| c.body_representation.clone());
-            let md = cur.map(|c| c.body_markdown.clone()).unwrap_or_default();
-            (md, raw, repr)
-        }
-    };
-    let effective_prev_version = match prev_version {
-        Some(v) if v > 0 => v,
-        _ => current
-            .as_ref()
-            .map(|c| c.summary.version_number)
-            .unwrap_or(1),
-    };
-
-    let patch = PageUpdate {
-        title: resolved_title,
-        body_markdown,
-        body_raw_passthrough,
-        body_representation,
-        prev_version: effective_prev_version,
-        version_message: message,
-    };
-    let updated = client.update_page(page_id, &patch).await?;
+    let updated = client
+        .edit_page(page_id, title, edit, prev_version, message)
+        .await?;
     let _ = storage.upsert_page_detail_for_site(site_id, &updated);
 
     if json_out {

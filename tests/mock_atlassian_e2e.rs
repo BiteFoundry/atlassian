@@ -1732,7 +1732,7 @@ async fn e2e_serve_http_mcp_image_preview_and_self_updater() {
     .await
     .expect("tools/list response");
     let tools = list_resp["result"]["tools"].as_array().unwrap();
-    assert_eq!(tools.len(), 28, "expected 28 MCP tools, got {}", tools.len());
+    assert!(tools.iter().any(|t| t["name"] == "move_confluence_page"));
     assert!(tools.iter().any(|t| t["name"] == "list_sites"));
     assert!(tools.iter().any(|t| t["name"] == "download_attachment"));
 

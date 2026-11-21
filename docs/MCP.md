@@ -1,6 +1,6 @@
 # `jira` / `confluence` MCP Server
 
-`jira mcp` or `confluence mcp` (alias `mcp-server`) runs a [Model Context Protocol](https://modelcontextprotocol.io/) server over **stdio** using newline-delimited JSON-RPC 2.0. It exposes **26 typed tools** covering Atlassian Jira, Jira Agile, Confluence, and unified search/sync to MCP-compatible clients such as Claude Code, Claude Desktop, and Codex.
+`jira mcp` or `confluence mcp` (alias `mcp-server`) runs a [Model Context Protocol](https://modelcontextprotocol.io/) server over **stdio** using newline-delimited JSON-RPC 2.0. Call `tools/list` to discover the active tool schemas. The server covers Atlassian Jira, Jira Agile, Confluence, and unified search/sync to MCP-compatible clients such as Claude Code, Claude Desktop, and Codex.
 
 ## Requirements
 
@@ -20,7 +20,7 @@
 
 ```bash
 jira mcp            # stdio: one JSON-RPC 2.0 object per line
-confluence mcp      # identical 26-tool MCP server under the confluence persona
+confluence mcp      # same tool catalog under the confluence persona
 jira mcp-server     # alias
 ```
 
@@ -92,9 +92,9 @@ args = ["mcp"]
 - **Error codes**: `-32700` parse error, `-32600` invalid JSON-RPC envelope, `-32601` method not found.
 - **`tools/call`**: returns `{ "content": [{ "type": "text", "text": "<pretty JSON>" }], "isError": false }` on success, or `"isError": true` with an error message on validation or API failures.
 
-## Tools (26)
+## Tools
 
-### Jira Tools (15)
+### Jira Tools
 
 | Tool | Arguments | Returns |
 | --- | --- | --- |
@@ -104,39 +104,65 @@ args = ["mcp"]
 | `list_sprints` | `board_id` (int), `offline?` (bool) | `{ "board_id": ..., "sprints": [...] }` |
 | `get_board_issues` | `board_id` (int), `sprint_id?` (int), `limit?` (1..1000), `offline?` (bool) | `{ "board_id": ..., "sprint_id": ..., "issues": [...] }` |
 | `search_jira_issues` | `jql?`, `query?`, `project?`, `limit?` (1..1000), `page_token?`, `offline?` (bool) | `{ "jql": "...", "issues": [...], ... }` or offline `{ "offline": true, "hits"\|"issues": [...] }` |
-| `get_jira_issue` | `key` (string), `offline?` (bool) | `{ "issue": {...} }` |
+| `get_jira_issue` | `key` (string), `offline?` (bool), `compact?` (bool) | `{ "issue": {...} }` |
 | `create_jira_issue` | `project_key`, `summary`, `issue_type?`, `description_markdown?`, `priority?`, `assignee_id?`, `labels?`, `parent_key?` | `{ "ok": true, "issue": {...} }` |
-| `update_jira_issue` | `key`, `summary?`, `description_markdown?`, `priority?`, `assignee_id?` (`string\|null`), `labels?` | `{ "ok": true, "issue": {...} }` |
+| `update_jira_issue` | `key`, `summary?`, `description_markdown?`, `append_markdown?`, `replace_text?`, `priority?`, `assignee_id?` (`string\|null`), `labels?` | `{ "ok": true, "issue": {...} }` |
 | `list_jira_transitions` | `key` (string) | `{ "key": "...", "transitions": [...] }` |
 | `transition_jira_issue` | `key`, `transition`, `comment_markdown?` | `{ "ok": true, "key": "...", "transition": "..." }` |
 | `assign_jira_issue` | `key`, `assignee_id?` (`string\|null`, `"me"` resolves current user) | `{ "ok": true, "key": "...", "assignee_id": ... }` |
 | `add_jira_comment` | `key`, `body_markdown` | `{ "ok": true, "comment": {...} }` |
 | `upload_jira_attachment` | `key`, `path` (local file path) | `{ "ok": true, "key": "...", "attachments": [...] }` |
 | `delete_jira_issue` | `key`, `confirm` (must be literal `true`) | `{ "ok": true, "key": "..." }` |
+| `set_jira_parent` | `key`, `parent_key` | Confirmed `parent_key` (epic key on Data Center) |
+| `update_jira_custom_fields` | `key`, `fields` (JSON object keyed by `customfield_<digits>`) | Values read back in `custom_fields` |
+| `create_jira_issue_link` | `inward_key`, `outward_key`, `link_type` (configured name) | `link` with ID and ends |
+| `move_jira_issues_to_sprint` | `sprint_id`, `issue_keys` (1–50 distinct keys) | `sprint_id` and confirmed `issue_keys` |
+| `add_jira_worklog` | `key`, `seconds`, `started?` (RFC 3339), `comment_markdown?` | Persisted `worklog` with ID and seconds |
 
-### Confluence Tools (9)
+### Confluence Tools
 
 | Tool | Arguments | Returns |
 | --- | --- | --- |
 | `list_confluence_spaces` | `refresh?` (bool), `limit?` (1..1000) | `{ "spaces": [...] }` |
 | `list_space_pages` | `space_key`, `limit?` (1..1000), `offline?` (bool) | `{ "space_key": "...", "pages": [...] }` |
 | `list_child_pages` | `page_id`, `offline?` (bool) | `{ "parent_id": "...", "pages": [...] }` |
-| `get_confluence_page` | `page_id`, `offline?` (bool) | `{ "page": {...} }` |
+| `get_confluence_page` | `page_id`, `offline?` (bool), `compact?` (bool) | `{ "page": {...} }` |
 | `create_confluence_page` | `space_id_or_key`, `title`, `body_markdown?`, `parent_id?` | `{ "ok": true, "page": {...} }` |
-| `update_confluence_page` | `page_id`, `title?`, `body_markdown?`, `prev_version?`, `version_message?` | `{ "ok": true, "page": {...} }` |
+| `update_confluence_page` | `page_id`, `title?`, `body_markdown?`, `append_markdown?`, `replace_text?`, `prev_version?`, `version_message?` | `{ "ok": true, "page": {...} }` |
 | `add_confluence_comment` | `page_id`, `body_markdown` | `{ "ok": true, "comment": {...} }` |
 | `search_confluence_pages` | `query?`, `cql?`, `remote?` (bool), `limit?` (1..1000) | `{ "remote": ..., "hits"\|"pages": [...] }` |
 | `delete_confluence_page` | `page_id`, `confirm` (must be literal `true`) | `{ "ok": true, "page_id": "..." }` |
+| `upload_confluence_attachment` | `page_id`, `path` (local file path) | `attachments` metadata |
+| `move_confluence_page` | `page_id`, `parent_id`, `prev_version?` (required on Data Center) | `page` summary with confirmed parent and version |
+| `add_confluence_labels` | `page_id`, `labels` (nonempty array) | `added` names |
+| `remove_confluence_label` | `page_id`, `label` | `removed` name |
 
-### Unified Tools (2)
+### Unified Tools
 
 | Tool | Arguments | Returns |
 | --- | --- | --- |
 | `search_all` | `query`, `scope?` (`all\|jira\|confluence`), `remote?` (bool), `limit?` (1..1000) | `{ "query": "...", "scope": "...", "remote": ..., "hits": [...] }` |
 | `sync_workspace` | _(none)_ | `{ "ok": true, "summary": "...", "counts": {...} }` |
+| `list_sites` | _(none)_ | Configured sites and the default site |
+| `download_attachment` | One of `issue_key` or `page_id`, plus `attachment_id?` and `dest_dir?` | Local path and attachment metadata |
+
+## Read and edit bodies
+
+- Pass `compact: true` to keep the full Markdown and the issue key, summary, and status or the page ID, title, space, and version. Both live and offline reads use the same shape.
+- Pass one of the body fields when editing. Use `description_markdown` for a full Jira description or `body_markdown` for a full Confluence body. `append_markdown` adds a fragment to the native body. `replace_text` accepts an object with `old_text` and `new_text` and requires one match in a single source text node.
+- Pass the current `page.version_number` from a compact read or `page.summary.version_number` from a full read as `prev_version` for any Confluence body edit. For a page at version 7, call `update_confluence_page` with `{"page_id":"40211","prev_version":7,"append_markdown":"Confirm monitoring before rollout."}`.
+
+## Incremental Jira and Confluence operations
+
+- `set_jira_parent` sets the existing issue's `parent` field in Cloud. In Data Center it assigns a non-subtask issue to an epic through Jira Software. For other Data Center hierarchy levels, use the configured Parent Link field ID where it is editable. Existing Data Center subtask parents can be changed in the Jira UI. [Cloud edit issue](https://developer.atlassian.com/cloud/jira/platform/rest/v3/api-group-issues/#api-rest-api-3-issue-issueidorkey-put) · [Data Center epic API](https://developer.atlassian.com/server/jira/platform/rest/v11002/api-group-epic/) · [Data Center subtask REST request](https://jira.atlassian.com/browse/JRASERVER-68763)
+- Pass native JSON values to `update_jira_custom_fields`, for example `{"key":"ENG-101","fields":{"customfield_10100":3,"customfield_10101":{"id":"10400"},"customfield_10102":null}}`. Jira determines which fields and shapes are accepted. A Cloud multiline text field expects ADF. The response reports the provider's read-back values, which may expand objects such as options. [Cloud edit issue](https://developer.atlassian.com/cloud/jira/platform/rest/v3/api-group-issues/#api-rest-api-3-issue-issueidorkey-put) · [Data Center field updates](https://developer.atlassian.com/server/jira/platform/updating-an-issue-via-the-jira-rest-apis-6848604/)
+- `create_jira_issue_link` accepts the configured type name, such as `Blocks`, and the named inward and outward ends. `move_jira_issues_to_sprint` requires Jira Software and an open or active sprint. Cloud OAuth credentials need `write:sprint:jira-software` and `read:issue:jira-software`. Use a Cloud API token for this workflow when using the app's default OAuth scope configuration. [Cloud issue links](https://developer.atlassian.com/cloud/jira/platform/rest/v3/api-group-issue-links/) · [Data Center issue links](https://developer.atlassian.com/server/jira/platform/rest/v10006/api-group-issuelink/) · [Cloud sprint API](https://developer.atlassian.com/cloud/jira/software/rest/api-group-sprint/) · [Cloud Agile issue API](https://developer.atlassian.com/cloud/jira/software/rest/api-group-issue/) · [Data Center sprint API](https://developer.atlassian.com/server/jira/platform/rest/v10007/api-group-sprint/)
+- `add_jira_worklog` requires time tracking and permission to log work. It keeps the remaining estimate. After a transport or read-back failure, inspect existing worklogs before sending another creation request. [Cloud worklogs](https://developer.atlassian.com/cloud/jira/platform/rest/v3/api-group-issue-worklogs/) · [Data Center worklogs](https://docs.atlassian.com/software/jira/docs/api/REST/9.10.2/#api/2/issue-addWorklog)
+- `move_confluence_page` uses the Cloud move-to-child operation with an empty request body. An optional Cloud version is checked before the move. Data Center requires the current `prev_version` and a parent in the same space. Its metadata update sends the next version and `ancestors` without a body. [Cloud page move](https://developer.atlassian.com/cloud/confluence/rest/v1/api-group-content---children-and-descendants/) · [Data Center update content](https://developer.atlassian.com/server/confluence/rest/v1001/api-group-content-resource/)
+- Labels use the dedicated add and remove endpoints. Add accepts multiple global labels in one request. Remove accepts one label name. Attachment upload uses the existing create-only multipart path shared with `conf attach`. [Cloud labels](https://developer.atlassian.com/cloud/confluence/rest/v1/api-group-content-labels/) · [Data Center labels](https://developer.atlassian.com/server/confluence/rest/v9227/api-group-content-labels/) · [Cloud attachments](https://developer.atlassian.com/cloud/confluence/rest/v1/api-group-content---attachments/) · [Data Center attachments](https://developer.atlassian.com/server/confluence/rest/latest/)
 
 ## Safety guards
 
 - Destructive tools (`delete_jira_issue` and `delete_confluence_page`) enforce `confirm: true` as a literal JSON boolean (`Value::Bool(true)`). Omitting `confirm` or passing `false`, `"true"`, `1`, or `null` returns `isError: true`.
 - `update_jira_issue` and `update_confluence_page` reject empty patches with no fields to update.
-- `update_confluence_page` automatically fetches the current page when `prev_version` is omitted so version-conflict checks (`prev_version + 1`) stay safe.
+- Confluence reports a version conflict if the page has changed since the supplied base version.

@@ -2,7 +2,8 @@
 
 use std::collections::HashSet;
 
-use anyhow::{anyhow, bail, Result};
+use anyhow::{anyhow, bail, Context, Result};
+use chrono::DateTime;
 use regex::Regex;
 use reqwest::StatusCode;
 use serde_json::{json, Map, Value};
@@ -13,6 +14,7 @@ use crate::{
         parse_adf_value, parse_jira_wiki, parse_storage_xhtml,
     },
     atlassian::{
+        body::{same_markdown, BodyEdit, BodyEditError},
         client::{
             first_nonempty_str, json_id_to_string, parse_attachment_item, parse_user_summary,
             HttpStatusError,
@@ -415,6 +417,20 @@ impl AtlassianClient {
     }
 
     pub async fn update_issue(&self, key: &str, patch: &IssueUpdate) -> Result<IssueDetail> {
+        self.edit_issue(
+            key,
+            patch,
+            patch.description_markdown.as_deref().map(BodyEdit::Full),
+        )
+        .await
+    }
+
+    pub(crate) async fn edit_issue(
+        &self,
+        key: &str,
+        patch: &IssueUpdate,
+        body: Option<BodyEdit<'_>>,
+    ) -> Result<IssueDetail> {
         let base = self.require_site_url()?;
         let ver = self.jira_api_version();
         let encoded_key = urlencoding::encode(key);
@@ -423,15 +439,6 @@ impl AtlassianClient {
         let mut fields = Map::new();
         if let Some(ref summary) = patch.summary {
             fields.insert("summary".into(), Value::String(summary.clone()));
-        }
-        if let Some(ref desc_md) = patch.description_markdown {
-            fields.insert(
-                "description".into(),
-                match self.deployment() {
-                    DeploymentKind::Cloud => markdown_to_adf(desc_md),
-                    DeploymentKind::DataCenter => Value::String(markdown_to_jira_wiki(desc_md)),
-                },
-            );
         }
         if let Some(ref priority) = patch.priority {
             fields.insert("priority".into(), json!({ "name": priority }));
@@ -450,9 +457,63 @@ impl AtlassianClient {
             fields.insert("labels".into(), json!(labels));
         }
 
+        let mut current = None;
+        let description = match body {
+            Some(BodyEdit::Full(md)) => {
+                let detail = self.get_issue(key).await?;
+                let changed = !same_markdown(md, &detail.description_markdown);
+                current = Some(detail);
+                changed.then(|| match self.deployment() {
+                    DeploymentKind::Cloud => markdown_to_adf(md),
+                    DeploymentKind::DataCenter => Value::String(markdown_to_jira_wiki(md)),
+                })
+            }
+            Some(BodyEdit::Append(md)) if md.trim().is_empty() => None,
+            Some(edit) => {
+                let source: Value = self
+                    .get_json(&format!("{url}?fields=description&expand=renderedFields"))
+                    .await?;
+                let description = source.pointer("/fields/description").ok_or(BodyEditError(
+                    "Jira did not return the original description",
+                ))?;
+                match self.deployment() {
+                    DeploymentKind::Cloud => {
+                        let original = if description.is_null() {
+                            if source
+                                .pointer("/renderedFields/description")
+                                .and_then(Value::as_str)
+                                .is_some_and(|html| !html.trim().is_empty())
+                            {
+                                return Err(BodyEditError("Jira returned rendered HTML without the original ADF description").into());
+                            }
+                            json!({"type": "doc", "version": 1, "content": []})
+                        } else {
+                            description.clone()
+                        };
+                        edit.adf(original)?
+                    }
+                    DeploymentKind::DataCenter => {
+                        let original = if description.is_null() {
+                            ""
+                        } else {
+                            description
+                                .as_str()
+                                .ok_or(BodyEditError("Jira did not return a wiki description"))?
+                        };
+                        edit.wiki(original)?.map(Value::String)
+                    }
+                }
+            }
+            None => None,
+        };
+        if let Some(description) = description {
+            fields.insert("description".into(), description);
+        }
         if !fields.is_empty() {
             self.put_json_empty(&url, &json!({ "fields": fields }))
                 .await?;
+        } else if let Some(detail) = current {
+            return Ok(detail);
         }
 
         self.get_issue(key).await
@@ -464,6 +525,229 @@ impl AtlassianClient {
         let encoded_key = urlencoding::encode(key);
         let url = format!("{base}/rest/api/{ver}/issue/{encoded_key}");
         self.delete_req(&url).await
+    }
+
+    pub async fn set_issue_parent(&self, key: &str, parent_key: &str) -> Result<String> {
+        let key = key.trim();
+        let parent_key = parent_key.trim();
+        if key.is_empty() || parent_key.is_empty() || key.eq_ignore_ascii_case(parent_key) {
+            bail!("provide an issue key and a different parent key");
+        }
+        if self.deployment() == DeploymentKind::DataCenter {
+            return self.set_dc_issue_epic(key, parent_key).await;
+        }
+        let base = self.require_site_url()?;
+        let key_segment = urlencoding::encode(key);
+        let url = format!("{base}/rest/api/3/issue/{key_segment}");
+        self.put_json_empty(&url, &json!({"fields": {"parent": {"key": parent_key}}}))
+            .await?;
+        let issue: Value = self
+            .get_json(&format!("{url}?fields=parent"))
+            .await
+            .with_context(|| {
+                format!("Jira accepted the parent update for {key}. Reading it back failed")
+            })?;
+        let actual = issue.pointer("/fields/parent/key").and_then(Value::as_str);
+        match actual {
+            Some(actual) if actual.eq_ignore_ascii_case(parent_key) => Ok(actual.to_owned()),
+            _ => bail!("Jira accepted the parent update for {key}. Expected {parent_key}, observed {actual:?}"),
+        }
+    }
+
+    async fn set_dc_issue_epic(&self, key: &str, epic_key: &str) -> Result<String> {
+        let base = self.require_site_url()?;
+        let key_segment = urlencoding::encode(key);
+        let issue: Value = self
+            .get_json(&format!(
+                "{base}/rest/api/2/issue/{key_segment}?fields=issuetype"
+            ))
+            .await?;
+        match issue.pointer("/fields/issuetype/subtask").and_then(Value::as_bool) {
+            Some(true) => bail!("Jira Data Center supports setting an epic here. Change subtask parents in the Jira UI."),
+            Some(false) => {}
+            None => bail!("Jira did not return whether {key} is a subtask"),
+        }
+        let epic = urlencoding::encode(epic_key);
+        self.post_json_empty(
+            &format!("{base}/rest/agile/1.0/epic/{epic}/issue"),
+            &json!({"issues": [key]}),
+        )
+        .await?;
+        let issue = self
+            .get_agile_issue_fields(key, "epic")
+            .await
+            .with_context(|| {
+                format!("Jira accepted the epic update for {key}. Reading it back failed")
+            })?;
+        let actual = issue.pointer("/fields/epic/key").and_then(Value::as_str);
+        match actual {
+            Some(actual) if actual.eq_ignore_ascii_case(epic_key) => Ok(actual.to_owned()),
+            _ => bail!(
+                "Jira accepted the epic update for {key}. Expected {epic_key}, observed {actual:?}"
+            ),
+        }
+    }
+
+    pub async fn edit_issue_custom_fields(
+        &self,
+        key: &str,
+        fields: &Map<String, Value>,
+    ) -> Result<Map<String, Value>> {
+        if key.trim().is_empty() {
+            bail!("issue key must not be empty");
+        }
+        if fields.is_empty() {
+            bail!("provide at least one custom field");
+        }
+        for field in fields.keys() {
+            let valid = field
+                .strip_prefix("customfield_")
+                .is_some_and(|id| !id.is_empty() && id.bytes().all(|byte| byte.is_ascii_digit()));
+            if !valid {
+                bail!("invalid custom field ID '{field}'. Use customfield_<digits>");
+            }
+        }
+        let base = self.require_site_url()?;
+        let ver = self.jira_api_version();
+        let encoded_key = urlencoding::encode(key.trim());
+        let url = format!("{base}/rest/api/{ver}/issue/{encoded_key}");
+        self.put_json_empty(&url, &json!({"fields": fields}))
+            .await?;
+        let selection = fields
+            .keys()
+            .map(String::as_str)
+            .collect::<Vec<_>>()
+            .join(",");
+        let issue: Value = self
+            .get_json(&format!("{url}?fields={}", urlencoding::encode(&selection)))
+            .await
+            .with_context(|| {
+                format!("Jira accepted the custom field update for {key}. Reading it back failed")
+            })?;
+        let observed = issue.get("fields").and_then(Value::as_object);
+        fields
+            .keys()
+            .map(|id| {
+                let value = observed.and_then(|fields| fields.get(id)).with_context(|| {
+                format!("Jira accepted the custom field update for {key}. The read omitted {id}")
+            })?;
+                Ok((id.clone(), value.clone()))
+            })
+            .collect()
+    }
+
+    pub async fn create_issue_link(
+        &self,
+        inward_key: &str,
+        outward_key: &str,
+        link_type: &str,
+    ) -> Result<Value> {
+        let (inward_key, outward_key, link_type) =
+            (inward_key.trim(), outward_key.trim(), link_type.trim());
+        if inward_key.is_empty()
+            || outward_key.is_empty()
+            || inward_key.eq_ignore_ascii_case(outward_key)
+            || link_type.is_empty()
+        {
+            bail!("provide two distinct issue keys and a link type name");
+        }
+        let base = self.require_site_url()?;
+        let ver = self.jira_api_version();
+        self.post_json_empty(
+            &format!("{base}/rest/api/{ver}/issueLink"),
+            &json!({
+                "inwardIssue": {"key": inward_key},
+                "outwardIssue": {"key": outward_key},
+                "type": {"name": link_type}
+            }),
+        )
+        .await?;
+
+        let encoded_key = urlencoding::encode(inward_key);
+        let issue: Value = self
+            .get_json(&format!(
+                "{base}/rest/api/{ver}/issue/{encoded_key}?fields=issuelinks"
+            ))
+            .await
+            .context("Jira accepted the issue link. Reading it back failed")?;
+        let link = issue
+            .pointer("/fields/issuelinks")
+            .and_then(Value::as_array)
+            .and_then(|links| {
+                links.iter().find(|link| {
+                    let type_matches = link
+                        .pointer("/type/name")
+                        .and_then(Value::as_str)
+                        .is_some_and(|name| name.eq_ignore_ascii_case(link_type));
+                    let symmetric = link
+                        .pointer("/type/inward")
+                        .and_then(Value::as_str)
+                        .is_some_and(|label| {
+                            Some(label) == link.pointer("/type/outward").and_then(Value::as_str)
+                        });
+                    let matches_outward = |path| {
+                        link.pointer(path)
+                            .and_then(Value::as_str)
+                            .is_some_and(|key| key.eq_ignore_ascii_case(outward_key))
+                    };
+                    type_matches
+                        && (matches_outward("/outwardIssue/key")
+                            || (symmetric && matches_outward("/inwardIssue/key")))
+                })
+            });
+        let id = json_id_to_string(link.and_then(|link| link.get("id")));
+        if id.is_empty() {
+            bail!("Jira accepted the issue link. The read did not contain a matching link ID");
+        }
+        Ok(
+            json!({ "id": id, "type": link_type, "inward_key": inward_key, "outward_key": outward_key }),
+        )
+    }
+
+    pub async fn log_issue_work(
+        &self,
+        key: &str,
+        seconds: i32,
+        started: Option<&str>,
+        comment: Option<&str>,
+    ) -> Result<Value> {
+        if key.trim().is_empty() || seconds <= 0 {
+            bail!("provide an issue key and a positive number of seconds");
+        }
+        let mut payload = json!({"timeSpentSeconds": seconds});
+        if let Some(started) = started {
+            let time = DateTime::parse_from_rfc3339(started)
+                .context("started must be an RFC 3339 date and time with a timezone")?;
+            payload["started"] = json!(time.format("%Y-%m-%dT%H:%M:%S%.3f%z").to_string());
+        }
+        if let Some(comment) = comment.filter(|value| !value.trim().is_empty()) {
+            payload["comment"] = match self.deployment() {
+                DeploymentKind::Cloud => markdown_to_adf(comment),
+                DeploymentKind::DataCenter => json!(markdown_to_jira_wiki(comment)),
+            };
+        }
+        let base = self.require_site_url()?;
+        let ver = self.jira_api_version();
+        let key_segment = urlencoding::encode(key.trim());
+        let url = format!("{base}/rest/api/{ver}/issue/{key_segment}/worklog");
+        // A gateway error can occur after a worklog is saved. Leave retries to callers
+        // that can inspect the issue's worklogs before making another POST.
+        let created: Value = self
+            .post_json_once(&format!("{url}?adjustEstimate=leave"), &payload)
+            .await
+            .context("Worklog creation failed. Check the issue's worklogs before retrying")?;
+        let id = json_id_to_string(created.get("id"));
+        if id.is_empty() {
+            bail!("Jira accepted the worklog. The response omitted its ID");
+        }
+        let logged: Value = self
+            .get_json(&format!("{url}/{}", urlencoding::encode(&id)))
+            .await
+            .with_context(|| format!("Jira created worklog {id}. Reading it back failed"))?;
+        if logged.get("timeSpentSeconds").and_then(Value::as_i64) != Some(i64::from(seconds)) {
+            bail!("Jira created worklog {id}. The read did not confirm {seconds} seconds");
+        }
+        Ok(logged)
     }
 
     pub async fn list_transitions(&self, key: &str) -> Result<Vec<IssueTransition>> {

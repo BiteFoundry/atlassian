@@ -12,7 +12,10 @@ use crate::{
         markdown_to_storage_xhtml, parse_adf_str, parse_storage_xhtml,
     },
     atlassian::{
-        client::{first_nonempty_str, join_url, json_id_to_string, parse_attachment_item},
+        body::{same_markdown, BodyEdit, BodyEditError},
+        client::{
+            first_nonempty_str, join_url, json_id_to_string, parse_attachment_item, HttpStatusError,
+        },
         AtlassianClient,
     },
     config::DeploymentKind,
@@ -221,6 +224,14 @@ impl AtlassianClient {
         &self,
         page_id: &str,
     ) -> Result<(PageDetail, PageSubresourceStatus)> {
+        self.fetch_page(page_id, false).await
+    }
+
+    async fn fetch_page(
+        &self,
+        page_id: &str,
+        require_native_body: bool,
+    ) -> Result<(PageDetail, PageSubresourceStatus)> {
         let conf_root = self.require_confluence_root()?;
         let encoded_id = urlencoding::encode(page_id.trim());
 
@@ -244,20 +255,25 @@ impl AtlassianClient {
                     let storage_url =
                         format!("{conf_root}/api/v2/pages/{encoded_id}?body-format=storage");
                     let storage_val: Value = self.get_json(&storage_url).await?;
-                    body_raw = storage_val
-                        .get("body")
-                        .and_then(|b| b.get("storage"))
-                        .and_then(|s| s.get("value"))
-                        .and_then(|v| v.as_str())
-                        .unwrap_or("")
-                        .to_string();
-                    if val.get("title").is_none() {
+                    let storage_body = storage_val
+                        .pointer("/body/storage/value")
+                        .and_then(Value::as_str);
+                    if require_native_body && storage_body.is_none() {
+                        return Err(
+                            BodyEditError("Confluence did not return the original body").into()
+                        );
+                    }
+                    body_raw = storage_body.unwrap_or("").to_owned();
+                    if require_native_body || val.get("title").is_none() {
                         val = storage_val;
                     }
                     ("storage".to_string(), parse_storage_xhtml(&body_raw))
                 };
 
                 let summary = parse_cloud_page_summary(&val, &conf_root);
+                if require_native_body {
+                    validate_source_version(&val)?;
+                }
 
                 let (labels, labels_ok) = match self
                     .get_json::<Value>(&format!("{conf_root}/api/v2/pages/{encoded_id}/labels"))
@@ -334,6 +350,9 @@ impl AtlassianClient {
                 );
                 let val: Value = self.get_json(&url).await?;
                 let summary = parse_dc_page_summary(&val, &conf_root);
+                if require_native_body {
+                    validate_source_version(&val)?;
+                }
 
                 let ancestors = val
                     .get("ancestors")
@@ -372,13 +391,11 @@ impl AtlassianClient {
                     })
                     .unwrap_or_default();
 
-                let body_raw = val
-                    .get("body")
-                    .and_then(|b| b.get("storage"))
-                    .and_then(|s| s.get("value"))
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("")
-                    .to_string();
+                let storage_body = val.pointer("/body/storage/value").and_then(Value::as_str);
+                if require_native_body && storage_body.is_none() {
+                    return Err(BodyEditError("Confluence did not return the original body").into());
+                }
+                let body_raw = storage_body.unwrap_or("").to_owned();
                 let blocks = parse_storage_xhtml(&body_raw);
                 let body_markdown = blocks_to_markdown(&blocks);
                 let toc = extract_toc(&blocks);
@@ -485,19 +502,92 @@ impl AtlassianClient {
         self.get_page(&created_id).await
     }
 
+    pub(crate) async fn edit_page(
+        &self,
+        page_id: &str,
+        title: Option<String>,
+        body: Option<BodyEdit<'_>>,
+        prev_version: Option<i32>,
+        version_message: Option<String>,
+    ) -> Result<PageDetail> {
+        if title.is_none() && body.is_none() && version_message.is_none() {
+            return Err(BodyEditError("at least one page change must be provided").into());
+        }
+        if title.as_ref().is_some_and(|title| title.trim().is_empty()) {
+            return Err(BodyEditError("title must not be empty").into());
+        }
+        if body.is_some() && prev_version.unwrap_or(0) <= 0 {
+            return Err(BodyEditError(
+                "prev_version (>= 1) is required for body edits. Read the current page first and use its version_number.",
+            ).into());
+        }
+
+        let (current, _) = self.fetch_page(page_id, true).await?;
+        let version = current.summary.version_number;
+        let prev_version = prev_version.filter(|&v| v > 0).unwrap_or(version);
+        check_page_base_version(prev_version, version)?;
+
+        let title = title.unwrap_or_else(|| current.summary.title.clone());
+        let mut patch = PageUpdate {
+            title,
+            prev_version,
+            version_message,
+            body_raw_passthrough: Some(current.body_raw.clone()),
+            body_representation: Some(current.body_representation.clone()),
+            ..Default::default()
+        };
+        let body_changed = match body {
+            None => false,
+            Some(BodyEdit::Full(md)) if !same_markdown(md, &current.body_markdown) => {
+                patch.body_markdown = md.to_owned();
+                patch.body_raw_passthrough = None;
+                patch.body_representation = None;
+                true
+            }
+            Some(BodyEdit::Full(_)) => false,
+            Some(BodyEdit::Append(md)) if md.trim().is_empty() => false,
+            Some(edit) => {
+                let updated = match current.body_representation.as_str() {
+                    "atlas_doc_format" => edit
+                        .adf(
+                            serde_json::from_str(&current.body_raw)
+                                .map_err(|_| BodyEditError("Confluence returned malformed ADF"))?,
+                        )?
+                        .map(|doc| serde_json::to_string(&doc))
+                        .transpose()?,
+                    "storage" => edit.storage(&current.body_raw)?,
+                    _ => {
+                        return Err(
+                            BodyEditError("unsupported Confluence body representation").into()
+                        )
+                    }
+                };
+                if let Some(raw) = updated {
+                    patch.body_raw_passthrough = Some(raw);
+                    true
+                } else {
+                    false
+                }
+            }
+        };
+        if !body_changed && patch.title == current.summary.title && patch.version_message.is_none()
+        {
+            return Ok(current);
+        }
+        self.update_page(page_id, &patch).await
+    }
+
     pub async fn update_page(&self, page_id: &str, patch: &PageUpdate) -> Result<PageDetail> {
         let conf_root = self.require_confluence_root()?;
         let encoded_id = urlencoding::encode(page_id.trim());
-        let next_version = patch.prev_version + 1;
+        let next_version = patch.prev_version.checked_add(1).ok_or(BodyEditError(
+            "prev_version exceeds the supported version range",
+        ))?;
         let version_message = patch.version_message.clone().unwrap_or_default();
 
         match self.deployment() {
             DeploymentKind::Cloud => {
-                let (representation, body_value) = match patch
-                    .body_raw_passthrough
-                    .as_deref()
-                    .filter(|s| !s.trim().is_empty())
-                {
+                let (representation, body_value) = match patch.body_raw_passthrough.as_deref() {
                     Some(raw) => {
                         let repr = patch
                             .body_representation
@@ -530,11 +620,7 @@ impl AtlassianClient {
                 let _: Value = self.put_json(&url, &payload).await?;
             }
             DeploymentKind::DataCenter => {
-                let storage_html = match patch
-                    .body_raw_passthrough
-                    .as_deref()
-                    .filter(|s| !s.trim().is_empty())
-                {
+                let storage_html = match patch.body_raw_passthrough.as_deref() {
                     Some(raw) => raw.to_string(),
                     None => markdown_to_storage_xhtml(&patch.body_markdown),
                 };
@@ -569,6 +655,122 @@ impl AtlassianClient {
             DeploymentKind::DataCenter => format!("{conf_root}/rest/api/content/{encoded_id}"),
         };
         self.delete_req(&url).await
+    }
+
+    pub async fn move_page(
+        &self,
+        page_id: &str,
+        parent_id: &str,
+        prev_version: Option<i32>,
+    ) -> Result<PageSummary> {
+        let (page_id, parent_id) = (page_id.trim(), parent_id.trim());
+        if page_id.is_empty() || parent_id.is_empty() || page_id == parent_id {
+            bail!("provide a page ID and a different parent page ID");
+        }
+        if prev_version.is_some_and(|version| version <= 0) {
+            bail!("prev_version must be positive");
+        }
+        let conf_root = self.require_confluence_root()?;
+        let page = urlencoding::encode(page_id);
+        let parent = urlencoding::encode(parent_id);
+        match self.deployment() {
+            DeploymentKind::Cloud => {
+                let current = self.get_page_revision(page_id).await?;
+                if let Some(expected) = prev_version {
+                    check_page_base_version(expected, current.version_number)?;
+                }
+                if current.parent_id.as_deref() == Some(parent_id) {
+                    return Ok(current);
+                }
+                self.put_without_body(&format!(
+                    "{conf_root}/rest/api/content/{page}/move/append/{parent}"
+                ))
+                .await?;
+            }
+            DeploymentKind::DataCenter => {
+                let expected = prev_version.context(
+                    "provide the current prev_version for a Confluence Data Center move",
+                )?;
+                let url = format!("{conf_root}/rest/api/content/{page}");
+                let source: Value = self
+                    .get_json(&format!("{url}?expand=version,space,ancestors"))
+                    .await?;
+                if source["type"] != "page" {
+                    bail!("Confluence Data Center move requires a page as the source");
+                }
+                validate_source_version(&source)?;
+                let current = parse_dc_page_summary(&source, &conf_root);
+                check_page_base_version(expected, current.version_number)?;
+                if current.parent_id.as_deref() == Some(parent_id) {
+                    return Ok(current);
+                }
+                let target = self.get_page_revision(parent_id).await?;
+                if current.space_key.is_empty() || target.space_key != current.space_key {
+                    bail!(
+                        "Confluence Data Center page moves require a parent in the current space"
+                    );
+                }
+                let next = current
+                    .version_number
+                    .checked_add(1)
+                    .context("page version exceeds supported range")?;
+                self.put_json_empty(
+                    &url,
+                    &json!({
+                        "id": page_id, "type": "page", "title": current.title,
+                        "space": {"key": current.space_key},
+                        "ancestors": [{"id": parent_id}],
+                        "version": {"number": next}
+                    }),
+                )
+                .await?;
+            }
+        }
+        let after = self
+            .get_page_revision(page_id)
+            .await
+            .context("Confluence accepted the page move. Reading it back failed")?;
+        if after.parent_id.as_deref() != Some(parent_id) {
+            bail!("Confluence accepted the page move. The read did not confirm parent {parent_id}");
+        }
+        Ok(after)
+    }
+
+    pub async fn add_page_labels(&self, page_id: &str, labels: &[String]) -> Result<Vec<String>> {
+        let mut seen = HashSet::new();
+        if labels.is_empty() {
+            bail!("provide at least one label");
+        }
+        let names: Vec<_> = labels
+            .iter()
+            .map(|label| validate_page_label(label))
+            .collect::<Result<Vec<_>>>()?
+            .into_iter()
+            .filter(|name| seen.insert(name.to_ascii_lowercase()))
+            .map(str::to_owned)
+            .collect();
+        let url = self.page_label_url(page_id)?;
+        let body: Vec<_> = names
+            .iter()
+            .map(|name| json!({"prefix": "global", "name": name}))
+            .collect();
+        self.post_json_empty(&url, &body).await?;
+        Ok(names)
+    }
+
+    pub async fn remove_page_label(&self, page_id: &str, label: &str) -> Result<()> {
+        let label = urlencoding::encode(validate_page_label(label)?);
+        let url = self.page_label_url(page_id)?;
+        self.delete_req(&format!("{url}?name={label}")).await
+    }
+
+    fn page_label_url(&self, page_id: &str) -> Result<String> {
+        if page_id.trim().is_empty() {
+            bail!("page ID must not be empty");
+        }
+        let root = self.require_confluence_root()?;
+        let page = urlencoding::encode(page_id.trim());
+        Ok(format!("{root}/rest/api/content/{page}/label"))
     }
 
     pub async fn list_page_comments(&self, page_id: &str) -> Result<Vec<ConfluenceComment>> {
@@ -789,6 +991,37 @@ fn parse_space_summary(val: &Value, conf_root: &str) -> SpaceSummary {
         web_url,
         pinned: false,
     }
+}
+
+fn validate_source_version(page: &Value) -> Result<()> {
+    page.pointer("/version/number")
+        .and_then(Value::as_i64)
+        .and_then(|version| i32::try_from(version).ok())
+        .filter(|&version| version > 0)
+        .ok_or_else(|| BodyEditError("Confluence did not return a valid current version").into())
+        .map(|_| ())
+}
+
+fn check_page_base_version(expected: i32, actual: i32) -> Result<()> {
+    if expected != actual {
+        return Err(HttpStatusError {
+            status: reqwest::StatusCode::CONFLICT,
+            message: format!(
+                "Confluence version conflict: expected {expected}, current version is {actual}"
+            ),
+            body: String::new(),
+        }
+        .into());
+    }
+    Ok(())
+}
+
+fn validate_page_label(label: &str) -> Result<&str> {
+    let label = label.trim();
+    if label.is_empty() || label.chars().any(char::is_whitespace) {
+        bail!("label names must be nonempty and contain no whitespace");
+    }
+    Ok(label)
 }
 
 fn parse_cloud_page_summary(val: &Value, conf_root: &str) -> PageSummary {

@@ -334,16 +334,36 @@ impl AtlassianClient {
         url: &str,
         body: &B,
     ) -> Result<T> {
+        self.post_json_with_retry(url, body, true).await
+    }
+
+    pub(crate) async fn post_json_once<B: Serialize, T: DeserializeOwned>(
+        &self,
+        url: &str,
+        body: &B,
+    ) -> Result<T> {
+        self.post_json_with_retry(url, body, false).await
+    }
+
+    async fn post_json_with_retry<B: Serialize, T: DeserializeOwned>(
+        &self,
+        url: &str,
+        body: &B,
+        retry_statuses: bool,
+    ) -> Result<T> {
         let target_url = self.resolve_api_url(url);
         let resp = self
-            .send_with_retry(|auth_header| {
-                Ok(self
-                    .http
-                    .post(&target_url)
-                    .header(AUTHORIZATION, auth_header)
-                    .header(ACCEPT, "application/json")
-                    .json(body))
-            })
+            .send_with_retry_policy(
+                |auth_header| {
+                    Ok(self
+                        .http
+                        .post(&target_url)
+                        .header(AUTHORIZATION, auth_header)
+                        .header(ACCEPT, "application/json")
+                        .json(body))
+                },
+                retry_statuses,
+            )
             .await?;
         decode_json_response(resp, &target_url).await
     }
@@ -411,6 +431,19 @@ impl AtlassianClient {
         Ok(())
     }
 
+    pub(crate) async fn put_without_body(&self, url: &str) -> Result<()> {
+        let target_url = self.resolve_api_url(url);
+        self.send_with_retry(|auth_header| {
+            Ok(self
+                .http
+                .put(&target_url)
+                .header(AUTHORIZATION, auth_header)
+                .header(ACCEPT, "application/json"))
+        })
+        .await?;
+        Ok(())
+    }
+
     pub(crate) async fn post_multipart(
         &self,
         url: &str,
@@ -418,6 +451,7 @@ impl AtlassianClient {
         file_name: &str,
         mime_type: &str,
         bytes: Vec<u8>,
+        extra_text: Option<(&str, &str)>,
     ) -> Result<Value> {
         let target_url = self.resolve_api_url(url);
         let resp = self
@@ -428,7 +462,10 @@ impl AtlassianClient {
                     .unwrap_or_else(|_| {
                         Part::bytes(bytes.clone()).file_name(file_name.to_string())
                     });
-                let form = Form::new().part(field_name.to_string(), part);
+                let mut form = Form::new().part(field_name.to_string(), part);
+                if let Some((name, value)) = extra_text {
+                    form = form.text(name.to_owned(), value.to_owned());
+                }
                 Ok(self
                     .http
                     .post(&target_url)
@@ -549,7 +586,18 @@ impl AtlassianClient {
         }
     }
 
-    async fn send_with_retry<F>(&self, mut build_req: F) -> Result<reqwest::Response>
+    async fn send_with_retry<F>(&self, build_req: F) -> Result<reqwest::Response>
+    where
+        F: FnMut(&str) -> Result<reqwest::RequestBuilder>,
+    {
+        self.send_with_retry_policy(build_req, true).await
+    }
+
+    async fn send_with_retry_policy<F>(
+        &self,
+        mut build_req: F,
+        retry_statuses: bool,
+    ) -> Result<reqwest::Response>
     where
         F: FnMut(&str) -> Result<reqwest::RequestBuilder>,
     {
@@ -575,7 +623,7 @@ impl AtlassianClient {
                     break Err(None);
                 }
 
-                if is_retryable_status(status) && attempt < MAX_RETRY_ATTEMPTS {
+                if retry_statuses && is_retryable_status(status) && attempt < MAX_RETRY_ATTEMPTS {
                     let delay = retry_delay(resp.headers().get(RETRY_AFTER), attempt);
                     if !delay.is_zero() {
                         tokio::time::sleep(delay).await;
