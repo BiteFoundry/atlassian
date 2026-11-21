@@ -9,7 +9,7 @@ use crate::{
     adf,
     models::{
         AttachmentItem, BoardColumn, BoardSummary, IssueComment, IssueDetail, IssuePriority,
-        IssueStatus, IssueSummary, IssueType, ProjectSummary, SavedFilter, SearchHitKind,
+        IssueStatus, IssueSummary, IssueType, ListPage, ProjectSummary, SavedFilter, SearchHitKind,
         SprintSummary, UnifiedSearchHit, UserSummary,
     },
     storage::{
@@ -754,6 +754,23 @@ impl Storage {
         Ok(removed)
     }
 
+    /// Stores one fetched page. Prunes only when it is a first page the source marked as the last.
+    pub fn record_board_issues_page_for_site(
+        &self,
+        site_id: &str,
+        board_id: i64,
+        sprint_id: Option<i64>,
+        page: &ListPage<IssueSummary>,
+        first_page: bool,
+    ) -> Result<()> {
+        self.upsert_board_issues_for_site(site_id, board_id, sprint_id, &page.items)?;
+        if first_page && page.has_more == Some(false) {
+            let keep: Vec<String> = page.items.iter().map(|i| i.key.clone()).collect();
+            self.prune_board_issues_for_site(site_id, board_id, sprint_id, &keep)?;
+        }
+        Ok(())
+    }
+
     pub fn list_issues(
         &self,
         project_key: Option<&str>,
@@ -811,6 +828,28 @@ impl Storage {
             })?;
             Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
         }
+    }
+
+    pub fn count_issues_for_site(
+        &self,
+        site_id: &str,
+        project_key: Option<&str>,
+    ) -> Result<usize> {
+        let conn = self.lock_conn()?;
+        let count: i64 = if let Some(pk) = project_key {
+            conn.query_row(
+                "SELECT COUNT(*) FROM issues WHERE site_id = ?1 AND project_key = ?2",
+                params![site_id, pk],
+                |row| row.get(0),
+            )?
+        } else {
+            conn.query_row(
+                "SELECT COUNT(*) FROM issues WHERE site_id = ?1",
+                [site_id],
+                |row| row.get(0),
+            )?
+        };
+        Ok(count.max(0) as usize)
     }
 
     pub fn list_issues_all_sites(
@@ -1584,6 +1623,7 @@ mod tests {
             linked_pages: vec![],
             attachments: vec![],
             comments: vec![],
+            incomplete: vec![],
         };
         storage.upsert_issue_detail(&detail).unwrap();
 
@@ -1814,5 +1854,102 @@ mod tests {
             storage.list_issues_for_site("site-b", None, 10).unwrap().len(),
             1
         );
+    }
+
+    #[test]
+    fn record_board_issues_prunes_only_on_complete_first_page() {
+        let storage = Storage::open_in_memory().unwrap();
+        let issues: Vec<IssueSummary> = (1..=120)
+            .map(|i| sample_issue(&format!("ENG-{i}"), "ENG", &format!("Issue {i}"), None))
+            .collect();
+        storage
+            .upsert_board_issues_for_site("default", 7, None, &issues)
+            .unwrap();
+
+        let partial = ListPage {
+            items: issues[0..100].to_vec(),
+            has_more: Some(true),
+            next_cursor: Some("100".into()),
+        };
+        storage
+            .record_board_issues_page_for_site("default", 7, None, &partial, true)
+            .unwrap();
+        assert_eq!(
+            storage
+                .list_board_issues_for_site("default", 7, None, 200)
+                .unwrap()
+                .len(),
+            120
+        );
+
+        // Second page with has_more=false does not prune earlier pages either
+        let second = ListPage {
+            items: issues[100..120].to_vec(),
+            has_more: Some(false),
+            next_cursor: None,
+        };
+        storage
+            .record_board_issues_page_for_site("default", 7, None, &second, false)
+            .unwrap();
+        assert_eq!(
+            storage
+                .list_board_issues_for_site("default", 7, None, 200)
+                .unwrap()
+                .len(),
+            120
+        );
+
+        // Complete first page prunes missing issues
+        let complete_first = ListPage {
+            items: issues[0..10].to_vec(),
+            has_more: Some(false),
+            next_cursor: None,
+        };
+        storage
+            .record_board_issues_page_for_site("default", 7, None, &complete_first, true)
+            .unwrap();
+        assert_eq!(
+            storage
+                .list_board_issues_for_site("default", 7, None, 200)
+                .unwrap()
+                .len(),
+            10
+        );
+    }
+
+    #[test]
+    fn count_issues_matches_list_filter() {
+        let storage = Storage::open_in_memory().unwrap();
+        storage
+            .upsert_issues_for_site(
+                "site-a",
+                &[
+                    sample_issue("ENG-1", "ENG", "A1", None),
+                    sample_issue("ENG-2", "ENG", "A2", None),
+                    sample_issue("OPS-1", "OPS", "A3", None),
+                ],
+            )
+            .unwrap();
+        storage
+            .upsert_issues_for_site(
+                "site-b",
+                &[
+                    sample_issue("ENG-1", "ENG", "B1", None),
+                    sample_issue("OPS-1", "OPS", "B2", None),
+                ],
+            )
+            .unwrap();
+
+        for (site, proj) in [
+            ("site-a", None),
+            ("site-a", Some("ENG")),
+            ("site-a", Some("OPS")),
+            ("site-b", None),
+            ("site-b", Some("ENG")),
+            ("site-b", Some("NONE")),
+        ] {
+            let expected = storage.list_issues_for_site(site, proj, 1000).unwrap().len();
+            assert_eq!(storage.count_issues_for_site(site, proj).unwrap(), expected);
+        }
     }
 }

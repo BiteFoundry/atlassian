@@ -969,7 +969,7 @@ mod tests {
                 author_name: Some("Bob".into()),
                 updated_at: "2026-11-15T13:00:00Z".into(),
                 position: 1,
-                has_children: false,
+                has_children: None,
                 web_url: "https://legacy.atlassian.net/wiki/spaces/DOCS/pages/100".into(),
             },
             body_markdown: "배포 절차 안내".into(),

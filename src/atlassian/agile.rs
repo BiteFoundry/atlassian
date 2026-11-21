@@ -8,11 +8,11 @@ use serde_json::{json, Value};
 
 use crate::{
     atlassian::{
-        client::{first_nonempty_str, json_id_to_string, HttpStatusError},
+        client::{first_nonempty_str, json_id_to_string, offset_page_state, HttpStatusError},
         jira::normalize_issue_summary,
         AtlassianClient,
     },
-    models::{BoardColumn, BoardSummary, IssueSummary, SprintSummary, StatusCategory},
+    models::{BoardColumn, BoardSummary, IssueSummary, ListPage, SprintSummary, StatusCategory},
 };
 
 impl AtlassianClient {
@@ -68,22 +68,34 @@ impl AtlassianClient {
 
     pub async fn list_boards(&self, project_key: Option<&str>) -> Result<Vec<BoardSummary>> {
         let base = self.require_site_url()?;
-        let mut url = format!("{base}/rest/agile/1.0/board?maxResults=50");
-        if let Some(pk) = project_key.map(str::trim).filter(|s| !s.is_empty()) {
-            url.push_str("&projectKeyOrId=");
-            url.push_str(&urlencoding::encode(pk));
-        }
+        let encoded_project = project_key
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(|pk| urlencoding::encode(pk).into_owned());
+        let mut start = 0usize;
+        let mut all = Vec::new();
+        let mut seen = HashSet::new();
 
-        let val: Value = self.get_json(&url).await?;
-        let arr = val
-            .get("values")
-            .and_then(|v| v.as_array())
-            .map(Vec::as_slice)
-            .unwrap_or(&[]);
+        loop {
+            let mut url = format!("{base}/rest/agile/1.0/board?maxResults=50");
+            if start > 0 {
+                url.push_str(&format!("&startAt={start}"));
+            }
+            if let Some(ref pk) = encoded_project {
+                url.push_str("&projectKeyOrId=");
+                url.push_str(pk);
+            }
 
-        Ok(arr
-            .iter()
-            .map(|b| {
+            let val: Value = self.get_json(&url).await?;
+            let arr = val
+                .get("values")
+                .and_then(|v| v.as_array())
+                .map(Vec::as_slice)
+                .unwrap_or(&[]);
+            let got = arr.len();
+            let mut added = 0usize;
+
+            for b in arr {
                 let loc = b.get("location").unwrap_or(&Value::Null);
                 let project_key = loc
                     .get("projectKey")
@@ -99,16 +111,30 @@ impl AtlassianClient {
                     .filter(|s| !s.is_empty())
                     .map(str::to_string);
 
-                BoardSummary {
+                let board = BoardSummary {
                     id: b.get("id").and_then(|v| v.as_i64()).unwrap_or(0),
                     name: first_nonempty_str(b, &["name"]),
                     board_type: first_nonempty_str(b, &["type"]).to_ascii_lowercase(),
                     project_key,
                     project_name,
                     columns: Vec::new(),
+                };
+                if seen.insert(board.id) {
+                    all.push(board);
+                    added += 1;
                 }
-            })
-            .collect())
+            }
+            if added == 0 {
+                break;
+            }
+            let (has_more, _) = offset_page_state(&val, start, got, 50);
+            if has_more == Some(false) {
+                break;
+            }
+            start += got;
+        }
+
+        Ok(all)
     }
 
     pub async fn get_board_columns(&self, board_id: i64) -> Result<Vec<BoardColumn>> {
@@ -175,9 +201,20 @@ impl AtlassianClient {
             .collect())
     }
 
-    pub async fn list_board_sprints(&self, board_id: i64) -> Result<Vec<SprintSummary>> {
+    pub async fn list_board_sprints_page(
+        &self,
+        board_id: i64,
+        limit: usize,
+        start: usize,
+    ) -> Result<ListPage<SprintSummary>> {
         let base = self.require_site_url()?;
-        let url = format!("{base}/rest/agile/1.0/board/{board_id}/sprint?state=active,future");
+        let max_results = limit.clamp(1, 50);
+        let mut url = format!(
+            "{base}/rest/agile/1.0/board/{board_id}/sprint?state=active,future&maxResults={max_results}"
+        );
+        if start > 0 {
+            url.push_str(&format!("&startAt={start}"));
+        }
 
         let val: Value = match self.get_json(&url).await {
             Ok(v) => v,
@@ -193,7 +230,11 @@ impl AtlassianClient {
                     })
                     .unwrap_or(false);
                 if is_kanban_no_sprints {
-                    return Ok(Vec::new());
+                    return Ok(ListPage {
+                        items: Vec::new(),
+                        has_more: Some(false),
+                        next_cursor: None,
+                    });
                 }
                 return Err(err);
             }
@@ -205,7 +246,7 @@ impl AtlassianClient {
             .map(Vec::as_slice)
             .unwrap_or(&[]);
 
-        Ok(arr
+        let items: Vec<SprintSummary> = arr
             .iter()
             .map(|s| SprintSummary {
                 id: s.get("id").and_then(|v| v.as_i64()).unwrap_or(0),
@@ -225,18 +266,29 @@ impl AtlassianClient {
                     .map(str::to_string),
                 goal: s.get("goal").and_then(|v| v.as_str()).map(str::to_string),
             })
-            .collect())
+            .collect();
+        let (has_more, next_cursor) = offset_page_state(&val, start, items.len(), max_results);
+        Ok(ListPage {
+            items,
+            has_more,
+            next_cursor,
+        })
     }
 
-    pub async fn list_board_issues(
+    pub async fn list_board_sprints(&self, board_id: i64) -> Result<Vec<SprintSummary>> {
+        Ok(self.list_board_sprints_page(board_id, 50, 0).await?.items)
+    }
+
+    pub async fn list_board_issues_page(
         &self,
         board_id: i64,
         sprint_id: Option<i64>,
         limit: usize,
-    ) -> Result<Vec<IssueSummary>> {
+        start: usize,
+    ) -> Result<ListPage<IssueSummary>> {
         let base = self.require_site_url()?;
         let max_results = limit.clamp(1, 100);
-        let url = match sprint_id {
+        let mut url = match sprint_id {
             Some(sid) => {
                 format!("{base}/rest/agile/1.0/sprint/{sid}/issue?maxResults={max_results}")
             }
@@ -244,6 +296,9 @@ impl AtlassianClient {
                 format!("{base}/rest/agile/1.0/board/{board_id}/issue?maxResults={max_results}")
             }
         };
+        if start > 0 {
+            url.push_str(&format!("&startAt={start}"));
+        }
 
         let val: Value = self.get_json(&url).await?;
         let arr = val
@@ -252,10 +307,28 @@ impl AtlassianClient {
             .map(Vec::as_slice)
             .unwrap_or(&[]);
 
-        Ok(arr
+        let items: Vec<IssueSummary> = arr
             .iter()
             .map(|issue| normalize_issue_summary(issue, &base, self.deployment()))
-            .collect())
+            .collect();
+        let (has_more, next_cursor) = offset_page_state(&val, start, items.len(), max_results);
+        Ok(ListPage {
+            items,
+            has_more,
+            next_cursor,
+        })
+    }
+
+    pub async fn list_board_issues(
+        &self,
+        board_id: i64,
+        sprint_id: Option<i64>,
+        limit: usize,
+    ) -> Result<Vec<IssueSummary>> {
+        Ok(self
+            .list_board_issues_page(board_id, sprint_id, limit, 0)
+            .await?
+            .items)
     }
 }
 
@@ -448,5 +521,198 @@ mod tests {
 
         let kanban_issues = client.list_board_issues(20, None, 50).await.unwrap();
         assert_eq!(kanban_issues[0].key, "OPS-88");
+    }
+
+    #[tokio::test]
+    async fn board_issues_page_reports_has_more_and_cursor() {
+        use axum::extract::Query;
+        use std::{
+            collections::HashMap,
+            sync::{Arc, Mutex},
+        };
+
+        let seen_max: Arc<Mutex<Vec<usize>>> = Arc::new(Mutex::new(Vec::new()));
+        let sm = seen_max.clone();
+        let all_issues: Vec<Value> = (1..=120)
+            .map(|i| {
+                json!({
+                    "id": format!("{i}"),
+                    "key": format!("ENG-{i}"),
+                    "fields": {
+                        "summary": format!("Issue {i}"),
+                        "status": { "id": "1", "name": "To Do", "statusCategory": { "key": "new" } },
+                        "issuetype": { "id": "1", "name": "Task", "subtask": false }
+                    }
+                })
+            })
+            .collect();
+
+        let app = Router::new()
+            .route(
+                "/rest/agile/1.0/board/7/issue",
+                get(move |Query(q): Query<HashMap<String, String>>| {
+                    let sm = sm.clone();
+                    let all_issues = all_issues.clone();
+                    async move {
+                        let max = q
+                            .get("maxResults")
+                            .and_then(|s| s.parse::<usize>().ok())
+                            .unwrap_or(50);
+                        let start = q
+                            .get("startAt")
+                            .and_then(|s| s.parse::<usize>().ok())
+                            .unwrap_or(0);
+                        sm.lock().unwrap().push(max);
+                        let slice: Vec<Value> =
+                            all_issues.iter().skip(start).take(max).cloned().collect();
+                        Json(json!({
+                            "startAt": start,
+                            "maxResults": max,
+                            "total": all_issues.len(),
+                            "issues": slice
+                        }))
+                    }
+                }),
+            )
+            .route(
+                "/rest/agile/1.0/board/8/issue",
+                get(|| async { Json(json!({ "total": 0, "issues": [] })) }),
+            );
+
+        let base_url = spawn_router(app).await;
+        let auth = AuthManager::with_credentials(
+            "test",
+            StoredCredentials::BearerPat {
+                site_url: base_url.clone(),
+                token: "tok".into(),
+                deployment: DeploymentKind::Cloud,
+            },
+        );
+        let client =
+            AtlassianClient::with_base_urls(&base_url, "", DeploymentKind::Cloud, auth).unwrap();
+
+        let p1 = client.list_board_issues_page(7, None, 500, 0).await.unwrap();
+        assert_eq!(p1.items.len(), 100);
+        assert_eq!(p1.has_more, Some(true));
+        assert_eq!(p1.next_cursor.as_deref(), Some("100"));
+        assert_eq!(seen_max.lock().unwrap()[0], 100);
+
+        let p2 = client
+            .list_board_issues_page(7, None, 500, 100)
+            .await
+            .unwrap();
+        assert_eq!(p2.items.len(), 20);
+        assert_eq!(p2.has_more, Some(false));
+        assert_eq!(p2.next_cursor, None);
+
+        let empty = client.list_board_issues_page(8, None, 50, 0).await.unwrap();
+        assert!(empty.items.is_empty());
+        assert_eq!(empty.has_more, Some(false));
+        assert_eq!(empty.next_cursor, None);
+    }
+
+    #[tokio::test]
+    async fn list_boards_and_sprints_follow_is_last() {
+        use axum::extract::Query;
+        use std::{
+            collections::HashMap,
+            sync::{
+                atomic::{AtomicUsize, Ordering},
+                Arc,
+            },
+        };
+
+        let board_calls = Arc::new(AtomicUsize::new(0));
+        let bc = board_calls.clone();
+        let all_boards: Vec<Value> = (1..=120)
+            .map(|i| {
+                json!({
+                    "id": i,
+                    "name": format!("Board {i}"),
+                    "type": "scrum",
+                    "location": { "projectKey": "ENG", "projectName": "Engineering" }
+                })
+            })
+            .collect();
+        let all_sprints: Vec<Value> = (1..=60)
+            .map(|i| {
+                json!({
+                    "id": i,
+                    "originBoardId": 1,
+                    "name": format!("Sprint {i}"),
+                    "state": if i == 1 { "active" } else { "future" }
+                })
+            })
+            .collect();
+
+        let app = Router::new()
+            .route(
+                "/rest/agile/1.0/board",
+                get(move |Query(q): Query<HashMap<String, String>>| {
+                    let bc = bc.clone();
+                    let all_boards = all_boards.clone();
+                    async move {
+                        bc.fetch_add(1, Ordering::SeqCst);
+                        let start = q
+                            .get("startAt")
+                            .and_then(|s| s.parse::<usize>().ok())
+                            .unwrap_or(0);
+                        let max = q
+                            .get("maxResults")
+                            .and_then(|s| s.parse::<usize>().ok())
+                            .unwrap_or(50);
+                        let slice: Vec<Value> =
+                            all_boards.iter().skip(start).take(max).cloned().collect();
+                        let is_last = start + slice.len() >= all_boards.len();
+                        Json(json!({ "isLast": is_last, "values": slice }))
+                    }
+                }),
+            )
+            .route(
+                "/rest/agile/1.0/board/1/sprint",
+                get(move |Query(q): Query<HashMap<String, String>>| {
+                    let all_sprints = all_sprints.clone();
+                    async move {
+                        let start = q
+                            .get("startAt")
+                            .and_then(|s| s.parse::<usize>().ok())
+                            .unwrap_or(0);
+                        let max = q
+                            .get("maxResults")
+                            .and_then(|s| s.parse::<usize>().ok())
+                            .unwrap_or(50);
+                        let slice: Vec<Value> =
+                            all_sprints.iter().skip(start).take(max).cloned().collect();
+                        let is_last = start + slice.len() >= all_sprints.len();
+                        Json(json!({ "isLast": is_last, "values": slice }))
+                    }
+                }),
+            );
+
+        let base_url = spawn_router(app).await;
+        let auth = AuthManager::with_credentials(
+            "test",
+            StoredCredentials::BearerPat {
+                site_url: base_url.clone(),
+                token: "tok".into(),
+                deployment: DeploymentKind::Cloud,
+            },
+        );
+        let client =
+            AtlassianClient::with_base_urls(&base_url, "", DeploymentKind::Cloud, auth).unwrap();
+
+        let boards = client.list_boards(None).await.unwrap();
+        assert_eq!(boards.len(), 120);
+        assert_eq!(board_calls.load(Ordering::SeqCst), 3);
+
+        let sp1 = client.list_board_sprints_page(1, 50, 0).await.unwrap();
+        assert_eq!(sp1.items.len(), 50);
+        assert_eq!(sp1.has_more, Some(true));
+        assert_eq!(sp1.next_cursor.as_deref(), Some("50"));
+
+        let sp2 = client.list_board_sprints_page(1, 50, 50).await.unwrap();
+        assert_eq!(sp2.items.len(), 10);
+        assert_eq!(sp2.has_more, Some(false));
+        assert_eq!(sp2.next_cursor, None);
     }
 }

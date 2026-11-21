@@ -342,7 +342,42 @@ pub struct IssueDetail {
     pub linked_pages: Vec<LinkedConfluencePage>,
     pub attachments: Vec<AttachmentItem>,
     pub comments: Vec<IssueComment>,
+    /// Collections this read could not confirm in full (failed or truncated subresource).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub incomplete: Vec<String>,
 }
+
+const ISSUE_COMPACT_OMITTED_FIELDS: &[&str] = &[
+    "summary.id",
+    "summary.project_key",
+    "summary.priority",
+    "summary.issue_type",
+    "summary.assignee",
+    "summary.reporter",
+    "summary.parent_key",
+    "summary.parent_summary",
+    "summary.story_points",
+    "summary.sprint_id",
+    "summary.sprint_name",
+    "summary.created_at",
+    "summary.updated_at",
+    "summary.web_url",
+    "description_raw",
+    "description_blocks",
+];
+
+const PAGE_COMPACT_OMITTED_FIELDS: &[&str] = &[
+    "summary.parent_id",
+    "summary.status",
+    "summary.author_name",
+    "summary.updated_at",
+    "summary.position",
+    "summary.has_children",
+    "summary.web_url",
+    "body_raw",
+    "body_representation",
+    "blocks",
+];
 
 impl IssueDetail {
     pub(crate) fn output(&self, compact: bool) -> serde_json::Value {
@@ -356,6 +391,34 @@ impl IssueDetail {
         } else {
             serde_json::json!(self)
         }
+    }
+
+    pub(crate) fn compact_output(&self, hint: &str) -> serde_json::Value {
+        let known = |name: &str, len: usize| -> serde_json::Value {
+            if self.incomplete.iter().any(|n| n == name) {
+                serde_json::Value::Null
+            } else {
+                serde_json::json!(len)
+            }
+        };
+        serde_json::json!({
+            "key": self.summary.key,
+            "summary": self.summary.summary,
+            "status": self.summary.status,
+            "description_markdown": self.description_markdown,
+            "omitted": {
+                "comments": self.summary.comment_count,
+                "attachments": self.attachments.len(),
+                "subtasks": self.subtasks.len(),
+                "linked_issues": self.linked_issues.len(),
+                "linked_pages": known("linked_pages", self.linked_pages.len()),
+                "fix_versions": self.fix_versions.len(),
+                "components": self.components.len(),
+                "labels": self.summary.labels.len(),
+                "fields": ISSUE_COMPACT_OMITTED_FIELDS,
+            },
+            "hint": hint,
+        })
     }
 }
 
@@ -401,6 +464,39 @@ pub struct JqlSearchPage {
     pub total: Option<usize>,
 }
 
+/// One page of a collection plus what the source said about the rest.
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct ListPage<T> {
+    pub items: Vec<T>,
+    /// None when the source gave no way to tell.
+    pub has_more: Option<bool>,
+    pub next_cursor: Option<String>,
+}
+
+pub(crate) const OFFSET_CURSOR_ERROR: &str =
+    "cursor must be a non-negative integer offset taken from next_cursor";
+
+/// A missing or blank cursor means offset 0.
+pub(crate) fn parse_offset_cursor(cursor: Option<&str>) -> Result<usize, String> {
+    match cursor.map(str::trim).filter(|s| !s.is_empty()) {
+        None => Ok(0),
+        Some(raw) => raw
+            .parse::<usize>()
+            .map_err(|_| OFFSET_CURSOR_ERROR.to_string()),
+    }
+}
+
+/// The input is the whole ordered set, or at least its first offset + limit + 1 rows.
+pub(crate) fn slice_page<T>(items: Vec<T>, offset: usize, limit: usize) -> ListPage<T> {
+    let has_more = items.len() > offset.saturating_add(limit);
+    let page: Vec<T> = items.into_iter().skip(offset).take(limit).collect();
+    ListPage {
+        items: page,
+        has_more: Some(has_more),
+        next_cursor: has_more.then(|| offset.saturating_add(limit).to_string()),
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SavedFilter {
     pub id: String,
@@ -444,7 +540,7 @@ pub struct PageSummary {
     pub author_name: Option<String>,
     pub updated_at: String,
     pub position: i32,
-    pub has_children: bool,
+    pub has_children: Option<bool>,
     pub web_url: String,
 }
 
@@ -480,6 +576,9 @@ pub struct PageDetail {
     pub attachments: Vec<AttachmentItem>,
     pub comments: Vec<ConfluenceComment>,
     pub linked_issue_keys: Vec<String>,
+    /// Collections this read could not confirm in full (failed or truncated subresource).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub incomplete: Vec<String>,
 }
 
 impl PageDetail {
@@ -496,6 +595,34 @@ impl PageDetail {
         } else {
             serde_json::json!(self)
         }
+    }
+
+    pub(crate) fn compact_output(&self, hint: &str) -> serde_json::Value {
+        let known = |name: &str, len: usize| -> serde_json::Value {
+            if self.incomplete.iter().any(|n| n == name) {
+                serde_json::Value::Null
+            } else {
+                serde_json::json!(len)
+            }
+        };
+        serde_json::json!({
+            "id": self.summary.id,
+            "title": self.summary.title,
+            "space_id": self.summary.space_id,
+            "space_key": self.summary.space_key,
+            "version_number": self.summary.version_number,
+            "body_markdown": self.body_markdown,
+            "omitted": {
+                "comments": known("comments", self.comments.len()),
+                "attachments": known("attachments", self.attachments.len()),
+                "labels": known("labels", self.labels.len()),
+                "ancestors": known("ancestors", self.ancestors.len()),
+                "toc": self.toc.len(),
+                "linked_issue_keys": self.linked_issue_keys.len(),
+                "fields": PAGE_COMPACT_OMITTED_FIELDS,
+            },
+            "hint": hint,
+        })
     }
 }
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -886,5 +1013,137 @@ mod tests {
         assert_eq!(val["id_or_key"], "ENG-1");
         let roundtrip: FederatedSearchHit = serde_json::from_value(val).unwrap();
         assert_eq!(roundtrip, hit);
+    }
+
+    #[test]
+    fn slice_page_boundaries() {
+        let p0 = slice_page(Vec::<usize>::new(), 0, 50);
+        assert_eq!(p0.items.len(), 0);
+        assert_eq!(p0.has_more, Some(false));
+        assert_eq!(p0.next_cursor, None);
+
+        let p50 = slice_page((0..50).collect(), 0, 50);
+        assert_eq!(p50.items.len(), 50);
+        assert_eq!(p50.has_more, Some(false));
+        assert_eq!(p50.next_cursor, None);
+
+        let p51_first = slice_page((0..51).collect(), 0, 50);
+        assert_eq!(p51_first.items.len(), 50);
+        assert_eq!(p51_first.has_more, Some(true));
+        assert_eq!(p51_first.next_cursor.as_deref(), Some("50"));
+
+        let p51_second = slice_page((0..51).collect(), 50, 50);
+        assert_eq!(p51_second.items, vec![50]);
+        assert_eq!(p51_second.has_more, Some(false));
+        assert_eq!(p51_second.next_cursor, None);
+
+        let past_end = slice_page((0..10).collect(), 99, 50);
+        assert!(past_end.items.is_empty());
+        assert_eq!(past_end.has_more, Some(false));
+        assert_eq!(past_end.next_cursor, None);
+    }
+
+    #[test]
+    fn parse_offset_cursor_accepts_blank_and_rejects_text() {
+        assert_eq!(parse_offset_cursor(None), Ok(0));
+        assert_eq!(parse_offset_cursor(Some("   ")), Ok(0));
+        assert_eq!(parse_offset_cursor(Some("100")), Ok(100));
+        assert_eq!(
+            parse_offset_cursor(Some("abc")),
+            Err(OFFSET_CURSOR_ERROR.to_string())
+        );
+        assert_eq!(
+            parse_offset_cursor(Some("-1")),
+            Err(OFFSET_CURSOR_ERROR.to_string())
+        );
+    }
+
+    #[test]
+    fn compact_output_counts_and_unknowns() {
+        let comments = (0..20)
+            .map(|i| IssueComment {
+                id: format!("c{i}"),
+                ..Default::default()
+            })
+            .collect();
+        let issue = IssueDetail {
+            summary: IssueSummary {
+                key: "ENG-42".into(),
+                summary: "Rollout".into(),
+                comment_count: 25,
+                labels: vec!["ops".into(), "canary".into()],
+                ..Default::default()
+            },
+            description_markdown: "Steps".into(),
+            attachments: vec![AttachmentItem::default(), AttachmentItem::default()],
+            comments,
+            incomplete: vec!["linked_pages".into(), "comments".into()],
+            ..Default::default()
+        };
+
+        let compact = issue.compact_output("h");
+        let obj = compact.as_object().unwrap();
+        assert_eq!(obj.len(), 6);
+        assert_eq!(compact["hint"], "h");
+        assert_eq!(compact["omitted"]["comments"], 25);
+        assert_eq!(compact["omitted"]["attachments"], 2);
+        assert_eq!(compact["omitted"]["labels"], 2);
+        assert!(compact["omitted"]["linked_pages"].is_null());
+        assert_eq!(
+            compact["omitted"]["fields"],
+            serde_json::json!(ISSUE_COMPACT_OMITTED_FIELDS)
+        );
+        let full = issue.output(false);
+        assert_eq!(full["incomplete"], serde_json::json!(["linked_pages", "comments"]));
+
+        let clean_issue = IssueDetail {
+            incomplete: Vec::new(),
+            ..issue
+        };
+        assert!(clean_issue.output(false).get("incomplete").is_none());
+
+        let page = PageDetail {
+            summary: PageSummary {
+                id: "701".into(),
+                title: "Plan".into(),
+                space_id: "77".into(),
+                space_key: "ENG".into(),
+                version_number: 7,
+                ..Default::default()
+            },
+            body_markdown: "# Plan".into(),
+            ancestors: vec![PageAncestor {
+                id: "700".into(),
+                title: "Root".into(),
+            }],
+            toc: vec![TocEntry {
+                level: 1,
+                text: "Plan".into(),
+                line_hint: 1,
+            }],
+            incomplete: vec!["labels".into()],
+            ..Default::default()
+        };
+
+        let page_compact = page.compact_output("h");
+        let pobj = page_compact.as_object().unwrap();
+        assert_eq!(pobj.len(), 8);
+        assert_eq!(page_compact["hint"], "h");
+        assert!(page_compact["omitted"]["labels"].is_null());
+        assert_eq!(page_compact["omitted"]["comments"], 0);
+        assert_eq!(page_compact["omitted"]["ancestors"], 1);
+        assert_eq!(page_compact["omitted"]["toc"], 1);
+        assert_eq!(page_compact["omitted"]["linked_issue_keys"], 0);
+        assert_eq!(
+            page_compact["omitted"]["fields"],
+            serde_json::json!(PAGE_COMPACT_OMITTED_FIELDS)
+        );
+        assert_eq!(page.output(false)["incomplete"], serde_json::json!(["labels"]));
+
+        let clean_page = PageDetail {
+            incomplete: Vec::new(),
+            ..page
+        };
+        assert!(clean_page.output(false).get("incomplete").is_none());
     }
 }

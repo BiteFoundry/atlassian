@@ -1102,6 +1102,53 @@ pub(crate) fn first_nonempty_str(val: &Value, keys: &[&str]) -> String {
     String::new()
 }
 
+/// Paging state for Jira offset APIs (startAt / maxResults, optional isLast / total).
+pub(crate) fn offset_page_state(
+    val: &Value,
+    start: usize,
+    got: usize,
+    max_results: usize,
+) -> (Option<bool>, Option<String>) {
+    if got == 0 {
+        return (Some(false), None);
+    }
+    let has_more = if let Some(last) = val.get("isLast").and_then(Value::as_bool) {
+        Some(!last)
+    } else if let Some(total) = val.get("total").and_then(Value::as_u64) {
+        Some(((start + got) as u64) < total)
+    } else if got < max_results {
+        Some(false)
+    } else {
+        None
+    };
+    let next = (has_more != Some(false)).then(|| (start + got).to_string());
+    (has_more, next)
+}
+
+/// Paging state for Confluence list responses (the _links.next link).
+pub(crate) fn next_link_page_state(
+    val: &Value,
+    cloud: bool,
+    start: usize,
+    got: usize,
+) -> (Option<bool>, Option<String>) {
+    let Some(link) = val.pointer("/_links/next").and_then(Value::as_str) else {
+        return (Some(false), None);
+    };
+    let next = if cloud {
+        link.split_once('?').and_then(|(_, query)| {
+            query
+                .split('&')
+                .find_map(|pair| pair.strip_prefix("cursor="))
+                .and_then(|raw| urlencoding::decode(raw).ok())
+                .map(|c| c.into_owned())
+        })
+    } else {
+        Some((start + got).to_string())
+    };
+    (Some(true), next)
+}
+
 trait StringExt {
     fn if_empty_then<F: FnOnce() -> String>(self, f: F) -> String;
 }
@@ -1548,5 +1595,60 @@ mod tests {
             }
             _ => panic!("expected CloudOAuth"),
         }
+    }
+
+    #[test]
+    fn offset_and_next_link_page_state() {
+        assert_eq!(
+            offset_page_state(&serde_json::json!({ "isLast": true }), 0, 50, 50),
+            (Some(false), None)
+        );
+        assert_eq!(
+            offset_page_state(&serde_json::json!({ "isLast": false }), 0, 50, 50),
+            (Some(true), Some("50".to_string()))
+        );
+        assert_eq!(
+            offset_page_state(&serde_json::json!({ "total": 120 }), 0, 100, 100),
+            (Some(true), Some("100".to_string()))
+        );
+        assert_eq!(
+            offset_page_state(&serde_json::json!({ "total": 120 }), 100, 20, 100),
+            (Some(false), None)
+        );
+        assert_eq!(
+            offset_page_state(&serde_json::json!({}), 0, 50, 50),
+            (None, Some("50".to_string()))
+        );
+        assert_eq!(
+            offset_page_state(&serde_json::json!({}), 0, 12, 50),
+            (Some(false), None)
+        );
+        assert_eq!(
+            offset_page_state(&serde_json::json!({ "isLast": false }), 0, 0, 50),
+            (Some(false), None)
+        );
+
+        assert_eq!(
+            next_link_page_state(
+                &serde_json::json!({ "_links": { "next": "/wiki/api/v2/pages/100/children?limit=2&cursor=abc%3D" } }),
+                true,
+                0,
+                2
+            ),
+            (Some(true), Some("abc=".to_string()))
+        );
+        assert_eq!(
+            next_link_page_state(
+                &serde_json::json!({ "_links": { "next": "/rest/api/content/100/child/page?limit=2&start=2" } }),
+                false,
+                0,
+                2
+            ),
+            (Some(true), Some("2".to_string()))
+        );
+        assert_eq!(
+            next_link_page_state(&serde_json::json!({ "_links": {} }), true, 0, 2),
+            (Some(false), None)
+        );
     }
 }

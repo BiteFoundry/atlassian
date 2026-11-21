@@ -25,7 +25,10 @@ use crate::{
     },
     config::{self, AppConfig},
     img_preview,
-    models::{FederatedSearchHit, IssueUpdate, OutgoingIssue, OutgoingPage},
+    models::{
+        parse_offset_cursor, slice_page, FederatedSearchHit, IssueUpdate, OutgoingIssue,
+        OutgoingPage,
+    },
     serve::{
         clamp_limit, escape_jql_str, issue_to_hit, looks_like_cql_expr, looks_like_jql_expr,
         page_to_hit,
@@ -475,12 +478,14 @@ async fn call_tool(
         }
 
         "list_projects" => {
+            let offset = parse_offset_cursor(args.optional_str("cursor")?.as_deref())?;
             let refresh = args.optional_bool("refresh")?.unwrap_or(false);
+            let limit = clamp_limit(args.optional_usize("limit")?.unwrap_or(50));
             let target_site = resolve_mcp_single_site_id(config, client, site_arg.as_deref())?;
             let cached = storage
                 .list_projects_for_site(&target_site)
                 .map_err(format_error)?;
-            let projects = if refresh || cached.is_empty() {
+            let all = if refresh || cached.is_empty() {
                 if !refresh && config.site_url.trim().is_empty() && config.sites.is_empty() {
                     cached
                 } else {
@@ -500,17 +505,26 @@ async fn call_tool(
             } else {
                 cached
             };
-            Ok(json!({ "site_id": target_site, "projects": projects }))
+            let page = slice_page(all, offset, limit);
+            Ok(json!({
+                "site_id": target_site,
+                "projects": page.items,
+                "returned": page.items.len(),
+                "has_more": page.has_more,
+                "next_cursor": page.next_cursor,
+            }))
         }
 
         "list_boards" => {
+            let offset = parse_offset_cursor(args.optional_str("cursor")?.as_deref())?;
             let project = args.optional_str("project")?;
             let refresh = args.optional_bool("refresh")?.unwrap_or(false);
+            let limit = clamp_limit(args.optional_usize("limit")?.unwrap_or(50));
             let target_site = resolve_mcp_single_site_id(config, client, site_arg.as_deref())?;
             let cached = storage
                 .list_boards_for_site(&target_site, project.as_deref())
                 .map_err(format_error)?;
-            let boards = if refresh || cached.is_empty() {
+            let all = if refresh || cached.is_empty() {
                 if !refresh && config.site_url.trim().is_empty() && config.sites.is_empty() {
                     cached
                 } else {
@@ -533,70 +547,90 @@ async fn call_tool(
             } else {
                 cached
             };
-            Ok(json!({ "site_id": target_site, "boards": boards }))
+            let page = slice_page(all, offset, limit);
+            Ok(json!({
+                "site_id": target_site,
+                "boards": page.items,
+                "returned": page.items.len(),
+                "has_more": page.has_more,
+                "next_cursor": page.next_cursor,
+            }))
         }
 
         "list_sprints" => {
             let board_id = args.required_i64("board_id")?;
+            let limit = clamp_limit(args.optional_usize("limit")?.unwrap_or(50));
+            let offset = parse_offset_cursor(args.optional_str("cursor")?.as_deref())?;
             let offline = args.optional_bool("offline")?.unwrap_or(false);
             let target_site = resolve_mcp_single_site_id(config, client, site_arg.as_deref())?;
-            let sprints = if offline {
-                storage
+            let page = if offline {
+                let rows = storage
                     .list_sprints_for_site(&target_site, board_id)
-                    .map_err(format_error)?
+                    .map_err(format_error)?;
+                slice_page(rows, offset, limit)
             } else {
                 let (target_site, target_client) =
                     resolve_mcp_client(config, client, site_arg.as_deref())?;
                 let fetched = target_client
-                    .list_board_sprints(board_id)
+                    .list_board_sprints_page(board_id, limit, offset)
                     .await
                     .map_err(format_error)?;
-                let _ = storage.upsert_sprints_for_site(&target_site, &fetched);
+                let _ = storage.upsert_sprints_for_site(&target_site, &fetched.items);
                 fetched
             };
-            Ok(json!({ "site_id": target_site, "board_id": board_id, "sprints": sprints }))
+            Ok(json!({
+                "site_id": target_site,
+                "board_id": board_id,
+                "sprints": page.items,
+                "returned": page.items.len(),
+                "has_more": page.has_more,
+                "next_cursor": page.next_cursor,
+            }))
         }
 
         "get_board_issues" => {
             let board_id = args.required_i64("board_id")?;
             let sprint_id = args.optional_i64("sprint_id")?;
             let limit = clamp_limit(args.optional_usize("limit")?.unwrap_or(50));
+            let cursor = args.optional_str("cursor")?;
+            let offset = parse_offset_cursor(cursor.as_deref())?;
             let offline = args.optional_bool("offline")?.unwrap_or(false);
             let target_site = resolve_mcp_single_site_id(config, client, site_arg.as_deref())?;
 
-            let issues = if offline {
-                storage
-                    .list_board_issues_for_site(&target_site, board_id, sprint_id, limit)
-                    .map_err(format_error)?
+            let page = if offline {
+                let rows = storage
+                    .list_board_issues_for_site(
+                        &target_site,
+                        board_id,
+                        sprint_id,
+                        offset.saturating_add(limit).saturating_add(1),
+                    )
+                    .map_err(format_error)?;
+                slice_page(rows, offset, limit)
             } else {
                 let (target_site, target_client) =
                     resolve_mcp_client(config, client, site_arg.as_deref())?;
                 let fetched = target_client
-                    .list_board_issues(board_id, sprint_id, limit)
+                    .list_board_issues_page(board_id, sprint_id, limit, offset)
                     .await
                     .map_err(format_error)?;
-                let _ = storage.upsert_board_issues_for_site(
+                let _ = storage.record_board_issues_page_for_site(
                     &target_site,
                     board_id,
                     sprint_id,
                     &fetched,
+                    cursor.is_none(),
                 );
-                if fetched.len() < limit {
-                    let keep: Vec<String> = fetched.iter().map(|i| i.key.clone()).collect();
-                    let _ = storage.prune_board_issues_for_site(
-                        &target_site,
-                        board_id,
-                        sprint_id,
-                        &keep,
-                    );
-                }
                 fetched
             };
             Ok(json!({
                 "site_id": target_site,
                 "board_id": board_id,
                 "sprint_id": sprint_id,
-                "issues": issues,
+                "issues": page.items,
+                "returned": page.items.len(),
+                "has_more": page.has_more,
+                "next_cursor": page.next_cursor,
             }))
         }
 
@@ -702,7 +736,11 @@ async fn call_tool(
                 return Ok(json!({
                     "site_id": target_site,
                     "detail_stale": stale,
-                    "issue": detail.output(compact),
+                    "issue": if compact {
+                        detail.compact_output("get_jira_issue with compact:false")
+                    } else {
+                        detail.output(false)
+                    },
                 }));
             }
             let (target_site, target_client) =
@@ -724,7 +762,11 @@ async fn call_tool(
             Ok(json!({
                 "site_id": target_site,
                 "detail_stale": false,
-                "issue": fetched.output(compact),
+                "issue": if compact {
+                    fetched.compact_output("get_jira_issue with compact:false")
+                } else {
+                    fetched.output(false)
+                },
             }))
         }
 
@@ -966,20 +1008,21 @@ async fn call_tool(
         // Confluence
         // -------------------------------------------------------------------
         "list_confluence_spaces" => {
+            let offset = parse_offset_cursor(args.optional_str("cursor")?.as_deref())?;
             let refresh = args.optional_bool("refresh")?.unwrap_or(false);
             let limit = clamp_limit(args.optional_usize("limit")?.unwrap_or(50));
             let target_site = resolve_mcp_single_site_id(config, client, site_arg.as_deref())?;
             let cached = storage
                 .list_spaces_for_site(&target_site)
                 .map_err(format_error)?;
-            let mut spaces = if refresh || cached.is_empty() {
+            let all = if refresh || cached.is_empty() {
                 if !refresh && config.site_url.trim().is_empty() && config.sites.is_empty() {
                     cached
                 } else {
                     let (target_site, target_client) =
                         resolve_mcp_client(config, client, site_arg.as_deref())?;
                     let fetched = target_client
-                        .list_spaces(limit)
+                        .list_all_spaces()
                         .await
                         .map_err(format_error)?;
                     let _ = storage.upsert_spaces_for_site(&target_site, &fetched);
@@ -995,61 +1038,90 @@ async fn call_tool(
             } else {
                 cached
             };
-            spaces.truncate(limit);
-            Ok(json!({ "site_id": target_site, "spaces": spaces }))
+            let page = slice_page(all, offset, limit);
+            Ok(json!({
+                "site_id": target_site,
+                "spaces": page.items,
+                "returned": page.items.len(),
+                "has_more": page.has_more,
+                "next_cursor": page.next_cursor,
+            }))
         }
 
         "list_space_pages" => {
             let space_key = args.required_str("space_key")?;
             let limit = clamp_limit(args.optional_usize("limit")?.unwrap_or(50));
+            let cursor = args.optional_str("cursor")?;
             let offline = args.optional_bool("offline")?.unwrap_or(false);
             let target_site = resolve_mcp_single_site_id(config, client, site_arg.as_deref())?;
-            let mut pages = if offline {
-                storage
+            let page = if offline {
+                let offset = parse_offset_cursor(cursor.as_deref())?;
+                let rows = storage
                     .list_space_root_pages_for_site(&target_site, &space_key)
-                    .map_err(format_error)?
+                    .map_err(format_error)?;
+                slice_page(rows, offset, limit)
             } else {
                 let (target_site, target_client) =
                     resolve_mcp_client(config, client, site_arg.as_deref())?;
-                let fetched = target_client
-                    .list_space_root_pages(&space_key, limit)
+                let mut fetched = target_client
+                    .list_space_root_pages_page(&space_key, limit, cursor.as_deref())
                     .await
                     .map_err(format_error)?;
-                let _ = storage.upsert_authoritative_pages_for_site(&target_site, &fetched);
-                if fetched.len() < limit {
-                    let keep: Vec<String> = fetched.iter().map(|p| p.id.clone()).collect();
-                    let _ =
-                        storage.prune_space_root_pages_for_site(&target_site, &space_key, &keep);
-                }
+                let _ = storage.record_root_pages_page_for_site(
+                    &target_site,
+                    &space_key,
+                    &fetched,
+                    cursor.is_none(),
+                );
+                let _ = storage.overlay_children_state_for_site(&target_site, &mut fetched.items);
                 fetched
             };
-            pages.truncate(limit);
-            Ok(json!({ "site_id": target_site, "space_key": space_key, "pages": pages }))
+            Ok(json!({
+                "site_id": target_site,
+                "space_key": space_key,
+                "pages": page.items,
+                "returned": page.items.len(),
+                "has_more": page.has_more,
+                "next_cursor": page.next_cursor,
+            }))
         }
 
         "list_child_pages" => {
             let page_id = args.required_str("page_id")?;
+            let limit = clamp_limit(args.optional_usize("limit")?.unwrap_or(100));
+            let cursor = args.optional_str("cursor")?;
             let offline = args.optional_bool("offline")?.unwrap_or(false);
             let target_site = resolve_mcp_single_site_id(config, client, site_arg.as_deref())?;
-            let pages = if offline {
-                storage
+            let page = if offline {
+                let offset = parse_offset_cursor(cursor.as_deref())?;
+                let rows = storage
                     .list_child_pages_for_site(&target_site, &page_id)
-                    .map_err(format_error)?
+                    .map_err(format_error)?;
+                slice_page(rows, offset, limit)
             } else {
                 let (target_site, target_client) =
                     resolve_mcp_client(config, client, site_arg.as_deref())?;
-                let fetched = target_client
-                    .list_child_pages(&page_id)
+                let mut fetched = target_client
+                    .list_child_pages_page(&page_id, limit, cursor.as_deref())
                     .await
                     .map_err(format_error)?;
-                let _ = storage.upsert_pages_for_site(&target_site, &fetched);
-                if fetched.len() < 100 {
-                    let keep: Vec<String> = fetched.iter().map(|p| p.id.clone()).collect();
-                    let _ = storage.prune_child_pages_for_site(&target_site, &page_id, &keep);
-                }
+                let _ = storage.record_child_pages_page_for_site(
+                    &target_site,
+                    &page_id,
+                    &fetched,
+                    cursor.is_none(),
+                );
+                let _ = storage.overlay_children_state_for_site(&target_site, &mut fetched.items);
                 fetched
             };
-            Ok(json!({ "site_id": target_site, "parent_id": page_id, "pages": pages }))
+            Ok(json!({
+                "site_id": target_site,
+                "parent_id": page_id,
+                "pages": page.items,
+                "returned": page.items.len(),
+                "has_more": page.has_more,
+                "next_cursor": page.next_cursor,
+            }))
         }
 
         "get_confluence_page" => {
@@ -1069,7 +1141,11 @@ async fn call_tool(
                 return Ok(json!({
                     "site_id": target_site,
                     "detail_stale": stale,
-                    "page": detail.output(compact),
+                    "page": if compact {
+                        detail.compact_output("get_confluence_page with compact:false")
+                    } else {
+                        detail.output(false)
+                    },
                 }));
             }
             let (target_site, target_client) =
@@ -1094,7 +1170,11 @@ async fn call_tool(
             Ok(json!({
                 "site_id": target_site,
                 "detail_stale": false,
-                "page": fetched.output(compact),
+                "page": if compact {
+                    fetched.compact_output("get_confluence_page with compact:false")
+                } else {
+                    fetched.output(false)
+                },
             }))
         }
 
@@ -1488,15 +1568,27 @@ pub(crate) fn validate_tool_args(name: &str, arguments: &Value) -> Result<(), St
         "list_sites" | "get_myself" | "sync_workspace" => Ok(()),
         "list_projects" => {
             let _ = args.optional_bool("refresh")?;
+            if let Some(l) = args.optional_usize("limit")? {
+                validate_range("limit", l, 1, 1_000)?;
+            }
+            let _ = args.optional_str("cursor")?;
             Ok(())
         }
         "list_boards" => {
             let _ = args.optional_str("project")?;
             let _ = args.optional_bool("refresh")?;
+            if let Some(l) = args.optional_usize("limit")? {
+                validate_range("limit", l, 1, 1_000)?;
+            }
+            let _ = args.optional_str("cursor")?;
             Ok(())
         }
         "list_sprints" => {
             let _ = args.required_i64("board_id")?;
+            if let Some(l) = args.optional_usize("limit")? {
+                validate_range("limit", l, 1, 1_000)?;
+            }
+            let _ = args.optional_str("cursor")?;
             let _ = args.optional_bool("offline")?;
             Ok(())
         }
@@ -1506,6 +1598,7 @@ pub(crate) fn validate_tool_args(name: &str, arguments: &Value) -> Result<(), St
             if let Some(l) = args.optional_usize("limit")? {
                 validate_range("limit", l, 1, 1_000)?;
             }
+            let _ = args.optional_str("cursor")?;
             let _ = args.optional_bool("offline")?;
             Ok(())
         }
@@ -1601,6 +1694,7 @@ pub(crate) fn validate_tool_args(name: &str, arguments: &Value) -> Result<(), St
             if let Some(l) = args.optional_usize("limit")? {
                 validate_range("limit", l, 1, 1_000)?;
             }
+            let _ = args.optional_str("cursor")?;
             Ok(())
         }
         "list_space_pages" => {
@@ -1608,6 +1702,7 @@ pub(crate) fn validate_tool_args(name: &str, arguments: &Value) -> Result<(), St
             if let Some(l) = args.optional_usize("limit")? {
                 validate_range("limit", l, 1, 1_000)?;
             }
+            let _ = args.optional_str("cursor")?;
             let _ = args.optional_bool("offline")?;
             Ok(())
         }
@@ -1617,6 +1712,10 @@ pub(crate) fn validate_tool_args(name: &str, arguments: &Value) -> Result<(), St
         }
         "list_child_pages" => {
             let _ = args.required_str("page_id")?;
+            if let Some(l) = args.optional_usize("limit")? {
+                validate_range("limit", l, 1, 1_000)?;
+            }
+            let _ = args.optional_str("cursor")?;
             let _ = args.optional_bool("offline")?;
             Ok(())
         }
@@ -2195,34 +2294,40 @@ fn tool_catalog() -> Vec<Value> {
         }),
         json!({
             "name": "list_projects",
-            "description": "List accessible Jira projects from SQLite cache or refresh from Jira API.",
+            "description": "List accessible Jira projects from SQLite cache or refresh from Jira API. Returns limit items from the cache; pass next_cursor as cursor to continue, and refresh: true to reload the full catalog.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
-                    "refresh": { "type": "boolean", "default": false }
+                    "refresh": { "type": "boolean", "default": false },
+                    "limit": { "type": "integer", "minimum": 1, "maximum": 1000, "default": 50 },
+                    "cursor": { "type": "string", "description": "Offset from next_cursor." }
                 },
                 "additionalProperties": false
             }
         }),
         json!({
             "name": "list_boards",
-            "description": "List Jira Agile boards, optionally filtered by project key.",
+            "description": "List Jira Agile boards, optionally filtered by project key. Returns limit items from the cache; pass next_cursor as cursor to continue, and refresh: true to reload the full catalog.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
                     "project": { "type": "string", "description": "Optional Jira project key (e.g. ENG)." },
-                    "refresh": { "type": "boolean", "default": false }
+                    "refresh": { "type": "boolean", "default": false },
+                    "limit": { "type": "integer", "minimum": 1, "maximum": 1000, "default": 50 },
+                    "cursor": { "type": "string", "description": "Offset from next_cursor." }
                 },
                 "additionalProperties": false
             }
         }),
         json!({
             "name": "list_sprints",
-            "description": "List sprints for a Jira Agile board.",
+            "description": "List sprints for a Jira Agile board. Returns active and future sprints only. Pass next_cursor as cursor to continue.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
                     "board_id": { "type": "integer" },
+                    "limit": { "type": "integer", "minimum": 1, "maximum": 1000, "default": 50 },
+                    "cursor": { "type": "string", "description": "Offset from next_cursor." },
                     "offline": { "type": "boolean", "default": false }
                 },
                 "required": ["board_id"],
@@ -2231,13 +2336,14 @@ fn tool_catalog() -> Vec<Value> {
         }),
         json!({
             "name": "get_board_issues",
-            "description": "Fetch issues on a Jira Agile board (optionally filtered by sprint_id).",
+            "description": "Fetch issues on a Jira Agile board (optionally filtered by sprint_id). A live call returns at most 100 issues; pass next_cursor as cursor to continue.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
                     "board_id": { "type": "integer" },
                     "sprint_id": { "type": "integer" },
                     "limit": { "type": "integer", "minimum": 1, "maximum": 1000, "default": 50 },
+                    "cursor": { "type": "string", "description": "Offset from next_cursor." },
                     "offline": { "type": "boolean", "default": false }
                 },
                 "required": ["board_id"],
@@ -2263,7 +2369,7 @@ fn tool_catalog() -> Vec<Value> {
         }),
         json!({
             "name": "get_jira_issue",
-            "description": "Get the Jira issue key, summary, status, and full Markdown description. Use compact: false for links, attachments, comments, and the full issue structure.",
+            "description": "Get the Jira issue key, summary, status, and full Markdown description. Use compact: false for links, attachments, comments, and the full issue structure. The omitted object lists what was left out; null means the count is unknown.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -2419,24 +2525,26 @@ fn tool_catalog() -> Vec<Value> {
         // --- Confluence ---
         json!({
             "name": "list_confluence_spaces",
-            "description": "List accessible Confluence spaces from cache or refresh from Confluence API.",
+            "description": "List accessible Confluence spaces from cache or refresh from Confluence API. Returns limit items from the cache; pass next_cursor as cursor to continue, and refresh: true to reload the full catalog.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
                     "refresh": { "type": "boolean", "default": false },
-                    "limit": { "type": "integer", "minimum": 1, "maximum": 1000, "default": 50 }
+                    "limit": { "type": "integer", "minimum": 1, "maximum": 1000, "default": 50 },
+                    "cursor": { "type": "string", "description": "Offset from next_cursor." }
                 },
                 "additionalProperties": false
             }
         }),
         json!({
             "name": "list_space_pages",
-            "description": "List root pages in a Confluence space.",
+            "description": "List root pages in a Confluence space. A live call returns at most 250 pages; pass next_cursor as cursor to continue. has_children is null when unknown.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
                     "space_key": { "type": "string", "minLength": 1 },
                     "limit": { "type": "integer", "minimum": 1, "maximum": 1000, "default": 50 },
+                    "cursor": { "type": "string", "description": "Value from next_cursor. Valid only with the same arguments." },
                     "offline": { "type": "boolean", "default": false }
                 },
                 "required": ["space_key"],
@@ -2445,11 +2553,13 @@ fn tool_catalog() -> Vec<Value> {
         }),
         json!({
             "name": "list_child_pages",
-            "description": "List direct child pages of a Confluence page.",
+            "description": "List direct child pages of a Confluence page. A live call returns at most 250 pages; pass next_cursor as cursor to continue. has_children is null when unknown.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
                     "page_id": { "type": "string", "minLength": 1 },
+                    "limit": { "type": "integer", "minimum": 1, "maximum": 1000, "default": 100 },
+                    "cursor": { "type": "string", "description": "Value from next_cursor. Valid only with the same arguments." },
                     "offline": { "type": "boolean", "default": false }
                 },
                 "required": ["page_id"],
@@ -2458,7 +2568,7 @@ fn tool_catalog() -> Vec<Value> {
         }),
         json!({
             "name": "get_confluence_page",
-            "description": "Get page identifiers, version, and full Markdown. Use compact: false for native body, blocks, TOC, comments, and attachments.",
+            "description": "Get page identifiers, version, and full Markdown. Use compact: false for native body, blocks, TOC, comments, and attachments. The omitted object lists what was left out; null means the count is unknown.",
             "inputSchema": {
                 "type": "object",
                 "properties": {

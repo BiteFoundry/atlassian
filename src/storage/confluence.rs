@@ -8,8 +8,8 @@ use rusqlite::{params, Connection, OptionalExtension, Row, ToSql};
 use crate::{
     adf,
     models::{
-        AttachmentItem, ConfluenceComment, PageDetail, PageSummary, SearchHitKind, SpaceSummary,
-        UnifiedSearchHit,
+        AttachmentItem, ConfluenceComment, ListPage, PageDetail, PageSummary, SearchHitKind,
+        SpaceSummary, UnifiedSearchHit,
     },
     storage::{
         db::{build_contextual_snippet, build_fts_query, escape_like, DEFAULT_SITE_ID},
@@ -623,6 +623,78 @@ impl Storage {
         Ok(removed)
     }
 
+    /// Stores one fetched page of space root pages. Prunes only on a complete first page.
+    pub fn record_root_pages_page_for_site(
+        &self,
+        site_id: &str,
+        space_key: &str,
+        page: &ListPage<PageSummary>,
+        first_page: bool,
+    ) -> Result<()> {
+        self.upsert_authoritative_pages_for_site(site_id, &page.items)?;
+        if first_page && page.has_more == Some(false) {
+            let keep: Vec<String> = page.items.iter().map(|p| p.id.clone()).collect();
+            self.prune_space_root_pages_for_site(site_id, space_key, &keep)?;
+        }
+        Ok(())
+    }
+
+    /// Stores one fetched page of child pages. Prunes and records childless state only on a complete first page.
+    pub fn record_child_pages_page_for_site(
+        &self,
+        site_id: &str,
+        parent_id: &str,
+        page: &ListPage<PageSummary>,
+        first_page: bool,
+    ) -> Result<()> {
+        self.upsert_pages_for_site(site_id, &page.items)?;
+        if first_page && page.has_more == Some(false) {
+            let keep: Vec<String> = page.items.iter().map(|p| p.id.clone()).collect();
+            self.prune_child_pages_for_site(site_id, parent_id, &keep)?;
+            if page.items.is_empty() {
+                self.set_page_has_no_children_for_site(site_id, parent_id)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Marks a page as confirmed childless after a complete, empty child listing.
+    pub fn set_page_has_no_children_for_site(&self, site_id: &str, page_id: &str) -> Result<()> {
+        let conn = self.lock_conn()?;
+        conn.execute(
+            "UPDATE pages SET has_children = 2 WHERE site_id = ?1 AND id = ?2",
+            params![site_id, page_id],
+        )?;
+        Ok(())
+    }
+
+    /// Replaces `has_children` on freshly fetched summaries with what the cache knows.
+    pub fn overlay_children_state_for_site(
+        &self,
+        site_id: &str,
+        pages: &mut [PageSummary],
+    ) -> Result<()> {
+        if pages.is_empty() {
+            return Ok(());
+        }
+        let conn = self.lock_conn()?;
+        let mut stmt =
+            conn.prepare("SELECT has_children FROM pages WHERE site_id = ?1 AND id = ?2")?;
+        for page in pages {
+            if let Some(raw) = stmt
+                .query_row(params![site_id, &page.id], |row| row.get::<_, i32>(0))
+                .optional()?
+            {
+                page.has_children = match raw {
+                    1 => Some(true),
+                    2 => Some(false),
+                    _ => None,
+                };
+            }
+        }
+        Ok(())
+    }
+
     pub fn list_pages_for_site(
         &self,
         site_id: &str,
@@ -1034,6 +1106,12 @@ fn upsert_page_row(
                     ],
                 )?;
             }
+            if let Some(pid) = next_parent {
+                conn.execute(
+                    "UPDATE pages SET has_children = 1 WHERE site_id = ?1 AND id = ?2",
+                    params![site_id, pid],
+                )?;
+            }
             return Ok(UpsertPageRowOutcome {
                 applied: false,
                 fts_needs_refresh: space_key_changed,
@@ -1070,7 +1148,7 @@ fn upsert_page_row(
             author_name = COALESCE(excluded.author_name, pages.author_name),
             updated_at = CASE WHEN excluded.updated_at != '' THEN excluded.updated_at ELSE pages.updated_at END,
             position = CASE WHEN ?14 != 0 OR excluded.position != 0 THEN excluded.position ELSE pages.position END,
-            has_children = CASE WHEN excluded.has_children != 0 THEN 1 ELSE pages.has_children END,
+            has_children = CASE WHEN excluded.has_children != 0 THEN excluded.has_children ELSE pages.has_children END,
             web_url = CASE WHEN excluded.web_url != '' THEN excluded.web_url ELSE pages.web_url END
         ",
         params![
@@ -1085,11 +1163,21 @@ fn upsert_page_row(
             page.author_name,
             page.updated_at,
             page.position,
-            if page.has_children { 1i32 } else { 0i32 },
+            match page.has_children {
+                Some(true) => 1i32,
+                Some(false) => 2i32,
+                None => 0i32,
+            },
             page.web_url,
             authoritative_flag,
         ],
     )?;
+    if let Some(pid) = incoming_parent {
+        conn.execute(
+            "UPDATE pages SET has_children = 1 WHERE site_id = ?1 AND id = ?2",
+            params![site_id, pid],
+        )?;
+    }
     Ok(UpsertPageRowOutcome {
         applied: true,
         fts_needs_refresh: true,
@@ -1130,7 +1218,11 @@ fn map_page_summary_row(row: &Row<'_>, offset: usize) -> rusqlite::Result<PageSu
         author_name: row.get(offset + 7)?,
         updated_at: row.get(offset + 8)?,
         position: row.get(offset + 9)?,
-        has_children: row.get::<_, i32>(offset + 10)? != 0,
+        has_children: match row.get::<_, i32>(offset + 10)? {
+            1 => Some(true),
+            2 => Some(false),
+            _ => None,
+        },
         web_url: row.get(offset + 11)?,
     })
 }
@@ -1302,7 +1394,7 @@ mod tests {
             author_name: Some("Bob".into()),
             updated_at: "2026-11-15T11:00:00Z".into(),
             position: pos,
-            has_children: parent_id.is_none(),
+            has_children: Some(parent_id.is_none()),
             web_url: format!("https://acme.atlassian.net/wiki/spaces/ENG/pages/{id}"),
         }
     }
@@ -1348,6 +1440,7 @@ mod tests {
             attachments: vec![],
             comments: vec![],
             linked_issue_keys: vec![],
+            incomplete: vec![],
         };
         storage.upsert_page_detail(&detail).unwrap();
 
@@ -1523,7 +1616,7 @@ mod tests {
             author_name: None,
             updated_at: String::new(),
             position: 2,
-            has_children: false,
+            has_children: None,
             web_url: String::new(),
         };
         storage
@@ -1552,7 +1645,7 @@ mod tests {
             author_name: None,
             updated_at: "2026-11-18T12:00:00Z".into(),
             position: 0,
-            has_children: false,
+            has_children: None,
             web_url: String::new(),
         };
         storage.upsert_pages_for_site("cloud", &[search_hit]).unwrap();
@@ -1576,5 +1669,141 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(detail_root.summary.parent_id, None);
+    }
+
+    #[test]
+    fn has_children_is_unknown_then_true_then_false() {
+        let storage = Storage::open_in_memory().unwrap();
+        let make = |id: &str, parent_id: Option<&str>| PageSummary {
+            id: id.into(),
+            space_id: "sp-1".into(),
+            space_key: "ENG".into(),
+            parent_id: parent_id.map(str::to_string),
+            title: format!("Page {id}"),
+            status: "current".into(),
+            version_number: 1,
+            updated_at: "2026-11-20T00:00:00Z".into(),
+            has_children: None,
+            ..Default::default()
+        };
+
+        // (a) Upsert 700 with None -> reads as None
+        storage
+            .upsert_pages_for_site("default", &[make("700", None)])
+            .unwrap();
+        let roots = storage.list_space_root_pages_for_site("default", "ENG").unwrap();
+        assert_eq!(roots[0].has_children, None);
+
+        // (b) Upsert child 701 with parent 700 -> 700 becomes Some(true)
+        storage
+            .upsert_pages_for_site("default", &[make("701", Some("700"))])
+            .unwrap();
+        let roots = storage.list_space_root_pages_for_site("default", "ENG").unwrap();
+        assert_eq!(roots[0].has_children, Some(true));
+
+        // (c) Record empty, complete first child page for 701 -> 701 becomes Some(false)
+        let empty_complete = ListPage {
+            items: Vec::new(),
+            has_more: Some(false),
+            next_cursor: None,
+        };
+        storage
+            .record_child_pages_page_for_site("default", "701", &empty_complete, true)
+            .unwrap();
+        let kids = storage.list_child_pages_for_site("default", "700").unwrap();
+        assert_eq!(kids[0].id, "701");
+        assert_eq!(kids[0].has_children, Some(false));
+
+        // (d) Empty page with has_more: None for 702 -> stays None
+        storage
+            .upsert_pages_for_site("default", &[make("702", None)])
+            .unwrap();
+        let empty_unknown = ListPage {
+            items: Vec::new(),
+            has_more: None,
+            next_cursor: None,
+        };
+        storage
+            .record_child_pages_page_for_site("default", "702", &empty_unknown, true)
+            .unwrap();
+        let roots = storage.list_space_root_pages_for_site("default", "ENG").unwrap();
+        let p702 = roots.iter().find(|p| p.id == "702").unwrap();
+        assert_eq!(p702.has_children, None);
+
+        // (e) Legacy row with has_children = 0 reads as None
+        {
+            let conn = storage.lock_conn().unwrap();
+            conn.execute(
+                "INSERT INTO pages (site_id, id, space_id, space_key, parent_id, title, status, version_number, updated_at, position, has_children, web_url) VALUES ('default', '703', 'sp-1', 'ENG', NULL, 'Legacy', 'current', 1, '2026-11-20T00:00:00Z', 0, 0, '')",
+                [],
+            )
+            .unwrap();
+        }
+        let roots = storage.list_space_root_pages_for_site("default", "ENG").unwrap();
+        let p703 = roots.iter().find(|p| p.id == "703").unwrap();
+        assert_eq!(p703.has_children, None);
+    }
+
+    #[test]
+    fn record_pages_prune_only_on_complete_first_page() {
+        let storage = Storage::open_in_memory().unwrap();
+        let a = sample_page("A", Some("P"), "Child A", 1);
+        let b = sample_page("B", Some("P"), "Child B", 2);
+        storage
+            .upsert_pages_for_site("default", &[a.clone(), b.clone()])
+            .unwrap();
+
+        // (a) has_more = Some(true), first_page = true -> B kept
+        storage
+            .record_child_pages_page_for_site(
+                "default",
+                "P",
+                &ListPage {
+                    items: vec![a.clone()],
+                    has_more: Some(true),
+                    next_cursor: Some("1".into()),
+                },
+                true,
+            )
+            .unwrap();
+        assert_eq!(
+            storage.list_child_pages_for_site("default", "P").unwrap().len(),
+            2
+        );
+
+        // (b) has_more = Some(false), first_page = false -> B kept
+        storage
+            .record_child_pages_page_for_site(
+                "default",
+                "P",
+                &ListPage {
+                    items: vec![a.clone()],
+                    has_more: Some(false),
+                    next_cursor: None,
+                },
+                false,
+            )
+            .unwrap();
+        assert_eq!(
+            storage.list_child_pages_for_site("default", "P").unwrap().len(),
+            2
+        );
+
+        // (c) has_more = Some(false), first_page = true -> B pruned
+        storage
+            .record_child_pages_page_for_site(
+                "default",
+                "P",
+                &ListPage {
+                    items: vec![a],
+                    has_more: Some(false),
+                    next_cursor: None,
+                },
+                true,
+            )
+            .unwrap();
+        let remaining = storage.list_child_pages_for_site("default", "P").unwrap();
+        assert_eq!(remaining.len(), 1);
+        assert_eq!(remaining[0].id, "A");
     }
 }

@@ -4062,3 +4062,524 @@ async fn regression_atlassian_bug_14_cloud_page_ancestors_and_controls() {
     assert_eq!(dc_detail.ancestors[0].id, "500");
     assert_eq!(dc_detail.ancestors[0].title, "DC Root");
 }
+
+#[tokio::test]
+async fn regression_atlassian_05_collection_paging_and_controls() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    let req_count = Arc::new(AtomicUsize::new(0));
+    let projects: Vec<Value> = (1..=150)
+        .map(|i| {
+            json!({
+                "id": format!("{i}"),
+                "key": format!("P{i:03}"),
+                "name": format!("Project {i:03}"),
+                "projectTypeKey": "software"
+            })
+        })
+        .collect();
+    let issues: Vec<Value> = (1..=120)
+        .map(|i| {
+            json!({
+                "id": format!("{i}"),
+                "key": format!("ENG-{i:03}"),
+                "fields": {
+                    "project": { "key": "ENG", "name": "Engineering" },
+                    "summary": format!("Board Issue {i:03}"),
+                    "status": { "id": "1", "name": "To Do", "statusCategory": { "key": "new" } },
+                    "issuetype": { "id": "1", "name": "Task", "subtask": false },
+                    "updated": format!("2026-11-20T{:02}:{:02}:00Z", i / 60, i % 60)
+                }
+            })
+        })
+        .collect();
+
+    let router = Router::new()
+        .route(
+            "/rest/api/3/project/search",
+            get({
+                let req_count = req_count.clone();
+                let projects = projects.clone();
+                move |Query(q): Query<HashMap<String, String>>| {
+                    let req_count = req_count.clone();
+                    let projects = projects.clone();
+                    async move {
+                        req_count.fetch_add(1, Ordering::SeqCst);
+                        let start: usize = q.get("startAt").and_then(|s| s.parse().ok()).unwrap_or(0);
+                        let max: usize = q.get("maxResults").and_then(|s| s.parse().ok()).unwrap_or(100);
+                        let slice: Vec<Value> = projects.iter().skip(start).take(max).cloned().collect();
+                        let is_last = start + slice.len() >= projects.len();
+                        Json(json!({
+                            "startAt": start,
+                            "maxResults": max,
+                            "total": projects.len(),
+                            "isLast": is_last,
+                            "values": slice
+                        }))
+                    }
+                }
+            }),
+        )
+        .route(
+            "/rest/api/2/project",
+            get({
+                let req_count = req_count.clone();
+                let projects = projects.clone();
+                move || {
+                    let req_count = req_count.clone();
+                    let projects = projects.clone();
+                    async move {
+                        req_count.fetch_add(1, Ordering::SeqCst);
+                        Json(json!(projects))
+                    }
+                }
+            }),
+        )
+        .route(
+            "/rest/agile/1.0/board/7/issue",
+            get({
+                let req_count = req_count.clone();
+                let issues = issues.clone();
+                move |Query(q): Query<HashMap<String, String>>| {
+                    let req_count = req_count.clone();
+                    let issues = issues.clone();
+                    async move {
+                        req_count.fetch_add(1, Ordering::SeqCst);
+                        let start: usize = q.get("startAt").and_then(|s| s.parse().ok()).unwrap_or(0);
+                        let max: usize = q.get("maxResults").and_then(|s| s.parse().ok()).unwrap_or(50);
+                        let slice: Vec<Value> = issues.iter().skip(start).take(max).cloned().collect();
+                        Json(json!({
+                            "startAt": start,
+                            "maxResults": max,
+                            "total": issues.len(),
+                            "issues": slice
+                        }))
+                    }
+                }
+            }),
+        )
+        .route(
+            "/wiki/api/v2/pages/700/children",
+            get({
+                let req_count = req_count.clone();
+                move |Query(q): Query<HashMap<String, String>>| {
+                    let req_count = req_count.clone();
+                    async move {
+                        req_count.fetch_add(1, Ordering::SeqCst);
+                        if q.get("cursor").map(String::as_str) == Some("c2=") {
+                            Json(json!({
+                                "results": [
+                                    { "id": "703", "spaceId": "77", "parentId": "700", "title": "Child 3", "status": "current", "version": { "number": 1 } }
+                                ]
+                            }))
+                        } else {
+                            Json(json!({
+                                "results": [
+                                    { "id": "701", "spaceId": "77", "parentId": "700", "title": "Child 1", "status": "current", "version": { "number": 1 } },
+                                    { "id": "702", "spaceId": "77", "parentId": "700", "title": "Child 2", "status": "current", "version": { "number": 1 } }
+                                ],
+                                "_links": { "next": "/wiki/api/v2/pages/700/children?limit=2&cursor=c2%3D" }
+                            }))
+                        }
+                    }
+                }
+            }),
+        )
+        .route(
+            "/rest/api/content/700/child/page",
+            get({
+                let req_count = req_count.clone();
+                move |Query(q): Query<HashMap<String, String>>| {
+                    let req_count = req_count.clone();
+                    async move {
+                        req_count.fetch_add(1, Ordering::SeqCst);
+                        let start: usize = q.get("start").and_then(|s| s.parse().ok()).unwrap_or(0);
+                        if start == 0 {
+                            Json(json!({
+                                "results": [
+                                    { "id": "701", "title": "Child 1", "space": { "key": "ENG" }, "version": { "number": 1 } },
+                                    { "id": "702", "title": "Child 2", "space": { "key": "ENG" }, "version": { "number": 1 } }
+                                ],
+                                "_links": { "next": "/rest/api/content/700/child/page?limit=2&start=2" }
+                            }))
+                        } else {
+                            Json(json!({
+                                "results": [
+                                    { "id": "703", "title": "Child 3", "space": { "key": "ENG" }, "version": { "number": 1 } }
+                                ]
+                            }))
+                        }
+                    }
+                }
+            }),
+        )
+        .route(
+            "/rest/api/3/search/jql",
+            post({
+                let issues = issues.clone();
+                move |Json(body): Json<Value>| {
+                    let issues = issues.clone();
+                    async move {
+                        let max = body["maxResults"].as_u64().unwrap_or(50) as usize;
+                        let start = body
+                            .get("nextPageToken")
+                            .and_then(Value::as_str)
+                            .and_then(|t| t.strip_prefix("tok:"))
+                            .and_then(|s| s.parse::<usize>().ok())
+                            .unwrap_or(0);
+                        let slice: Vec<Value> = issues.iter().skip(start).take(max).cloned().collect();
+                        let mut resp = json!({ "issues": slice });
+                        if start + slice.len() < issues.len() {
+                            resp["nextPageToken"] = json!(format!("tok:{}", start + slice.len()));
+                        }
+                        Json(resp)
+                    }
+                }
+            }),
+        )
+        .route(
+            "/rest/api/2/search",
+            post({
+                let issues = issues.clone();
+                move |Json(body): Json<Value>| {
+                    let issues = issues.clone();
+                    async move {
+                        let max = body["maxResults"].as_u64().unwrap_or(50) as usize;
+                        let start = body["startAt"].as_u64().unwrap_or(0) as usize;
+                        let slice: Vec<Value> = issues.iter().skip(start).take(max).cloned().collect();
+                        Json(json!({
+                            "startAt": start,
+                            "maxResults": max,
+                            "total": issues.len(),
+                            "issues": slice
+                        }))
+                    }
+                }
+            }),
+        );
+
+    let base_url = spawn_server(router).await;
+
+    async fn call_mcp(
+        cfg: &AppConfig,
+        client: &AtlassianClient,
+        storage: &Storage,
+        name: &str,
+        arguments: Value,
+    ) -> (bool, Value) {
+        let resp = mcp::handle_rpc_line(
+            cfg,
+            client,
+            storage,
+            &json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "tools/call",
+                "params": { "name": name, "arguments": arguments }
+            })
+            .to_string(),
+        )
+        .await
+        .unwrap();
+        assert!(
+            resp["result"].get("structuredContent").is_none(),
+            "MCP result must not add structuredContent"
+        );
+        let is_error = resp["result"]["isError"].as_bool().unwrap_or(false);
+        let text = resp["result"]["content"][0]["text"].as_str().unwrap();
+        if is_error {
+            (true, Value::String(text.to_string()))
+        } else {
+            (false, serde_json::from_str(text).unwrap())
+        }
+    }
+
+    for deployment in [DeploymentKind::Cloud, DeploymentKind::DataCenter] {
+        let conf_url = if deployment == DeploymentKind::Cloud {
+            format!("{base_url}/wiki")
+        } else {
+            base_url.clone()
+        };
+        let auth = AuthManager::with_credentials(
+            "paging-test",
+            StoredCredentials::BearerPat {
+                site_url: base_url.clone(),
+                token: "tok".into(),
+                deployment,
+            },
+        );
+        let client =
+            AtlassianClient::with_base_urls(&base_url, &conf_url, deployment, auth).unwrap();
+        let cfg = AppConfig {
+            site_url: base_url.clone(),
+            confluence_url: conf_url,
+            deployment,
+            ..Default::default()
+        };
+        let storage = Storage::open_in_memory().unwrap();
+
+        // 1. get_board_issues: limit 500 -> 100 / true / "100", then cursor "100" -> 20 / false / null
+        let (err, b1) = call_mcp(
+            &cfg,
+            &client,
+            &storage,
+            "get_board_issues",
+            json!({ "board_id": 7, "limit": 500 }),
+        )
+        .await;
+        assert!(!err, "{b1}");
+        assert_eq!(b1["returned"], 100);
+        assert_eq!(b1["has_more"], true);
+        assert_eq!(b1["next_cursor"], "100");
+        assert_eq!(b1["issues"].as_array().unwrap().len(), 100);
+
+        let (err, b2) = call_mcp(
+            &cfg,
+            &client,
+            &storage,
+            "get_board_issues",
+            json!({ "board_id": 7, "limit": 500, "cursor": "100" }),
+        )
+        .await;
+        assert!(!err, "{b2}");
+        assert_eq!(b2["returned"], 20);
+        assert_eq!(b2["has_more"], false);
+        assert!(b2["next_cursor"].is_null());
+
+        // Offline continuation reads all 120 from cache in consistent order
+        let (err, off1) = call_mcp(
+            &cfg,
+            &client,
+            &storage,
+            "get_board_issues",
+            json!({ "board_id": 7, "limit": 70, "offline": true }),
+        )
+        .await;
+        assert!(!err, "{off1}");
+        assert_eq!(off1["returned"], 70);
+        assert_eq!(off1["has_more"], true);
+        assert_eq!(off1["next_cursor"], "70");
+        let (err, off2) = call_mcp(
+            &cfg,
+            &client,
+            &storage,
+            "get_board_issues",
+            json!({ "board_id": 7, "limit": 70, "cursor": "70", "offline": true }),
+        )
+        .await;
+        assert!(!err, "{off2}");
+        assert_eq!(off2["returned"], 50);
+        assert_eq!(off2["has_more"], false);
+        assert!(off2["next_cursor"].is_null());
+
+        // 2. list_projects: refresh -> 50 / "50" -> 50 / "100" -> 50 / null (all 150 in both Cloud & DC)
+        let mut recovered_projects = Vec::new();
+        let proj_before = req_count.load(Ordering::SeqCst);
+        let (err, pr1) = call_mcp(
+            &cfg,
+            &client,
+            &storage,
+            "list_projects",
+            json!({ "refresh": true }),
+        )
+        .await;
+        assert!(!err, "{pr1}");
+        let proj_calls = req_count.load(Ordering::SeqCst) - proj_before;
+        assert_eq!(
+            proj_calls,
+            if deployment == DeploymentKind::Cloud { 2 } else { 1 },
+            "Cloud follows isLast (2 requests); Data Center fetches once"
+        );
+        assert_eq!(pr1["returned"], 50);
+        assert_eq!(pr1["has_more"], true);
+        assert_eq!(pr1["next_cursor"], "50");
+        recovered_projects.extend(
+            pr1["projects"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|p| p["key"].as_str().unwrap().to_string()),
+        );
+        let (err, pr2) = call_mcp(
+            &cfg,
+            &client,
+            &storage,
+            "list_projects",
+            json!({ "cursor": "50" }),
+        )
+        .await;
+        assert!(!err, "{pr2}");
+        assert_eq!(pr2["returned"], 50);
+        assert_eq!(pr2["has_more"], true);
+        assert_eq!(pr2["next_cursor"], "100");
+        recovered_projects.extend(
+            pr2["projects"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|p| p["key"].as_str().unwrap().to_string()),
+        );
+        let (err, pr3) = call_mcp(
+            &cfg,
+            &client,
+            &storage,
+            "list_projects",
+            json!({ "cursor": "100" }),
+        )
+        .await;
+        assert!(!err, "{pr3}");
+        assert_eq!(pr3["returned"], 50);
+        assert_eq!(pr3["has_more"], false);
+        assert!(pr3["next_cursor"].is_null());
+        recovered_projects.extend(
+            pr3["projects"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|p| p["key"].as_str().unwrap().to_string()),
+        );
+        assert_eq!(recovered_projects.len(), 150);
+
+        // 3. list_child_pages: limit 2 -> cursor -> remaining 1
+        let (err, ch1) = call_mcp(
+            &cfg,
+            &client,
+            &storage,
+            "list_child_pages",
+            json!({ "page_id": "700", "limit": 2 }),
+        )
+        .await;
+        assert!(!err, "{ch1}");
+        assert_eq!(ch1["returned"], 2);
+        assert_eq!(ch1["has_more"], true);
+        let cursor = ch1["next_cursor"].as_str().unwrap().to_string();
+        let (err, ch2) = call_mcp(
+            &cfg,
+            &client,
+            &storage,
+            "list_child_pages",
+            json!({ "page_id": "700", "limit": 2, "cursor": cursor }),
+        )
+        .await;
+        assert!(!err, "{ch2}");
+        assert_eq!(ch2["returned"], 1);
+        assert_eq!(ch2["has_more"], false);
+        assert!(ch2["next_cursor"].is_null());
+
+        // 4. Invalid offset cursor rejects with zero upstream calls
+        let before = req_count.load(Ordering::SeqCst);
+        let (is_err, err_msg) = call_mcp(
+            &cfg,
+            &client,
+            &storage,
+            "get_board_issues",
+            json!({ "board_id": 7, "cursor": "abc" }),
+        )
+        .await;
+        assert!(is_err);
+        assert_eq!(
+            err_msg.as_str().unwrap(),
+            "cursor must be a non-negative integer offset taken from next_cursor"
+        );
+        assert_eq!(
+            req_count.load(Ordering::SeqCst),
+            before,
+            "invalid cursor must not trigger upstream requests"
+        );
+
+        // 5. Control: search_jira_issues preserves v0.5.1 keys and 2-page continuation
+        let (err, s1) = call_mcp(
+            &cfg,
+            &client,
+            &storage,
+            "search_jira_issues",
+            json!({ "jql": "project = ENG", "limit": 100 }),
+        )
+        .await;
+        assert!(!err, "{s1}");
+        let mut s1_keys: Vec<&str> = s1.as_object().unwrap().keys().map(String::as_str).collect();
+        s1_keys.sort();
+        assert_eq!(
+            s1_keys,
+            vec!["issues", "jql", "next_page_token", "next_start_at", "site_id", "total"]
+        );
+        assert_eq!(s1["issues"].as_array().unwrap().len(), 100);
+        let next_args = if deployment == DeploymentKind::Cloud {
+            assert!(s1["total"].is_null());
+            json!({ "jql": "project = ENG", "limit": 100, "page_token": s1["next_page_token"] })
+        } else {
+            assert_eq!(s1["total"], 120);
+            json!({ "jql": "project = ENG", "limit": 100, "start_at": s1["next_start_at"] })
+        };
+        let (err, s2) = call_mcp(&cfg, &client, &storage, "search_jira_issues", next_args).await;
+        assert!(!err, "{s2}");
+        assert_eq!(s2["issues"].as_array().unwrap().len(), 20);
+        assert!(s2["next_page_token"].is_null());
+        assert!(s2["next_start_at"].is_null());
+    }
+}
+
+#[tokio::test]
+async fn http_offline_issues_total_is_cache_count() {
+    ensure_isolated_env();
+    let storage = Storage::open_in_memory().expect("storage");
+    let issues: Vec<atlassian_cli::models::IssueSummary> = (1..=120)
+        .map(|i| atlassian_cli::models::IssueSummary {
+            id: format!("{i}"),
+            key: format!("ENG-{i}"),
+            project_key: "ENG".into(),
+            summary: format!("Cached issue {i}"),
+            updated_at: format!("2026-11-20T{:02}:{:02}:00Z", i / 60, i % 60),
+            ..Default::default()
+        })
+        .collect();
+    storage.upsert_issues(&issues).unwrap();
+    storage
+        .upsert_issue_detail(&atlassian_cli::models::IssueDetail {
+            summary: issues[0].clone(),
+            description_raw: "raw body".into(),
+            description_markdown: "md body".into(),
+            ..Default::default()
+        })
+        .unwrap();
+
+    let cfg = AppConfig::default();
+    let auth = AuthManager::new("http-offline-total");
+    let client = AtlassianClient::new(cfg.clone(), auth).unwrap();
+    let serve_url = spawn_server(serve::build_router(cfg, client, storage, None)).await;
+
+    let http = reqwest::Client::new();
+    let r2: Value = http
+        .get(format!("{serve_url}/issues?offline=true&limit=2"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(r2["issues"].as_array().unwrap().len(), 2);
+    assert_eq!(r2["total"], 120);
+
+    let r1000: Value = http
+        .get(format!("{serve_url}/issues?offline=true&limit=1000"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(r1000["issues"].as_array().unwrap().len(), 120);
+    assert_eq!(r1000["total"], 120);
+
+    // Control: HTTP detail still defaults to full
+    let detail: Value = http
+        .get(format!("{serve_url}/issues/ENG-1?offline=true"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(detail["issue"]["description_raw"], "raw body");
+    assert!(detail["issue"].get("omitted").is_none());
+}

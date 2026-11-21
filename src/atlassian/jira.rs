@@ -16,8 +16,8 @@ use crate::{
     atlassian::{
         body::{body_change, same_markdown, BodyEdit, BodyEditError},
         client::{
-            first_nonempty_str, json_id_to_string, parse_attachment_item, parse_user_summary,
-            HttpStatusError,
+            first_nonempty_str, json_id_to_string, offset_page_state, parse_attachment_item,
+            parse_user_summary, HttpStatusError,
         },
         AtlassianClient,
     },
@@ -74,45 +74,86 @@ impl AtlassianClient {
 
     pub async fn list_projects(&self) -> Result<Vec<ProjectSummary>> {
         let base = self.require_site_url()?;
-        let val: Value = match self.deployment() {
+        match self.deployment() {
             DeploymentKind::Cloud => {
-                let search_url = format!("{base}/rest/api/3/project/search?maxResults=100");
-                match self.get_json::<Value>(&search_url).await {
-                    Ok(v) => v,
-                    Err(err) => {
-                        let should_fallback = err
-                            .downcast_ref::<HttpStatusError>()
-                            .map(|e| {
-                                matches!(
-                                    e.status,
-                                    StatusCode::NOT_FOUND
-                                        | StatusCode::METHOD_NOT_ALLOWED
-                                        | StatusCode::BAD_REQUEST
-                                )
-                            })
-                            .unwrap_or(false);
-                        if should_fallback {
-                            self.get_json::<Value>(&format!("{base}/rest/api/3/project"))
-                                .await?
-                        } else {
+                let mut start = 0usize;
+                let mut all = Vec::new();
+                let mut seen = HashSet::new();
+
+                loop {
+                    let search_url = if start == 0 {
+                        format!("{base}/rest/api/3/project/search?maxResults=100")
+                    } else {
+                        format!("{base}/rest/api/3/project/search?maxResults=100&startAt={start}")
+                    };
+                    let val: Value = match self.get_json::<Value>(&search_url).await {
+                        Ok(v) => v,
+                        Err(err) if start == 0 => {
+                            let should_fallback = err
+                                .downcast_ref::<HttpStatusError>()
+                                .map(|e| {
+                                    matches!(
+                                        e.status,
+                                        StatusCode::NOT_FOUND
+                                            | StatusCode::METHOD_NOT_ALLOWED
+                                            | StatusCode::BAD_REQUEST
+                                    )
+                                })
+                                .unwrap_or(false);
+                            if should_fallback {
+                                let fallback = self
+                                    .get_json::<Value>(&format!("{base}/rest/api/3/project"))
+                                    .await?;
+                                let items = fallback
+                                    .as_array()
+                                    .or_else(|| fallback.get("values").and_then(|v| v.as_array()))
+                                    .map(Vec::as_slice)
+                                    .unwrap_or(&[]);
+                                return Ok(items.iter().map(parse_project_summary).collect());
+                            }
                             return Err(err);
                         }
+                        Err(err) => return Err(err),
+                    };
+
+                    let items = val
+                        .as_array()
+                        .or_else(|| val.get("values").and_then(|v| v.as_array()))
+                        .map(Vec::as_slice)
+                        .unwrap_or(&[]);
+                    let got = items.len();
+                    let mut added = 0usize;
+                    for item in items {
+                        let proj = parse_project_summary(item);
+                        if seen.insert(proj.key.clone()) {
+                            all.push(proj);
+                            added += 1;
+                        }
                     }
+                    if added == 0 {
+                        break;
+                    }
+                    let (has_more, _) = offset_page_state(&val, start, got, 100);
+                    if has_more == Some(false) {
+                        break;
+                    }
+                    start += got;
                 }
+
+                Ok(all)
             }
             DeploymentKind::DataCenter => {
-                self.get_json::<Value>(&format!("{base}/rest/api/2/project"))
-                    .await?
+                let val: Value = self
+                    .get_json::<Value>(&format!("{base}/rest/api/2/project"))
+                    .await?;
+                let items = val
+                    .as_array()
+                    .or_else(|| val.get("values").and_then(|v| v.as_array()))
+                    .map(Vec::as_slice)
+                    .unwrap_or(&[]);
+                Ok(items.iter().map(parse_project_summary).collect())
             }
-        };
-
-        let items = val
-            .as_array()
-            .or_else(|| val.get("values").and_then(|v| v.as_array()))
-            .map(Vec::as_slice)
-            .unwrap_or(&[]);
-
-        Ok(items.iter().map(parse_project_summary).collect())
+        }
     }
 
     pub async fn search_issues_jql(
@@ -352,6 +393,14 @@ impl AtlassianClient {
             &mut linked_pages,
         );
 
+        let mut incomplete = Vec::new();
+        if !remote_links_ok {
+            incomplete.push("linked_pages".to_string());
+        }
+        if comments.len() < summary.comment_count {
+            incomplete.push("comments".to_string());
+        }
+
         Ok((
             IssueDetail {
                 summary,
@@ -365,6 +414,7 @@ impl AtlassianClient {
                 linked_pages,
                 attachments,
                 comments,
+                incomplete,
             },
             IssueSubresourceStatus { remote_links_ok },
         ))
@@ -1861,5 +1911,164 @@ mod tests {
         assert_eq!(filters[0].name, "My Bugs");
 
         client.delete_issue("ENG-42").await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn cloud_list_projects_follows_pages_until_is_last() {
+        use axum::extract::Query;
+        use std::collections::HashMap;
+
+        let seen_queries: Arc<Mutex<Vec<Option<String>>>> = Arc::new(Mutex::new(Vec::new()));
+        let sq = seen_queries.clone();
+        let all_projects: Vec<Value> = (1..=150)
+            .map(|i| {
+                json!({
+                    "id": format!("{i}"),
+                    "key": format!("P{i:03}"),
+                    "name": format!("Project {i:03}"),
+                    "projectTypeKey": "software"
+                })
+            })
+            .collect();
+
+        let app = Router::new().route(
+            "/rest/api/3/project/search",
+            get(move |Query(q): Query<HashMap<String, String>>| {
+                let sq = sq.clone();
+                let all_projects = all_projects.clone();
+                async move {
+                    sq.lock().unwrap().push(q.get("startAt").cloned());
+                    let start: usize = q
+                        .get("startAt")
+                        .and_then(|s| s.parse().ok())
+                        .unwrap_or(0);
+                    let max: usize = q
+                        .get("maxResults")
+                        .and_then(|s| s.parse().ok())
+                        .unwrap_or(100);
+                    let slice: Vec<Value> = all_projects
+                        .iter()
+                        .skip(start)
+                        .take(max)
+                        .cloned()
+                        .collect();
+                    let is_last = start + slice.len() >= all_projects.len();
+                    Json(json!({
+                        "startAt": start,
+                        "maxResults": max,
+                        "total": all_projects.len(),
+                        "isLast": is_last,
+                        "values": slice
+                    }))
+                }
+            }),
+        );
+
+        let base_url = spawn_router(app).await;
+        let client = make_client(&base_url, DeploymentKind::Cloud);
+
+        let projects = client.list_projects().await.unwrap();
+        assert_eq!(projects.len(), 150);
+        assert_eq!(projects[0].key, "P001");
+        assert_eq!(projects[149].key, "P150");
+        assert_eq!(
+            *seen_queries.lock().unwrap(),
+            vec![None, Some("100".to_string())]
+        );
+    }
+
+    #[tokio::test]
+    async fn cloud_list_projects_stops_on_exact_page_and_repeated_page() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let exact_calls = Arc::new(AtomicUsize::new(0));
+        let ec = exact_calls.clone();
+        let page100: Vec<Value> = (1..=100)
+            .map(|i| {
+                json!({
+                    "id": format!("{i}"),
+                    "key": format!("EX{i:03}"),
+                    "name": format!("Exact {i:03}"),
+                    "projectTypeKey": "software"
+                })
+            })
+            .collect();
+        let p1 = page100.clone();
+        let app_exact = Router::new().route(
+            "/rest/api/3/project/search",
+            get(move || {
+                let ec = ec.clone();
+                let p1 = p1.clone();
+                async move {
+                    ec.fetch_add(1, Ordering::SeqCst);
+                    Json(json!({ "isLast": true, "values": p1 }))
+                }
+            }),
+        );
+        let base_exact = spawn_router(app_exact).await;
+        let client_exact = make_client(&base_exact, DeploymentKind::Cloud);
+        let projects_exact = client_exact.list_projects().await.unwrap();
+        assert_eq!(projects_exact.len(), 100);
+        assert_eq!(exact_calls.load(Ordering::SeqCst), 1);
+
+        let repeat_calls = Arc::new(AtomicUsize::new(0));
+        let rc = repeat_calls.clone();
+        let app_repeat = Router::new().route(
+            "/rest/api/3/project/search",
+            get(move || {
+                let rc = rc.clone();
+                let page100 = page100.clone();
+                async move {
+                    rc.fetch_add(1, Ordering::SeqCst);
+                    Json(json!({ "values": page100 }))
+                }
+            }),
+        );
+        let base_repeat = spawn_router(app_repeat).await;
+        let client_repeat = make_client(&base_repeat, DeploymentKind::Cloud);
+        let projects_repeat = client_repeat.list_projects().await.unwrap();
+        assert_eq!(projects_repeat.len(), 100);
+        assert_eq!(repeat_calls.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn cloud_list_projects_error_on_second_page_returns_error() {
+        use axum::extract::Query;
+        use std::collections::HashMap;
+
+        let page100: Vec<Value> = (1..=100)
+            .map(|i| {
+                json!({
+                    "id": format!("{i}"),
+                    "key": format!("ER{i:03}"),
+                    "name": format!("ErrProj {i:03}"),
+                    "projectTypeKey": "software"
+                })
+            })
+            .collect();
+
+        let app = Router::new().route(
+            "/rest/api/3/project/search",
+            get(move |Query(q): Query<HashMap<String, String>>| {
+                let page100 = page100.clone();
+                async move {
+                    if q.contains_key("startAt") {
+                        (
+                            AxumStatus::INTERNAL_SERVER_ERROR,
+                            Json(json!({ "message": "second page failed" })),
+                        )
+                    } else {
+                        (
+                            AxumStatus::OK,
+                            Json(json!({ "isLast": false, "values": page100 })),
+                        )
+                    }
+                }
+            }),
+        );
+
+        let base_url = spawn_router(app).await;
+        let client = make_client(&base_url, DeploymentKind::Cloud);
+        assert!(client.list_projects().await.is_err());
     }
 }

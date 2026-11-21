@@ -80,7 +80,8 @@ atlassian doctor
 atlassian boards --project ENG --json
 atlassian issues --jql "project = ENG AND sprint in openSprints()" --json
 atlassian search "migration runbook" --json
-atlassian view ENG-101 --json --compact
+atlassian view ENG-101 --json
+atlassian view ENG-101 --json --full
 atlassian edit ENG-101 --append "Confirm monitoring before rollout." --dry-run
 atlassian transition ENG-101 "In Review" --comment "Canary 50% green"
 atlassian attach ENG-101 ./architecture.png
@@ -88,7 +89,8 @@ atlassian attach ENG-101 ./architecture.png
 # Confluence spaces, pages and versioned edits
 conf spaces --json
 conf pages ENG --json
-conf view 40211 --json --compact
+conf view 40211 --json
+conf view 40211 --json --full
 # This example uses page.version_number 7.
 conf edit 40211 --prev-version 7 --replace "canary" "canary-verified"
 # Preview replacing the body under a top-level Confluence Cloud heading.
@@ -116,6 +118,8 @@ Add `--dry-run` to print the pending changes as JSON before saving.
 
 If you are upgrading from 0.3.x, change shell commands such as `jira view ENG-101 --json` to `atlassian view ENG-101 --json`. In MCP settings, change `"command": "jira"` to `"command": "atlassian"` and keep the `mcp` argument.
 
+If you are upgrading from 0.5.x, `atlassian view --json` and `conf view --json` now return compact JSON by default (with `omitted` counts and a `hint`). Pass `--full` (for example `atlassian view ENG-101 --json --full`) in scripts that expect the full structure. `projects --json`, `boards --json`, and MCP `list_projects` / `list_boards` default to 50 items with `has_more` and `next_cursor`; pass `--limit 1000` / `limit: 1000` and continue with `cursor` when needed. `has_children` on page summaries can now be `null` when unknown.
+
 For Jira, `fields.json` maps explicit field IDs to JSON values, such as `{"customfield_10100":3}`. The Data Center parent command sets a Jira Software epic on an eligible issue. Confluence Data Center page moves take `--prev-version` from the current page read and require a parent in the same space. [Operation details and supported APIs](docs/MCP.md#incremental-jira-and-confluence-operations)
 
 ### Local HTTP JSON API (`atlassian serve`)
@@ -141,7 +145,7 @@ Full endpoint catalog and OpenAPI schema: **[docs/API.md](docs/API.md)** · **[d
 }
 ```
 
-The two MCP detail tools return identifying fields and full Markdown by default. Set `compact: false` for native body data and the full structure.
+Both CLI `--json` detail views (`atlassian view`, `atlassian wiki view`, `conf view`) and the two MCP detail tools (`get_jira_issue`, `get_confluence_page`) return compact responses with identifying fields, full Markdown, an `omitted` summary, and a `hint` by default. Pass `--json --full` in the CLI or `compact: false` in MCP for native body data and the full structure. In `omitted`, a `null` count means the collection could not be confirmed in full (failed or truncated subresource).
 
 Full tool catalog and argument schemas: **[docs/MCP.md](docs/MCP.md)** · npm packaging details: **[docs/NPM.md](docs/NPM.md)**.
 

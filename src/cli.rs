@@ -26,8 +26,8 @@ use crate::{
     },
     daemon, img_preview,
     models::{
-        AttachmentItem, BoardSummary, IssueDetail, IssueSummary, IssueUpdate, OutgoingIssue,
-        OutgoingPage, PageDetail, SprintSummary, StatusCategory,
+        parse_offset_cursor, slice_page, AttachmentItem, BoardSummary, IssueDetail, IssueSummary,
+        IssueUpdate, OutgoingIssue, OutgoingPage, PageDetail, SprintSummary, StatusCategory,
     },
     serve::{self, ServeOptions},
     storage::{SiteRecord, Storage},
@@ -318,6 +318,12 @@ pub enum Command {
     Projects {
         #[arg(long)]
         refresh: bool,
+        /// Maximum number of projects to return (default: 50 for --json, all for text)
+        #[arg(long)]
+        limit: Option<usize>,
+        /// Pagination offset cursor from next_cursor
+        #[arg(long)]
+        cursor: Option<String>,
         #[arg(long)]
         json: bool,
     },
@@ -327,12 +333,24 @@ pub enum Command {
         project: Option<String>,
         #[arg(long)]
         refresh: bool,
+        /// Maximum number of boards to return (default: 50 for --json, all for text)
+        #[arg(long)]
+        limit: Option<usize>,
+        /// Pagination offset cursor from next_cursor
+        #[arg(long)]
+        cursor: Option<String>,
         #[arg(long)]
         json: bool,
     },
-    /// List sprints for a Jira Agile board
+    /// List active and future sprints for a Jira Agile board
     Sprints {
         board_id: i64,
+        /// Maximum number of sprints to return (up to 50 per live call)
+        #[arg(long, default_value_t = 50)]
+        limit: usize,
+        /// Pagination offset cursor from next_cursor
+        #[arg(long)]
+        cursor: Option<String>,
         #[arg(long)]
         json: bool,
     },
@@ -357,6 +375,12 @@ pub enum Command {
         status: Option<String>,
         #[arg(long, default_value_t = 50)]
         limit: usize,
+        /// Cloud pagination token from next_page_token
+        #[arg(long = "page-token", conflicts_with_all = ["start_at", "offline"])]
+        page_token: Option<String>,
+        /// Data Center 0-based pagination offset from next_start_at
+        #[arg(long = "start-at", conflicts_with = "offline")]
+        start_at: Option<usize>,
         #[arg(long)]
         offline: bool,
         #[arg(long)]
@@ -372,9 +396,12 @@ pub enum Command {
         offline: bool,
         #[arg(long)]
         json: bool,
-        /// Return only identifying fields and the full Markdown body
+        /// Accepted for compatibility: compact is the default for --json
         #[arg(long, requires = "json")]
         compact: bool,
+        /// Return the full structure: native body, blocks, comments, attachments
+        #[arg(long, requires = "json", conflicts_with = "compact")]
+        full: bool,
     },
     /// Create a new Jira issue
     #[command(visible_alias = "new")]
@@ -483,6 +510,12 @@ pub enum Command {
         remote: bool,
         #[arg(long, default_value_t = 30)]
         limit: usize,
+        /// Cloud pagination token from next_page_token (requires --remote or --jql)
+        #[arg(long = "page-token", conflicts_with = "start_at")]
+        page_token: Option<String>,
+        /// Data Center 0-based pagination offset from next_start_at (requires --remote or --jql)
+        #[arg(long = "start-at")]
+        start_at: Option<usize>,
         #[arg(long)]
         json: bool,
     },
@@ -624,6 +657,9 @@ pub enum ConfluenceCommand {
         refresh: bool,
         #[arg(long, default_value_t = 50)]
         limit: usize,
+        /// Pagination offset cursor from next_cursor
+        #[arg(long)]
+        cursor: Option<String>,
         #[arg(long)]
         json: bool,
     },
@@ -635,6 +671,9 @@ pub enum ConfluenceCommand {
         parent: Option<String>,
         #[arg(long, default_value_t = 50)]
         limit: usize,
+        /// Pagination cursor from next_cursor
+        #[arg(long)]
+        cursor: Option<String>,
         #[arg(long)]
         offline: bool,
         #[arg(long)]
@@ -650,9 +689,12 @@ pub enum ConfluenceCommand {
         offline: bool,
         #[arg(long)]
         json: bool,
-        /// Return only identifying fields and the full Markdown body
+        /// Accepted for compatibility: compact is the default for --json
         #[arg(long, requires = "json")]
         compact: bool,
+        /// Return the full structure: native body, blocks, comments, attachments
+        #[arg(long, requires = "json", conflicts_with = "compact")]
+        full: bool,
     },
     /// Create a new Confluence page
     #[command(visible_alias = "new")]
@@ -811,6 +853,9 @@ pub enum WikiCommand {
         refresh: bool,
         #[arg(long, default_value_t = 50)]
         limit: usize,
+        /// Pagination offset cursor from next_cursor
+        #[arg(long)]
+        cursor: Option<String>,
         #[arg(long)]
         json: bool,
     },
@@ -822,6 +867,9 @@ pub enum WikiCommand {
         parent: Option<String>,
         #[arg(long, default_value_t = 50)]
         limit: usize,
+        /// Pagination cursor from next_cursor
+        #[arg(long)]
+        cursor: Option<String>,
         #[arg(long)]
         offline: bool,
         #[arg(long)]
@@ -837,9 +885,12 @@ pub enum WikiCommand {
         offline: bool,
         #[arg(long)]
         json: bool,
-        /// Return only identifying fields and the full Markdown body
+        /// Accepted for compatibility: compact is the default for --json
         #[arg(long, requires = "json")]
         compact: bool,
+        /// Return the full structure: native body, blocks, comments, attachments
+        #[arg(long, requires = "json", conflicts_with = "compact")]
+        full: bool,
     },
     /// Create a new Confluence page
     #[command(visible_alias = "new")]
@@ -932,6 +983,12 @@ pub enum JiraSubcommand {
     Projects {
         #[arg(long)]
         refresh: bool,
+        /// Maximum number of projects to return (default: 50 for --json, all for text)
+        #[arg(long)]
+        limit: Option<usize>,
+        /// Pagination offset cursor from next_cursor
+        #[arg(long)]
+        cursor: Option<String>,
         #[arg(long)]
         json: bool,
     },
@@ -941,12 +998,24 @@ pub enum JiraSubcommand {
         project: Option<String>,
         #[arg(long)]
         refresh: bool,
+        /// Maximum number of boards to return (default: 50 for --json, all for text)
+        #[arg(long)]
+        limit: Option<usize>,
+        /// Pagination offset cursor from next_cursor
+        #[arg(long)]
+        cursor: Option<String>,
         #[arg(long)]
         json: bool,
     },
-    /// List sprints for a board
+    /// List active and future sprints for a board
     Sprints {
         board_id: i64,
+        /// Maximum number of sprints to return (up to 50 per live call)
+        #[arg(long, default_value_t = 50)]
+        limit: usize,
+        /// Pagination offset cursor from next_cursor
+        #[arg(long)]
+        cursor: Option<String>,
         #[arg(long)]
         json: bool,
     },
@@ -971,6 +1040,12 @@ pub enum JiraSubcommand {
         status: Option<String>,
         #[arg(long, default_value_t = 50)]
         limit: usize,
+        /// Cloud pagination token from next_page_token
+        #[arg(long = "page-token", conflicts_with_all = ["start_at", "offline"])]
+        page_token: Option<String>,
+        /// Data Center 0-based pagination offset from next_start_at
+        #[arg(long = "start-at", conflicts_with = "offline")]
+        start_at: Option<usize>,
         #[arg(long)]
         offline: bool,
         #[arg(long)]
@@ -986,9 +1061,12 @@ pub enum JiraSubcommand {
         offline: bool,
         #[arg(long)]
         json: bool,
-        /// Return only identifying fields and the full Markdown body
+        /// Accepted for compatibility: compact is the default for --json
         #[arg(long, requires = "json")]
         compact: bool,
+        /// Return the full structure: native body, blocks, comments, attachments
+        #[arg(long, requires = "json", conflicts_with = "compact")]
+        full: bool,
     },
     /// Create a new Jira issue
     #[command(visible_alias = "new")]
@@ -1097,6 +1175,12 @@ pub enum JiraSubcommand {
         remote: bool,
         #[arg(long, default_value_t = 30)]
         limit: usize,
+        /// Cloud pagination token from next_page_token (requires --remote or --jql)
+        #[arg(long = "page-token", conflicts_with = "start_at")]
+        page_token: Option<String>,
+        /// Data Center 0-based pagination offset from next_start_at (requires --remote or --jql)
+        #[arg(long = "start-at")]
+        start_at: Option<usize>,
         #[arg(long)]
         json: bool,
     },
@@ -1576,21 +1660,41 @@ async fn dispatch_jira_cli(
             let scoped = apply_site_override(cfg, site_override.as_deref())?;
             Box::pin(cmd_doctor(&scoped, persona, probe, json)).await
         }
-        Some(Command::Projects { refresh, json }) => {
+        Some(Command::Projects {
+            refresh,
+            limit,
+            cursor,
+            json,
+        }) => {
             let scoped = apply_site_override(cfg, site_override.as_deref())?;
-            Box::pin(cmd_projects(&scoped, refresh, json)).await
+            Box::pin(cmd_projects(&scoped, refresh, limit, cursor.as_deref(), json)).await
         }
         Some(Command::Boards {
             project,
             refresh,
+            limit,
+            cursor,
             json,
         }) => {
             let scoped = apply_site_override(cfg, site_override.as_deref())?;
-            Box::pin(cmd_boards(&scoped, project.as_deref(), refresh, json)).await
+            Box::pin(cmd_boards(
+                &scoped,
+                project.as_deref(),
+                refresh,
+                limit,
+                cursor.as_deref(),
+                json,
+            ))
+            .await
         }
-        Some(Command::Sprints { board_id, json }) => {
+        Some(Command::Sprints {
+            board_id,
+            limit,
+            cursor,
+            json,
+        }) => {
             let scoped = apply_site_override(cfg, site_override.as_deref())?;
-            Box::pin(cmd_sprints(&scoped, board_id, json)).await
+            Box::pin(cmd_sprints(&scoped, board_id, limit, cursor.as_deref(), json)).await
         }
         Some(Command::Board {
             board_id,
@@ -1606,6 +1710,8 @@ async fn dispatch_jira_cli(
             mine,
             status,
             limit,
+            page_token,
+            start_at,
             offline,
             json,
         }) => {
@@ -1617,6 +1723,8 @@ async fn dispatch_jira_cli(
                 mine,
                 status.as_deref(),
                 limit,
+                page_token.as_deref(),
+                start_at,
                 offline,
                 json,
             ))
@@ -1631,7 +1739,8 @@ async fn dispatch_jira_cli(
             preview_images,
             offline,
             json,
-            compact,
+            compact: _,
+            full,
         }) => {
             let scoped = apply_site_override(cfg, site_override.as_deref())?;
             Box::pin(cmd_issue_view(
@@ -1640,7 +1749,7 @@ async fn dispatch_jira_cli(
                 preview_images,
                 offline,
                 json,
-                compact,
+                !full,
             ))
             .await
         }
@@ -1747,10 +1856,22 @@ async fn dispatch_jira_cli(
             jql,
             remote,
             limit,
+            page_token,
+            start_at,
             json,
         }) => {
             let scoped = apply_site_override(cfg, site_override.as_deref())?;
-            Box::pin(cmd_issue_search(&scoped, &query, jql, remote, limit, json)).await
+            Box::pin(cmd_issue_search(
+                &scoped,
+                &query,
+                jql,
+                remote,
+                limit,
+                page_token.as_deref(),
+                start_at,
+                json,
+            ))
+            .await
         }
         Some(Command::Open { key }) => {
             let scoped = apply_site_override(cfg, site_override.as_deref())?;
@@ -1878,15 +1999,17 @@ async fn dispatch_confluence_cli(
         Some(ConfluenceCommand::Spaces {
             refresh,
             limit,
+            cursor,
             json,
         }) => {
             let scoped = apply_site_override(cfg, site_override.as_deref())?;
-            Box::pin(cmd_spaces(&scoped, refresh, limit, json)).await
+            Box::pin(cmd_spaces(&scoped, refresh, limit, cursor.as_deref(), json)).await
         }
         Some(ConfluenceCommand::Pages {
             space,
             parent,
             limit,
+            cursor,
             offline,
             json,
         }) => {
@@ -1896,6 +2019,7 @@ async fn dispatch_confluence_cli(
                 space.as_deref(),
                 parent.as_deref(),
                 limit,
+                cursor.as_deref(),
                 offline,
                 json,
             ))
@@ -1910,7 +2034,8 @@ async fn dispatch_confluence_cli(
             preview_images,
             offline,
             json,
-            compact,
+            compact: _,
+            full,
         }) => {
             let scoped = apply_site_override(cfg, site_override.as_deref())?;
             Box::pin(cmd_page_view(
@@ -1919,7 +2044,7 @@ async fn dispatch_confluence_cli(
                 preview_images,
                 offline,
                 json,
-                compact,
+                !full,
             ))
             .await
         }
@@ -2079,12 +2204,14 @@ async fn dispatch_wiki_subcommand(cfg: &AppConfig, command: WikiCommand) -> Resu
         WikiCommand::Spaces {
             refresh,
             limit,
+            cursor,
             json,
-        } => Box::pin(cmd_spaces(cfg, refresh, limit, json)).await,
+        } => Box::pin(cmd_spaces(cfg, refresh, limit, cursor.as_deref(), json)).await,
         WikiCommand::Pages {
             space,
             parent,
             limit,
+            cursor,
             offline,
             json,
         } => {
@@ -2093,6 +2220,7 @@ async fn dispatch_wiki_subcommand(cfg: &AppConfig, command: WikiCommand) -> Resu
                 space.as_deref(),
                 parent.as_deref(),
                 limit,
+                cursor.as_deref(),
                 offline,
                 json,
             ))
@@ -2106,7 +2234,8 @@ async fn dispatch_wiki_subcommand(cfg: &AppConfig, command: WikiCommand) -> Resu
             preview_images,
             offline,
             json,
-            compact,
+            compact: _,
+            full,
         } => {
             Box::pin(cmd_page_view(
                 cfg,
@@ -2114,7 +2243,7 @@ async fn dispatch_wiki_subcommand(cfg: &AppConfig, command: WikiCommand) -> Resu
                 preview_images,
                 offline,
                 json,
-                compact,
+                !full,
             ))
             .await
         }
@@ -2197,15 +2326,35 @@ async fn dispatch_wiki_subcommand(cfg: &AppConfig, command: WikiCommand) -> Resu
 
 async fn dispatch_jira_subcommand(cfg: &AppConfig, command: JiraSubcommand) -> Result<()> {
     match command {
-        JiraSubcommand::Projects { refresh, json } => Box::pin(cmd_projects(cfg, refresh, json)).await,
+        JiraSubcommand::Projects {
+            refresh,
+            limit,
+            cursor,
+            json,
+        } => Box::pin(cmd_projects(cfg, refresh, limit, cursor.as_deref(), json)).await,
         JiraSubcommand::Boards {
             project,
             refresh,
+            limit,
+            cursor,
             json,
-        } => Box::pin(cmd_boards(cfg, project.as_deref(), refresh, json)).await,
-        JiraSubcommand::Sprints { board_id, json } => {
-            Box::pin(cmd_sprints(cfg, board_id, json)).await
+        } => {
+            Box::pin(cmd_boards(
+                cfg,
+                project.as_deref(),
+                refresh,
+                limit,
+                cursor.as_deref(),
+                json,
+            ))
+            .await
         }
+        JiraSubcommand::Sprints {
+            board_id,
+            limit,
+            cursor,
+            json,
+        } => Box::pin(cmd_sprints(cfg, board_id, limit, cursor.as_deref(), json)).await,
         JiraSubcommand::Board {
             board_id,
             sprint,
@@ -2217,6 +2366,8 @@ async fn dispatch_jira_subcommand(cfg: &AppConfig, command: JiraSubcommand) -> R
             mine,
             status,
             limit,
+            page_token,
+            start_at,
             offline,
             json,
         } => {
@@ -2227,6 +2378,8 @@ async fn dispatch_jira_subcommand(cfg: &AppConfig, command: JiraSubcommand) -> R
                 mine,
                 status.as_deref(),
                 limit,
+                page_token.as_deref(),
+                start_at,
                 offline,
                 json,
             ))
@@ -2238,7 +2391,8 @@ async fn dispatch_jira_subcommand(cfg: &AppConfig, command: JiraSubcommand) -> R
             preview_images,
             offline,
             json,
-            compact,
+            compact: _,
+            full,
         } => {
             Box::pin(cmd_issue_view(
                 cfg,
@@ -2246,7 +2400,7 @@ async fn dispatch_jira_subcommand(cfg: &AppConfig, command: JiraSubcommand) -> R
                 preview_images,
                 offline,
                 json,
-                compact,
+                !full,
             ))
             .await
         }
@@ -2343,8 +2497,22 @@ async fn dispatch_jira_subcommand(cfg: &AppConfig, command: JiraSubcommand) -> R
             jql,
             remote,
             limit,
+            page_token,
+            start_at,
             json,
-        } => Box::pin(cmd_issue_search(cfg, &query, jql, remote, limit, json)).await,
+        } => {
+            Box::pin(cmd_issue_search(
+                cfg,
+                &query,
+                jql,
+                remote,
+                limit,
+                page_token.as_deref(),
+                start_at,
+                json,
+            ))
+            .await
+        }
         JiraSubcommand::Open { key } => Box::pin(cmd_issue_open(cfg, &key)).await,
     }
 }
@@ -3650,28 +3818,52 @@ async fn cmd_doctor(
 // Jira commands
 // ---------------------------------------------------------------------------
 
-async fn cmd_projects(cfg: &AppConfig, refresh: bool, json_out: bool) -> Result<()> {
+async fn cmd_projects(
+    cfg: &AppConfig,
+    refresh: bool,
+    limit: Option<usize>,
+    cursor: Option<&str>,
+    json_out: bool,
+) -> Result<()> {
+    let offset = parse_offset_cursor(cursor).map_err(anyhow::Error::msg)?;
+    let eff_limit = limit
+        .map(serve::clamp_limit)
+        .unwrap_or(if json_out { 50 } else { usize::MAX });
     let (auth, client, storage) = open_runtime(cfg, refresh)?;
     let site_id = client.site_id();
     let cached = storage.list_projects_for_site(site_id)?;
-    let projects = if refresh || cached.is_empty() {
+    let all = if refresh || cached.is_empty() {
         if !refresh && !auth.is_logged_in() {
             cached
         } else {
             let fetched = client.list_projects().await?;
             let _ = storage.upsert_projects_for_site(site_id, &fetched);
-            fetched
+            let stored = storage.list_projects_for_site(site_id)?;
+            if stored.is_empty() {
+                fetched
+            } else {
+                stored
+            }
         }
     } else {
         cached
     };
+    let page = slice_page(all, offset, eff_limit);
 
     if json_out {
-        println!("{}", serde_json::to_string_pretty(&json!({ "projects": projects }))?);
-    } else if projects.is_empty() {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&json!({
+                "projects": page.items,
+                "returned": page.items.len(),
+                "has_more": page.has_more,
+                "next_cursor": page.next_cursor,
+            }))?
+        );
+    } else if page.items.is_empty() {
         println!("프로젝트가 없습니다.");
     } else {
-        for p in &projects {
+        for p in &page.items {
             println!(
                 "{:<10} {:<28} [{}] lead={}",
                 p.key,
@@ -3679,6 +3871,9 @@ async fn cmd_projects(cfg: &AppConfig, refresh: bool, json_out: bool) -> Result<
                 p.project_type,
                 p.lead_name.as_deref().unwrap_or("-")
             );
+        }
+        if let Some(next) = page.next_cursor.as_deref() {
+            eprintln!("다음 페이지: --cursor {next}");
         }
     }
     Ok(())
@@ -3688,29 +3883,49 @@ async fn cmd_boards(
     cfg: &AppConfig,
     project: Option<&str>,
     refresh: bool,
+    limit: Option<usize>,
+    cursor: Option<&str>,
     json_out: bool,
 ) -> Result<()> {
+    let offset = parse_offset_cursor(cursor).map_err(anyhow::Error::msg)?;
+    let eff_limit = limit
+        .map(serve::clamp_limit)
+        .unwrap_or(if json_out { 50 } else { usize::MAX });
     let (auth, client, storage) = open_runtime(cfg, refresh)?;
     let site_id = client.site_id();
     let cached = storage.list_boards_for_site(site_id, project)?;
-    let boards = if refresh || cached.is_empty() {
+    let all = if refresh || cached.is_empty() {
         if !refresh && !auth.is_logged_in() {
             cached
         } else {
             let fetched = client.list_boards(project).await?;
             let _ = storage.upsert_boards_for_site(site_id, &fetched);
-            fetched
+            let stored = storage.list_boards_for_site(site_id, project)?;
+            if stored.is_empty() {
+                fetched
+            } else {
+                stored
+            }
         }
     } else {
         cached
     };
+    let page = slice_page(all, offset, eff_limit);
 
     if json_out {
-        println!("{}", serde_json::to_string_pretty(&json!({ "boards": boards }))?);
-    } else if boards.is_empty() {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&json!({
+                "boards": page.items,
+                "returned": page.items.len(),
+                "has_more": page.has_more,
+                "next_cursor": page.next_cursor,
+            }))?
+        );
+    } else if page.items.is_empty() {
         println!("보드가 없습니다.");
     } else {
-        for b in &boards {
+        for b in &page.items {
             println!(
                 "#{:<6} {:<32} ({}) project={}",
                 b.id,
@@ -3719,25 +3934,43 @@ async fn cmd_boards(
                 b.project_key.as_deref().unwrap_or("-")
             );
         }
+        if let Some(next) = page.next_cursor.as_deref() {
+            eprintln!("다음 페이지: --cursor {next}");
+        }
     }
     Ok(())
 }
 
-async fn cmd_sprints(cfg: &AppConfig, board_id: i64, json_out: bool) -> Result<()> {
+async fn cmd_sprints(
+    cfg: &AppConfig,
+    board_id: i64,
+    limit: usize,
+    cursor: Option<&str>,
+    json_out: bool,
+) -> Result<()> {
+    let start = parse_offset_cursor(cursor).map_err(anyhow::Error::msg)?;
     let (_auth, client, storage) = open_runtime(cfg, true)?;
     let site_id = client.site_id();
-    let sprints = client.list_board_sprints(board_id).await?;
-    let _ = storage.upsert_sprints_for_site(site_id, &sprints);
+    let page = client
+        .list_board_sprints_page(board_id, serve::clamp_limit(limit), start)
+        .await?;
+    let _ = storage.upsert_sprints_for_site(site_id, &page.items);
 
     if json_out {
         println!(
             "{}",
-            serde_json::to_string_pretty(&json!({ "board_id": board_id, "sprints": sprints }))?
+            serde_json::to_string_pretty(&json!({
+                "board_id": board_id,
+                "sprints": page.items,
+                "returned": page.items.len(),
+                "has_more": page.has_more,
+                "next_cursor": page.next_cursor,
+            }))?
         );
-    } else if sprints.is_empty() {
+    } else if page.items.is_empty() {
         println!("보드 #{board_id}에 스프린트가 없습니다.");
     } else {
-        for s in &sprints {
+        for s in &page.items {
             println!(
                 "#{:<6} [{}] {:<28} {} ~ {}",
                 s.id,
@@ -3746,6 +3979,9 @@ async fn cmd_sprints(cfg: &AppConfig, board_id: i64, json_out: bool) -> Result<(
                 s.start_date.as_deref().unwrap_or("-"),
                 s.end_date.as_deref().unwrap_or("-")
             );
+        }
+        if let Some(next) = page.next_cursor.as_deref() {
+            eprintln!("다음 페이지: --cursor {next}");
         }
     }
     Ok(())
@@ -3837,6 +4073,8 @@ async fn cmd_issues(
     mine: bool,
     status: Option<&str>,
     limit: usize,
+    page_token: Option<&str>,
+    start_at: Option<usize>,
     offline: bool,
     json_out: bool,
 ) -> Result<()> {
@@ -3844,13 +4082,14 @@ async fn cmd_issues(
     let site_id = client.site_id();
     let limit = serve::clamp_limit(limit);
 
-    let mut issues = if offline {
+    let (issues, remote_page) = if offline {
         let mut list = storage.list_issues_for_site(site_id, project, limit)?;
         if let Some(st) = status {
             let st_low = st.trim().to_ascii_lowercase();
             list.retain(|i| i.status.name.to_ascii_lowercase().contains(&st_low));
         }
-        list
+        list.truncate(limit);
+        (list, None)
     } else {
         let effective_jql = if let Some(raw) = jql {
             raw.to_string()
@@ -3874,16 +4113,27 @@ async fn cmd_issues(
             }
         };
         let page = client
-            .search_issues_jql(&effective_jql, limit, None, None)
+            .search_issues_jql(&effective_jql, limit, page_token, start_at)
             .await?;
         let _ = storage.upsert_issues_for_site(site_id, &page.issues);
-        page.issues
+        let issues = page.issues.clone();
+        (issues, Some(page))
     };
 
-    issues.truncate(limit);
-
     if json_out {
-        println!("{}", serde_json::to_string_pretty(&json!({ "issues": issues }))?);
+        if let Some(page) = remote_page {
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&json!({
+                    "issues": page.issues,
+                    "next_page_token": page.next_page_token,
+                    "next_start_at": page.next_start_at,
+                    "total": page.total,
+                }))?
+            );
+        } else {
+            println!("{}", serde_json::to_string_pretty(&json!({ "issues": issues }))?);
+        }
     } else if issues.is_empty() {
         println!("이슈가 없습니다.");
     } else {
@@ -3902,6 +4152,13 @@ async fn cmd_issues(
                 "{:<12} [{:<12}] ({:<6}) {:<12} {}",
                 issue.key, issue.status.name, prio, assignee, issue.summary
             );
+        }
+        if let Some(page) = remote_page {
+            if let Some(tok) = page.next_page_token.as_deref() {
+                eprintln!("다음 페이지: --page-token {tok}");
+            } else if let Some(next_start) = page.next_start_at {
+                eprintln!("다음 페이지: --start-at {next_start}");
+            }
         }
     }
     Ok(())
@@ -3944,12 +4201,21 @@ async fn cmd_issue_view(
     };
 
     if json_out {
+        let body = if compact {
+            let mut hint = format!("atlassian view {key} --json --full");
+            if offline {
+                hint.push_str(" --offline");
+            }
+            detail.compact_output(&hint)
+        } else {
+            detail.output(false)
+        };
         println!(
             "{}",
             serde_json::to_string_pretty(&json!({
                 "site_id": site_id,
                 "detail_stale": detail_stale,
-                "issue": detail.output(compact),
+                "issue": body,
             }))?
         );
         return Ok(());
@@ -4369,16 +4635,23 @@ async fn cmd_issue_delete(cfg: &AppConfig, key: &str, yes: bool, json_out: bool)
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn cmd_issue_search(
     cfg: &AppConfig,
     query: &str,
     jql: bool,
     remote: bool,
     limit: usize,
+    page_token: Option<&str>,
+    start_at: Option<usize>,
     json_out: bool,
 ) -> Result<()> {
     let limit = serve::clamp_limit(limit);
     let use_remote = remote || jql;
+    let clean_token = page_token.map(str::trim).filter(|s| !s.is_empty());
+    if !use_remote && (clean_token.is_some() || start_at.is_some()) {
+        bail!("--page-token and --start-at require --remote or --jql");
+    }
     let (_auth, client, storage) = open_runtime(cfg, use_remote)?;
     let site_id = client.site_id();
 
@@ -4392,7 +4665,7 @@ async fn cmd_issue_search(
             )
         };
         let page = client
-            .search_issues_jql(&effective_jql, limit, None, None)
+            .search_issues_jql(&effective_jql, limit, clean_token, start_at)
             .await?;
         let _ = storage.upsert_issues_for_site(site_id, &page.issues);
 
@@ -4404,6 +4677,9 @@ async fn cmd_issue_search(
                     "site_id": site_id,
                     "jql": effective_jql,
                     "issues": page.issues,
+                    "next_page_token": page.next_page_token,
+                    "next_start_at": page.next_start_at,
+                    "total": page.total,
                 }))?
             );
         } else if page.issues.is_empty() {
@@ -4411,6 +4687,11 @@ async fn cmd_issue_search(
         } else {
             for i in &page.issues {
                 println!("{:<12} [{:<12}] {}", i.key, i.status.name, i.summary);
+            }
+            if let Some(tok) = page.next_page_token.as_deref() {
+                eprintln!("다음 페이지: --page-token {tok}");
+            } else if let Some(next_start) = page.next_start_at {
+                eprintln!("다음 페이지: --start-at {next_start}");
             }
         }
     } else {
@@ -4468,31 +4749,54 @@ async fn cmd_issue_open(cfg: &AppConfig, key: &str) -> Result<()> {
 // Confluence commands
 // ---------------------------------------------------------------------------
 
-async fn cmd_spaces(cfg: &AppConfig, refresh: bool, limit: usize, json_out: bool) -> Result<()> {
+async fn cmd_spaces(
+    cfg: &AppConfig,
+    refresh: bool,
+    limit: usize,
+    cursor: Option<&str>,
+    json_out: bool,
+) -> Result<()> {
+    let offset = parse_offset_cursor(cursor).map_err(anyhow::Error::msg)?;
     let limit = serve::clamp_limit(limit);
     let (auth, client, storage) = open_runtime(cfg, refresh)?;
     let site_id = client.site_id();
     let cached = storage.list_spaces_for_site(site_id)?;
-    let mut spaces = if refresh || cached.is_empty() {
+    let all = if refresh || cached.is_empty() {
         if !refresh && !auth.is_logged_in() {
             cached
         } else {
-            let fetched = client.list_spaces(limit).await?;
+            let fetched = client.list_all_spaces().await?;
             let _ = storage.upsert_spaces_for_site(site_id, &fetched);
-            fetched
+            let stored = storage.list_spaces_for_site(site_id)?;
+            if stored.is_empty() {
+                fetched
+            } else {
+                stored
+            }
         }
     } else {
         cached
     };
-    spaces.truncate(limit);
+    let page = slice_page(all, offset, limit);
 
     if json_out {
-        println!("{}", serde_json::to_string_pretty(&json!({ "spaces": spaces }))?);
-    } else if spaces.is_empty() {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&json!({
+                "spaces": page.items,
+                "returned": page.items.len(),
+                "has_more": page.has_more,
+                "next_cursor": page.next_cursor,
+            }))?
+        );
+    } else if page.items.is_empty() {
         println!("스페이스가 없습니다.");
     } else {
-        for s in &spaces {
+        for s in &page.items {
             println!("{:<12} {:<32} [{}]", s.key, s.name, s.space_type);
+        }
+        if let Some(next) = page.next_cursor.as_deref() {
+            eprintln!("다음 페이지: --cursor {next}");
         }
     }
     Ok(())
@@ -4503,55 +4807,86 @@ async fn cmd_pages(
     space: Option<&str>,
     parent: Option<&str>,
     limit: usize,
+    cursor: Option<&str>,
     offline: bool,
     json_out: bool,
 ) -> Result<()> {
+    let clean_cursor = cursor.map(str::trim).filter(|s| !s.is_empty());
+    let first_page = clean_cursor.is_none();
+    let offline_offset = if offline {
+        parse_offset_cursor(clean_cursor).map_err(anyhow::Error::msg)?
+    } else {
+        0
+    };
     let limit = serve::clamp_limit(limit);
     let (_auth, client, storage) = open_runtime(cfg, !offline)?;
     let site_id = client.site_id();
 
-    let mut pages = if let Some(parent_id) = parent {
+    let page = if let Some(parent_id) = parent {
         if offline {
-            storage.list_child_pages_for_site(site_id, parent_id)?
+            let rows = storage.list_child_pages_for_site(site_id, parent_id)?;
+            slice_page(rows, offline_offset, limit)
         } else {
-            let fetched = client.list_child_pages(parent_id).await?;
-            let _ = storage.upsert_pages_for_site(site_id, &fetched);
-            if fetched.len() < 100 {
-                let keep: Vec<String> = fetched.iter().map(|p| p.id.clone()).collect();
-                let _ = storage.prune_child_pages_for_site(site_id, parent_id, &keep);
-            }
+            let mut fetched = client
+                .list_child_pages_page(parent_id, limit, clean_cursor)
+                .await?;
+            let _ = storage.record_child_pages_page_for_site(
+                site_id,
+                parent_id,
+                &fetched,
+                first_page,
+            );
+            let _ = storage.overlay_children_state_for_site(site_id, &mut fetched.items);
             fetched
         }
     } else if let Some(sp) = space.or(cfg.default_space_key.as_deref()) {
         if offline {
-            storage.list_space_root_pages_for_site(site_id, sp)?
+            let rows = storage.list_space_root_pages_for_site(site_id, sp)?;
+            slice_page(rows, offline_offset, limit)
         } else {
-            let fetched = client.list_space_root_pages(sp, limit).await?;
-            let _ = storage.upsert_authoritative_pages_for_site(site_id, &fetched);
-            if fetched.len() < limit {
-                let keep: Vec<String> = fetched.iter().map(|p| p.id.clone()).collect();
-                let _ = storage.prune_space_root_pages_for_site(site_id, sp, &keep);
-            }
+            let mut fetched = client
+                .list_space_root_pages_page(sp, limit, clean_cursor)
+                .await?;
+            let _ = storage.record_root_pages_page_for_site(site_id, sp, &fetched, first_page);
+            let _ = storage.overlay_children_state_for_site(site_id, &mut fetched.items);
             fetched
         }
     } else if offline {
-        storage.list_recent_pages_for_site(site_id, limit)?
+        let rows = storage.list_recent_pages_for_site(
+            site_id,
+            offline_offset.saturating_add(limit).saturating_add(1),
+        )?;
+        slice_page(rows, offline_offset, limit)
     } else {
         bail!("스페이스 키 또는 `--parent <PAGE_ID>` 를 지정하세요.");
     };
-    pages.truncate(limit);
 
     if json_out {
-        println!("{}", serde_json::to_string_pretty(&json!({ "pages": pages }))?);
-    } else if pages.is_empty() {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&json!({
+                "pages": page.items,
+                "returned": page.items.len(),
+                "has_more": page.has_more,
+                "next_cursor": page.next_cursor,
+            }))?
+        );
+    } else if page.items.is_empty() {
         println!("페이지가 없습니다.");
     } else {
-        for p in &pages {
-            let children_mark = if p.has_children { "▸" } else { "·" };
+        for p in &page.items {
+            let children_mark = if p.has_children == Some(true) {
+                "▸"
+            } else {
+                "·"
+            };
             println!(
                 "{children_mark} {:<12} [{}] v{} {}",
                 p.id, p.space_key, p.version_number, p.title
             );
+        }
+        if let Some(next) = page.next_cursor.as_deref() {
+            eprintln!("다음 페이지: --cursor {next}");
         }
     }
     Ok(())
@@ -4593,12 +4928,21 @@ async fn cmd_page_view(
     };
 
     if json_out {
+        let body = if compact {
+            let mut hint = format!("atlassian wiki view {page_id} --json --full");
+            if offline {
+                hint.push_str(" --offline");
+            }
+            detail.compact_output(&hint)
+        } else {
+            detail.output(false)
+        };
         println!(
             "{}",
             serde_json::to_string_pretty(&json!({
                 "site_id": site_id,
                 "detail_stale": detail_stale,
-                "page": detail.output(compact),
+                "page": body,
             }))?
         );
         return Ok(());

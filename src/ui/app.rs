@@ -4570,20 +4570,20 @@ impl AppState {
                         // Keep tree rows updated for title/version changes when matching space/parent.
                         if let Some(roots) = self.root_pages_by_space.get_mut(&d.summary.space_key) {
                             if let Some(existing) = roots.iter_mut().find(|p| p.id == d.summary.id) {
-                                let had_children = existing.has_children;
+                                let had_children = existing.has_children == Some(true);
                                 *existing = d.summary.clone();
                                 if had_children {
-                                    existing.has_children = true;
+                                    existing.has_children = Some(true);
                                 }
                             }
                         }
                         if let Some(ref parent_id) = d.summary.parent_id {
                             if let Some(kids) = self.page_children_map.get_mut(parent_id) {
                                 if let Some(existing) = kids.iter_mut().find(|p| p.id == d.summary.id) {
-                                    let had_children = existing.has_children;
+                                    let had_children = existing.has_children == Some(true);
                                     *existing = d.summary.clone();
                                     if had_children {
-                                        existing.has_children = true;
+                                        existing.has_children = Some(true);
                                     }
                                 }
                             }
@@ -5078,7 +5078,7 @@ pub fn flatten_page_tree(
             }
             let children = children_map.get(&page.id);
             let has_children =
-                page.has_children || children.is_some_and(|c| !c.is_empty());
+                page.has_children == Some(true) || children.is_some_and(|c| !c.is_empty());
             let is_expanded = expanded.contains(&page.id);
             out.push(TreeRow {
                 page: page.clone(),
@@ -5192,14 +5192,14 @@ mod tests {
         let root = PageSummary {
             id: "100".into(),
             title: "Architecture".into(),
-            has_children: true,
+            has_children: Some(true),
             ..Default::default()
         };
         let child = PageSummary {
             id: "101".into(),
             parent_id: Some("100".into()),
             title: "TUI Design".into(),
-            has_children: false,
+            has_children: Some(false),
             ..Default::default()
         };
         let mut children_map = HashMap::new();

@@ -66,6 +66,27 @@ the platform package is missing (for example because optional dependencies were
 skipped), the launcher prints the supported platforms and the
 `--include=optional` hint instead of a stack trace.
 
+## Startup latency
+
+Because the npm package stays postinstall-free, invocations through the npm bin
+shim start Node before spawning the native binary. Measured on public v0.5.1
+Windows x64 (median of 25 interleaved runs after 3 warmups; macOS and Linux
+were not measured):
+
+| Invocation | `--version` p50 |
+| --- | --- |
+| Direct executable (`atlassian.exe`) | 12.67 ms |
+| Node launcher (`node bin/atlassian.js`) | 50.52 ms (+37.85 ms) |
+| npm `.cmd` shim | 66.83 ms |
+| Direct `.cmd` wrapper calling `.exe` (control) | 26.28 ms |
+
+If you invoke short-lived CLI commands in tight loops, you can call the
+platform binary directly at
+`node_modules/@bitefoundry/atlassian-<platform>-<arch>/bin/atlassian[.exe]`.
+For Confluence persona mode when calling the binary directly, set
+`ATLASSIAN_PERSONA=confluence`. Long-running `atlassian mcp` and
+`atlassian serve` sessions pay the launcher startup cost only once at startup.
+
 ## Layout
 
 ```text

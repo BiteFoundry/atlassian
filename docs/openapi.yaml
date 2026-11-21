@@ -1136,6 +1136,11 @@ components:
           type: array
           items:
             $ref: "#/components/schemas/IssueComment"
+        incomplete:
+          type: array
+          description: Collections that could not be confirmed in full (failed or truncated subresource). Omitted when empty.
+          items:
+            type: string
     OutgoingIssue:
       type: object
       required: [project_key, summary]
@@ -1291,7 +1296,8 @@ components:
         position:
           type: integer
         has_children:
-          type: boolean
+          type: [boolean, "null"]
+          description: null when unknown
         web_url:
           type: string
     PageDetail:
@@ -1328,6 +1334,11 @@ components:
             $ref: "#/components/schemas/ConfluenceComment"
         linked_issue_keys:
           type: array
+          items:
+            type: string
+        incomplete:
+          type: array
+          description: Collections that could not be confirmed in full (failed or truncated subresource). Omitted when empty.
           items:
             type: string
     OutgoingPage:

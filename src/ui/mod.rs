@@ -679,7 +679,7 @@ mod tests {
             space_key: "ENG".into(),
             title: "System Architecture".into(),
             version_number: 3,
-            has_children: true,
+            has_children: Some(true),
             ..Default::default()
         };
         app.root_pages_by_space

@@ -105,10 +105,10 @@ args = ["mcp"]
 | Tool | Arguments | Returns |
 | --- | --- | --- |
 | `get_myself` | _(none)_ | `{ "user": {...} }` |
-| `list_projects` | `refresh?` (bool) | `{ "projects": [...] }` |
-| `list_boards` | `project?` (string), `refresh?` (bool) | `{ "boards": [...] }` |
-| `list_sprints` | `board_id` (int), `offline?` (bool) | `{ "board_id": ..., "sprints": [...] }` |
-| `get_board_issues` | `board_id` (int), `sprint_id?` (int), `limit?` (1..1000), `offline?` (bool) | `{ "board_id": ..., "sprint_id": ..., "issues": [...] }` |
+| `list_projects` | `refresh?` (bool), `limit?` (1..1000, default 50), `cursor?` (string) | `{ "projects": [...], "returned": ..., "has_more": ..., "next_cursor": ... }` |
+| `list_boards` | `project?` (string), `refresh?` (bool), `limit?` (1..1000, default 50), `cursor?` (string) | `{ "boards": [...], "returned": ..., "has_more": ..., "next_cursor": ... }` |
+| `list_sprints` | `board_id` (int), `limit?` (1..1000, default 50), `cursor?` (string), `offline?` (bool) | `{ "board_id": ..., "sprints": [...], "returned": ..., "has_more": ..., "next_cursor": ... }` |
+| `get_board_issues` | `board_id` (int), `sprint_id?` (int), `limit?` (1..1000, default 50), `cursor?` (string), `offline?` (bool) | `{ "board_id": ..., "sprint_id": ..., "issues": [...], "returned": ..., "has_more": ..., "next_cursor": ... }` |
 | `search_jira_issues` | `jql?`, `query?`, `project?`, `limit?` (1..1000), `page_token?` (Cloud), `start_at?` (Data Center, >= 0), `offline?` (bool) | `{ "jql": "...", "issues": [...], "next_page_token": ..., "next_start_at": ..., "total": ... }` or offline `{ "offline": true, "hits"\|"issues": [...] }` |
 | `get_jira_issue` | `key` (string), `offline?` (bool), `compact?` (bool) | `{ "issue": {...} }` |
 | `create_jira_issue` | `project_key`, `summary`, `issue_type?`, `description_markdown?`, `priority?`, `assignee_id?`, `labels?`, `parent_key?` | `{ "ok": true, "issue": {...} }` |
@@ -129,9 +129,9 @@ args = ["mcp"]
 
 | Tool | Arguments | Returns |
 | --- | --- | --- |
-| `list_confluence_spaces` | `refresh?` (bool), `limit?` (1..1000) | `{ "spaces": [...] }` |
-| `list_space_pages` | `space_key`, `limit?` (1..1000), `offline?` (bool) | `{ "space_key": "...", "pages": [...] }` |
-| `list_child_pages` | `page_id`, `offline?` (bool) | `{ "parent_id": "...", "pages": [...] }` |
+| `list_confluence_spaces` | `refresh?` (bool), `limit?` (1..1000, default 50), `cursor?` (string) | `{ "spaces": [...], "returned": ..., "has_more": ..., "next_cursor": ... }` |
+| `list_space_pages` | `space_key`, `limit?` (1..1000, default 50), `cursor?` (string), `offline?` (bool) | `{ "space_key": "...", "pages": [...], "returned": ..., "has_more": ..., "next_cursor": ... }` |
+| `list_child_pages` | `page_id`, `limit?` (1..1000, default 100), `cursor?` (string), `offline?` (bool) | `{ "parent_id": "...", "pages": [...], "returned": ..., "has_more": ..., "next_cursor": ... }` |
 | `get_confluence_page` | `page_id`, `offline?` (bool), `compact?` (bool) | `{ "page": {...} }` |
 | `create_confluence_page` | `space_id_or_key`, `title`, `body_markdown?`, `parent_id?` | `{ "ok": true, "page": {...} }` |
 | `update_confluence_page` | `page_id`, `title?`, `body_markdown?`, `append_markdown?`, `replace_text?`, `replace_section?`, `prev_version?`, `version_message?`, `dry_run?` (bool) | Updated `page` or a `preview` |
@@ -139,6 +139,8 @@ args = ["mcp"]
 | `search_confluence_pages` | `query?`, `cql?`, `remote?` (bool), `limit?` (1..1000) | `{ "remote": ..., "hits"\|"pages": [...] }` |
 
 > **Search queries & pagination**: Plain-text `query` values (including phrases containing `and`, `or`, `=`, or `~` such as `read and write` or `timeout=30`) are escaped into `text ~ "..."` (with `project = "..." AND ...` when `project` is supplied). Standard leading field expressions (e.g. `project = FLS`, `space = ENG`, `status IN (...)`, `cf[10016] >= 5`, or `ORDER BY ...`) are recognized automatically; pass explicit `jql` (e.g. `{"jql": "customField = \"value\""}`) or `cql` (e.g. `{"cql": "customMeta = \"value\""}`) for custom raw expressions. For Jira pagination, use `page_token` on Cloud and `start_at` (from `next_start_at`) on Data Center; passing both cursors together is rejected.
+
+> **Collection paging**: `list_projects`, `list_boards`, `list_confluence_spaces`, `list_sprints`, `get_board_issues`, `list_space_pages`, and `list_child_pages` include `returned`, `has_more` (`true`, `false`, or `null` when upstream gives no completion signal), and `next_cursor` (`string` or `null`). Pass `next_cursor` back as `cursor` with the same arguments to continue. Catalog tools (`list_projects`, `list_boards`, `list_confluence_spaces`) follow all upstream pages on refresh and page locally from SQLite by integer offset; when reading from a cache populated by sync, pass `refresh: true` to load the full catalog. Single-page remote tools fetch one upstream page per call, capped by upstream per-call limits (`get_board_issues`: 100, `list_space_pages` / `list_child_pages`: 250, `list_sprints`: 50). `list_sprints` returns `active` and `future` sprints only. On Confluence page summaries, `has_children` is `true`, `false`, or `null` when unknown from cache without extra requests.
 | `delete_confluence_page` | `page_id`, `confirm` (must be literal `true`) | `{ "ok": true, "page_id": "..." }` |
 | `upload_confluence_attachment` | `page_id`, `path` (local file path) | `attachments` metadata |
 | `move_confluence_page` | `page_id`, `parent_id`, `prev_version?` (required on Data Center) | `page` summary with confirmed parent and version |
@@ -156,7 +158,7 @@ args = ["mcp"]
 
 ## Read and edit bodies
 
-- `get_jira_issue` and `get_confluence_page` default to `compact: true` for live and offline reads. Both return full Markdown. An issue includes its key, summary, and status, and a page includes its ID, title, space, and version. Set `compact: false` to keep the full response shape used by earlier versions.
+- `get_jira_issue` and `get_confluence_page` default to `compact: true` for live and offline reads. Both return full Markdown, an `omitted` object summarizing left-out collections and field paths (`null` when a subresource failed or was truncated), and a `hint` showing how to request the full response. An issue includes its key, summary, and status, and a page includes its ID, title, space, and version. Set `compact: false` for the full response structure; when any subresource failed or was truncated, the full response includes an `incomplete` array listing those collections.
 - Pass one of the body fields when editing. Use `description_markdown` for a full Jira description or `body_markdown` for a full Confluence body. `append_markdown` adds a fragment to the native body. `replace_text` accepts an object with `old_text` and `new_text` and requires one match in a single source text node.
 - Pass the current `page.version_number` from a compact read or `page.summary.version_number` from a full read as `prev_version` for any Confluence body edit.
 - Use `replace_section: {"heading":"Rollout","markdown":"Verify the canary."}` on a Confluence Cloud ADF page. The heading text needs an exact, unique match among top-level headings and direct headings inside layout columns. The edit keeps that heading and replaces the content up to the next heading at the same or a higher level in the same container (or the end of that container). An empty Markdown string removes that content.

@@ -733,7 +733,7 @@ async fn list_board_issues(
             query.sprint_id,
             &fetched,
         );
-        if fetched.len() < limit {
+        if fetched.len() < limit.min(100) {
             let keep: Vec<String> = fetched.iter().map(|i| i.key.clone()).collect();
             let _ = state.storage.prune_board_issues_for_site(
                 &target_site,
@@ -777,7 +777,9 @@ async fn list_issues(
     if query.offline {
         let target_site = resolve_single_site_id(&state, query.site.as_deref())?;
         let issues = state.storage.list_issues_for_site(&target_site, project, limit)?;
-        let total = issues.len();
+        let total = state
+            .storage
+            .count_issues_for_site(&target_site, project)?;
         return Ok(Json(json!({
             "site_id": target_site,
             "issues": issues,
@@ -1096,16 +1098,19 @@ async fn list_space_pages(
             .list_space_root_pages_for_site(&target_site, space)?
     } else {
         let (target_site, client) = resolve_site_client(&state, query.site.as_deref())?;
-        let fetched = client.list_space_root_pages(space, limit).await?;
+        let mut fetched = client.list_space_root_pages(space, limit).await?;
         let _ = state
             .storage
             .upsert_authoritative_pages_for_site(&target_site, &fetched);
-        if fetched.len() < limit {
+        if fetched.len() < limit.min(250) {
             let keep: Vec<String> = fetched.iter().map(|p| p.id.clone()).collect();
             let _ = state
                 .storage
                 .prune_space_root_pages_for_site(&target_site, space, &keep);
         }
+        let _ = state
+            .storage
+            .overlay_children_state_for_site(&target_site, &mut fetched);
         fetched
     };
     pages.truncate(limit);
@@ -1167,7 +1172,7 @@ async fn list_child_pages(
         state.storage.list_child_pages_for_site(&target_site, id)?
     } else {
         let (target_site, client) = resolve_site_client(&state, query.site.as_deref())?;
-        let fetched = client.list_child_pages(id).await?;
+        let mut fetched = client.list_child_pages(id).await?;
         let _ = state.storage.upsert_pages_for_site(&target_site, &fetched);
         if fetched.len() < 100 {
             let keep: Vec<String> = fetched.iter().map(|p| p.id.clone()).collect();
@@ -1175,6 +1180,9 @@ async fn list_child_pages(
                 .storage
                 .prune_child_pages_for_site(&target_site, id, &keep);
         }
+        let _ = state
+            .storage
+            .overlay_children_state_for_site(&target_site, &mut fetched);
         fetched
     };
     Ok(Json(json!({ "site_id": target_site, "parent_id": id, "pages": pages })))

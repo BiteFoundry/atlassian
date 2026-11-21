@@ -33,6 +33,8 @@ struct Fixture {
     labels: Vec<String>,
     attachments: Vec<Value>,
     worklogs: Vec<Value>,
+    fail_remotelink: bool,
+    fail_labels: bool,
     requests: Vec<(String, String)>,
     writes: Vec<(String, String, Value)>,
 }
@@ -57,6 +59,8 @@ impl Fixture {
             labels: vec!["keep".into(), "legacy/ops".into()],
             attachments: Vec::new(),
             worklogs: Vec::new(),
+            fail_remotelink: false,
+            fail_labels: false,
             requests: Vec::new(),
             writes: Vec::new(),
         }
@@ -76,10 +80,14 @@ impl Fixture {
                 "body": {"atlas_doc_format": {"value": self.page_body}}})
         } else {
             let ancestors: Vec<_> = parent.into_iter().map(|p| json!({"id": p})).collect();
+            let mut labels_obj = json!({"results": self.label_entries()});
+            if self.fail_labels {
+                labels_obj["_links"] = json!({"next": format!("/rest/api/content/{id}/label?start=2")});
+            }
             json!({"id": id, "space": {"id": 77, "key": if id == "704" {"OTHER"} else {"ENG"}},
                 "title": title, "type": "page", "version": {"number": version},
                 "ancestors": ancestors, "body": {"storage": {"value": self.page_body}},
-                "metadata": {"labels": {"results": self.label_entries()}},
+                "metadata": {"labels": labels_obj},
                 "children": {"attachment": {"results": self.attachments}}})
         }
     }
@@ -162,6 +170,13 @@ async fn upstream(
             return Json(entry.clone()).into_response();
         }
         if get && key.ends_with("/remotelink") {
+            if state.fail_remotelink {
+                return (
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    Json(json!({"message": "remotelink unavailable"})),
+                )
+                    .into_response();
+            }
             return Json(json!([])).into_response();
         }
         if get {
@@ -244,6 +259,13 @@ async fn upstream(
     }) {
         if get {
             if page.ends_with("/labels") {
+                if state.fail_labels {
+                    return (
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        Json(json!({"message": "labels unavailable"})),
+                    )
+                        .into_response();
+                }
                 return Json(json!({"results": state.label_entries()})).into_response();
             }
             if page.ends_with("/attachments") {
@@ -744,7 +766,9 @@ async fn confluence_workflows_keep_native_body_and_use_versioned_metadata_on_dc(
             )
             .await;
         assert_eq!(uploaded["attachments"][0]["id"], "att-54");
-        let page = mock.cli(&["wiki", "view", "701", "--json"], true).await;
+        let page = mock
+            .cli(&["wiki", "view", "701", "--json", "--full"], true)
+            .await;
         assert_eq!(page["page"]["summary"]["version_number"], expected_version);
         assert_eq!(page["page"]["labels"], json!(["keep", "ops", "new"]));
         let native = if cloud {
@@ -796,7 +820,7 @@ fn native_body(cloud: bool, raw: &str) -> Value {
 }
 
 #[tokio::test]
-async fn detail_mcp_defaults_to_compact_for_live_and_offline_without_changing_cli() {
+async fn detail_defaults_to_compact_on_cli_and_mcp_for_live_and_offline() {
     for cloud in [true, false] {
         let mock = Harness::new(cloud).await;
         for (tool, field, identifier, id, markdown, raw, cli_args) in [
@@ -807,7 +831,7 @@ async fn detail_mcp_defaults_to_compact_for_live_and_offline_without_changing_cl
                 "ATL-1",
                 "description_markdown",
                 "description_raw",
-                vec!["view", "ATL-1", "--json"],
+                vec!["view", "ATL-1", "--json", "--full"],
             ),
             (
                 "get_confluence_page",
@@ -816,7 +840,7 @@ async fn detail_mcp_defaults_to_compact_for_live_and_offline_without_changing_cl
                 "701",
                 "body_markdown",
                 "body_raw",
-                vec!["wiki", "view", "701", "--json"],
+                vec!["wiki", "view", "701", "--json", "--full"],
             ),
         ] {
             let expected = mock.cli(&cli_args, true).await;
@@ -844,12 +868,25 @@ async fn detail_mcp_defaults_to_compact_for_live_and_offline_without_changing_cl
                 assert_eq!(default, compact, "{tool}, offline={offline}");
                 assert_eq!(
                     default[field].as_object().unwrap().len(),
-                    if field == "issue" { 4 } else { 6 }
+                    if field == "issue" { 6 } else { 8 }
                 );
                 assert_eq!(default[field][markdown], expected[field][markdown]);
                 assert_eq!(full[field][markdown], default[field][markdown]);
                 assert_eq!(full[field][raw], expected[field][raw]);
                 assert_eq!(full[field]["summary"], expected[field]["summary"]);
+
+                let mut cli_default_args: Vec<&str> = cli_args[..cli_args.len() - 1].to_vec();
+                if offline {
+                    cli_default_args.push("--offline");
+                }
+                let mut cli_default = mock.cli(&cli_default_args, true).await;
+                let mut mcp_without_hint = default.clone();
+                cli_default[field].as_object_mut().unwrap().remove("hint");
+                mcp_without_hint[field]
+                    .as_object_mut()
+                    .unwrap()
+                    .remove("hint");
+                assert_eq!(cli_default, mcp_without_hint, "{tool}, offline={offline}");
             }
         }
         assert!(mock.state.lock().unwrap().writes.is_empty());
@@ -1655,7 +1692,7 @@ async fn regression_atlassian_bug_02_tree_preservation_and_controls() {
     let dc_profile = tempfile::tempdir().unwrap();
 
     // Detail -> Child listing -> CQL search -> Space root listing
-    let (ok, _, err) = run_cli(&bin, &dc_profile, &dc_url, false, &["wiki", "view", "101", "--json"]).await;
+    let (ok, _, err) = run_cli(&bin, &dc_profile, &dc_url, false, &["wiki", "view", "101", "--json", "--full"]).await;
     assert!(ok, "DC view 101 failed: {err}");
     let (ok, children_live, err) = run_cli(&bin, &dc_profile, &dc_url, false, &["wiki", "pages", "--parent", "100", "--json"]).await;
     assert!(ok, "DC child list failed: {err}");
@@ -1674,7 +1711,7 @@ async fn regression_atlassian_bug_02_tree_preservation_and_controls() {
         .filter_map(|p| p["id"].as_str())
         .collect();
     assert_eq!(dc_child_ids, vec!["101"], "DC child 101 must remain under parent 100 once");
-    let (ok, dc_view_off, err) = run_cli(&bin, &dc_profile, &dc_url, false, &["wiki", "view", "101", "--offline", "--json"]).await;
+    let (ok, dc_view_off, err) = run_cli(&bin, &dc_profile, &dc_url, false, &["wiki", "view", "101", "--offline", "--json", "--full"]).await;
     assert!(ok, "DC offline view 101 failed after space listing: {err}");
     assert!(
         dc_view_off["page"]["body_markdown"]
@@ -1823,7 +1860,7 @@ async fn regression_atlassian_bug_02_tree_preservation_and_controls() {
     let cloud_profile = tempfile::tempdir().unwrap();
 
     // Cloud v1 (101) cached via detail; 102 stays uncached before child listing
-    let (ok, _, err) = run_cli(&bin, &cloud_profile, &cloud_url, true, &["wiki", "view", "101", "--json"]).await;
+    let (ok, _, err) = run_cli(&bin, &cloud_profile, &cloud_url, true, &["wiki", "view", "101", "--json", "--full"]).await;
     assert!(ok, "Cloud view 101 failed: {err}");
     let (ok, cloud_children_live, err) = run_cli(&bin, &cloud_profile, &cloud_url, true, &["wiki", "pages", "--parent", "100", "--json"]).await;
     assert!(ok, "Cloud child list failed: {err}");
@@ -1841,17 +1878,17 @@ async fn regression_atlassian_bug_02_tree_preservation_and_controls() {
     assert_eq!(child_ids, vec!["101", "102"], "both cached v1 (101) and uncached (102) must remain once under 100");
     assert!(child_pages.iter().all(|p| p["space_key"] == "ENG"), "space_key preserved/filled: {child_pages:?}");
 
-    let (ok, cloud_view_off, err) = run_cli(&bin, &cloud_profile, &cloud_url, true, &["wiki", "view", "101", "--offline", "--json"]).await;
+    let (ok, cloud_view_off, err) = run_cli(&bin, &cloud_profile, &cloud_url, true, &["wiki", "view", "101", "--offline", "--json", "--full"]).await;
     assert!(ok, "Cloud offline view 101 failed: {err}");
     assert!(cloud_view_off["page"]["body_markdown"].as_str().unwrap().contains("Cloud v1 child body"));
 
     // Control 1: Cloud v3 latest body is not replaced or downgraded by stale v1 summary
-    let (ok, _, err) = run_cli(&bin, &cloud_profile, &cloud_url, true, &["wiki", "view", "103", "--json"]).await;
+    let (ok, _, err) = run_cli(&bin, &cloud_profile, &cloud_url, true, &["wiki", "view", "103", "--json", "--full"]).await;
     assert!(ok, "Cloud view 103 failed: {err}");
     cloud_state.lock().unwrap().cloud_stale_103_summary = true;
     let (ok, _, err) = run_cli(&bin, &cloud_profile, &cloud_url, true, &["wiki", "search", "Cloud Child", "--remote", "--json"]).await;
     assert!(ok, "Cloud search with stale 103 failed: {err}");
-    let (ok, v3_off, err) = run_cli(&bin, &cloud_profile, &cloud_url, true, &["wiki", "view", "103", "--offline", "--json"]).await;
+    let (ok, v3_off, err) = run_cli(&bin, &cloud_profile, &cloud_url, true, &["wiki", "view", "103", "--offline", "--json", "--full"]).await;
     assert!(ok, "Cloud offline view 103 failed: {err}");
     assert_eq!(v3_off["page"]["summary"]["version_number"], 3);
     assert_eq!(v3_off["page"]["summary"]["title"], "Cloud Child v3");
@@ -1863,7 +1900,7 @@ async fn regression_atlassian_bug_02_tree_preservation_and_controls() {
         g.cloud_page_101_parent = Some("200".to_string());
         g.cloud_page_101_version = 2;
     }
-    let (ok, _, err) = run_cli(&bin, &cloud_profile, &cloud_url, true, &["wiki", "view", "101", "--json"]).await;
+    let (ok, _, err) = run_cli(&bin, &cloud_profile, &cloud_url, true, &["wiki", "view", "101", "--json", "--full"]).await;
     assert!(ok, "Cloud view 101 after parent change failed: {err}");
     let (ok, under_200, err) = run_cli(&bin, &cloud_profile, &cloud_url, true, &["wiki", "pages", "--parent", "200", "--offline", "--json"]).await;
     assert!(ok, "offline children under 200 failed: {err}");
@@ -1877,7 +1914,7 @@ async fn regression_atlassian_bug_02_tree_preservation_and_controls() {
         // Also remove root 105 from space roots to verify complete-scope pruning still deletes removed roots
         g.cloud_roots = vec!["100".to_string(), "101".to_string()];
     }
-    let (ok, _, err) = run_cli(&bin, &cloud_profile, &cloud_url, true, &["wiki", "view", "101", "--json"]).await;
+    let (ok, _, err) = run_cli(&bin, &cloud_profile, &cloud_url, true, &["wiki", "view", "101", "--json", "--full"]).await;
     assert!(ok, "Cloud view 101 after move to root failed: {err}");
     let (ok, under_200_after, err) = run_cli(&bin, &cloud_profile, &cloud_url, true, &["wiki", "pages", "--parent", "200", "--offline", "--json"]).await;
     assert!(ok, "offline children under 200 after move to root failed: {err}");
@@ -2406,7 +2443,7 @@ async fn regression_atlassian_bug_06_dc_wiki_plain_text_replace_and_roundtrip() 
         )
         .await;
     assert_eq!(r1["ok"], true);
-    let view1 = mock.cli(&["view", "ATL-1", "--json"], true).await;
+    let view1 = mock.cli(&["view", "ATL-1", "--json", "--full"], true).await;
     let md1 = view1["issue"]["description_markdown"].as_str().unwrap();
     assert!(
         md1.contains("feature_flag #1!"),
@@ -2432,7 +2469,7 @@ async fn regression_atlassian_bug_06_dc_wiki_plain_text_replace_and_roundtrip() 
         )
         .await;
     assert_eq!(r2["ok"], true);
-    let view2 = mock.cli(&["view", "ATL-1", "--json"], true).await;
+    let view2 = mock.cli(&["view", "ATL-1", "--json", "--full"], true).await;
     assert!(
         view2["issue"]["description_markdown"]
             .as_str()
@@ -2501,7 +2538,7 @@ async fn regression_atlassian_bug_06_dc_wiki_plain_text_replace_and_roundtrip() 
         final_wiki.contains("{code}feature_flag{code}"),
         "code block preserved: {final_wiki}"
     );
-    let final_view = mock.cli(&["view", "ATL-1", "--json"], true).await;
+    let final_view = mock.cli(&["view", "ATL-1", "--json", "--full"], true).await;
     let final_md = final_view["issue"]["description_markdown"].as_str().unwrap();
     assert!(final_md.contains("x+y"), "{final_md}");
     assert!(final_md.contains("retry_limit"), "{final_md}");
@@ -2602,7 +2639,9 @@ async fn regression_atlassian_bug_08_full_body_adf_roundtrip_and_no_empty_text()
     mock.state.lock().unwrap().page_body = serde_json::to_string(&rich_adf).unwrap();
 
     // 1. view -> append unrelated line -> save full body
-    let viewed = mock.cli(&["wiki", "view", "701", "--json"], true).await;
+    let viewed = mock
+        .cli(&["wiki", "view", "701", "--json", "--full"], true)
+        .await;
     let orig_md = viewed["page"]["body_markdown"].as_str().unwrap().to_string();
     let edited_md = format!("{orig_md}\n\nAdded unrelated trailing line.");
 
@@ -2753,7 +2792,9 @@ async fn regression_atlassian_bug_10_rich_heading_section_selection() {
     });
     mock.state.lock().unwrap().page_body = serde_json::to_string(&rich_headings_adf).unwrap();
 
-    let view = mock.cli(&["wiki", "view", "701", "--json"], true).await;
+    let view = mock
+        .cli(&["wiki", "view", "701", "--json", "--full"], true)
+        .await;
     let toc = view["page"]["toc"].as_array().unwrap();
     let md_headings: Vec<String> = view["page"]["body_markdown"]
         .as_str()
@@ -2861,4 +2902,512 @@ async fn regression_atlassian_bug_10_rich_heading_section_selection() {
         assert_eq!(preview["preview"]["changed"], true, "control heading '{ok_heading}' failed");
     }
     assert!(mock.state.lock().unwrap().writes.is_empty());
+}
+
+#[tokio::test]
+async fn cli_view_json_is_compact_and_full_restores_structure() {
+    for cloud in [true, false] {
+        let mock = Harness::new(cloud).await;
+
+        let issue_default = mock.cli(&["view", "ATL-1", "--json"], true).await;
+        let issue_compact = mock
+            .cli(&["view", "ATL-1", "--json", "--compact"], true)
+            .await;
+        let issue_full = mock.cli(&["view", "ATL-1", "--json", "--full"], true).await;
+        assert_eq!(issue_default, issue_compact);
+        assert_eq!(
+            issue_default["issue"]["hint"],
+            "atlassian view ATL-1 --json --full"
+        );
+        assert!(issue_default["issue"]["omitted"].is_object());
+        assert!(issue_default["issue"].get("description_raw").is_none());
+        assert!(issue_full["issue"]["description_raw"].is_string());
+
+        let issue_off_default = mock
+            .cli(&["view", "ATL-1", "--json", "--offline"], true)
+            .await;
+        let issue_off_compact = mock
+            .cli(&["view", "ATL-1", "--json", "--compact", "--offline"], true)
+            .await;
+        let issue_off_full = mock
+            .cli(&["view", "ATL-1", "--json", "--full", "--offline"], true)
+            .await;
+        assert_eq!(issue_off_default, issue_off_compact);
+        assert_eq!(
+            issue_off_default["issue"]["hint"],
+            "atlassian view ATL-1 --json --full --offline"
+        );
+        assert!(issue_off_full["issue"]["description_raw"].is_string());
+
+        let page_default = mock.cli(&["wiki", "view", "701", "--json"], true).await;
+        let page_compact = mock
+            .cli(&["wiki", "view", "701", "--json", "--compact"], true)
+            .await;
+        let page_full = mock
+            .cli(&["wiki", "view", "701", "--json", "--full"], true)
+            .await;
+        assert_eq!(page_default, page_compact);
+        assert_eq!(
+            page_default["page"]["hint"],
+            "atlassian wiki view 701 --json --full"
+        );
+        assert!(page_default["page"]["omitted"].is_object());
+        assert!(page_default["page"].get("body_raw").is_none());
+        assert!(page_full["page"]["body_raw"].is_string());
+
+        let page_off_default = mock
+            .cli(&["wiki", "view", "701", "--json", "--offline"], true)
+            .await;
+        let page_off_compact = mock
+            .cli(
+                &["wiki", "view", "701", "--json", "--compact", "--offline"],
+                true,
+            )
+            .await;
+        let page_off_full = mock
+            .cli(
+                &["wiki", "view", "701", "--json", "--full", "--offline"],
+                true,
+            )
+            .await;
+        assert_eq!(page_off_default, page_off_compact);
+        assert_eq!(
+            page_off_default["page"]["hint"],
+            "atlassian wiki view 701 --json --full --offline"
+        );
+        assert!(page_off_full["page"]["body_raw"].is_string());
+
+        assert!(mock.state.lock().unwrap().writes.is_empty());
+    }
+}
+
+#[tokio::test]
+async fn cli_view_rejects_compact_with_full() {
+    let mock = Harness::new(true).await;
+
+    for (args, expected_fragment) in [
+        (
+            vec!["view", "ATL-1", "--json", "--compact", "--full"],
+            "cannot be used with",
+        ),
+        (vec!["view", "ATL-1", "--full"], "--json"),
+    ] {
+        let output = tokio::time::timeout(
+            Duration::from_secs(20),
+            mock.process().args(&args).output(),
+        )
+        .await
+        .expect("CLI timed out")
+        .unwrap();
+        assert_eq!(output.status.code(), Some(2), "{args:?}");
+        assert!(output.stdout.is_empty(), "stdout not empty for {args:?}");
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            !stderr.trim().is_empty() && stderr.contains(expected_fragment),
+            "unexpected stderr for {args:?}: {stderr}"
+        );
+    }
+
+    assert!(
+        mock.state.lock().unwrap().requests.is_empty(),
+        "usage error must not issue any upstream requests"
+    );
+}
+
+#[tokio::test]
+async fn detail_marks_failed_subresources_incomplete() {
+    for cloud in [true, false] {
+        let mock = Harness::new(cloud).await;
+        {
+            let mut st = mock.state.lock().unwrap();
+            st.fail_remotelink = true;
+            st.fail_labels = true;
+        }
+
+        let issue_compact = mock.cli(&["view", "ATL-1", "--json"], true).await;
+        assert!(
+            issue_compact["issue"]["omitted"]["linked_pages"].is_null(),
+            "cloud={cloud}: {issue_compact}"
+        );
+        let issue_full = mock
+            .cli(&["view", "ATL-1", "--json", "--full"], true)
+            .await;
+        assert_eq!(
+            issue_full["issue"]["incomplete"],
+            json!(["linked_pages"]),
+            "cloud={cloud}: {issue_full}"
+        );
+
+        let page_compact = mock
+            .mcp("get_confluence_page", json!({ "page_id": "701" }), true)
+            .await;
+        assert!(
+            page_compact["page"]["omitted"]["labels"].is_null(),
+            "cloud={cloud}: {page_compact}"
+        );
+        let page_full = mock
+            .mcp(
+                "get_confluence_page",
+                json!({ "page_id": "701", "compact": false }),
+                true,
+            )
+            .await;
+        assert_eq!(
+            page_full["page"]["incomplete"],
+            json!(["labels"]),
+            "cloud={cloud}: {page_full}"
+        );
+
+        // Control: when failures are cleared, counts are integers and `incomplete` is absent
+        {
+            let mut st = mock.state.lock().unwrap();
+            st.fail_remotelink = false;
+            st.fail_labels = false;
+        }
+
+        let issue_ok_compact = mock.cli(&["view", "ATL-1", "--json"], true).await;
+        assert_eq!(issue_ok_compact["issue"]["omitted"]["linked_pages"], 0);
+        let issue_ok_full = mock
+            .cli(&["view", "ATL-1", "--json", "--full"], true)
+            .await;
+        assert!(issue_ok_full["issue"].get("incomplete").is_none());
+
+        let page_ok_compact = mock
+            .mcp("get_confluence_page", json!({ "page_id": "701" }), true)
+            .await;
+        assert_eq!(page_ok_compact["page"]["omitted"]["labels"], 2);
+        let page_ok_full = mock
+            .mcp(
+                "get_confluence_page",
+                json!({ "page_id": "701", "compact": false }),
+                true,
+            )
+            .await;
+        assert!(page_ok_full["page"].get("incomplete").is_none());
+
+        // Truncated issue comments (total 25, returned 20): omitted.comments == 25, full incomplete includes "comments"
+        {
+            let mut st = mock.state.lock().unwrap();
+            let comments: Vec<Value> = (1..=20)
+                .map(|i| {
+                    json!({
+                        "id": format!("c-{i}"),
+                        "author": { "accountId": "acc-1", "displayName": "Alice" },
+                        "body": if cloud {
+                            json!({"version": 1, "type": "doc", "content": [{"type": "paragraph", "content": [{"type": "text", "text": format!("Comment {i}")}]}]})
+                        } else {
+                            json!(format!("Comment {i}"))
+                        },
+                        "created": "2026-11-20T00:00:00Z",
+                        "updated": "2026-11-20T00:00:00Z"
+                    })
+                })
+                .collect();
+            st.fields["comment"] = json!({ "total": 25, "maxResults": 20, "startAt": 0, "comments": comments });
+        }
+        let trunc_compact = mock.cli(&["view", "ATL-1", "--json"], true).await;
+        assert_eq!(trunc_compact["issue"]["omitted"]["comments"], 25);
+        let trunc_full = mock
+            .cli(&["view", "ATL-1", "--json", "--full"], true)
+            .await;
+        assert_eq!(trunc_full["issue"]["summary"]["comment_count"], 25);
+        assert_eq!(trunc_full["issue"]["comments"].as_array().unwrap().len(), 20);
+        assert_eq!(trunc_full["issue"]["incomplete"], json!(["comments"]));
+    }
+}
+
+#[tokio::test]
+async fn cli_issues_emits_continuation_and_accepts_tokens() {
+    let all_issues: Vec<Value> = (1..=120)
+        .map(|i| {
+            json!({
+                "id": format!("{i}"),
+                "key": format!("ENG-{i}"),
+                "fields": {
+                    "project": { "key": "ENG", "name": "Engineering" },
+                    "summary": format!("Issue {i}"),
+                    "status": { "id": "1", "name": "To Do", "statusCategory": { "key": "new" } },
+                    "issuetype": { "id": "1", "name": "Task", "subtask": false },
+                    "updated": format!("2026-11-20T00:{:02}:{:02}Z", i / 60, i % 60)
+                }
+            })
+        })
+        .collect();
+
+    let router = Router::new()
+        .route(
+            "/rest/api/3/search/jql",
+            axum::routing::post({
+                let issues = all_issues.clone();
+                move |Json(body): Json<Value>| {
+                    let issues = issues.clone();
+                    async move {
+                        let max = body["maxResults"].as_u64().unwrap_or(50) as usize;
+                        let start = body
+                            .get("nextPageToken")
+                            .and_then(Value::as_str)
+                            .and_then(|t| t.strip_prefix("off:"))
+                            .and_then(|s| s.parse::<usize>().ok())
+                            .unwrap_or(0);
+                        let slice: Vec<Value> =
+                            issues.iter().skip(start).take(max).cloned().collect();
+                        let next_tok = if start + slice.len() < issues.len() {
+                            Some(format!("off:{}", start + slice.len()))
+                        } else {
+                            None
+                        };
+                        let mut resp = json!({ "issues": slice });
+                        if let Some(t) = next_tok {
+                            resp["nextPageToken"] = json!(t);
+                        }
+                        Json(resp)
+                    }
+                }
+            }),
+        )
+        .route(
+            "/rest/api/2/search",
+            axum::routing::post({
+                let issues = all_issues.clone();
+                move |Json(body): Json<Value>| {
+                    let issues = issues.clone();
+                    async move {
+                        let max = body["maxResults"].as_u64().unwrap_or(50) as usize;
+                        let start = body["startAt"].as_u64().unwrap_or(0) as usize;
+                        let slice: Vec<Value> =
+                            issues.iter().skip(start).take(max).cloned().collect();
+                        Json(json!({
+                            "startAt": start,
+                            "maxResults": max,
+                            "total": issues.len(),
+                            "issues": slice
+                        }))
+                    }
+                }
+            }),
+        );
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("http://{}", listener.local_addr().unwrap());
+    let srv = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+
+    let bin = std::env::var_os("ATLASSIAN_WORKFLOW_TEST_BIN")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from(env!("CARGO_BIN_EXE_atlassian")));
+
+    async fn run_raw(
+        bin: &PathBuf,
+        profile: &TempDir,
+        url: &str,
+        cloud: bool,
+        args: &[&str],
+    ) -> std::process::Output {
+        let mut cmd = Command::new(bin);
+        cmd.kill_on_drop(true)
+            .current_dir(profile.path())
+            .env("ATLASSIAN_CONFIG_DIR", profile.path())
+            .env("ATLASSIAN_DISABLE_KEYRING", "1")
+            .env("ATLASSIAN_SITE_URL", url)
+            .env("ATLASSIAN_CONFLUENCE_URL", url)
+            .env(
+                "ATLASSIAN_DEPLOYMENT",
+                if cloud { "cloud" } else { "datacenter" },
+            )
+            .env("NO_PROXY", "127.0.0.1,localhost")
+            .env_remove("ATLASSIAN_SITE");
+        if cloud {
+            cmd.env("ATLASSIAN_EMAIL", "test@example.invalid")
+                .env("ATLASSIAN_API_TOKEN", "tok");
+        } else {
+            cmd.env("ATLASSIAN_PAT", "pat");
+        }
+        tokio::time::timeout(Duration::from_secs(20), cmd.args(args).output())
+            .await
+            .expect("CLI timed out")
+            .unwrap()
+    }
+
+    for cloud in [true, false] {
+        let profile = tempfile::tempdir().unwrap();
+        let out1 = run_raw(
+            &bin,
+            &profile,
+            &url,
+            cloud,
+            &["issues", "--jql", "project = ENG", "--limit", "500", "--json"],
+        )
+        .await;
+        assert!(
+            out1.status.success(),
+            "cloud={cloud}: {}",
+            String::from_utf8_lossy(&out1.stderr)
+        );
+        let p1: Value = serde_json::from_slice(&out1.stdout).unwrap();
+        assert_eq!(p1["issues"].as_array().unwrap().len(), 100);
+
+        let out2 = if cloud {
+            assert_eq!(p1["next_page_token"], "off:100");
+            assert!(p1["next_start_at"].is_null());
+            assert!(p1["total"].is_null());
+            run_raw(
+                &bin,
+                &profile,
+                &url,
+                true,
+                &[
+                    "issues",
+                    "--jql",
+                    "project = ENG",
+                    "--limit",
+                    "500",
+                    "--page-token",
+                    "off:100",
+                    "--json",
+                ],
+            )
+            .await
+        } else {
+            assert!(p1["next_page_token"].is_null());
+            assert_eq!(p1["next_start_at"], 100);
+            assert_eq!(p1["total"], 120);
+            run_raw(
+                &bin,
+                &profile,
+                &url,
+                false,
+                &[
+                    "issues",
+                    "--jql",
+                    "project = ENG",
+                    "--limit",
+                    "500",
+                    "--start-at",
+                    "100",
+                    "--json",
+                ],
+            )
+            .await
+        };
+        assert!(
+            out2.status.success(),
+            "cloud={cloud} page 2: {}",
+            String::from_utf8_lossy(&out2.stderr)
+        );
+        let p2: Value = serde_json::from_slice(&out2.stdout).unwrap();
+        assert_eq!(p2["issues"].as_array().unwrap().len(), 20);
+        assert!(p2["next_page_token"].is_null());
+        assert!(p2["next_start_at"].is_null());
+        if cloud {
+            assert!(p2["total"].is_null());
+        } else {
+            assert_eq!(p2["total"], 120);
+        }
+
+        // Error controls: mutually exclusive tokens and offline + start-at
+        let err_both = run_raw(
+            &bin,
+            &profile,
+            &url,
+            cloud,
+            &["issues", "--page-token", "x", "--start-at", "1", "--json"],
+        )
+        .await;
+        assert_eq!(err_both.status.code(), Some(2));
+        assert!(err_both.stdout.is_empty());
+
+        let err_off = run_raw(
+            &bin,
+            &profile,
+            &url,
+            cloud,
+            &["issues", "--offline", "--start-at", "1", "--json"],
+        )
+        .await;
+        assert_eq!(err_off.status.code(), Some(2));
+        assert!(err_off.stdout.is_empty());
+
+        // Search --remote / --jql continuation tokens
+        let s_out1 = run_raw(
+            &bin,
+            &profile,
+            &url,
+            cloud,
+            &["search", "project = ENG", "--jql", "--limit", "500", "--json"],
+        )
+        .await;
+        assert!(
+            s_out1.status.success(),
+            "cloud={cloud} search p1: {}",
+            String::from_utf8_lossy(&s_out1.stderr)
+        );
+        let sp1: Value = serde_json::from_slice(&s_out1.stdout).unwrap();
+        assert_eq!(sp1["issues"].as_array().unwrap().len(), 100);
+        let s_out2 = if cloud {
+            assert_eq!(sp1["next_page_token"], "off:100");
+            assert!(sp1["total"].is_null());
+            run_raw(
+                &bin,
+                &profile,
+                &url,
+                true,
+                &[
+                    "search",
+                    "Fixture",
+                    "--remote",
+                    "--limit",
+                    "500",
+                    "--page-token",
+                    "off:100",
+                    "--json",
+                ],
+            )
+            .await
+        } else {
+            assert_eq!(sp1["next_start_at"], 100);
+            assert_eq!(sp1["total"], 120);
+            run_raw(
+                &bin,
+                &profile,
+                &url,
+                false,
+                &[
+                    "search",
+                    "Fixture",
+                    "--remote",
+                    "--limit",
+                    "500",
+                    "--start-at",
+                    "100",
+                    "--json",
+                ],
+            )
+            .await
+        };
+        assert!(
+            s_out2.status.success(),
+            "cloud={cloud} search p2: {}",
+            String::from_utf8_lossy(&s_out2.stderr)
+        );
+        let sp2: Value = serde_json::from_slice(&s_out2.stdout).unwrap();
+        assert_eq!(sp2["issues"].as_array().unwrap().len(), 20);
+        assert!(sp2["next_page_token"].is_null());
+        assert!(sp2["next_start_at"].is_null());
+
+        // Search without --remote/--jql rejects continuation tokens (exit 1)
+        let err_search = run_raw(
+            &bin,
+            &profile,
+            &url,
+            cloud,
+            &["search", "foo", "--start-at", "1", "--json"],
+        )
+        .await;
+        assert_eq!(err_search.status.code(), Some(1));
+        assert!(
+            String::from_utf8_lossy(&err_search.stderr)
+                .contains("--page-token and --start-at require --remote or --jql")
+        );
+    }
+
+    srv.abort();
 }

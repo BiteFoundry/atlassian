@@ -405,7 +405,7 @@ mod tests {
             author_name: Some("Author".into()),
             updated_at: updated_at.to_string(),
             position: 1,
-            has_children: false,
+            has_children: None,
             web_url: format!("https://{site_host}/wiki/spaces/{space_key}/pages/{id}"),
         }
     }

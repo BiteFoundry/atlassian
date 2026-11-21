@@ -25,7 +25,7 @@ atlassian api                        # alias for `serve`
 
 - All responses are JSON (`Content-Type: application/json`).
 - Errors use `{"error": "<message>"}` with HTTP `400`, `401`, `404`, or `500`.
-- `limit` defaults to `50` (`30` for `/search`) and is clamped to `1..=1000`.
+- `limit` defaults to `50` (`30` for `/search`) and is clamped to `1..=1000`. Live board issue queries return at most `100` items per call and live space root page queries return at most `250` items per call.
 - Permissive CORS (`CorsLayer::permissive()`) is enabled for local browser-based agent UIs.
 
 ---
@@ -153,7 +153,7 @@ Lists issues on a Jira Agile board, optionally scoped to `sprint_id`.
 
 ### `GET /issues?jql=&project=&limit=50&page_token=&start_at=&offline=false`
 
-Searches Jira issues by explicit `jql`, `project` filter, or `my_open_issues_jql()`, or reads cached issues when `offline=true`. On Cloud, pass `page_token` (from `next_page_token`); on Data Center, pass non-negative integer `start_at` (from `next_start_at`, default `0`). Supplying both `page_token` and `start_at` returns HTTP 400.
+Searches Jira issues by explicit `jql`, `project` filter, or `my_open_issues_jql()`, or reads cached issues when `offline=true`. When `offline=true`, `total` is the total number of matching cached rows (not just the returned slice). On Cloud, pass `page_token` (from `next_page_token`); on Data Center, pass non-negative integer `start_at` (from `next_start_at`, default `0`). Supplying both `page_token` and `start_at` returns HTTP 400.
 
 ```bash
 curl "http://127.0.0.1:8789/issues?project=ENG&limit=20"
@@ -198,9 +198,9 @@ curl -X POST http://127.0.0.1:8789/issues \
 
 ### `GET /issues/{key}?offline=false&compact=false`
 
-Fetches full issue details (`IssueDetail`: metadata, Markdown description, subtasks, linked issues, linked Confluence pages, attachments, comments).
+Fetches full issue details (`IssueDetail`: metadata, Markdown description, subtasks, linked issues, linked Confluence pages, attachments, comments). Unlike the CLI (`--json`) and MCP detail tools, HTTP detail endpoints default to full (`compact=false`).
 
-`compact=true` returns `key`, `summary`, `status`, and the full `description_markdown` inside the `issue` envelope. It works for live and offline reads.
+`compact=true` returns `key`, `summary`, `status`, and the full `description_markdown` inside the `issue` envelope (without CLI/MCP `omitted` or `hint` fields). It works for live and offline reads.
 
 ### `PATCH /issues/{key}`
 
@@ -290,9 +290,9 @@ Creates a new Confluence page (`OutgoingPage`). `space_id_or_key` and `title` ar
 
 ### `GET /pages/{id}?offline=false&compact=false`
 
-Fetches full Confluence page detail (`PageDetail`: summary, ancestors, labels, `body_markdown`, `blocks`, `toc`, `attachments`, `comments`, `linked_issue_keys`).
+Fetches full Confluence page detail (`PageDetail`: summary, ancestors, labels, `body_markdown`, `blocks`, `toc`, `attachments`, `comments`, `linked_issue_keys`). Unlike the CLI (`--json`) and MCP detail tools, HTTP detail endpoints default to full (`compact=false`).
 
-`compact=true` returns `id`, `title`, `space_id`, `space_key`, `version_number`, and the full `body_markdown` inside the `page` envelope. It works for live and offline reads. Detail endpoints reject unsupported query arguments.
+`compact=true` returns `id`, `title`, `space_id`, `space_key`, `version_number`, and the full `body_markdown` inside the `page` envelope (without CLI/MCP `omitted` or `hint` fields). It works for live and offline reads. Detail endpoints reject unsupported query arguments.
 
 ### `GET /pages/{id}/children?offline=false`
 

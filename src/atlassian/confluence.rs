@@ -14,14 +14,15 @@ use crate::{
     atlassian::{
         body::{body_change, same_markdown, BodyEdit, BodyEditError},
         client::{
-            first_nonempty_str, join_url, json_id_to_string, parse_attachment_item, HttpStatusError,
+            first_nonempty_str, join_url, json_id_to_string, next_link_page_state,
+            parse_attachment_item, HttpStatusError,
         },
         AtlassianClient,
     },
     config::DeploymentKind,
     models::{
-        ConfluenceComment, CrossRefTarget, OutgoingPage, PageAncestor, PageDetail, PageSummary,
-        PageUpdate, SpaceSummary,
+        parse_offset_cursor, ConfluenceComment, CrossRefTarget, ListPage, OutgoingPage,
+        PageAncestor, PageDetail, PageSummary, PageUpdate, SpaceSummary,
     },
 };
 
@@ -36,14 +37,37 @@ pub struct PageSubresourceStatus {
 }
 
 impl AtlassianClient {
-    pub async fn list_spaces(&self, limit: usize) -> Result<Vec<SpaceSummary>> {
-        let conf_root = self.require_confluence_root()?;
+    pub async fn list_spaces_page(
+        &self,
+        limit: usize,
+        cursor: Option<&str>,
+    ) -> Result<ListPage<SpaceSummary>> {
         let lim = limit.clamp(1, 250);
+        let cloud = self.deployment() == DeploymentKind::Cloud;
+        let start = if cloud {
+            0
+        } else {
+            parse_offset_cursor(cursor).map_err(anyhow::Error::msg)?
+        };
+        let conf_root = self.require_confluence_root()?;
 
         let url = match self.deployment() {
-            DeploymentKind::Cloud => format!("{conf_root}/api/v2/spaces?limit={lim}"),
+            DeploymentKind::Cloud => {
+                let mut u = format!("{conf_root}/api/v2/spaces?limit={lim}");
+                if let Some(c) = cursor.map(str::trim).filter(|s| !s.is_empty()) {
+                    u.push_str("&cursor=");
+                    u.push_str(&urlencoding::encode(c));
+                }
+                u
+            }
             DeploymentKind::DataCenter => {
-                format!("{conf_root}/rest/api/space?limit={lim}&expand=description.plain,homepage")
+                let mut u = format!(
+                    "{conf_root}/rest/api/space?limit={lim}&expand=description.plain,homepage"
+                );
+                if start > 0 {
+                    u.push_str(&format!("&start={start}"));
+                }
+                u
             }
         };
 
@@ -65,15 +89,50 @@ impl AtlassianClient {
                 }
             }
         }
-        Ok(spaces)
+        let (has_more, next_cursor) = next_link_page_state(&val, cloud, start, spaces.len());
+        Ok(ListPage {
+            items: spaces,
+            has_more,
+            next_cursor,
+        })
     }
 
-    pub async fn list_space_root_pages(
+    pub async fn list_spaces(&self, limit: usize) -> Result<Vec<SpaceSummary>> {
+        Ok(self.list_spaces_page(limit, None).await?.items)
+    }
+
+    pub async fn list_all_spaces(&self) -> Result<Vec<SpaceSummary>> {
+        let mut cursor: Option<String> = None;
+        let mut all = Vec::new();
+        let mut seen = HashSet::new();
+
+        loop {
+            let page = self.list_spaces_page(250, cursor.as_deref()).await?;
+            let mut added = 0usize;
+            for space in page.items {
+                if seen.insert(space.id.clone()) {
+                    all.push(space);
+                    added += 1;
+                }
+            }
+            if added == 0 {
+                break;
+            }
+            match page.next_cursor {
+                Some(next) => cursor = Some(next),
+                None => break,
+            }
+        }
+
+        Ok(all)
+    }
+
+    pub async fn list_space_root_pages_page(
         &self,
         space_id_or_key: &str,
         limit: usize,
-    ) -> Result<Vec<PageSummary>> {
-        let conf_root = self.require_confluence_root()?;
+        cursor: Option<&str>,
+    ) -> Result<ListPage<PageSummary>> {
         let lim = limit.clamp(1, 250);
         let input = space_id_or_key.trim();
         if input.is_empty() {
@@ -82,18 +141,24 @@ impl AtlassianClient {
 
         match self.deployment() {
             DeploymentKind::Cloud => {
+                let conf_root = self.require_confluence_root()?;
                 let (space_id, known_key) = self.resolve_cloud_space_id(input).await?;
                 let encoded_id = urlencoding::encode(&space_id);
-                let url =
+                let mut url =
                     format!("{conf_root}/api/v2/spaces/{encoded_id}/pages?depth=root&limit={lim}");
+                if let Some(c) = cursor.map(str::trim).filter(|s| !s.is_empty()) {
+                    url.push_str("&cursor=");
+                    url.push_str(&urlencoding::encode(c));
+                }
                 let val: Value = self.get_json(&url).await?;
                 let arr = val
                     .get("results")
                     .and_then(|v| v.as_array())
                     .map(Vec::as_slice)
                     .unwrap_or(&[]);
+                let got = arr.len();
 
-                Ok(arr
+                let items: Vec<PageSummary> = arr
                     .iter()
                     .map(|p| {
                         let mut summary = parse_cloud_page_summary(p, &conf_root);
@@ -105,13 +170,24 @@ impl AtlassianClient {
                         summary
                     })
                     .filter(|p| p.parent_id.is_none())
-                    .collect())
+                    .collect();
+                let (has_more, next_cursor) = next_link_page_state(&val, true, 0, got);
+                Ok(ListPage {
+                    items,
+                    has_more,
+                    next_cursor,
+                })
             }
             DeploymentKind::DataCenter => {
+                let start = parse_offset_cursor(cursor).map_err(anyhow::Error::msg)?;
+                let conf_root = self.require_confluence_root()?;
                 let encoded_key = urlencoding::encode(input);
-                let url = format!(
+                let mut url = format!(
                     "{conf_root}/rest/api/space/{encoded_key}/content/page?depth=root&limit={lim}&expand=version,space"
                 );
+                if start > 0 {
+                    url.push_str(&format!("&start={start}"));
+                }
                 let val: Value = self.get_json(&url).await?;
                 let arr = val
                     .get("results")
@@ -119,8 +195,9 @@ impl AtlassianClient {
                     .and_then(|v| v.as_array())
                     .map(Vec::as_slice)
                     .unwrap_or(&[]);
+                let got = arr.len();
 
-                Ok(arr
+                let items: Vec<PageSummary> = arr
                     .iter()
                     .map(|p| {
                         let mut summary = parse_dc_page_summary(p, &conf_root);
@@ -129,26 +206,54 @@ impl AtlassianClient {
                         }
                         summary
                     })
-                    .collect())
+                    .collect();
+                let (has_more, next_cursor) = next_link_page_state(&val, false, start, got);
+                Ok(ListPage {
+                    items,
+                    has_more,
+                    next_cursor,
+                })
             }
         }
     }
 
-    pub async fn list_child_pages(&self, page_id: &str) -> Result<Vec<PageSummary>> {
-        let conf_root = self.require_confluence_root()?;
+    pub async fn list_space_root_pages(
+        &self,
+        space_id_or_key: &str,
+        limit: usize,
+    ) -> Result<Vec<PageSummary>> {
+        Ok(self
+            .list_space_root_pages_page(space_id_or_key, limit, None)
+            .await?
+            .items)
+    }
+
+    pub async fn list_child_pages_page(
+        &self,
+        page_id: &str,
+        limit: usize,
+        cursor: Option<&str>,
+    ) -> Result<ListPage<PageSummary>> {
+        let lim = limit.clamp(1, 250);
         let parent_id = page_id.trim();
         let encoded_id = urlencoding::encode(parent_id);
 
         match self.deployment() {
             DeploymentKind::Cloud => {
-                let url = format!("{conf_root}/api/v2/pages/{encoded_id}/children?limit=100");
+                let conf_root = self.require_confluence_root()?;
+                let mut url = format!("{conf_root}/api/v2/pages/{encoded_id}/children?limit={lim}");
+                if let Some(c) = cursor.map(str::trim).filter(|s| !s.is_empty()) {
+                    url.push_str("&cursor=");
+                    url.push_str(&urlencoding::encode(c));
+                }
                 let val: Value = self.get_json(&url).await?;
                 let arr = val
                     .get("results")
                     .and_then(|v| v.as_array())
                     .map(Vec::as_slice)
                     .unwrap_or(&[]);
-                Ok(arr
+                let got = arr.len();
+                let items: Vec<PageSummary> = arr
                     .iter()
                     .map(|p| {
                         let mut summary = parse_cloud_page_summary(p, &conf_root);
@@ -161,7 +266,8 @@ impl AtlassianClient {
                         {
                             summary.parent_id = Some(parent_id.to_string());
                         }
-                        if summary.space_key.trim().is_empty() && !summary.space_id.trim().is_empty() {
+                        if summary.space_key.trim().is_empty() && !summary.space_id.trim().is_empty()
+                        {
                             if let Ok(cache) = self.space_id_cache.read() {
                                 if let Some((_, key)) = cache
                                     .values()
@@ -173,19 +279,31 @@ impl AtlassianClient {
                         }
                         summary
                     })
-                    .collect())
+                    .collect();
+                let (has_more, next_cursor) = next_link_page_state(&val, true, 0, got);
+                Ok(ListPage {
+                    items,
+                    has_more,
+                    next_cursor,
+                })
             }
             DeploymentKind::DataCenter => {
-                let url = format!(
-                    "{conf_root}/rest/api/content/{encoded_id}/child/page?limit=100&expand=version,space"
+                let start = parse_offset_cursor(cursor).map_err(anyhow::Error::msg)?;
+                let conf_root = self.require_confluence_root()?;
+                let mut url = format!(
+                    "{conf_root}/rest/api/content/{encoded_id}/child/page?limit={lim}&expand=version,space"
                 );
+                if start > 0 {
+                    url.push_str(&format!("&start={start}"));
+                }
                 let val: Value = self.get_json(&url).await?;
                 let arr = val
                     .get("results")
                     .and_then(|v| v.as_array())
                     .map(Vec::as_slice)
                     .unwrap_or(&[]);
-                Ok(arr
+                let got = arr.len();
+                let items: Vec<PageSummary> = arr
                     .iter()
                     .map(|p| {
                         let mut summary = parse_dc_page_summary(p, &conf_root);
@@ -200,9 +318,19 @@ impl AtlassianClient {
                         }
                         summary
                     })
-                    .collect())
+                    .collect();
+                let (has_more, next_cursor) = next_link_page_state(&val, false, start, got);
+                Ok(ListPage {
+                    items,
+                    has_more,
+                    next_cursor,
+                })
             }
         }
+    }
+
+    pub async fn list_child_pages(&self, page_id: &str) -> Result<Vec<PageSummary>> {
+        Ok(self.list_child_pages_page(page_id, 100, None).await?.items)
     }
 
     /// Lightweight single-request Confluence page revision probe (version, title, updated_at;
@@ -324,7 +452,7 @@ impl AtlassianClient {
                     validate_source_version(&val)?;
                 }
 
-                let (labels, labels_ok) = match self
+                let (labels, labels_ok, labels_more) = match self
                     .get_json::<Value>(&format!("{conf_root}/api/v2/pages/{encoded_id}/labels"))
                     .await
                 {
@@ -340,11 +468,12 @@ impl AtlassianClient {
                             })
                             .unwrap_or_default(),
                         true,
+                        v.pointer("/_links/next").and_then(Value::as_str).is_some(),
                     ),
-                    Err(_) => (Vec::new(), false),
+                    Err(_) => (Vec::new(), false, false),
                 };
 
-                let (attachments, attachments_ok) = match self
+                let (attachments, attachments_ok, attachments_more) = match self
                     .get_json::<Value>(&format!(
                         "{conf_root}/api/v2/pages/{encoded_id}/attachments"
                     ))
@@ -360,14 +489,16 @@ impl AtlassianClient {
                             })
                             .unwrap_or_default(),
                         true,
+                        v.pointer("/_links/next").and_then(Value::as_str).is_some(),
                     ),
-                    Err(_) => (Vec::new(), false),
+                    Err(_) => (Vec::new(), false, false),
                 };
 
-                let (comments, comments_ok) = match self.list_page_comments(page_id).await {
-                    Ok(c) => (c, true),
-                    Err(_) => (Vec::new(), false),
-                };
+                let (comments, comments_ok, comments_more) =
+                    match self.list_page_comments_page(page_id).await {
+                        Ok((c, more)) => (c, true, more),
+                        Err(_) => (Vec::new(), false, false),
+                    };
                 let (ancestors, ancestors_ok) = if require_native_body
                     || summary
                         .parent_id
@@ -384,6 +515,19 @@ impl AtlassianClient {
                 let body_markdown = blocks_to_markdown(&blocks);
                 let toc = extract_toc(&blocks);
                 let linked_issue_keys = extract_linked_issue_keys(&blocks, &body_raw);
+                let mut incomplete = Vec::new();
+                if !labels_ok || labels_more {
+                    incomplete.push("labels".to_string());
+                }
+                if !attachments_ok || attachments_more {
+                    incomplete.push("attachments".to_string());
+                }
+                if !comments_ok || comments_more {
+                    incomplete.push("comments".to_string());
+                }
+                if !ancestors_ok {
+                    incomplete.push("ancestors".to_string());
+                }
 
                 Ok((
                     PageDetail {
@@ -398,6 +542,7 @@ impl AtlassianClient {
                         attachments,
                         comments,
                         linked_issue_keys,
+                        incomplete,
                     },
                     PageSubresourceStatus {
                         labels_ok,
@@ -430,6 +575,10 @@ impl AtlassianClient {
                     })
                     .unwrap_or_default();
 
+                let labels_more = val
+                    .pointer("/metadata/labels/_links/next")
+                    .and_then(Value::as_str)
+                    .is_some();
                 let labels = val
                     .get("metadata")
                     .and_then(|m| m.get("labels"))
@@ -442,6 +591,10 @@ impl AtlassianClient {
                     })
                     .unwrap_or_default();
 
+                let attachments_more = val
+                    .pointer("/children/attachment/_links/next")
+                    .and_then(Value::as_str)
+                    .is_some();
                 let attachments = val
                     .get("children")
                     .and_then(|c| c.get("attachment"))
@@ -463,10 +616,21 @@ impl AtlassianClient {
                 let body_markdown = blocks_to_markdown(&blocks);
                 let toc = extract_toc(&blocks);
                 let linked_issue_keys = extract_linked_issue_keys(&blocks, &body_raw);
-                let (comments, comments_ok) = match self.list_page_comments(page_id).await {
-                    Ok(c) => (c, true),
-                    Err(_) => (Vec::new(), false),
-                };
+                let (comments, comments_ok, comments_more) =
+                    match self.list_page_comments_page(page_id).await {
+                        Ok((c, more)) => (c, true, more),
+                        Err(_) => (Vec::new(), false, false),
+                    };
+                let mut incomplete = Vec::new();
+                if labels_more {
+                    incomplete.push("labels".to_string());
+                }
+                if attachments_more {
+                    incomplete.push("attachments".to_string());
+                }
+                if !comments_ok || comments_more {
+                    incomplete.push("comments".to_string());
+                }
 
                 Ok((
                     PageDetail {
@@ -481,6 +645,7 @@ impl AtlassianClient {
                         attachments,
                         comments,
                         linked_issue_keys,
+                        incomplete,
                     },
                     PageSubresourceStatus {
                         labels_ok: true,
@@ -1075,42 +1240,37 @@ impl AtlassianClient {
         Ok(format!("{root}/rest/api/content/{page}/label"))
     }
 
-    pub async fn list_page_comments(&self, page_id: &str) -> Result<Vec<ConfluenceComment>> {
+    pub async fn list_page_comments_page(
+        &self,
+        page_id: &str,
+    ) -> Result<(Vec<ConfluenceComment>, bool)> {
         let conf_root = self.require_confluence_root()?;
         let encoded_id = urlencoding::encode(page_id.trim());
 
-        match self.deployment() {
-            DeploymentKind::Cloud => {
-                let url = format!(
-                    "{conf_root}/api/v2/pages/{encoded_id}/footer-comments?body-format=atlas_doc_format"
-                );
-                let val: Value = self.get_json(&url).await?;
-                let arr = val
-                    .get("results")
-                    .and_then(|v| v.as_array())
-                    .map(Vec::as_slice)
-                    .unwrap_or(&[]);
-                Ok(arr
-                    .iter()
-                    .map(|c| parse_confluence_comment(c, page_id))
-                    .collect())
-            }
-            DeploymentKind::DataCenter => {
-                let url = format!(
-                    "{conf_root}/rest/api/content/{encoded_id}/child/comment?expand=body.storage,version"
-                );
-                let val: Value = self.get_json(&url).await?;
-                let arr = val
-                    .get("results")
-                    .and_then(|v| v.as_array())
-                    .map(Vec::as_slice)
-                    .unwrap_or(&[]);
-                Ok(arr
-                    .iter()
-                    .map(|c| parse_confluence_comment(c, page_id))
-                    .collect())
-            }
-        }
+        let url = match self.deployment() {
+            DeploymentKind::Cloud => format!(
+                "{conf_root}/api/v2/pages/{encoded_id}/footer-comments?body-format=atlas_doc_format"
+            ),
+            DeploymentKind::DataCenter => format!(
+                "{conf_root}/rest/api/content/{encoded_id}/child/comment?expand=body.storage,version"
+            ),
+        };
+        let val: Value = self.get_json(&url).await?;
+        let arr = val
+            .get("results")
+            .and_then(|v| v.as_array())
+            .map(Vec::as_slice)
+            .unwrap_or(&[]);
+        let comments = arr
+            .iter()
+            .map(|c| parse_confluence_comment(c, page_id))
+            .collect();
+        let has_more = val.pointer("/_links/next").and_then(Value::as_str).is_some();
+        Ok((comments, has_more))
+    }
+
+    pub async fn list_page_comments(&self, page_id: &str) -> Result<Vec<ConfluenceComment>> {
+        Ok(self.list_page_comments_page(page_id).await?.0)
     }
 
     pub async fn add_page_comment(
@@ -1382,7 +1542,7 @@ fn parse_cloud_page_summary(val: &Value, conf_root: &str) -> PageSummary {
         author_name,
         updated_at,
         position,
-        has_children: false,
+        has_children: None,
         web_url,
     }
 }
@@ -1439,7 +1599,7 @@ fn parse_dc_page_summary(val: &Value, conf_root: &str) -> PageSummary {
         author_name,
         updated_at,
         position,
-        has_children: false,
+        has_children: None,
         web_url,
     }
 }
@@ -1871,5 +2031,216 @@ mod tests {
 
         let hits = client.search_confluence_cql("text ~ \"DC\"", 10).await.unwrap();
         assert_eq!(hits[0].id, "501");
+    }
+
+    #[tokio::test]
+    async fn confluence_pages_follow_next_links_cloud_and_dc() {
+        let app = Router::new()
+            .route(
+                "/wiki/api/v2/spaces/999/pages",
+                get(|Query(q): Query<HashMap<String, String>>| async move {
+                    if q.get("cursor").map(String::as_str) == Some("r2=") {
+                        Json(json!({
+                            "results": [
+                                { "id": "203", "spaceId": "999", "parentId": null, "title": "Root 3", "status": "current", "version": { "number": 1 } }
+                            ]
+                        }))
+                    } else {
+                        Json(json!({
+                            "results": [
+                                { "id": "201", "spaceId": "999", "parentId": null, "title": "Root 1", "status": "current", "version": { "number": 1 } },
+                                { "id": "202", "spaceId": "999", "parentId": null, "title": "Root 2", "status": "current", "version": { "number": 1 } }
+                            ],
+                            "_links": { "next": "/wiki/api/v2/spaces/999/pages?depth=root&limit=2&cursor=r2%3D" }
+                        }))
+                    }
+                }),
+            )
+            .route(
+                "/rest/api/space/ENG/content/page",
+                get(|Query(q): Query<HashMap<String, String>>| async move {
+                    let start = q
+                        .get("start")
+                        .and_then(|s| s.parse::<usize>().ok())
+                        .unwrap_or(0);
+                    if start == 0 {
+                        Json(json!({
+                            "results": [
+                                { "id": "201", "title": "Root 1", "space": { "key": "ENG" }, "version": { "number": 1 } },
+                                { "id": "202", "title": "Root 2", "space": { "key": "ENG" }, "version": { "number": 1 } }
+                            ],
+                            "_links": { "next": "/rest/api/space/ENG/content/page?depth=root&limit=2&start=2" }
+                        }))
+                    } else {
+                        Json(json!({
+                            "results": [
+                                { "id": "203", "title": "Root 3", "space": { "key": "ENG" }, "version": { "number": 1 } }
+                            ]
+                        }))
+                    }
+                }),
+            )
+            .route(
+                "/wiki/api/v2/pages/100/children",
+                get(|Query(q): Query<HashMap<String, String>>| async move {
+                    if q.get("cursor").map(String::as_str) == Some("abc=") {
+                        Json(json!({
+                            "results": [
+                                { "id": "103", "spaceId": "999", "parentId": "100", "title": "Child 3", "status": "current", "version": { "number": 1 } }
+                            ]
+                        }))
+                    } else {
+                        Json(json!({
+                            "results": [
+                                { "id": "101", "spaceId": "999", "parentId": "100", "title": "Child 1", "status": "current", "version": { "number": 1 } },
+                                { "id": "102", "spaceId": "999", "parentId": "100", "title": "Child 2", "status": "current", "version": { "number": 1 } }
+                            ],
+                            "_links": { "next": "/wiki/api/v2/pages/100/children?limit=2&cursor=abc%3D" }
+                        }))
+                    }
+                }),
+            )
+            .route(
+                "/rest/api/content/100/child/page",
+                get(|Query(q): Query<HashMap<String, String>>| async move {
+                    let start = q
+                        .get("start")
+                        .and_then(|s| s.parse::<usize>().ok())
+                        .unwrap_or(0);
+                    if start == 0 {
+                        Json(json!({
+                            "results": [
+                                { "id": "101", "title": "Child 1", "space": { "key": "ENG" }, "version": { "number": 1 } },
+                                { "id": "102", "title": "Child 2", "space": { "key": "ENG" }, "version": { "number": 1 } }
+                            ],
+                            "_links": { "next": "/rest/api/content/100/child/page?limit=2&start=2" }
+                        }))
+                    } else {
+                        Json(json!({
+                            "results": [
+                                { "id": "103", "title": "Child 3", "space": { "key": "ENG" }, "version": { "number": 1 } }
+                            ]
+                        }))
+                    }
+                }),
+            )
+            .route(
+                "/wiki/api/v2/spaces",
+                get(|Query(q): Query<HashMap<String, String>>| async move {
+                    match q.get("cursor").map(String::as_str) {
+                        None => Json(json!({
+                            "results": [{ "id": "1", "key": "S1", "name": "Space 1", "type": "global" }],
+                            "_links": { "next": "/wiki/api/v2/spaces?limit=250&cursor=p2" }
+                        })),
+                        Some("p2") => Json(json!({
+                            "results": [{ "id": "2", "key": "S2", "name": "Space 2", "type": "global" }],
+                            "_links": { "next": "/wiki/api/v2/spaces?limit=250&cursor=p3" }
+                        })),
+                        _ => Json(json!({
+                            "results": [{ "id": "3", "key": "S3", "name": "Space 3", "type": "global" }]
+                        })),
+                    }
+                }),
+            )
+            .route(
+                "/rest/api/space",
+                get(|Query(q): Query<HashMap<String, String>>| async move {
+                    match q.get("start").and_then(|s| s.parse::<usize>().ok()).unwrap_or(0) {
+                        0 => Json(json!({
+                            "results": [{ "id": "1", "key": "S1", "name": "Space 1", "type": "global" }],
+                            "_links": { "next": "/rest/api/space?limit=250&start=1" }
+                        })),
+                        1 => Json(json!({
+                            "results": [{ "id": "2", "key": "S2", "name": "Space 2", "type": "global" }],
+                            "_links": { "next": "/rest/api/space?limit=250&start=2" }
+                        })),
+                        _ => Json(json!({
+                            "results": [{ "id": "3", "key": "S3", "name": "Space 3", "type": "global" }]
+                        })),
+                    }
+                }),
+            );
+
+        let base_url = spawn_router(app).await;
+        let cloud_client = make_client(&base_url, &format!("{base_url}/wiki"), DeploymentKind::Cloud);
+        let dc_client = make_client(&base_url, &base_url, DeploymentKind::DataCenter);
+
+        let c1 = cloud_client
+            .list_child_pages_page("100", 2, None)
+            .await
+            .unwrap();
+        assert_eq!(c1.items.len(), 2);
+        assert_eq!(c1.has_more, Some(true));
+        assert_eq!(c1.next_cursor.as_deref(), Some("abc="));
+        assert!(c1.items.iter().all(|p| p.has_children.is_none()));
+
+        let c2 = cloud_client
+            .list_child_pages_page("100", 2, c1.next_cursor.as_deref())
+            .await
+            .unwrap();
+        assert_eq!(c2.items.len(), 1);
+        assert_eq!(c2.items[0].id, "103");
+        assert_eq!(c2.has_more, Some(false));
+        assert_eq!(c2.next_cursor, None);
+
+        let d1 = dc_client
+            .list_child_pages_page("100", 2, None)
+            .await
+            .unwrap();
+        assert_eq!(d1.items.len(), 2);
+        assert_eq!(d1.has_more, Some(true));
+        assert_eq!(d1.next_cursor.as_deref(), Some("2"));
+
+        let d2 = dc_client
+            .list_child_pages_page("100", 2, d1.next_cursor.as_deref())
+            .await
+            .unwrap();
+        assert_eq!(d2.items.len(), 1);
+        assert_eq!(d2.items[0].id, "103");
+        assert_eq!(d2.has_more, Some(false));
+        assert_eq!(d2.next_cursor, None);
+
+        let cloud_spaces = cloud_client.list_all_spaces().await.unwrap();
+        assert_eq!(
+            cloud_spaces.iter().map(|s| s.key.as_str()).collect::<Vec<_>>(),
+            vec!["S1", "S2", "S3"]
+        );
+        let dc_spaces = dc_client.list_all_spaces().await.unwrap();
+        assert_eq!(
+            dc_spaces.iter().map(|s| s.key.as_str()).collect::<Vec<_>>(),
+            vec!["S1", "S2", "S3"]
+        );
+
+        let cr1 = cloud_client
+            .list_space_root_pages_page("999", 2, None)
+            .await
+            .unwrap();
+        assert_eq!(cr1.items.len(), 2);
+        assert_eq!(cr1.has_more, Some(true));
+        assert_eq!(cr1.next_cursor.as_deref(), Some("r2="));
+        let cr2 = cloud_client
+            .list_space_root_pages_page("999", 2, cr1.next_cursor.as_deref())
+            .await
+            .unwrap();
+        assert_eq!(cr2.items.len(), 1);
+        assert_eq!(cr2.items[0].id, "203");
+        assert_eq!(cr2.has_more, Some(false));
+        assert_eq!(cr2.next_cursor, None);
+
+        let dr1 = dc_client
+            .list_space_root_pages_page("ENG", 2, None)
+            .await
+            .unwrap();
+        assert_eq!(dr1.items.len(), 2);
+        assert_eq!(dr1.has_more, Some(true));
+        assert_eq!(dr1.next_cursor.as_deref(), Some("2"));
+        let dr2 = dc_client
+            .list_space_root_pages_page("ENG", 2, dr1.next_cursor.as_deref())
+            .await
+            .unwrap();
+        assert_eq!(dr2.items.len(), 1);
+        assert_eq!(dr2.items[0].id, "203");
+        assert_eq!(dr2.has_more, Some(false));
+        assert_eq!(dr2.next_cursor, None);
     }
 }

@@ -769,6 +769,7 @@ fn build_demo_state() -> (AppState, UiState) {
                 updated_at: "2025-11-19T14:05:00Z".into(),
             },
         ],
+        incomplete: vec![],
     });
 
     // Confluence Spaces & Hierarchical Page Tree
@@ -807,7 +808,7 @@ fn build_demo_state() -> (AppState, UiState) {
         author_name: Some("Alex Rivera".into()),
         updated_at: "2025-11-19T13:45:00Z".into(),
         position: 0,
-        has_children: true,
+        has_children: Some(true),
         web_url: "https://acme.atlassian.net/wiki/spaces/ENG/pages/40200".into(),
     };
     let child_runbook = PageSummary {
@@ -821,7 +822,7 @@ fn build_demo_state() -> (AppState, UiState) {
         author_name: Some("Alex Rivera".into()),
         updated_at: "2025-11-19T14:20:00Z".into(),
         position: 0,
-        has_children: false,
+        has_children: Some(false),
         web_url: "https://acme.atlassian.net/wiki/spaces/ENG/pages/40211".into(),
     };
     let child_gateway = PageSummary {
@@ -835,7 +836,7 @@ fn build_demo_state() -> (AppState, UiState) {
         author_name: Some("Maya Chen".into()),
         updated_at: "2025-11-18T16:10:00Z".into(),
         position: 1,
-        has_children: false,
+        has_children: Some(false),
         web_url: "https://acme.atlassian.net/wiki/spaces/ENG/pages/40212".into(),
     };
     let root_oncall = PageSummary {
@@ -849,7 +850,7 @@ fn build_demo_state() -> (AppState, UiState) {
         author_name: Some("Priya Nair".into()),
         updated_at: "2025-11-17T08:00:00Z".into(),
         position: 1,
-        has_children: true,
+        has_children: Some(true),
         web_url: "https://acme.atlassian.net/wiki/spaces/ENG/pages/40230".into(),
     };
 
@@ -984,6 +985,7 @@ fn build_demo_state() -> (AppState, UiState) {
             created_at: "2025-11-19T13:55:00Z".into(),
         }],
         linked_issue_keys: vec!["ENG-101".into(), "ENG-104".into()],
+        incomplete: vec![],
     });
 
     app.cache_counts = CacheCounts {
