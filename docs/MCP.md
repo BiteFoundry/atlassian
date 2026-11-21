@@ -109,7 +109,7 @@ args = ["mcp"]
 | `list_boards` | `project?` (string), `refresh?` (bool) | `{ "boards": [...] }` |
 | `list_sprints` | `board_id` (int), `offline?` (bool) | `{ "board_id": ..., "sprints": [...] }` |
 | `get_board_issues` | `board_id` (int), `sprint_id?` (int), `limit?` (1..1000), `offline?` (bool) | `{ "board_id": ..., "sprint_id": ..., "issues": [...] }` |
-| `search_jira_issues` | `jql?`, `query?`, `project?`, `limit?` (1..1000), `page_token?`, `offline?` (bool) | `{ "jql": "...", "issues": [...], ... }` or offline `{ "offline": true, "hits"\|"issues": [...] }` |
+| `search_jira_issues` | `jql?`, `query?`, `project?`, `limit?` (1..1000), `page_token?` (Cloud), `start_at?` (Data Center, >= 0), `offline?` (bool) | `{ "jql": "...", "issues": [...], "next_page_token": ..., "next_start_at": ..., "total": ... }` or offline `{ "offline": true, "hits"\|"issues": [...] }` |
 | `get_jira_issue` | `key` (string), `offline?` (bool), `compact?` (bool) | `{ "issue": {...} }` |
 | `create_jira_issue` | `project_key`, `summary`, `issue_type?`, `description_markdown?`, `priority?`, `assignee_id?`, `labels?`, `parent_key?` | `{ "ok": true, "issue": {...} }` |
 | `update_jira_issue` | `key`, `summary?`, `description_markdown?`, `append_markdown?`, `replace_text?`, `priority?`, `assignee_id?` (`string\|null`), `labels?`, `dry_run?` (bool) | Updated `issue` or a `preview` |
@@ -137,6 +137,8 @@ args = ["mcp"]
 | `update_confluence_page` | `page_id`, `title?`, `body_markdown?`, `append_markdown?`, `replace_text?`, `replace_section?`, `prev_version?`, `version_message?`, `dry_run?` (bool) | Updated `page` or a `preview` |
 | `add_confluence_comment` | `page_id`, `body_markdown` | `{ "ok": true, "comment": {...} }` |
 | `search_confluence_pages` | `query?`, `cql?`, `remote?` (bool), `limit?` (1..1000) | `{ "remote": ..., "hits"\|"pages": [...] }` |
+
+> **Search queries & pagination**: Plain-text `query` values (including phrases containing `and`, `or`, `=`, or `~` such as `read and write` or `timeout=30`) are escaped into `text ~ "..."` (with `project = "..." AND ...` when `project` is supplied). Standard leading field expressions (e.g. `project = FLS`, `space = ENG`, `status IN (...)`, `cf[10016] >= 5`, or `ORDER BY ...`) are recognized automatically; pass explicit `jql` (e.g. `{"jql": "customField = \"value\""}`) or `cql` (e.g. `{"cql": "customMeta = \"value\""}`) for custom raw expressions. For Jira pagination, use `page_token` on Cloud and `start_at` (from `next_start_at`) on Data Center; passing both cursors together is rejected.
 | `delete_confluence_page` | `page_id`, `confirm` (must be literal `true`) | `{ "ok": true, "page_id": "..." }` |
 | `upload_confluence_attachment` | `page_id`, `path` (local file path) | `attachments` metadata |
 | `move_confluence_page` | `page_id`, `parent_id`, `prev_version?` (required on Data Center) | `page` summary with confirmed parent and version |

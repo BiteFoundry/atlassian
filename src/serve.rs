@@ -168,6 +168,8 @@ pub struct IssuesQuery {
     #[serde(default)]
     pub page_token: Option<String>,
     #[serde(default)]
+    pub start_at: Option<usize>,
+    #[serde(default)]
     pub offline: bool,
     #[serde(default)]
     pub site: Option<String>,
@@ -538,14 +540,11 @@ async fn refresh_page_cache_after_write(
     site_id: &str,
     page_id: &str,
 ) {
-    if let Ok((mut detail, meta)) = client.get_page_with_meta(page_id).await {
-        let _ = storage.upsert_page_detail_for_site_merging(
-            site_id,
-            &mut detail,
-            !meta.labels_ok,
-            !meta.attachments_ok,
-            !meta.comments_ok,
-        );
+    if let Ok((mut detail, meta)) = client
+        .get_page_with_meta_in_cache(page_id, site_id, storage)
+        .await
+    {
+        let _ = storage.upsert_page_detail_for_site_with_meta(site_id, &mut detail, meta);
     }
 }
 
@@ -759,6 +758,16 @@ async fn list_issues(
     Query(query): Query<IssuesQuery>,
 ) -> Result<Json<Value>, ApiError> {
     let limit = clamp_limit(query.limit.unwrap_or(50));
+    let page_token = query
+        .page_token
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty());
+    if page_token.is_some() && query.start_at.is_some() {
+        return Err(ApiError::bad_request(
+            "specify either 'page_token' or 'start_at', not both",
+        ));
+    }
     let project = query
         .project
         .as_deref()
@@ -790,7 +799,7 @@ async fn list_issues(
     };
 
     let page = client
-        .search_issues_jql(&jql, limit, query.page_token.as_deref(), None)
+        .search_issues_jql(&jql, limit, page_token, query.start_at)
         .await?;
     let _ = state.storage.upsert_issues_for_site(&target_site, &page.issues);
 
@@ -1088,7 +1097,9 @@ async fn list_space_pages(
     } else {
         let (target_site, client) = resolve_site_client(&state, query.site.as_deref())?;
         let fetched = client.list_space_root_pages(space, limit).await?;
-        let _ = state.storage.upsert_pages_for_site(&target_site, &fetched);
+        let _ = state
+            .storage
+            .upsert_authoritative_pages_for_site(&target_site, &fetched);
         if fetched.len() < limit {
             let keep: Vec<String> = fetched.iter().map(|p| p.id.clone()).collect();
             let _ = state
@@ -1125,7 +1136,10 @@ async fn get_page(
     }
 
     let (target_site, client) = resolve_site_client(&state, query.site.as_deref())?;
-    let (mut fetched, meta) = match client.get_page_with_meta(id).await {
+    let (mut fetched, meta) = match client
+        .get_page_with_meta_in_cache(id, &target_site, &state.storage)
+        .await
+    {
         Ok(res) => res,
         Err(err) => {
             if is_not_found_error(&err) {
@@ -1134,13 +1148,9 @@ async fn get_page(
             return Err(err.into());
         }
     };
-    let _ = state.storage.upsert_page_detail_for_site_merging(
-        &target_site,
-        &mut fetched,
-        !meta.labels_ok,
-        !meta.attachments_ok,
-        !meta.comments_ok,
-    );
+    let _ = state
+        .storage
+        .upsert_page_detail_for_site_with_meta(&target_site, &mut fetched, meta);
     Ok(Json(
         json!({ "site_id": target_site, "detail_stale": false, "page": fetched.output(query.compact) }),
     ))
@@ -1322,7 +1332,7 @@ async fn search(
         let target_name = site_name_lookup(&state.config, &target_site);
         let mut combined = Vec::new();
         if scope == "all" || scope == "jira" {
-            let jql = if looks_like_query_expr(q) {
+            let jql = if looks_like_jql_expr(q) {
                 q.to_string()
             } else {
                 format!("text ~ \"{}\"", escape_jql_str(q))
@@ -1336,7 +1346,7 @@ async fn search(
             }));
         }
         if scope == "all" || scope == "confluence" {
-            let cql = if looks_like_query_expr(q) {
+            let cql = if looks_like_cql_expr(q) {
                 q.to_string()
             } else {
                 format!("text ~ \"{}\"", escape_jql_str(q))
@@ -1347,6 +1357,7 @@ async fn search(
                 FederatedSearchHit::new(target_site.clone(), target_name.clone(), page_to_hit(p))
             }));
         }
+        crate::storage::sort_federated_hits(&mut combined);
         combined.truncate(limit);
         combined
     };
@@ -1411,13 +1422,188 @@ pub(crate) fn escape_jql_str(raw: &str) -> String {
     raw.replace('\\', "\\\\").replace('"', "\\\"")
 }
 
-pub(crate) fn looks_like_query_expr(raw: &str) -> bool {
-    let upper = raw.to_ascii_uppercase();
-    raw.contains('=')
-        || raw.contains('~')
-        || upper.contains(" AND ")
-        || upper.contains(" OR ")
-        || upper.contains(" ORDER BY ")
+const JQL_AUTO_FIELDS: &[&str] = &[
+    "project",
+    "key",
+    "issuekey",
+    "issuetype",
+    "type",
+    "status",
+    "assignee",
+    "reporter",
+    "summary",
+    "text",
+    "labels",
+    "priority",
+    "created",
+    "updated",
+    "resolution",
+    "sprint",
+];
+
+const CQL_AUTO_FIELDS: &[&str] = &[
+    "space",
+    "type",
+    "title",
+    "text",
+    "ancestor",
+    "parent",
+    "label",
+    "creator",
+    "created",
+    "lastmodified",
+    "id",
+];
+
+pub(crate) fn looks_like_jql_expr(raw: &str) -> bool {
+    looks_like_structured_query_expr(raw, JQL_AUTO_FIELDS, true)
+}
+
+pub(crate) fn looks_like_cql_expr(raw: &str) -> bool {
+    looks_like_structured_query_expr(raw, CQL_AUTO_FIELDS, false)
+}
+
+fn looks_like_structured_query_expr(raw: &str, known_fields: &[&str], allow_jira_cf: bool) -> bool {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return false;
+    }
+
+    // Leading `ORDER BY <expr>`
+    if let Some(after_order) = strip_ascii_keyword(trimmed, "order") {
+        let after_ws = after_order.trim_start();
+        if after_ws.len() < after_order.len() {
+            if let Some(after_by) = strip_ascii_keyword(after_ws, "by") {
+                let operand = after_by.trim_start();
+                if operand.len() < after_by.len() && !operand.is_empty() {
+                    return true;
+                }
+            }
+        }
+    }
+
+    let Some(after_field) = consume_query_field(trimmed, known_fields, allow_jira_cf) else {
+        return false;
+    };
+    consume_operator_and_operand(after_field)
+}
+
+fn strip_ascii_keyword<'a>(input: &'a str, kw: &str) -> Option<&'a str> {
+    if input.len() < kw.len() || !input.is_char_boundary(kw.len()) {
+        return None;
+    }
+    let (head, tail) = input.split_at(kw.len());
+    if !head.eq_ignore_ascii_case(kw) {
+        return None;
+    }
+    if tail
+        .chars()
+        .next()
+        .is_some_and(|c| c.is_ascii_alphanumeric() || c == '_')
+    {
+        return None;
+    }
+    Some(tail)
+}
+
+fn consume_query_field<'a>(
+    input: &'a str,
+    known_fields: &[&str],
+    allow_jira_cf: bool,
+) -> Option<&'a str> {
+    // Quoted field name: "Custom Field" = ...
+    if let Some(rest) = input.strip_prefix('"') {
+        let mut escaped = false;
+        let mut inner_len = 0usize;
+        for (idx, ch) in rest.char_indices() {
+            if escaped {
+                escaped = false;
+                inner_len += 1;
+                continue;
+            }
+            if ch == '\\' {
+                escaped = true;
+                inner_len += 1;
+                continue;
+            }
+            if ch == '"' {
+                if inner_len == 0 {
+                    return None;
+                }
+                return Some(&rest[idx + 1..]);
+            }
+            inner_len += 1;
+        }
+        return None;
+    }
+
+    // Jira custom field syntax: cf[10016]
+    if allow_jira_cf && input.len() >= 5 && input.is_char_boundary(3) {
+        let (prefix, rest) = input.split_at(3);
+        if prefix.eq_ignore_ascii_case("cf[") {
+            let digits = rest.bytes().take_while(|b| b.is_ascii_digit()).count();
+            if digits > 0 && rest.as_bytes().get(digits) == Some(&b']') {
+                return Some(&rest[digits + 1..]);
+            }
+        }
+    }
+
+    // Known field identifier (case-insensitive, word boundary)
+    for &field in known_fields {
+        if let Some(tail) = strip_ascii_keyword(input, field) {
+            return Some(tail);
+        }
+    }
+    None
+}
+
+fn consume_operator_and_operand(after_field: &str) -> bool {
+    let op_start = after_field.trim_start();
+    let had_ws_before_op = op_start.len() < after_field.len();
+
+    for sym in ["!=", "!~", "<=", ">=", "=", "~", "<", ">"] {
+        if let Some(after_op) = op_start.strip_prefix(sym) {
+            return !after_op.trim().is_empty();
+        }
+    }
+
+    if !had_ws_before_op {
+        return false;
+    }
+
+    // `NOT IN`
+    if let Some(after_not) = strip_ascii_keyword(op_start, "not") {
+        let after_not_ws = after_not.trim_start();
+        if after_not_ws.len() < after_not.len() {
+            if let Some(after_in) = strip_ascii_keyword(after_not_ws, "in") {
+                return has_keyword_operand(after_in, true);
+            }
+        }
+    }
+    // `IN`
+    if let Some(after_in) = strip_ascii_keyword(op_start, "in") {
+        return has_keyword_operand(after_in, true);
+    }
+    // `IS NOT` / `IS`
+    if let Some(after_is) = strip_ascii_keyword(op_start, "is") {
+        let after_is_ws = after_is.trim_start();
+        if after_is_ws.len() < after_is.len() {
+            if let Some(after_not) = strip_ascii_keyword(after_is_ws, "not") {
+                return has_keyword_operand(after_not, false);
+            }
+            return !after_is_ws.is_empty();
+        }
+    }
+
+    false
+}
+
+fn has_keyword_operand(after_kw: &str, allow_open_paren: bool) -> bool {
+    let trimmed = after_kw.trim_start();
+    if trimmed.is_empty() {
+        return false;
+    }
+    trimmed.len() < after_kw.len() || (allow_open_paren && trimmed.starts_with('('))
 }
 
 pub(crate) fn issue_to_hit(issue: &IssueSummary) -> UnifiedSearchHit {

@@ -122,6 +122,10 @@ impl AtlassianClient {
         page_token: Option<&str>,
         start_at: Option<usize>,
     ) -> Result<JqlSearchPage> {
+        let trimmed_token = page_token.map(str::trim).filter(|s| !s.is_empty());
+        if trimmed_token.is_some() && start_at.is_some() {
+            bail!("specify either 'page_token' (Cloud) or 'start_at' (Data Center), not both");
+        }
         let base = self.require_site_url()?;
         let max_results = limit.clamp(1, 100);
 
@@ -135,7 +139,7 @@ impl AtlassianClient {
                     "maxResults": max_results,
                     "fields": SEARCH_FIELDS,
                 });
-                if let Some(token) = page_token.map(str::trim).filter(|s| !s.is_empty()) {
+                if let Some(token) = trimmed_token {
                     payload["nextPageToken"] = Value::String(token.to_string());
                 }
 

@@ -2882,7 +2882,7 @@ impl AppState {
             let page_limit = 100usize;
             match client.list_space_root_pages(&sk, page_limit).await {
                 Ok(pages) => {
-                    let _ = storage.upsert_pages_for_site(&site_id, &pages);
+                    let _ = storage.upsert_authoritative_pages_for_site(&site_id, &pages);
                     if pages.len() < page_limit {
                         let keep: Vec<String> = pages.iter().map(|p| p.id.clone()).collect();
                         let _ = storage.prune_space_root_pages_for_site(&site_id, &sk, &keep);
@@ -3073,15 +3073,13 @@ impl AppState {
         let tx = self.ui_tx.clone();
         let pid = page_id.to_string();
         tokio::spawn(async move {
-            match client.get_page_with_meta(&pid).await {
+            match client
+                .get_page_with_meta_in_cache(&pid, &site_id, &storage)
+                .await
+            {
                 Ok((mut detail, meta)) => {
-                    let _ = storage.upsert_page_detail_for_site_merging(
-                        &site_id,
-                        &mut detail,
-                        !meta.labels_ok,
-                        !meta.attachments_ok,
-                        !meta.comments_ok,
-                    );
+                    let _ =
+                        storage.upsert_page_detail_for_site_with_meta(&site_id, &mut detail, meta);
                     let _ = tx.send(UiMsg::PageDetailLoaded {
                         seq: Some(seq),
                         site_id,
@@ -4090,13 +4088,19 @@ impl AppState {
                     // Late response after site/item switch: persist strictly to original site cache only.
                     let _ = self
                         .storage
-                        .upsert_pages_for_site(&effective_sid, std::slice::from_ref(&summary));
+                        .upsert_authoritative_pages_for_site(
+                            &effective_sid,
+                            std::slice::from_ref(&summary),
+                        );
                     return;
                 }
                 if self.page_revision_needs_detail(&effective_sid, &summary) {
                     let _ = self
                         .storage
-                        .upsert_pages_for_site(&effective_sid, std::slice::from_ref(&summary));
+                        .upsert_authoritative_pages_for_site(
+                            &effective_sid,
+                            std::slice::from_ref(&summary),
+                        );
                     self.request_page_detail_for_site_if_needed(
                         ui,
                         Some(&effective_sid),

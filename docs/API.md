@@ -151,12 +151,14 @@ Lists issues on a Jira Agile board, optionally scoped to `sprint_id`.
 
 ## Jira Issues
 
-### `GET /issues?jql=&project=&limit=50&page_token=&offline=false`
+### `GET /issues?jql=&project=&limit=50&page_token=&start_at=&offline=false`
 
-Searches Jira issues by `jql`, `project` filter, or `my_open_issues_jql()`, or reads cached issues when `offline=true`.
+Searches Jira issues by explicit `jql`, `project` filter, or `my_open_issues_jql()`, or reads cached issues when `offline=true`. On Cloud, pass `page_token` (from `next_page_token`); on Data Center, pass non-negative integer `start_at` (from `next_start_at`, default `0`). Supplying both `page_token` and `start_at` returns HTTP 400.
 
 ```bash
 curl "http://127.0.0.1:8789/issues?project=ENG&limit=20"
+# Data Center next page:
+curl "http://127.0.0.1:8789/issues?jql=project%20%3D%20ENG&limit=20&start_at=20"
 ```
 
 ```json
@@ -328,7 +330,7 @@ Lists footer comments on a Confluence page, or adds a Markdown comment (`{"body_
 Searches across Jira issues and Confluence pages.
 
 - `remote=false` (default): searches local SQLite FTS5 (`issues_fts` / `pages_fts` + Korean short-query fallback).
-- `remote=true`: executes Jira JQL (`text ~ "..."` or raw JQL expression) and/or Confluence CQL (`text ~ "..."` or raw CQL expression).
+- `remote=true`: executes Jira JQL (`text ~ "..."` for plain text, or compatible leading standard-field JQL such as `project = FLS` / `status IN (...)`) and/or Confluence CQL (`text ~ "..."` for plain text, or compatible leading standard-field CQL such as `space = ENG`). Phrases containing `and`/`or`/`=`/`~` (e.g. `read and write`, `timeout=30`) are treated as plain text. For custom raw JQL expressions, use `GET /issues?jql=customField%20%3D%20%22value%22`.
 - `scope`: `all` (default), `jira`, or `confluence`.
 
 ```json

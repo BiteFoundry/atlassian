@@ -8,7 +8,10 @@ use serde::Deserialize;
 use serde_json::{json, Value};
 use thiserror::Error;
 
-use crate::adf::{markdown_to_adf, markdown_to_jira_wiki, markdown_to_storage_xhtml, xml_escape};
+use crate::adf::{
+    adf_heading_display_variants, is_wiki_escapable, markdown_to_adf, markdown_to_jira_wiki,
+    markdown_to_storage_xhtml, normalize_markdown_heading_text, xml_escape,
+};
 
 #[derive(Debug, Error)]
 #[error("{0}")]
@@ -198,17 +201,11 @@ fn heading_level(node: &Value) -> Option<u64> {
         .flatten()
 }
 
-fn heading_text(node: &Value) -> Option<String> {
-    node["content"]
-        .as_array()?
-        .iter()
-        .map(|inline| match inline["type"].as_str() {
-            Some("text") => inline["text"].as_str(),
-            Some("hardBreak") => Some("\n"),
-            Some("mention" | "emoji") => inline.pointer("/attrs/text").and_then(Value::as_str),
-            _ => None,
-        })
-        .collect()
+fn heading_matches(node: &Value, target_trimmed: &str, target_normalized: &str) -> bool {
+    let Some((plain, markdown)) = adf_heading_display_variants(node) else {
+        return false;
+    };
+    plain == target_trimmed || markdown == target_trimmed || plain == target_normalized
 }
 
 fn section_range_in_container(
@@ -225,6 +222,8 @@ fn section_range_in_container(
 }
 
 fn section_body_range(content: &[Value], heading: &str) -> Result<SectionTarget> {
+    let target_trimmed = heading.trim();
+    let target_normalized = normalize_markdown_heading_text(target_trimmed);
     let mut matched: Option<SectionTarget> = None;
     let mut record = |candidate: SectionTarget| -> Result<()> {
         if matched.is_some() {
@@ -236,7 +235,7 @@ fn section_body_range(content: &[Value], heading: &str) -> Result<SectionTarget>
 
     for (index, node) in content.iter().enumerate() {
         if let Some(level) = heading_level(node) {
-            if heading_text(node).as_deref() == Some(heading) {
+            if heading_matches(node, target_trimmed, &target_normalized) {
                 record(SectionTarget::TopLevel(section_range_in_container(
                     content, index, level,
                 )))?;
@@ -252,7 +251,7 @@ fn section_body_range(content: &[Value], heading: &str) -> Result<SectionTarget>
                     };
                     for (node_index, child) in column_content.iter().enumerate() {
                         if let Some(level) = heading_level(child) {
-                            if heading_text(child).as_deref() == Some(heading) {
+                            if heading_matches(child, target_trimmed, &target_normalized) {
                                 record(SectionTarget::LayoutColumn {
                                     section_index: index,
                                     column_index,
@@ -507,29 +506,287 @@ fn replace_storage_text(original: &str, edit: &TextReplacement) -> Result<Option
     ))
 }
 
-fn replace_wiki_text(original: &str, edit: &TextReplacement) -> Result<Option<String>> {
-    // Wiki link destinations, macros, and images have no standalone text nodes.
-    // Treat their source tokens as boundaries and preserve wiki formatting.
-    static TOKEN: LazyLock<Regex> = LazyLock::new(|| {
-        Regex::new(r"(?s)\{code[^}]*\}.*?\{code\}|\{noformat\}.*?\{noformat\}|\[[^\]\n]*\]|\{[^{}\n]*\}|![^!\n]*!|https?://[^\s\]]+|[*_+~^]+|\r?\n").unwrap()
-    });
-    let mut runs = Vec::new();
-    let mut run = TextRun::default();
-    let mut start = 0;
-    for token in TOKEN.find_iter(original) {
-        run.push(&original[start..token.start()], start);
-        start = token.end();
-        if !token.as_str().chars().all(|c| "*_+~^".contains(c)) {
-            runs.push(std::mem::take(&mut run));
+fn find_wiki_opaque_token(slice: &str) -> Option<usize> {
+    // Multiline {code...}...{code} or {noformat}...{noformat}
+    if slice.starts_with("{code") {
+        if let Some(open_end) = slice.find('}') {
+            if let Some(close_rel) = slice[open_end + 1..].find("{code}") {
+                return Some(open_end + 1 + close_rel + "{code}".len());
+            }
         }
     }
-    run.push(&original[start..], start);
-    runs.push(run);
-    let (start, range) = unique_match(&runs, &edit.old_text)?;
+    if slice.starts_with("{noformat}") {
+        if let Some(close_rel) = slice["{noformat}".len()..].find("{noformat}") {
+            return Some("{noformat}".len() + close_rel + "{noformat}".len());
+        }
+    }
+    // Inline monospace {{...}} on the same line
+    if slice.starts_with("{{") {
+        let line_end = slice.find('\n').unwrap_or(slice.len());
+        if let Some(close_rel) = slice[2..line_end].find("}}") {
+            return Some(2 + close_rel + 2);
+        }
+    }
+    // Single-line macro tag {name...}
+    if slice.starts_with('{') {
+        let line_end = slice.find('\n').unwrap_or(slice.len());
+        if let Some(close_rel) = slice[1..line_end].find('}') {
+            let inner = &slice[1..1 + close_rel];
+            if !inner.is_empty() && inner.chars().next().is_some_and(|c| c.is_ascii_alphabetic()) {
+                return Some(1 + close_rel + 1);
+            }
+        }
+    }
+    // Wiki link or mention: [title|url], [url], [~user]
+    if slice.starts_with('[') {
+        let line_end = slice.find('\n').unwrap_or(slice.len());
+        if let Some(close_rel) = slice[1..line_end].find(']') {
+            let inner = &slice[1..1 + close_rel];
+            if !inner.is_empty() {
+                return Some(1 + close_rel + 1);
+            }
+        }
+    }
+    // Wiki image token: !image.png! or !https://...! or !file.png|width=200!
+    // Never consumes ordinary prose sentences between exclamation marks (`Alert! Watch now!`).
+    if slice.starts_with('!') {
+        let line_end = slice.find('\n').unwrap_or(slice.len());
+        let line = &slice[..line_end];
+        if let Some(close_rel) = find_unescaped_char(&line[1..], '!') {
+            let inner = &line[1..1 + close_rel];
+            if is_wiki_image_target(inner) {
+                return Some(1 + close_rel + 1);
+            }
+        }
+    }
+    // Bare HTTP(S) URL
+    if slice.starts_with("http://") || slice.starts_with("https://") {
+        let end = slice
+            .find(|c: char| c.is_whitespace() || c == ']')
+            .unwrap_or(slice.len());
+        if end > "http://".len() {
+            return Some(end);
+        }
+    }
+    // Newline boundary
+    if slice.starts_with("\r\n") {
+        return Some(2);
+    }
+    if slice.starts_with('\n') {
+        return Some(1);
+    }
+    None
+}
+
+fn find_unescaped_char(s: &str, target: char) -> Option<usize> {
+    let mut iter = s.char_indices();
+    while let Some((idx, ch)) = iter.next() {
+        if ch == '\\' {
+            let _ = iter.next();
+            continue;
+        }
+        if ch == target {
+            return Some(idx);
+        }
+    }
+    None
+}
+
+fn is_wiki_image_target(inner: &str) -> bool {
+    if inner.is_empty()
+        || inner.starts_with(char::is_whitespace)
+        || inner.ends_with(char::is_whitespace)
+    {
+        return false;
+    }
+    let (target, params) = match inner.split_once('|') {
+        Some((t, p)) => (t, Some(p)),
+        None => (inner, None),
+    };
+    if target.is_empty() || target.chars().any(char::is_whitespace) {
+        return false;
+    }
+    if target.starts_with("http://") || target.starts_with("https://") {
+        return true;
+    }
+    if let Some(p) = params {
+        let lower = p.to_ascii_lowercase();
+        if lower.contains("thumbnail")
+            || lower.contains("width=")
+            || lower.contains("height=")
+            || lower.contains("alt=")
+        {
+            return true;
+        }
+    }
+    if let Some((_, ext)) = target.rsplit_once('.') {
+        !ext.is_empty()
+            && ext.len() <= 8
+            && ext.chars().all(|c| c.is_ascii_alphanumeric())
+            && !target.starts_with('.')
+    } else {
+        false
+    }
+}
+
+fn find_wiki_inline_delim_close(line: &str, open_end: usize, delim: char) -> Option<usize> {
+    let after = &line[open_end..];
+    let first = after.chars().next()?;
+    if first.is_whitespace() || first == delim {
+        return None;
+    }
+    let mut iter = after.char_indices().peekable();
+    let mut prev_char: Option<char> = None;
+    while let Some((rel, ch)) = iter.next() {
+        if ch == '\\' {
+            if let Some(&(_, next_ch)) = iter.peek() {
+                if is_wiki_escapable(next_ch) {
+                    iter.next();
+                    prev_char = Some(next_ch);
+                    continue;
+                }
+            }
+        }
+        if ch == delim
+            && rel > 0
+            && prev_char.is_some_and(|p| !p.is_whitespace())
+            && iter
+                .peek()
+                .map_or(true, |&(_, next_ch)| !next_ch.is_alphanumeric())
+        {
+            return Some(open_end + rel);
+        }
+        prev_char = Some(ch);
+    }
+    None
+}
+
+fn push_wiki_decoded_segment(
+    run: &mut TextRun<(usize, Vec<(usize, usize)>)>,
+    original: &str,
+    seg_start: usize,
+    seg_end: usize,
+) {
+    if seg_start >= seg_end {
+        return;
+    }
+    let raw = &original[seg_start..seg_end];
+    let mut decoded = String::with_capacity(raw.len());
+    let mut offsets = vec![(0usize, 0usize)];
+    let mut iter = raw.char_indices().peekable();
+    while let Some((idx, ch)) = iter.next() {
+        if ch == '\\' {
+            if let Some(&(next_idx, next_ch)) = iter.peek() {
+                if is_wiki_escapable(next_ch) {
+                    iter.next();
+                    offsets.push((decoded.len(), idx));
+                    decoded.push(next_ch);
+                    offsets.push((decoded.len(), next_idx + next_ch.len_utf8()));
+                    continue;
+                }
+            }
+        }
+        decoded.push(ch);
+    }
+    run.push(&decoded, (seg_start, offsets));
+}
+
+fn replace_wiki_text(original: &str, edit: &TextReplacement) -> Result<Option<String>> {
+    // Parse wiki markup into display-text runs with exact source byte offset maps.
+    // Words with internal `_` / `+` and prose `!` stay literal; actual formatting pairs,
+    // images, links, macros, and code blocks remain protected boundaries.
+    let mut runs: Vec<TextRun<(usize, Vec<(usize, usize)>)>> = Vec::new();
+    let mut run = TextRun::default();
+    let mut seg_start = 0usize;
+    let mut i = 0usize;
+    let mut active_close: Option<usize> = None;
+
+    let flush_seg = |run: &mut TextRun<(usize, Vec<(usize, usize)>)>,
+                     seg_start: &mut usize,
+                     end: usize| {
+        if *seg_start < end {
+            push_wiki_decoded_segment(run, original, *seg_start, end);
+            *seg_start = end;
+        }
+    };
+
+    while i < original.len() {
+        if active_close == Some(i) {
+            flush_seg(&mut run, &mut seg_start, i);
+            let ch_len = original[i..].chars().next().unwrap().len_utf8();
+            i += ch_len;
+            seg_start = i;
+            active_close = None;
+            continue;
+        }
+
+        let rest = &original[i..];
+
+        // Backslash escape: keep inside the current literal segment
+        if let Some(after_bs) = rest.strip_prefix('\\') {
+            if let Some(next_ch) = after_bs.chars().next() {
+                if is_wiki_escapable(next_ch) {
+                    i += 1 + next_ch.len_utf8();
+                    continue;
+                }
+            }
+        }
+
+        // Opaque boundaries (macros, code, links, real images, URLs, newlines)
+        if let Some(tok_len) = find_wiki_opaque_token(rest) {
+            flush_seg(&mut run, &mut seg_start, i);
+            if !run.text.is_empty() {
+                runs.push(std::mem::take(&mut run));
+            }
+            i += tok_len;
+            seg_start = i;
+            if active_close.is_some_and(|c| c < i) {
+                active_close = None;
+            }
+            continue;
+        }
+
+        // Real inline formatting pairs (*bold*, _italic_, +underline+, ^sup^, ~sub~)
+        let ch = rest.chars().next().unwrap();
+        if active_close.is_none() && matches!(ch, '*' | '_' | '+' | '^' | '~') {
+            let prev_ok = original[..i]
+                .chars()
+                .next_back()
+                .map_or(true, |p| !p.is_alphanumeric() && p != '\\');
+            if prev_ok {
+                let line_end = i + rest.find('\n').unwrap_or(rest.len());
+                let open_end = i + ch.len_utf8();
+                if let Some(close_pos) = find_wiki_inline_delim_close(&original[..line_end], open_end, ch) {
+                    flush_seg(&mut run, &mut seg_start, i);
+                    i = open_end;
+                    seg_start = i;
+                    active_close = Some(close_pos);
+                    continue;
+                }
+            }
+        }
+
+        i += ch.len_utf8();
+    }
+
+    flush_seg(&mut run, &mut seg_start, original.len());
+    if !run.text.is_empty() {
+        runs.push(run);
+    }
+
+    let ((seg_base, offsets), range) = unique_match(&runs, &edit.old_text)?;
     if edit.old_text == edit.new_text {
         return Ok(None);
     }
-    // Escape wiki metacharacters so the new phrase stays literal.
+    let to_offset = |pos: usize| {
+        let &(decoded, raw) = offsets
+            .iter()
+            .rev()
+            .find(|(decoded, _)| *decoded <= pos)
+            .unwrap();
+        seg_base + raw + pos - decoded
+    };
+    // Escape wiki metacharacters once so the replacement stays literal in Jira Wiki.
     let literal: String = edit
         .new_text
         .chars()
@@ -540,7 +797,7 @@ fn replace_wiki_text(original: &str, edit: &TextReplacement) -> Result<Option<St
         .collect();
     Ok(replace_range(
         original,
-        start + range.start..start + range.end,
+        to_offset(range.start)..to_offset(range.end),
         &literal,
     ))
 }

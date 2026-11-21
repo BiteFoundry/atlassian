@@ -26,7 +26,10 @@ use crate::{
     config::{self, AppConfig},
     img_preview,
     models::{FederatedSearchHit, IssueUpdate, OutgoingIssue, OutgoingPage},
-    serve::{clamp_limit, escape_jql_str, issue_to_hit, looks_like_query_expr, page_to_hit},
+    serve::{
+        clamp_limit, escape_jql_str, issue_to_hit, looks_like_cql_expr, looks_like_jql_expr,
+        page_to_hit,
+    },
     storage::Storage,
     sync::{self, SiteSyncTarget},
 };
@@ -383,14 +386,11 @@ async fn refresh_mcp_page_cache(
     site_id: &str,
     page_id: &str,
 ) {
-    if let Ok((mut detail, meta)) = client.get_page_with_meta(page_id).await {
-        let _ = storage.upsert_page_detail_for_site_merging(
-            site_id,
-            &mut detail,
-            !meta.labels_ok,
-            !meta.attachments_ok,
-            !meta.comments_ok,
-        );
+    if let Ok((mut detail, meta)) = client
+        .get_page_with_meta_in_cache(page_id, site_id, storage)
+        .await
+    {
+        let _ = storage.upsert_page_detail_for_site_with_meta(site_id, &mut detail, meta);
     }
 }
 
@@ -606,6 +606,10 @@ async fn call_tool(
             let project = args.optional_str("project")?;
             let limit = clamp_limit(args.optional_usize("limit")?.unwrap_or(50));
             let page_token = args.optional_str("page_token")?;
+            let start_at = args.optional_nonneg_usize("start_at")?;
+            if page_token.is_some() && start_at.is_some() {
+                return Err("specify either 'page_token' or 'start_at', not both".to_string());
+            }
             let offline = args.optional_bool("offline")?.unwrap_or(false);
 
             if offline {
@@ -645,7 +649,7 @@ async fn call_tool(
             let effective_jql = if let Some(raw_jql) = jql {
                 raw_jql
             } else if let Some(q) = query {
-                if looks_like_query_expr(&q) {
+                if looks_like_jql_expr(&q) {
                     q
                 } else if let Some(proj) = project.as_deref() {
                     format!(
@@ -666,7 +670,7 @@ async fn call_tool(
             };
 
             let page = target_client
-                .search_issues_jql(&effective_jql, limit, page_token.as_deref(), None)
+                .search_issues_jql(&effective_jql, limit, page_token.as_deref(), start_at)
                 .await
                 .map_err(format_error)?;
             let _ = storage.upsert_issues_for_site(&target_site, &page.issues);
@@ -1011,7 +1015,7 @@ async fn call_tool(
                     .list_space_root_pages(&space_key, limit)
                     .await
                     .map_err(format_error)?;
-                let _ = storage.upsert_pages_for_site(&target_site, &fetched);
+                let _ = storage.upsert_authoritative_pages_for_site(&target_site, &fetched);
                 if fetched.len() < limit {
                     let keep: Vec<String> = fetched.iter().map(|p| p.id.clone()).collect();
                     let _ =
@@ -1070,7 +1074,10 @@ async fn call_tool(
             }
             let (target_site, target_client) =
                 resolve_mcp_client(config, client, site_arg.as_deref())?;
-            let (mut fetched, meta) = match target_client.get_page_with_meta(&page_id).await {
+            let (mut fetched, meta) = match target_client
+                .get_page_with_meta_in_cache(&page_id, &target_site, storage)
+                .await
+            {
                 Ok(res) => res,
                 Err(err) => {
                     if is_not_found_error(&err) {
@@ -1079,12 +1086,10 @@ async fn call_tool(
                     return Err(format_error(err));
                 }
             };
-            let _ = storage.upsert_page_detail_for_site_merging(
+            let _ = storage.upsert_page_detail_for_site_with_meta(
                 &target_site,
                 &mut fetched,
-                !meta.labels_ok,
-                !meta.attachments_ok,
-                !meta.comments_ok,
+                meta,
             );
             Ok(json!({
                 "site_id": target_site,
@@ -1175,7 +1180,7 @@ async fn call_tool(
                     Some(raw) => raw,
                     None => {
                         let q = query.as_deref().unwrap_or_default();
-                        if looks_like_query_expr(q) {
+                        if looks_like_cql_expr(q) {
                             q.to_string()
                         } else {
                             format!("text ~ \"{}\"", escape_jql_str(q))
@@ -1317,7 +1322,7 @@ async fn call_tool(
                     .map(|s| s.display_name().to_string());
                 let mut combined = Vec::new();
                 if scope == "all" || scope == "jira" {
-                    let jql = if looks_like_query_expr(&query) {
+                    let jql = if looks_like_jql_expr(&query) {
                         query.clone()
                     } else {
                         format!("text ~ \"{}\"", escape_jql_str(&query))
@@ -1336,7 +1341,7 @@ async fn call_tool(
                     }));
                 }
                 if scope == "all" || scope == "confluence" {
-                    let cql = if looks_like_query_expr(&query) {
+                    let cql = if looks_like_cql_expr(&query) {
                         query.clone()
                     } else {
                         format!("text ~ \"{}\"", escape_jql_str(&query))
@@ -1354,6 +1359,7 @@ async fn call_tool(
                         )
                     }));
                 }
+                crate::storage::sort_federated_hits(&mut combined);
                 combined.truncate(limit);
                 combined
             };
@@ -1390,12 +1396,18 @@ async fn call_tool(
                         )
                         .await;
                         let counts = storage.cache_counts().map_err(format_error)?;
-                        return Ok(json!({
+                        let payload = json!({
                             "ok": outcome.succeeded_sites > 0,
                             "summary": outcome.summary,
                             "sites": outcome.per_site,
                             "counts": counts,
-                        }));
+                        });
+                        if outcome.total_sites > 0 && outcome.succeeded_sites == 0 {
+                            let text = serde_json::to_string_pretty(&payload)
+                                .unwrap_or_else(|_| payload.to_string());
+                            return Err(text);
+                        }
+                        return Ok(payload);
                     }
                 }
             }
@@ -1504,7 +1516,11 @@ pub(crate) fn validate_tool_args(name: &str, arguments: &Value) -> Result<(), St
             if let Some(l) = args.optional_usize("limit")? {
                 validate_range("limit", l, 1, 1_000)?;
             }
-            let _ = args.optional_str("page_token")?;
+            let page_token = args.optional_str("page_token")?;
+            let start_at = args.optional_nonneg_usize("start_at")?;
+            if page_token.is_some() && start_at.is_some() {
+                return Err("specify either 'page_token' or 'start_at', not both".to_string());
+            }
             let _ = args.optional_bool("offline")?;
             Ok(())
         }
@@ -2019,6 +2035,20 @@ impl<'a> Args<'a> {
         }
     }
 
+    fn optional_nonneg_usize(&self, key: &str) -> Result<Option<usize>, String> {
+        match self.get(key)? {
+            None | Some(Value::Null) => Ok(None),
+            Some(v) => {
+                let n = v
+                    .as_u64()
+                    .ok_or_else(|| format!("'{key}' must be a non-negative integer"))?;
+                usize::try_from(n)
+                    .map(Some)
+                    .map_err(|_| format!("'{key}' is too large"))
+            }
+        }
+    }
+
     fn optional_str_array(&self, key: &str) -> Result<Vec<String>, String> {
         Ok(self.optional_str_array_opt(key)?.unwrap_or_default())
     }
@@ -2216,15 +2246,16 @@ fn tool_catalog() -> Vec<Value> {
         }),
         json!({
             "name": "search_jira_issues",
-            "description": "Search Jira issues using JQL, plain query text, project filter, or offline SQLite cache.",
+            "description": "Search Jira issues using explicit JQL (jql), plain query text (query), project filter, or offline SQLite cache. For custom field expressions (e.g. `customField = \"foo\"`), pass `jql` explicitly.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
-                    "jql": { "type": "string" },
-                    "query": { "type": "string" },
+                    "jql": { "type": "string", "description": "Explicit raw JQL expression (e.g. `customField = \"value\" ORDER BY updated DESC`). Takes precedence over query." },
+                    "query": { "type": "string", "description": "Plain text search query (or compatible standard-field JQL expression)." },
                     "project": { "type": "string" },
                     "limit": { "type": "integer", "minimum": 1, "maximum": 1000, "default": 50 },
-                    "page_token": { "type": "string" },
+                    "page_token": { "type": "string", "description": "Cloud pagination cursor (`next_page_token`). Mutually exclusive with `start_at`." },
+                    "start_at": { "type": "integer", "minimum": 0, "description": "Data Center 0-based pagination offset (`next_start_at`). Mutually exclusive with `page_token`." },
                     "offline": { "type": "boolean", "default": false }
                 },
                 "additionalProperties": false
@@ -2498,12 +2529,12 @@ fn tool_catalog() -> Vec<Value> {
         }),
         json!({
             "name": "search_confluence_pages",
-            "description": "Search Confluence pages locally (FTS5) or remotely via CQL.",
+            "description": "Search Confluence pages locally (FTS5) or remotely via CQL. For custom field expressions (e.g. `customMeta = \"value\"`), pass `cql` explicitly.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
-                    "query": { "type": "string" },
-                    "cql": { "type": "string" },
+                    "query": { "type": "string", "description": "Plain text search query (or compatible standard-field CQL expression)." },
+                    "cql": { "type": "string", "description": "Explicit raw CQL expression (e.g. `space = ENG AND title ~ \"Spec\"`). Takes precedence over query." },
                     "remote": { "type": "boolean", "default": false },
                     "limit": { "type": "integer", "minimum": 1, "maximum": 1000, "default": 30 }
                 },

@@ -1977,7 +1977,7 @@ async fn sync_space_pages_for_site(
     let page_limit = 50usize;
     let pages = client.list_space_root_pages(space_key, page_limit).await?;
     let count = pages.len();
-    storage.upsert_pages_for_site(site_id, &pages)?;
+    storage.upsert_authoritative_pages_for_site(site_id, &pages)?;
     if count < page_limit {
         let keep_ids: Vec<String> = pages.iter().map(|p| p.id.clone()).collect();
         let _ = storage.prune_space_root_pages_for_site(site_id, space_key, &keep_ids);

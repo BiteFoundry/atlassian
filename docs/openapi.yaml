@@ -227,8 +227,16 @@ paths:
         - name: page_token
           in: query
           required: false
+          description: Cloud pagination cursor (`next_page_token`). Mutually exclusive with `start_at`.
           schema:
             type: string
+        - name: start_at
+          in: query
+          required: false
+          description: Data Center 0-based pagination offset (`next_start_at`). Mutually exclusive with `page_token`.
+          schema:
+            type: integer
+            minimum: 0
         - name: offline
           in: query
           required: false

@@ -1519,7 +1519,13 @@ pub fn parse_jira_wiki(markup: &str) -> Vec<DocBlock> {
         }
 
         // Media line: !file.png! or !file.png|alt=foo!
-        if trimmed.starts_with('!') && trimmed.ends_with('!') && trimmed.len() > 2 && !trimmed[1..trimmed.len() - 1].contains('\n') && !trimmed[1..trimmed.len() - 1].contains(' ') {
+        if trimmed.starts_with('!')
+            && trimmed.ends_with('!')
+            && !trimmed.ends_with("\\!")
+            && trimmed.len() > 2
+            && !trimmed[1..trimmed.len() - 1].contains('\n')
+            && !trimmed[1..trimmed.len() - 1].contains(' ')
+        {
             let inner = &trimmed[1..trimmed.len() - 1];
             let filename = inner.split('|').next().unwrap_or(inner).trim().to_string();
             blocks.push(DocBlock::Media {
@@ -1653,6 +1659,13 @@ fn is_wiki_ordered_line(trimmed: &str) -> bool {
     hashes >= 1 && trimmed[hashes..].starts_with(' ')
 }
 
+pub(crate) fn is_wiki_escapable(ch: char) -> bool {
+    matches!(
+        ch,
+        '\\' | '*' | '_' | '+' | '~' | '^' | '{' | '}' | '[' | ']' | '!' | '|' | '#' | '-'
+    )
+}
+
 fn parse_wiki_inlines(input: &str) -> Vec<InlineNode> {
     let mut out = Vec::new();
     let mut buf = String::new();
@@ -1667,6 +1680,13 @@ fn parse_wiki_inlines(input: &str) -> Vec<InlineNode> {
     };
 
     while i < chars.len() {
+        // Backslash-escaped wiki metacharacters: \_, \#, \!, etc.
+        if chars[i] == '\\' && i + 1 < chars.len() && is_wiki_escapable(chars[i + 1]) {
+            buf.push(chars[i + 1]);
+            i += 2;
+            continue;
+        }
+
         // {{monospace}}
         if i + 1 < chars.len() && chars[i] == '{' && chars[i + 1] == '{' {
             if let Some(end) = find_char_seq(&chars, i + 2, &['}', '}']) {
@@ -1749,7 +1769,7 @@ fn parse_wiki_inlines(input: &str) -> Vec<InlineNode> {
             let delim = chars[i];
             if let Some(end) = find_closing_wiki_delim(&chars, i + 1, delim) {
                 flush_buf(&mut buf, &mut out);
-                let inner: String = chars[i + 1..end].iter().collect();
+                let inner = unescape_wiki_chars(&chars[i + 1..end]);
                 let mut style = InlineStyle::default();
                 match delim {
                     '*' => style.bold = true,
@@ -1772,6 +1792,21 @@ fn parse_wiki_inlines(input: &str) -> Vec<InlineNode> {
     out
 }
 
+fn unescape_wiki_chars(slice: &[char]) -> String {
+    let mut out = String::with_capacity(slice.len());
+    let mut idx = 0usize;
+    while idx < slice.len() {
+        if slice[idx] == '\\' && idx + 1 < slice.len() && is_wiki_escapable(slice[idx + 1]) {
+            out.push(slice[idx + 1]);
+            idx += 2;
+        } else {
+            out.push(slice[idx]);
+            idx += 1;
+        }
+    }
+    out
+}
+
 fn find_char_seq(chars: &[char], start: usize, seq: &[char]) -> Option<usize> {
     if seq.is_empty() || start + seq.len() > chars.len() {
         return None;
@@ -1786,13 +1821,19 @@ fn is_wiki_delim_open(chars: &[char], idx: usize) -> bool {
 }
 
 fn find_closing_wiki_delim(chars: &[char], start: usize, delim: char) -> Option<usize> {
-    for j in start..chars.len() {
+    let mut j = start;
+    while j < chars.len() {
+        if chars[j] == '\\' && j + 1 < chars.len() && is_wiki_escapable(chars[j + 1]) {
+            j += 2;
+            continue;
+        }
         if chars[j] == delim && j > start && !chars[j - 1].is_whitespace() {
             let next_ok = j + 1 >= chars.len() || !chars[j + 1].is_alphanumeric();
             if next_ok {
                 return Some(j);
             }
         }
+        j += 1;
     }
     None
 }
@@ -1812,6 +1853,23 @@ pub fn blocks_to_plain_text(blocks: &[DocBlock]) -> String {
     let mut parts = Vec::new();
     collect_plain_text_blocks(blocks, &mut parts);
     parts.join("\n")
+}
+
+/// Extracts the TOC plain display title and `view` Markdown display title for an ADF heading node
+/// using the same inline renderer as `extract_toc` and `blocks_to_markdown`.
+pub(crate) fn adf_heading_display_variants(node: &Value) -> Option<(String, String)> {
+    let content = node.get("content")?.as_array()?;
+    let spans = parse_adf_inlines(content);
+    let plain = inlines_to_plain_text(&spans).trim().to_string();
+    let markdown = inlines_to_markdown(&spans).trim().to_string();
+    Some((plain, markdown))
+}
+
+/// Normalizes a Markdown heading string into its visible inline plain text using the same inline
+/// parser/renderer as `view`.
+pub(crate) fn normalize_markdown_heading_text(raw: &str) -> String {
+    let spans = parse_md_inlines(raw.trim());
+    inlines_to_plain_text(&spans).trim().to_string()
 }
 
 /// Extracts Table of Contents (`H1`–`H6`) entries from `DocBlock`s with cumulative `line_hint`.
@@ -1998,16 +2056,32 @@ fn escape_table_cell(s: &str) -> String {
     s.replace('\n', " ").replace('|', "\\|")
 }
 
+fn max_consecutive_backticks(s: &str) -> usize {
+    let mut best = 0usize;
+    let mut cur = 0usize;
+    for ch in s.chars() {
+        if ch == '`' {
+            cur += 1;
+            best = best.max(cur);
+        } else {
+            cur = 0;
+        }
+    }
+    best
+}
+
 fn inlines_to_markdown(spans: &[InlineNode]) -> String {
     let mut out = String::new();
     for node in spans {
         match node {
             InlineNode::Text { text, style } => {
                 let mut formatted = if style.code {
-                    if text.contains('`') {
-                        format!("`` {text} ``")
-                    } else {
+                    let max_ticks = max_consecutive_backticks(text);
+                    if max_ticks == 0 {
                         format!("`{text}`")
+                    } else {
+                        let fence = "`".repeat(max_ticks + 1);
+                        format!("{fence} {text} {fence}")
                     }
                 } else {
                     text.clone()
@@ -2397,6 +2471,23 @@ pub fn parse_markdown(markdown: &str) -> Vec<DocBlock> {
             continue;
         }
 
+        // Standalone Markdown image: ![alt](url)
+        if let Some((label, target)) = parse_md_image_line(trimmed) {
+            let is_external = target.starts_with("http://") || target.starts_with("https://");
+            let alt = if label.is_empty() || label == target {
+                None
+            } else {
+                Some(label)
+            };
+            blocks.push(DocBlock::Media {
+                id_or_filename: target.clone(),
+                alt,
+                url: is_external.then_some(target),
+            });
+            i += 1;
+            continue;
+        }
+
         // Task list: - [ ] / - [x]
         if parse_md_task_line(trimmed).is_some() {
             let mut items = Vec::new();
@@ -2415,40 +2506,18 @@ pub fn parse_markdown(markdown: &str) -> Vec<DocBlock> {
             continue;
         }
 
-        // Bullet list: - / * / +
-        if let Some(_) = parse_md_bullet_line(trimmed) {
-            let mut items = Vec::new();
-            while i < lines.len() {
-                let t = lines[i].trim();
-                if parse_md_task_line(t).is_some() {
-                    break;
-                }
-                if let Some(rest) = parse_md_bullet_line(t) {
-                    items.push(vec![DocBlock::Paragraph {
-                        spans: parse_md_inlines(rest),
-                    }]);
-                    i += 1;
-                } else {
-                    break;
-                }
-            }
+        // Bullet list: - / * / + (including 2-space+ indented nested sublists)
+        if parse_md_bullet_line(trimmed).is_some() {
+            let base_indent = md_leading_indent(line);
+            let items = parse_md_list_items(&lines, &mut i, base_indent, false);
             blocks.push(DocBlock::BulletList { items });
             continue;
         }
 
-        // Ordered list: 1. ...
+        // Ordered list: 1. ... (including indented nested sublists)
         if let Some((first_num, _)) = parse_md_ordered_line(trimmed) {
-            let mut items = Vec::new();
-            while i < lines.len() {
-                if let Some((_, rest)) = parse_md_ordered_line(lines[i].trim()) {
-                    items.push(vec![DocBlock::Paragraph {
-                        spans: parse_md_inlines(rest),
-                    }]);
-                    i += 1;
-                } else {
-                    break;
-                }
-            }
+            let base_indent = md_leading_indent(line);
+            let items = parse_md_list_items(&lines, &mut i, base_indent, true);
             blocks.push(DocBlock::OrderedList {
                 start: first_num.max(1),
                 items,
@@ -2465,6 +2534,7 @@ pub fn parse_markdown(markdown: &str) -> Vec<DocBlock> {
                 || is_md_rule(t)
                 || parse_md_heading(t).is_some()
                 || t.starts_with('>')
+                || parse_md_image_line(t).is_some()
                 || parse_md_task_line(t).is_some()
                 || parse_md_bullet_line(t).is_some()
                 || parse_md_ordered_line(t).is_some()
@@ -2484,6 +2554,156 @@ pub fn parse_markdown(markdown: &str) -> Vec<DocBlock> {
     }
 
     blocks
+}
+
+fn md_leading_indent(line: &str) -> usize {
+    let mut indent = 0usize;
+    for ch in line.chars() {
+        match ch {
+            ' ' => indent += 1,
+            '\t' => indent += 2,
+            _ => break,
+        }
+    }
+    indent
+}
+
+fn strip_md_indent(line: &str, mut amount: usize) -> &str {
+    let mut byte_idx = 0usize;
+    for (idx, ch) in line.char_indices() {
+        if amount == 0 {
+            return &line[idx..];
+        }
+        match ch {
+            ' ' => {
+                amount -= 1;
+                byte_idx = idx + 1;
+            }
+            '\t' => {
+                amount = amount.saturating_sub(2);
+                byte_idx = idx + 1;
+            }
+            _ => return &line[idx..],
+        }
+    }
+    &line[byte_idx..]
+}
+
+fn parse_md_list_items(
+    lines: &[&str],
+    i: &mut usize,
+    base_indent: usize,
+    ordered: bool,
+) -> Vec<Vec<DocBlock>> {
+    let mut items = Vec::new();
+    while *i < lines.len() {
+        let cur = lines[*i];
+        let t = cur.trim();
+        if t.is_empty() {
+            break;
+        }
+        if md_leading_indent(cur) != base_indent {
+            break;
+        }
+        let rest = if ordered {
+            parse_md_ordered_line(t).map(|(_, r)| r)
+        } else {
+            if parse_md_task_line(t).is_some() {
+                None
+            } else {
+                parse_md_bullet_line(t)
+            }
+        };
+        let Some(rest) = rest else {
+            break;
+        };
+
+        let mut item_blocks = vec![DocBlock::Paragraph {
+            spans: parse_md_inlines(rest),
+        }];
+        *i += 1;
+
+        // Collect nested/continuation lines indented strictly deeper than `base_indent`,
+        // allowing blank separator lines emitted by `blocks_to_markdown`.
+        let mut child_lines: Vec<&str> = Vec::new();
+        while *i < lines.len() {
+            let next_line = lines[*i];
+            if next_line.trim().is_empty() {
+                let mut look = *i + 1;
+                while look < lines.len() && lines[look].trim().is_empty() {
+                    look += 1;
+                }
+                if look < lines.len() && md_leading_indent(lines[look]) > base_indent {
+                    while *i < look {
+                        child_lines.push("");
+                        *i += 1;
+                    }
+                    continue;
+                }
+                break;
+            }
+            if md_leading_indent(next_line) > base_indent {
+                child_lines.push(next_line);
+                *i += 1;
+            } else {
+                break;
+            }
+        }
+
+        if let Some(min_indent) = child_lines
+            .iter()
+            .filter(|l| !l.trim().is_empty())
+            .map(|l| md_leading_indent(l))
+            .min()
+        {
+            let dedented: String = child_lines
+                .iter()
+                .map(|l| {
+                    if l.trim().is_empty() {
+                        ""
+                    } else {
+                        strip_md_indent(l, min_indent)
+                    }
+                })
+                .collect::<Vec<_>>()
+                .join("\n");
+            item_blocks.extend(parse_markdown(&dedented));
+        }
+
+        items.push(item_blocks);
+
+        // Allow a single blank line between loose items of the same list level.
+        if *i < lines.len() && lines[*i].trim().is_empty() {
+            let mut look = *i + 1;
+            while look < lines.len() && lines[look].trim().is_empty() {
+                look += 1;
+            }
+            if look < lines.len() && md_leading_indent(lines[look]) == base_indent {
+                let nt = lines[look].trim();
+                let same_list = if ordered {
+                    parse_md_ordered_line(nt).is_some()
+                } else {
+                    parse_md_task_line(nt).is_none() && parse_md_bullet_line(nt).is_some()
+                };
+                if same_list {
+                    *i = look;
+                }
+            }
+        }
+    }
+    items
+}
+
+fn parse_md_image_line(trimmed: &str) -> Option<(String, String)> {
+    let rest = trimmed.strip_prefix("![")?;
+    let rest = rest.strip_suffix(')')?;
+    let sep = rest.rfind("](")?;
+    let label = rest[..sep].trim();
+    let target = rest[sep + 2..].trim();
+    if target.is_empty() || target.chars().any(char::is_whitespace) {
+        return None;
+    }
+    Some((label.to_string(), target.to_string()))
 }
 
 fn is_md_rule(trimmed: &str) -> bool {
@@ -2543,8 +2763,40 @@ fn is_md_table_separator(trimmed: &str) -> bool {
 }
 
 fn split_md_table_row(line: &str) -> Vec<String> {
-    let trimmed = line.trim().trim_start_matches('|').trim_end_matches('|');
-    trimmed.split('|').map(|s| s.trim().to_string()).collect()
+    let mut trimmed = line.trim();
+    if let Some(rest) = trimmed.strip_prefix('|') {
+        trimmed = rest;
+    }
+    if trimmed.ends_with('|') {
+        let backslashes = trimmed[..trimmed.len() - 1]
+            .bytes()
+            .rev()
+            .take_while(|&b| b == b'\\')
+            .count();
+        if backslashes % 2 == 0 {
+            trimmed = &trimmed[..trimmed.len() - 1];
+        }
+    }
+
+    let mut cells = Vec::new();
+    let mut cur = String::new();
+    let chars: Vec<char> = trimmed.chars().collect();
+    let mut i = 0usize;
+    while i < chars.len() {
+        if chars[i] == '\\' && i + 1 < chars.len() && chars[i + 1] == '|' {
+            cur.push('|');
+            i += 2;
+        } else if chars[i] == '|' {
+            cells.push(cur.trim().to_string());
+            cur.clear();
+            i += 1;
+        } else {
+            cur.push(chars[i]);
+            i += 1;
+        }
+    }
+    cells.push(cur.trim().to_string());
+    cells
 }
 
 fn parse_md_task_line(trimmed: &str) -> Option<(bool, &str)> {
@@ -2596,21 +2848,50 @@ fn parse_md_inlines(input: &str) -> Vec<InlineNode> {
     };
 
     while i < chars.len() {
-        // Inline code: `...`
+        // Inline code: variable-length backtick spans (`...`, `` `x` ``, etc.)
         if chars[i] == '`' {
-            if let Some(end) = chars[i + 1..].iter().position(|&c| c == '`').map(|p| i + 1 + p) {
+            let tick_len = chars[i..].iter().take_while(|&&c| c == '`').count();
+            let mut j = i + tick_len;
+            let mut found_end = None;
+            while j < chars.len() {
+                if chars[j] == '`' {
+                    let run = chars[j..].iter().take_while(|&&c| c == '`').count();
+                    if run == tick_len {
+                        found_end = Some(j);
+                        break;
+                    }
+                    j += run;
+                } else {
+                    j += 1;
+                }
+            }
+            if let Some(end) = found_end {
                 flush_buf(&mut buf, &mut out);
-                let code_text: String = chars[i + 1..end].iter().collect();
-                out.push(InlineNode::Text {
-                    text: code_text,
-                    style: InlineStyle {
-                        code: true,
-                        ..Default::default()
-                    },
-                });
-                i = end + 1;
+                let mut code_text: String = chars[i + tick_len..end].iter().collect();
+                if code_text.len() >= 2
+                    && code_text.starts_with(' ')
+                    && code_text.ends_with(' ')
+                    && code_text.chars().any(|c| c != ' ')
+                {
+                    code_text = code_text[1..code_text.len() - 1].to_string();
+                }
+                if !code_text.is_empty() {
+                    out.push(InlineNode::Text {
+                        text: code_text,
+                        style: InlineStyle {
+                            code: true,
+                            ..Default::default()
+                        },
+                    });
+                }
+                i = end + tick_len;
                 continue;
             }
+            for _ in 0..tick_len {
+                buf.push('`');
+            }
+            i += tick_len;
+            continue;
         }
 
         // Bold: **...**
@@ -2753,10 +3034,15 @@ fn block_to_adf(block: &DocBlock) -> Value {
             if let Some(lang) = language.as_deref().filter(|s| !s.is_empty()) {
                 attrs.insert("language".to_string(), Value::String(lang.to_string()));
             }
+            let content = if code.is_empty() {
+                Vec::new()
+            } else {
+                vec![json!({ "type": "text", "text": code })]
+            };
             json!({
                 "type": "codeBlock",
                 "attrs": Value::Object(attrs),
-                "content": [{ "type": "text", "text": code }]
+                "content": content
             })
         }
         DocBlock::Blockquote { blocks: inner } => json!({
@@ -2842,13 +3128,24 @@ fn block_to_adf(block: &DocBlock) -> Value {
             url,
         } => {
             let mut attrs = serde_json::Map::new();
-            attrs.insert("id".to_string(), Value::String(id_or_filename.clone()));
-            attrs.insert("type".to_string(), Value::String("file".to_string()));
-            if let Some(a) = alt {
-                attrs.insert("alt".to_string(), Value::String(a.clone()));
-            }
-            if let Some(u) = url {
-                attrs.insert("url".to_string(), Value::String(u.clone()));
+            if let Some(ext_url) = url
+                .as_deref()
+                .filter(|u| u.starts_with("http://") || u.starts_with("https://"))
+            {
+                attrs.insert("type".to_string(), Value::String("external".to_string()));
+                attrs.insert("url".to_string(), Value::String(ext_url.to_string()));
+                if let Some(a) = alt.as_deref().filter(|s| !s.is_empty()) {
+                    attrs.insert("alt".to_string(), Value::String(a.to_string()));
+                }
+            } else {
+                attrs.insert("id".to_string(), Value::String(id_or_filename.clone()));
+                attrs.insert("type".to_string(), Value::String("file".to_string()));
+                if let Some(a) = alt {
+                    attrs.insert("alt".to_string(), Value::String(a.clone()));
+                }
+                if let Some(u) = url {
+                    attrs.insert("url".to_string(), Value::String(u.clone()));
+                }
             }
             json!({
                 "type": "mediaSingle",
@@ -2862,8 +3159,11 @@ fn block_to_adf(block: &DocBlock) -> Value {
 fn inlines_to_adf(spans: &[InlineNode]) -> Vec<Value> {
     spans
         .iter()
-        .map(|node| match node {
+        .filter_map(|node| match node {
             InlineNode::Text { text, style } => {
+                if text.is_empty() {
+                    return None;
+                }
                 let mut marks = Vec::new();
                 if style.bold {
                     marks.push(json!({ "type": "strong" }));
@@ -2886,38 +3186,43 @@ fn inlines_to_adf(spans: &[InlineNode]) -> Vec<Value> {
                         "attrs": { "href": href }
                     }));
                 }
-                if marks.is_empty() {
+                Some(if marks.is_empty() {
                     json!({ "type": "text", "text": text })
                 } else {
                     json!({ "type": "text", "text": text, "marks": marks })
-                }
+                })
             }
-            InlineNode::Mention { id, display } => json!({
+            InlineNode::Mention { id, display } => Some(json!({
                 "type": "mention",
                 "attrs": { "id": id, "text": format!("@{display}") }
-            }),
+            })),
             InlineNode::StatusLozenge { text, category } => {
                 let color = match category {
                     StatusCategory::Done => "green",
                     StatusCategory::InProgress => "blue",
                     StatusCategory::Todo => "neutral",
                 };
-                json!({
+                Some(json!({
                     "type": "status",
                     "attrs": { "text": text, "color": color }
+                }))
+            }
+            InlineNode::IssueRef { key } => (!key.is_empty()).then(|| json!({ "type": "text", "text": key })),
+            InlineNode::PageRef { page_id, title } => {
+                let text = if title.is_empty() { page_id } else { title };
+                (!text.is_empty()).then(|| {
+                    json!({
+                        "type": "text",
+                        "text": text,
+                        "marks": [{ "type": "link", "attrs": { "href": format!("/pages/{page_id}") } }]
+                    })
                 })
             }
-            InlineNode::IssueRef { key } => json!({ "type": "text", "text": key }),
-            InlineNode::PageRef { page_id, title } => json!({
-                "type": "text",
-                "text": title,
-                "marks": [{ "type": "link", "attrs": { "href": format!("/pages/{page_id}") } }]
-            }),
-            InlineNode::Emoji { text } => json!({
+            InlineNode::Emoji { text } => Some(json!({
                 "type": "emoji",
                 "attrs": { "shortName": text, "text": text }
-            }),
-            InlineNode::HardBreak => json!({ "type": "hardBreak" }),
+            })),
+            InlineNode::HardBreak => Some(json!({ "type": "hardBreak" })),
         })
         .collect()
 }

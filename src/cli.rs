@@ -472,10 +472,11 @@ pub enum Command {
         #[arg(long)]
         json: bool,
     },
-    /// Search Jira issues in local SQLite cache or via remote JQL
+    /// Search Jira issues in local SQLite cache or via remote JQL (for custom raw JQL, pass `--jql`, e.g. `atlassian search 'customField = "foo"' --jql`)
     Search {
         #[arg(allow_hyphen_values = true)]
         query: String,
+        /// Treat `query` as a raw JQL expression verbatim (e.g. `--jql 'customField = "read and write"'`)
         #[arg(long)]
         jql: bool,
         #[arg(long)]
@@ -718,10 +719,11 @@ pub enum ConfluenceCommand {
         #[arg(long)]
         json: bool,
     },
-    /// Search Confluence pages in local SQLite cache or via remote CQL
+    /// Search Confluence pages in local SQLite cache or via remote CQL (for custom raw CQL, pass `--cql`, e.g. `confluence search 'customMeta = "foo"' --cql`)
     Search {
         #[arg(allow_hyphen_values = true)]
         query: String,
+        /// Treat `query` as a raw CQL expression verbatim (e.g. `--cql 'customMeta = "alpha or beta"'`)
         #[arg(long)]
         cql: bool,
         #[arg(long)]
@@ -904,10 +906,11 @@ pub enum WikiCommand {
         #[arg(long)]
         json: bool,
     },
-    /// Search Confluence pages
+    /// Search Confluence pages (for custom raw CQL, pass `--cql`, e.g. `atlassian wiki search 'customMeta = "foo"' --cql`)
     Search {
         #[arg(allow_hyphen_values = true)]
         query: String,
+        /// Treat `query` as a raw CQL expression verbatim
         #[arg(long)]
         cql: bool,
         #[arg(long)]
@@ -1083,10 +1086,11 @@ pub enum JiraSubcommand {
         #[arg(long)]
         json: bool,
     },
-    /// Search Jira issues
+    /// Search Jira issues (for custom raw JQL, pass `--jql`, e.g. `confluence jira search 'customField = "foo"' --jql`)
     Search {
         #[arg(allow_hyphen_values = true)]
         query: String,
+        /// Treat `query` as a raw JQL expression verbatim
         #[arg(long)]
         jql: bool,
         #[arg(long)]
@@ -1540,6 +1544,7 @@ async fn dispatch_jira_cli(
         }) => {
             Box::pin(cmd_login(
                 cfg,
+                site_override.as_deref(),
                 LoginParams {
                     url,
                     confluence_url,
@@ -1838,6 +1843,7 @@ async fn dispatch_confluence_cli(
         }) => {
             Box::pin(cmd_login(
                 cfg,
+                site_override.as_deref(),
                 LoginParams {
                     url,
                     confluence_url,
@@ -2373,12 +2379,7 @@ fn open_runtime(
 
 fn open_client(cfg: &AppConfig, require_login: bool) -> Result<(AuthManager, AtlassianClient)> {
     if let Ok(pool) = SiteClientPool::from_config(cfg) {
-        if let Some(target_site) = cfg
-            .active_site
-            .as_deref()
-            .and_then(|id| cfg.find_effective_site(id))
-            .or_else(|| cfg.default_site_profile())
-        {
+        if let Some(target_site) = cfg.resolved_site_profile() {
             if let Ok(client) = pool.client_for(&target_site.id) {
                 let auth = client.auth().clone();
                 if require_login && !auth.is_logged_in() {
@@ -2433,6 +2434,7 @@ async fn cmd_tui(cfg: &mut AppConfig, persona: Persona) -> Result<()> {
         println!();
         cmd_login(
             cfg,
+            None,
             LoginParams {
                 url: None,
                 confluence_url: None,
@@ -2457,7 +2459,12 @@ async fn cmd_tui(cfg: &mut AppConfig, persona: Persona) -> Result<()> {
     tui::run_with_persona(cfg.clone(), persona, auth, client, storage).await
 }
 
-async fn cmd_login(cfg: &mut AppConfig, params: LoginParams, json_out: bool) -> Result<()> {
+async fn cmd_login(
+    cfg: &mut AppConfig,
+    site_override: Option<&str>,
+    params: LoginParams,
+    json_out: bool,
+) -> Result<()> {
     if params.oauth {
         return cmd_login_oauth(cfg, params, json_out).await;
     }
@@ -2465,24 +2472,55 @@ async fn cmd_login(cfg: &mut AppConfig, params: LoginParams, json_out: bool) -> 
         return cmd_login_cloud_account(cfg, params, json_out).await;
     }
 
+    let explicit_site_ref = site_override
+        .map(str::trim)
+        .filter(|s| !s.is_empty() && !s.eq_ignore_ascii_case("all"));
+    let target_site = if let Some(raw) = explicit_site_ref {
+        let Some(found) = cfg.find_effective_site(raw) else {
+            let available: Vec<String> = cfg
+                .effective_sites()
+                .into_iter()
+                .map(|s| s.id)
+                .collect();
+            if available.is_empty() {
+                bail!(
+                    "Site '{raw}' not found (no sites configured). Run `atlassian sites add <URL>` or `atlassian login --oauth` first."
+                );
+            }
+            bail!(
+                "Site '{raw}' not found. Available sites: {}.",
+                available.join(", ")
+            );
+        };
+        Some(found)
+    } else {
+        None
+    };
+
+    let default_url_hint = target_site
+        .as_ref()
+        .map(|s| s.site_url.clone())
+        .or_else(|| cfg.resolved_site_profile().map(|s| s.site_url))
+        .unwrap_or_else(|| cfg.site_url.clone());
+
     let raw_url = match params.url.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
         Some(u) => u.to_string(),
         None => {
-            if !cfg.site_url.trim().is_empty()
+            if !default_url_hint.trim().is_empty()
                 && (params.pat.is_some() || (params.email.is_some() && params.token.is_some()))
             {
-                cfg.site_url.clone()
+                default_url_hint.clone()
             } else {
-                let default_hint = if cfg.site_url.trim().is_empty() {
+                let default_hint = if default_url_hint.trim().is_empty() {
                     String::new()
                 } else {
-                    format!(" [{}]", cfg.site_url)
+                    format!(" [{default_url_hint}]")
                 };
                 let entered = prompt_line(&format!(
                     "Atlassian 사이트 URL{default_hint} (예: https://acme.atlassian.net): "
                 ))?;
-                if entered.is_empty() && !cfg.site_url.trim().is_empty() {
-                    cfg.site_url.clone()
+                if entered.is_empty() && !default_url_hint.trim().is_empty() {
+                    default_url_hint.clone()
                 } else {
                     entered
                 }
@@ -2494,18 +2532,48 @@ async fn cmd_login(cfg: &mut AppConfig, params: LoginParams, json_out: bool) -> 
         bail!("사이트 URL이 비어 있습니다. `--url https://<site>.atlassian.net` 를 지정하세요.");
     }
 
-    let deployment = params
-        .deployment
-        .unwrap_or_else(|| DeploymentKind::infer_from_url(&site_url));
+    let matched_site: Option<SiteProfile> = if let Some(ref target) = target_site {
+        Some(target.clone())
+    } else if !cfg.sites.is_empty() {
+        let norm_target = config::normalize_url_for_match(&site_url);
+        cfg.sites
+            .iter()
+            .find(|s| {
+                let norm = config::normalize_url_for_match(&s.site_url);
+                !norm.is_empty() && norm == norm_target
+            })
+            .cloned()
+    } else {
+        None
+    };
+
+    let deployment = params.deployment.unwrap_or_else(|| {
+        if params.url.is_none() {
+            if let Some(ref matched) = matched_site {
+                return matched.deployment;
+            }
+        }
+        DeploymentKind::infer_from_url(&site_url)
+    });
 
     let confluence_url = if let Some(ref cu) = params.confluence_url {
         config::normalize_base_url(cu)
-    } else if deployment == DeploymentKind::DataCenter && params.pat.is_none() && params.token.is_none()
+    } else if deployment == DeploymentKind::DataCenter
+        && params.pat.is_none()
+        && params.token.is_none()
     {
         let entered = prompt_line("Confluence 별도 URL (동일 호스트면 Enter): ")?;
         config::normalize_base_url(&entered)
-    } else {
+    } else if let Some(ref matched) = matched_site {
+        matched.confluence_url.clone()
+    } else if cfg.sites.is_empty()
+        && !cfg.site_url.trim().is_empty()
+        && config::normalize_url_for_match(&cfg.site_url)
+            == config::normalize_url_for_match(&site_url)
+    {
         cfg.confluence_url.clone()
+    } else {
+        String::new()
     };
 
     let creds = if let Some(pat) = params.pat.filter(|s| !s.trim().is_empty()) {
@@ -2579,62 +2647,122 @@ async fn cmd_login(cfg: &mut AppConfig, params: LoginParams, json_out: bool) -> 
         }
     };
 
-    let account_id = params
+    let explicit_account = params
         .account
         .as_deref()
         .map(str::trim)
         .filter(|s| !s.is_empty())
-        .map(str::to_string)
-        .unwrap_or_else(|| cfg.profile.clone());
+        .map(str::to_string);
+    let explicit_name = params
+        .name
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string);
 
-    cfg.site_url = site_url.clone();
-    cfg.confluence_url = confluence_url.clone();
-    cfg.deployment = deployment;
-    if !cfg.sites.is_empty() || params.name.is_some() || params.account.is_some() {
-        let site_id = config::slugify_site_id(&site_url);
-        let display_name = params
-            .name
-            .as_deref()
-            .map(str::trim)
-            .filter(|s| !s.is_empty())
-            .map(str::to_string)
-            .unwrap_or_else(|| site_id.clone());
-        let profile = SiteProfile {
-            id: site_id.clone(),
-            name: display_name,
-            site_url: site_url.clone(),
-            confluence_url,
-            deployment,
-            cloud_id: None,
-            account_id: account_id.clone(),
-            enabled: true,
-            scopes: Vec::new(),
-        };
-        cfg.upsert_site(profile);
-        if cfg.default_site.is_none() {
-            cfg.default_site = Some(site_id);
+    let has_legacy_other_url = cfg.sites.is_empty()
+        && !cfg.site_url.trim().is_empty()
+        && config::normalize_url_for_match(&cfg.site_url)
+            != config::normalize_url_for_match(&site_url);
+    let use_multi_site = target_site.is_some()
+        || !cfg.sites.is_empty()
+        || explicit_name.is_some()
+        || explicit_account.is_some()
+        || has_legacy_other_url;
+
+    let (resolved_site_id, account_id, display_name) = if use_multi_site {
+        if let Some(ref existing) = matched_site {
+            let sid = existing.id.clone();
+            let acct = explicit_account.unwrap_or_else(|| existing.account_id.clone());
+            let name = explicit_name.unwrap_or_else(|| existing.name.clone());
+            (sid, acct, name)
+        } else {
+            let base_id = config::slugify_site_id(&site_url);
+            let existing_ids: Vec<String> = cfg
+                .effective_sites()
+                .into_iter()
+                .map(|s| s.id)
+                .collect();
+            let mut sid = base_id.clone();
+            let mut suffix = 2usize;
+            while existing_ids.iter().any(|id| id.eq_ignore_ascii_case(&sid)) {
+                sid = format!("{base_id}-{suffix}");
+                suffix += 1;
+            }
+            let acct = explicit_account.unwrap_or_else(|| sid.clone());
+            let name = explicit_name.unwrap_or_else(|| sid.clone());
+            (sid, acct, name)
         }
-    }
-    cfg.save()?;
+    } else {
+        let acct = explicit_account.unwrap_or_else(|| cfg.profile.clone());
+        ("default".to_string(), acct, "default".to_string())
+    };
+
+    let candidate_profile = SiteProfile {
+        id: resolved_site_id.clone(),
+        name: display_name,
+        site_url: site_url.clone(),
+        confluence_url: confluence_url.clone(),
+        deployment,
+        cloud_id: matched_site.as_ref().and_then(|s| s.cloud_id.clone()),
+        account_id: account_id.clone(),
+        enabled: true,
+        scopes: matched_site
+            .as_ref()
+            .map(|s| s.scopes.clone())
+            .unwrap_or_default(),
+    };
+
+    // Validate credentials against the target site BEFORE persisting config or credentials.
+    let probe_auth = AuthManager::with_credentials(&account_id, creds.clone());
+    let probe_client = AtlassianClient::for_site(&candidate_profile, probe_auth, None)?;
+    let me = probe_client
+        .get_myself()
+        .await
+        .context("자격 증명 검증(`/myself`)에 실패했습니다")?;
 
     let auth = AuthManager::for_account(&account_id);
     auth.save_credentials(&creds)?;
 
-    let client = AtlassianClient::new(cfg.clone(), auth)?;
-    let me = client
-        .get_myself()
-        .await
-        .context("자격 증명 저장 후 `/myself` 검증에 실패했습니다")?;
-    client.set_cached_me(me.clone());
+    if use_multi_site {
+        if cfg.sites.is_empty() && !cfg.site_url.trim().is_empty() {
+            cfg.sites = cfg.effective_sites();
+        }
+        cfg.upsert_site(candidate_profile.clone());
+        if target_site.is_none() {
+            cfg.default_site = Some(resolved_site_id.clone());
+            cfg.site_url = site_url.clone();
+            cfg.confluence_url = confluence_url.clone();
+            cfg.deployment = deployment;
+        } else if cfg
+            .default_site
+            .as_deref()
+            .is_some_and(|d| d.eq_ignore_ascii_case(&resolved_site_id))
+        {
+            cfg.site_url = site_url.clone();
+            cfg.confluence_url = confluence_url.clone();
+            cfg.deployment = deployment;
+        }
+    } else {
+        cfg.site_url = site_url.clone();
+        cfg.confluence_url = confluence_url.clone();
+        cfg.deployment = deployment;
+    }
+    cfg.save()?;
+
+    let effective_site_url = probe_client.site_url();
+    let effective_conf_url = probe_client.confluence_root_url();
+    let effective_deployment = probe_client.deployment().as_str();
 
     if json_out {
         println!(
             "{}",
             serde_json::to_string_pretty(&json!({
                 "ok": true,
-                "deployment": cfg.deployment.as_str(),
-                "site_url": cfg.site_url,
-                "confluence_url": cfg.effective_confluence_root(),
+                "site_id": resolved_site_id,
+                "deployment": effective_deployment,
+                "site_url": effective_site_url,
+                "confluence_url": effective_conf_url,
                 "account_id": account_id,
                 "user": me,
             }))?
@@ -2647,10 +2775,8 @@ async fn cmd_login(cfg: &mut AppConfig, params: LoginParams, json_out: bool) -> 
             me.id
         );
         println!(
-            "환경: {} · Jira={} · Confluence={}",
-            cfg.deployment.as_str(),
-            cfg.site_url,
-            cfg.effective_confluence_root()
+            "환경: {} · Jira={} · Confluence={} · 계정={}",
+            effective_deployment, effective_site_url, effective_conf_url, account_id
         );
     }
     Ok(())
@@ -3332,9 +3458,7 @@ async fn cmd_sites(cfg: &mut AppConfig, action: SitesCommand) -> Result<()> {
 
 fn cmd_logout(cfg: &AppConfig, json_out: bool) -> Result<()> {
     let account_id = cfg
-        .active_site
-        .as_deref()
-        .and_then(|id| cfg.find_effective_site(id))
+        .resolved_site_profile()
         .map(|s| s.account_id)
         .unwrap_or_else(|| cfg.profile.clone());
     let auth = AuthManager::for_account(&account_id);
@@ -3360,28 +3484,30 @@ async fn refresh_cli_issue_cache(client: &AtlassianClient, storage: &Storage, ke
 
 async fn refresh_cli_page_cache(client: &AtlassianClient, storage: &Storage, page_id: &str) {
     let site_id = client.site_id();
-    if let Ok((mut detail, meta)) = client.get_page_with_meta(page_id).await {
-        let _ = storage.upsert_page_detail_for_site_merging(
-            site_id,
-            &mut detail,
-            !meta.labels_ok,
-            !meta.attachments_ok,
-            !meta.comments_ok,
-        );
+    if let Ok((mut detail, meta)) = client
+        .get_page_with_meta_in_cache(page_id, site_id, storage)
+        .await
+    {
+        let _ = storage.upsert_page_detail_for_site_with_meta(site_id, &mut detail, meta);
     }
 }
 
 async fn cmd_whoami(cfg: &AppConfig, persona: Persona, json_out: bool) -> Result<()> {
     let (auth, client, _storage) = open_runtime(cfg, true)?;
     let me = client.get_myself().await?;
+    let effective_site_url = client.site_url();
+    let effective_conf_url = client.confluence_root_url();
+    let effective_deployment = client.deployment().as_str();
     if json_out {
         println!(
             "{}",
             serde_json::to_string_pretty(&json!({
                 "persona": persona.as_str(),
-                "deployment": cfg.deployment.as_str(),
-                "site_url": cfg.site_url,
-                "confluence_url": cfg.effective_confluence_root(),
+                "site_id": client.site_id(),
+                "account_id": auth.profile(),
+                "deployment": effective_deployment,
+                "site_url": effective_site_url,
+                "confluence_url": effective_conf_url,
                 "auth_status": auth.status_summary(),
                 "user": me,
             }))?
@@ -3394,9 +3520,9 @@ async fn cmd_whoami(cfg: &AppConfig, persona: Persona, json_out: bool) -> Result
             me.email.as_deref().unwrap_or("-")
         );
         println!("id: {}", me.id);
-        println!("배포: {}", cfg.deployment.as_str());
-        println!("Jira URL: {}", cfg.site_url);
-        println!("Confluence URL: {}", cfg.effective_confluence_root());
+        println!("배포: {effective_deployment}");
+        println!("Jira URL: {effective_site_url}");
+        println!("Confluence URL: {effective_conf_url}");
         println!("인증: {}", auth.status_summary());
     }
     Ok(())
@@ -3408,13 +3534,16 @@ async fn cmd_doctor(
     probe: bool,
     json_out: bool,
 ) -> Result<()> {
-    let auth = AuthManager::new(&cfg.profile);
+    let (auth, client) = open_client(cfg, false)?;
     let cfg_path = config::config_file_path();
     let cred_path = config::credentials_fallback_path();
     let db_path = config::cache_db_path(&cfg.profile);
     let dl_dir = cfg.resolved_download_dir();
     let auth_status = auth.status_summary();
     let logged_in = auth.is_logged_in();
+    let effective_site_url = client.site_url().to_string();
+    let effective_conf_url = client.confluence_root_url();
+    let effective_deployment = client.deployment().as_str();
 
     let cache_counts = if db_path.exists() {
         Storage::open(&db_path)
@@ -3427,7 +3556,6 @@ async fn cmd_doctor(
     let mut probe_me = None;
     let mut probe_error = None;
     if probe {
-        let client = AtlassianClient::new(cfg.clone(), auth.clone())?;
         match client.get_myself().await {
             Ok(me) => probe_me = Some(me),
             Err(err) => probe_error = Some(format!("{err:#}")),
@@ -3441,9 +3569,11 @@ async fn cmd_doctor(
                 "version": env!("CARGO_PKG_VERSION"),
                 "persona": persona.as_str(),
                 "profile": cfg.profile,
-                "deployment": cfg.deployment.as_str(),
-                "site_url": cfg.site_url,
-                "confluence_url": cfg.effective_confluence_root(),
+                "site_id": client.site_id(),
+                "account_id": auth.profile(),
+                "deployment": effective_deployment,
+                "site_url": effective_site_url,
+                "confluence_url": effective_conf_url,
                 "logged_in": logged_in,
                 "auth_status": auth_status,
                 "config_path": cfg_path,
@@ -3460,15 +3590,22 @@ async fn cmd_doctor(
         );
     } else {
         println!("atlassian-cli v{} ({})", env!("CARGO_PKG_VERSION"), persona.as_str());
-        println!("프로필: {} · 배포: {}", cfg.profile, cfg.deployment.as_str());
+        println!("프로필: {} · 배포: {effective_deployment}", cfg.profile);
         println!(
             "Jira URL: {}",
-            if cfg.site_url.is_empty() { "(미설정)" } else { &cfg.site_url }
+            if effective_site_url.is_empty() {
+                "(미설정)"
+            } else {
+                &effective_site_url
+            }
         );
-        let conf_root = cfg.effective_confluence_root();
         println!(
             "Confluence URL: {}",
-            if conf_root.is_empty() { "(미설정)" } else { &conf_root }
+            if effective_conf_url.is_empty() {
+                "(미설정)"
+            } else {
+                &effective_conf_url
+            }
         );
         println!("인증 상태: {auth_status}");
         println!(
@@ -4246,7 +4383,7 @@ async fn cmd_issue_search(
     let site_id = client.site_id();
 
     if use_remote {
-        let effective_jql = if jql || serve::looks_like_query_expr(query) {
+        let effective_jql = if jql || serve::looks_like_jql_expr(query) {
             query.to_string()
         } else {
             format!(
@@ -4390,7 +4527,7 @@ async fn cmd_pages(
             storage.list_space_root_pages_for_site(site_id, sp)?
         } else {
             let fetched = client.list_space_root_pages(sp, limit).await?;
-            let _ = storage.upsert_pages_for_site(site_id, &fetched);
+            let _ = storage.upsert_authoritative_pages_for_site(site_id, &fetched);
             if fetched.len() < limit {
                 let keep: Vec<String> = fetched.iter().map(|p| p.id.clone()).collect();
                 let _ = storage.prune_space_root_pages_for_site(site_id, sp, &keep);
@@ -4439,7 +4576,10 @@ async fn cmd_page_view(
             .unwrap_or(false);
         (d, stale)
     } else {
-        let (mut fetched, meta) = match client.get_page_with_meta(page_id).await {
+        let (mut fetched, meta) = match client
+            .get_page_with_meta_in_cache(page_id, site_id, &storage)
+            .await
+        {
             Ok(res) => res,
             Err(err) => {
                 if is_not_found_error(&err) {
@@ -4448,13 +4588,7 @@ async fn cmd_page_view(
                 return Err(err);
             }
         };
-        let _ = storage.upsert_page_detail_for_site_merging(
-            site_id,
-            &mut fetched,
-            !meta.labels_ok,
-            !meta.attachments_ok,
-            !meta.comments_ok,
-        );
+        let _ = storage.upsert_page_detail_for_site_with_meta(site_id, &mut fetched, meta);
         (fetched, false)
     };
 
@@ -4753,7 +4887,7 @@ async fn cmd_page_search(
     let site_id = client.site_id();
 
     if use_remote {
-        let effective_cql = if cql || serve::looks_like_query_expr(query) {
+        let effective_cql = if cql || serve::looks_like_cql_expr(query) {
             query.to_string()
         } else {
             format!("text ~ \"{}\"", serve::escape_jql_str(query))
@@ -4918,6 +5052,7 @@ async fn cmd_sync(cfg: &AppConfig, site_filter: Option<&str>, json_out: bool) ->
         )
         .await;
         let counts = storage.cache_counts()?;
+        let all_failed = outcome.total_sites > 0 && outcome.succeeded_sites == 0;
         if json_out {
             println!(
                 "{}",
@@ -4929,13 +5064,36 @@ async fn cmd_sync(cfg: &AppConfig, site_filter: Option<&str>, json_out: bool) ->
                 }))?
             );
         } else {
-            println!("Sync complete: {}", outcome.summary);
+            if all_failed {
+                println!("Sync failed: {}", outcome.summary);
+            } else {
+                println!("Sync complete: {}", outcome.summary);
+            }
             for s in &outcome.per_site {
-                println!("  - {} ({}): {}", s.site_id, s.site_url, s.summary);
+                if let Some(ref err) = s.error {
+                    println!("  - {} ({}): FAILED - {err}", s.site_id, s.site_url);
+                } else {
+                    println!("  - {} ({}): {}", s.site_id, s.site_url, s.summary);
+                }
             }
             println!(
                 "Cache counts: projects={}, boards={}, issues={}, spaces={}, pages={}",
                 counts.projects, counts.boards, counts.issues, counts.spaces, counts.pages
+            );
+        }
+        if all_failed {
+            let reasons: Vec<String> = outcome
+                .per_site
+                .iter()
+                .map(|s| {
+                    let reason = s.error.as_deref().unwrap_or(s.summary.as_str());
+                    format!("{}: {reason}", s.site_id)
+                })
+                .collect();
+            bail!(
+                "Sync failed for all sites ({}): {}",
+                outcome.summary,
+                reasons.join("; ")
             );
         }
         return Ok(());

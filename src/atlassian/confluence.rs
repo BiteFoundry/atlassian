@@ -1,6 +1,6 @@
 //! Confluence REST API (Cloud v2 `/wiki/api/v2` + CQL `/wiki/rest/api/search`, Data Center v1 `/rest/api/content`).
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 use anyhow::{anyhow, bail, Context, Result};
 use regex::Regex;
@@ -26,12 +26,13 @@ use crate::{
 };
 
 /// Subresource fetch health flags returned alongside [`PageDetail`] so callers can
-/// preserve previously cached labels, attachments, or comments on transient subresource failures.
+/// preserve previously cached labels, attachments, comments, or ancestors on transient subresource failures.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct PageSubresourceStatus {
     pub labels_ok: bool,
     pub attachments_ok: bool,
     pub comments_ok: bool,
+    pub ancestors_ok: bool,
 }
 
 impl AtlassianClient {
@@ -135,7 +136,8 @@ impl AtlassianClient {
 
     pub async fn list_child_pages(&self, page_id: &str) -> Result<Vec<PageSummary>> {
         let conf_root = self.require_confluence_root()?;
-        let encoded_id = urlencoding::encode(page_id.trim());
+        let parent_id = page_id.trim();
+        let encoded_id = urlencoding::encode(parent_id);
 
         match self.deployment() {
             DeploymentKind::Cloud => {
@@ -148,7 +150,29 @@ impl AtlassianClient {
                     .unwrap_or(&[]);
                 Ok(arr
                     .iter()
-                    .map(|p| parse_cloud_page_summary(p, &conf_root))
+                    .map(|p| {
+                        let mut summary = parse_cloud_page_summary(p, &conf_root);
+                        if summary
+                            .parent_id
+                            .as_deref()
+                            .map(str::trim)
+                            .unwrap_or("")
+                            .is_empty()
+                        {
+                            summary.parent_id = Some(parent_id.to_string());
+                        }
+                        if summary.space_key.trim().is_empty() && !summary.space_id.trim().is_empty() {
+                            if let Ok(cache) = self.space_id_cache.read() {
+                                if let Some((_, key)) = cache
+                                    .values()
+                                    .find(|(id, _)| id == summary.space_id.trim())
+                                {
+                                    summary.space_key = key.clone();
+                                }
+                            }
+                        }
+                        summary
+                    })
                     .collect())
             }
             DeploymentKind::DataCenter => {
@@ -163,7 +187,19 @@ impl AtlassianClient {
                     .unwrap_or(&[]);
                 Ok(arr
                     .iter()
-                    .map(|p| parse_dc_page_summary(p, &conf_root))
+                    .map(|p| {
+                        let mut summary = parse_dc_page_summary(p, &conf_root);
+                        if summary
+                            .parent_id
+                            .as_deref()
+                            .map(str::trim)
+                            .unwrap_or("")
+                            .is_empty()
+                        {
+                            summary.parent_id = Some(parent_id.to_string());
+                        }
+                        summary
+                    })
                     .collect())
             }
         }
@@ -224,13 +260,26 @@ impl AtlassianClient {
         &self,
         page_id: &str,
     ) -> Result<(PageDetail, PageSubresourceStatus)> {
-        self.fetch_page(page_id, false).await
+        self.fetch_page(page_id, false, None).await
+    }
+
+    /// Fetches full page detail and subresource health, using the site-scoped SQLite cache first
+    /// when resolving Cloud ancestor titles.
+    pub async fn get_page_with_meta_in_cache(
+        &self,
+        page_id: &str,
+        site_id: &str,
+        storage: &crate::storage::Storage,
+    ) -> Result<(PageDetail, PageSubresourceStatus)> {
+        self.fetch_page(page_id, false, Some((site_id, storage)))
+            .await
     }
 
     async fn fetch_page(
         &self,
         page_id: &str,
         require_native_body: bool,
+        title_cache: Option<(&str, &crate::storage::Storage)>,
     ) -> Result<(PageDetail, PageSubresourceStatus)> {
         let conf_root = self.require_confluence_root()?;
         let encoded_id = urlencoding::encode(page_id.trim());
@@ -319,6 +368,19 @@ impl AtlassianClient {
                     Ok(c) => (c, true),
                     Err(_) => (Vec::new(), false),
                 };
+                let (ancestors, ancestors_ok) = if require_native_body
+                    || summary
+                        .parent_id
+                        .as_deref()
+                        .map(str::trim)
+                        .unwrap_or("")
+                        .is_empty()
+                {
+                    (Vec::new(), true)
+                } else {
+                    self.fetch_cloud_page_ancestors(&conf_root, page_id.trim(), title_cache)
+                        .await
+                };
                 let body_markdown = blocks_to_markdown(&blocks);
                 let toc = extract_toc(&blocks);
                 let linked_issue_keys = extract_linked_issue_keys(&blocks, &body_raw);
@@ -326,7 +388,7 @@ impl AtlassianClient {
                 Ok((
                     PageDetail {
                         summary,
-                        ancestors: Vec::new(),
+                        ancestors,
                         labels,
                         body_raw,
                         body_representation,
@@ -341,6 +403,7 @@ impl AtlassianClient {
                         labels_ok,
                         attachments_ok,
                         comments_ok,
+                        ancestors_ok,
                     },
                 ))
             }
@@ -423,10 +486,163 @@ impl AtlassianClient {
                         labels_ok: true,
                         attachments_ok: true,
                         comments_ok,
+                        ancestors_ok: true,
                     },
                 ))
             }
         }
+    }
+
+    async fn fetch_cloud_page_ancestors(
+        &self,
+        conf_root: &str,
+        page_id: &str,
+        title_cache: Option<(&str, &crate::storage::Storage)>,
+    ) -> (Vec<PageAncestor>, bool) {
+        const ANCESTOR_LIMIT: usize = 250;
+        const MAX_SEGMENTS: usize = 20;
+
+        #[derive(Clone)]
+        struct RawAncestor {
+            id: String,
+            kind: String,
+            inline_title: String,
+        }
+
+        let parse_batch = |val: &Value| -> Vec<RawAncestor> {
+            val.get("results")
+                .and_then(|r| r.as_array())
+                .map(|arr| {
+                    arr.iter()
+                        .filter_map(|item| {
+                            let id = json_id_to_string(item.get("id"));
+                            let trimmed = id.trim();
+                            if trimmed.is_empty() {
+                                return None;
+                            }
+                            let kind = first_nonempty_str(item, &["type"]).to_ascii_lowercase();
+                            let inline_title = first_nonempty_str(item, &["title"]);
+                            Some(RawAncestor {
+                                id: trimmed.to_string(),
+                                kind,
+                                inline_title,
+                            })
+                        })
+                        .collect()
+                })
+                .unwrap_or_default()
+        };
+
+        let first_url = format!(
+            "{conf_root}/api/v2/pages/{}/ancestors?limit={ANCESTOR_LIMIT}",
+            urlencoding::encode(page_id)
+        );
+        let first_val = match self.get_json::<Value>(&first_url).await {
+            Ok(v) => v,
+            Err(_) => return (Vec::new(), false),
+        };
+        let mut ordered: Vec<RawAncestor> = parse_batch(&first_val);
+        let mut last_batch_len = ordered.len();
+        let mut complete = true;
+        let mut queried_roots: HashSet<String> = HashSet::new();
+        queried_roots.insert(page_id.to_string());
+
+        for _ in 0..MAX_SEGMENTS {
+            if last_batch_len < ANCESTOR_LIMIT {
+                break;
+            }
+            let Some(head) = ordered.first().cloned() else {
+                break;
+            };
+            if !queried_roots.insert(head.id.clone()) {
+                break;
+            }
+            let seg_url = match head.kind.as_str() {
+                "folder" => format!(
+                    "{conf_root}/api/v2/folders/{}/ancestors?limit={ANCESTOR_LIMIT}",
+                    urlencoding::encode(&head.id)
+                ),
+                _ => format!(
+                    "{conf_root}/api/v2/pages/{}/ancestors?limit={ANCESTOR_LIMIT}",
+                    urlencoding::encode(&head.id)
+                ),
+            };
+            match self.get_json::<Value>(&seg_url).await {
+                Ok(v) => {
+                    let upper = parse_batch(&v);
+                    last_batch_len = upper.len();
+                    if upper.is_empty() {
+                        break;
+                    }
+                    let mut combined = Vec::with_capacity(upper.len() + ordered.len());
+                    combined.extend(upper);
+                    combined.extend(ordered);
+                    ordered = combined;
+                }
+                Err(_) => {
+                    complete = false;
+                    break;
+                }
+            }
+        }
+
+        // Deduplicate while preserving top-most -> direct-parent order.
+        let mut seen = HashSet::new();
+        let mut deduped = Vec::with_capacity(ordered.len());
+        for item in ordered {
+            if seen.insert(item.id.clone()) {
+                deduped.push(item);
+            }
+        }
+
+        // Resolve titles: inline title -> site-scoped SQLite cache -> lightweight metadata endpoint -> ID fallback.
+        let missing_ids: Vec<String> = deduped
+            .iter()
+            .filter(|a| a.inline_title.is_empty())
+            .map(|a| a.id.clone())
+            .collect();
+        let cached_titles: HashMap<String, String> = match title_cache {
+            Some((site_id, storage)) if !missing_ids.is_empty() => storage
+                .get_page_titles_for_site(site_id, &missing_ids)
+                .unwrap_or_default(),
+            _ => HashMap::new(),
+        };
+
+        let mut ancestors = Vec::with_capacity(deduped.len());
+        for item in deduped {
+            let title = if !item.inline_title.is_empty() {
+                item.inline_title
+            } else if let Some(cached) = cached_titles.get(&item.id) {
+                cached.clone()
+            } else {
+                self.fetch_cloud_ancestor_title(conf_root, &item.id, &item.kind)
+                    .await
+                    .unwrap_or_else(|| item.id.clone())
+            };
+            ancestors.push(PageAncestor { id: item.id, title });
+        }
+
+        (ancestors, complete)
+    }
+
+    async fn fetch_cloud_ancestor_title(
+        &self,
+        conf_root: &str,
+        id: &str,
+        kind: &str,
+    ) -> Option<String> {
+        let encoded = urlencoding::encode(id);
+        let segment = match kind {
+            "folder" => "folders",
+            "whiteboard" => "whiteboards",
+            "database" => "databases",
+            "embed" => "embeds",
+            _ => "pages",
+        };
+        let url = format!("{conf_root}/api/v2/{segment}/{encoded}");
+        let val: Value = self.get_json(&url).await.ok()?;
+        let title = first_nonempty_str(&val, &["title"]);
+        (!title.is_empty()).then_some(title)
     }
 
     pub async fn create_page(&self, req: &OutgoingPage) -> Result<PageDetail> {
@@ -604,7 +820,7 @@ impl AtlassianClient {
                 BodyEditError("section replacement requires a Confluence Cloud ADF page").into(),
             );
         }
-        let (current, _) = self.fetch_page(page_id, true).await?;
+        let (current, _) = self.fetch_page(page_id, true, None).await?;
         let version = current.summary.version_number;
         let prev_version = prev_version.filter(|&v| v > 0).unwrap_or(version);
         check_page_base_version(prev_version, version)?;
@@ -903,14 +1119,15 @@ impl AtlassianClient {
         body_markdown: &str,
     ) -> Result<ConfluenceComment> {
         let conf_root = self.require_confluence_root()?;
-        let encoded_id = urlencoding::encode(page_id.trim());
+        let page_id = page_id.trim();
 
         let resp: Value = match self.deployment() {
             DeploymentKind::Cloud => {
                 let adf_str = serde_json::to_string(&markdown_to_adf(body_markdown))
                     .context("ADF 직렬화 실패")?;
-                let url = format!("{conf_root}/api/v2/pages/{encoded_id}/footer-comments");
+                let url = format!("{conf_root}/api/v2/footer-comments");
                 let payload = json!({
+                    "pageId": page_id,
                     "body": {
                         "representation": "atlas_doc_format",
                         "value": adf_str,
@@ -1137,7 +1354,10 @@ fn parse_cloud_page_summary(val: &Value, conf_root: &str) -> PageSummary {
         .if_empty(|| extract_space_key_from_webui(webui).unwrap_or_default());
 
     let version = val.get("version").unwrap_or(&Value::Null);
-    let version_number = version.get("number").and_then(|v| v.as_i64()).unwrap_or(1) as i32;
+    let version_number = version
+        .get("number")
+        .and_then(|v| v.as_i64())
+        .unwrap_or(0) as i32;
     let author_name = version
         .get("authorId")
         .or_else(|| val.get("authorId"))
@@ -1145,7 +1365,11 @@ fn parse_cloud_page_summary(val: &Value, conf_root: &str) -> PageSummary {
         .map(str::to_string);
     let updated_at = first_nonempty_str(version, &["createdAt"])
         .if_empty(|| first_nonempty_str(val, &["createdAt"]));
-    let position = val.get("position").and_then(|v| v.as_i64()).unwrap_or(0) as i32;
+    let position = val
+        .get("position")
+        .or_else(|| val.get("childPosition"))
+        .and_then(|v| v.as_i64())
+        .unwrap_or(0) as i32;
 
     PageSummary {
         id,
@@ -1188,7 +1412,10 @@ fn parse_dc_page_summary(val: &Value, conf_root: &str) -> PageSummary {
         .filter(|s| !s.is_empty());
 
     let version = val.get("version").unwrap_or(&Value::Null);
-    let version_number = version.get("number").and_then(|v| v.as_i64()).unwrap_or(1) as i32;
+    let version_number = version
+        .get("number")
+        .and_then(|v| v.as_i64())
+        .unwrap_or(0) as i32;
     let author_name = version
         .get("by")
         .and_then(|b| b.get("displayName"))
@@ -1456,8 +1683,12 @@ mod tests {
                             }
                         }]
                     }))
-                })
-                .post(|Json(body): Json<Value>| async move {
+                }),
+            )
+            .route(
+                "/wiki/api/v2/footer-comments",
+                post(|Json(body): Json<Value>| async move {
+                    assert_eq!(body["pageId"], "200");
                     assert_eq!(body["body"]["representation"], "atlas_doc_format");
                     Json(json!({
                         "id": "cm-2",

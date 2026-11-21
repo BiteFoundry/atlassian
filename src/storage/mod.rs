@@ -237,12 +237,7 @@ impl Storage {
         }
         let mut hits = self.search_issues_scoped(query, site_id, limit)?;
         hits.extend(self.search_pages_scoped(query, site_id, limit)?);
-        hits.sort_by(|a, b| {
-            b.1.updated_at
-                .cmp(&a.1.updated_at)
-                .then_with(|| a.0.cmp(&b.0))
-                .then_with(|| a.1.id_or_key.cmp(&b.1.id_or_key))
-        });
+        hits.sort_by(|a, b| compare_unified_hits(&a.0, &a.1, &b.0, &b.1));
         hits.truncate(limit);
         Ok(hits)
     }
@@ -251,6 +246,42 @@ impl Storage {
         let scoped = self.unified_search_scoped(query, None, limit)?;
         Ok(scoped.into_iter().map(|(_, hit)| hit).collect())
     }
+}
+
+fn parse_unified_timestamp_millis(raw: &str) -> Option<i64> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    chrono::DateTime::parse_from_rfc3339(trimmed)
+        .or_else(|_| chrono::DateTime::parse_from_str(trimmed, "%Y-%m-%dT%H:%M:%S%.f%z"))
+        .or_else(|_| chrono::DateTime::parse_from_str(trimmed, "%Y-%m-%dT%H:%M:%S%z"))
+        .ok()
+        .map(|dt| dt.timestamp_millis())
+}
+
+pub(crate) fn compare_unified_hits(
+    site_a: &str,
+    hit_a: &UnifiedSearchHit,
+    site_b: &str,
+    hit_b: &UnifiedSearchHit,
+) -> std::cmp::Ordering {
+    let time_ord = match (
+        parse_unified_timestamp_millis(&hit_a.updated_at),
+        parse_unified_timestamp_millis(&hit_b.updated_at),
+    ) {
+        (Some(a), Some(b)) => b.cmp(&a),
+        (Some(_), None) => std::cmp::Ordering::Less,
+        (None, Some(_)) => std::cmp::Ordering::Greater,
+        (None, None) => hit_b.updated_at.trim().cmp(hit_a.updated_at.trim()),
+    };
+    time_ord
+        .then_with(|| site_a.cmp(site_b))
+        .then_with(|| hit_a.id_or_key.cmp(&hit_b.id_or_key))
+}
+
+pub(crate) fn sort_federated_hits(hits: &mut [crate::models::FederatedSearchHit]) {
+    hits.sort_by(|a, b| compare_unified_hits(&a.site_id, &a.hit, &b.site_id, &b.hit));
 }
 
 fn map_site_record_row(row: &Row<'_>) -> rusqlite::Result<SiteRecord> {

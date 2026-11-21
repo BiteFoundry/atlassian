@@ -1,6 +1,6 @@
 //! Confluence spaces, hierarchical page tree, page details, and `pages_fts` persistence (multi-site aware).
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 use anyhow::{Context, Result};
 use rusqlite::{params, Connection, OptionalExtension, Row, ToSql};
@@ -119,6 +119,29 @@ impl Storage {
     }
 
     pub fn upsert_pages_for_site(&self, site_id: &str, pages: &[PageSummary]) -> Result<()> {
+        self.upsert_pages_for_site_with_mode(
+            site_id,
+            pages,
+            ParentUpdateMode::PreserveExistingOnNone,
+        )
+    }
+
+    /// Upserts summaries whose `parent_id` is authoritative (e.g., space root listings or full
+    /// revision probes), allowing `None` to clear an outdated `parent_id`.
+    pub fn upsert_authoritative_pages_for_site(
+        &self,
+        site_id: &str,
+        pages: &[PageSummary],
+    ) -> Result<()> {
+        self.upsert_pages_for_site_with_mode(site_id, pages, ParentUpdateMode::Authoritative)
+    }
+
+    fn upsert_pages_for_site_with_mode(
+        &self,
+        site_id: &str,
+        pages: &[PageSummary],
+        parent_mode: ParentUpdateMode,
+    ) -> Result<()> {
         if pages.is_empty() {
             return Ok(());
         }
@@ -126,23 +149,23 @@ impl Storage {
         let tx = conn.transaction()?;
         {
             for page in pages {
-                let applied = upsert_page_row(&tx, site_id, page)?;
-                if !applied {
+                let outcome = upsert_page_row(&tx, site_id, page, parent_mode)?;
+                if !outcome.applied && !outcome.fts_needs_refresh {
                     continue;
                 }
-                let existing_body: String = tx
+                let (eff_space_key, eff_title, existing_body): (String, String, String) = tx
                     .query_row(
-                        "SELECT body_markdown FROM pages WHERE site_id = ?1 AND id = ?2",
+                        "SELECT space_key, title, body_markdown FROM pages WHERE site_id = ?1 AND id = ?2",
                         params![site_id, &page.id],
-                        |r| r.get(0),
+                        |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
                     )
-                    .unwrap_or_default();
+                    .unwrap_or_else(|_| (page.space_key.clone(), page.title.clone(), String::new()));
                 refresh_page_fts(
                     &tx,
                     site_id,
                     &page.id,
-                    &page.space_key,
-                    &page.title,
+                    &eff_space_key,
+                    &eff_title,
                     &existing_body,
                 )?;
             }
@@ -171,6 +194,43 @@ impl Storage {
         preserve_attachments: bool,
         preserve_comments: bool,
     ) -> Result<()> {
+        self.upsert_page_detail_for_site_merging_inner(
+            site_id,
+            detail,
+            preserve_labels,
+            preserve_attachments,
+            preserve_comments,
+            false,
+        )
+    }
+
+    /// Upserts a Confluence page detail using [`PageSubresourceStatus`] flags to preserve
+    /// previously cached labels, attachments, comments, or ancestors when any subresource failed.
+    pub fn upsert_page_detail_for_site_with_meta(
+        &self,
+        site_id: &str,
+        detail: &mut PageDetail,
+        meta: crate::atlassian::confluence::PageSubresourceStatus,
+    ) -> Result<()> {
+        self.upsert_page_detail_for_site_merging_inner(
+            site_id,
+            detail,
+            !meta.labels_ok,
+            !meta.attachments_ok,
+            !meta.comments_ok,
+            !meta.ancestors_ok,
+        )
+    }
+
+    fn upsert_page_detail_for_site_merging_inner(
+        &self,
+        site_id: &str,
+        detail: &mut PageDetail,
+        preserve_labels: bool,
+        preserve_attachments: bool,
+        preserve_comments: bool,
+        preserve_ancestors: bool,
+    ) -> Result<()> {
         let mut conn = self.lock_conn()?;
         let tx = conn.transaction()?;
         {
@@ -183,18 +243,66 @@ impl Storage {
                 .optional()?
                 .flatten();
 
-            let applied = upsert_page_row(&tx, site_id, &detail.summary)?;
-            if !applied {
+            let outcome = upsert_page_row(
+                &tx,
+                site_id,
+                &detail.summary,
+                ParentUpdateMode::Authoritative,
+            )?;
+            if !outcome.applied {
                 if let Some(raw) = existing_detail_raw.as_deref() {
-                    if let Ok(newer) = serde_json::from_str::<PageDetail>(raw) {
+                    if let Ok(mut newer) = serde_json::from_str::<PageDetail>(raw) {
+                        if let Ok(reconciled_summary) = tx.query_row(
+                            "
+                            SELECT
+                                id, space_id, space_key, parent_id, title, status,
+                                version_number, author_name, updated_at, position, has_children, web_url
+                            FROM pages
+                            WHERE site_id = ?1 AND id = ?2
+                            ",
+                            params![site_id, &detail.summary.id],
+                            |row| map_page_summary_row(row, 0),
+                        ) {
+                            newer.summary = reconciled_summary;
+                        }
                         *detail = newer;
+                    }
+                }
+                if outcome.fts_needs_refresh {
+                    if let Ok((eff_space_key, eff_title, existing_body)) = tx.query_row(
+                        "SELECT space_key, title, body_markdown FROM pages WHERE site_id = ?1 AND id = ?2",
+                        params![site_id, &detail.summary.id],
+                        |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?, r.get::<_, String>(2)?)),
+                    ) {
+                        refresh_page_fts(
+                            &tx,
+                            site_id,
+                            &detail.summary.id,
+                            &eff_space_key,
+                            &eff_title,
+                            &existing_body,
+                        )?;
                     }
                 }
                 tx.commit()?;
                 return Ok(());
             }
 
-            if preserve_labels || preserve_attachments || preserve_comments {
+            if let Ok(reconciled_summary) = tx.query_row(
+                "
+                SELECT
+                    id, space_id, space_key, parent_id, title, status,
+                    version_number, author_name, updated_at, position, has_children, web_url
+                FROM pages
+                WHERE site_id = ?1 AND id = ?2
+                ",
+                params![site_id, &detail.summary.id],
+                |row| map_page_summary_row(row, 0),
+            ) {
+                detail.summary = reconciled_summary;
+            }
+
+            if preserve_labels || preserve_attachments || preserve_comments || preserve_ancestors {
                 if let Some(raw) = existing_detail_raw.as_deref() {
                     if let Ok(prev) = serde_json::from_str::<PageDetail>(raw) {
                         if preserve_labels && detail.labels.is_empty() {
@@ -205,6 +313,9 @@ impl Storage {
                         }
                         if preserve_comments && detail.comments.is_empty() {
                             detail.comments = prev.comments;
+                        }
+                        if preserve_ancestors && detail.ancestors.is_empty() {
+                            detail.ancestors = prev.ancestors;
                         }
                     }
                 }
@@ -239,6 +350,34 @@ impl Storage {
         }
         tx.commit()?;
         Ok(())
+    }
+
+    /// Looks up cached non-empty page titles for `(site_id, ids)`.
+    pub fn get_page_titles_for_site(
+        &self,
+        site_id: &str,
+        ids: &[String],
+    ) -> Result<HashMap<String, String>> {
+        if ids.is_empty() {
+            return Ok(HashMap::new());
+        }
+        let conn = self.lock_conn()?;
+        let mut stmt = conn.prepare(
+            "SELECT title FROM pages WHERE site_id = ?1 AND id = ?2",
+        )?;
+        let mut titles = HashMap::new();
+        for id in ids {
+            if let Some(title) = stmt
+                .query_row(params![site_id, id], |row| row.get::<_, String>(0))
+                .optional()?
+            {
+                let trimmed = title.trim();
+                if !trimmed.is_empty() {
+                    titles.insert(id.clone(), trimmed.to_string());
+                }
+            }
+        }
+        Ok(titles)
     }
 
     pub fn get_page_detail(&self, page_id: &str) -> Result<Option<PageDetail>> {
@@ -749,27 +888,164 @@ fn map_space_row(row: &Row<'_>, offset: usize) -> rusqlite::Result<SpaceSummary>
     })
 }
 
-fn upsert_page_row(conn: &Connection, site_id: &str, page: &PageSummary) -> Result<bool> {
-    if let Some((existing_ver, existing_updated)) = conn
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ParentUpdateMode {
+    PreserveExistingOnNone,
+    Authoritative,
+}
+
+struct UpsertPageRowOutcome {
+    applied: bool,
+    fts_needs_refresh: bool,
+}
+
+fn upsert_page_row(
+    conn: &Connection,
+    site_id: &str,
+    page: &PageSummary,
+    parent_mode: ParentUpdateMode,
+) -> Result<UpsertPageRowOutcome> {
+    let incoming_parent = page
+        .parent_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty());
+    let incoming_space_id = page.space_id.trim();
+    let mut resolved_space_key = page.space_key.trim().to_string();
+
+    let existing: Option<(i32, String, Option<String>, String, String, String)> = conn
         .query_row(
-            "SELECT version_number, updated_at FROM pages WHERE site_id = ?1 AND id = ?2",
+            "SELECT version_number, updated_at, parent_id, space_id, space_key, web_url FROM pages WHERE site_id = ?1 AND id = ?2",
             params![site_id, &page.id],
-            |row| Ok((row.get::<_, i32>(0)?, row.get::<_, String>(1)?)),
+            |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                    row.get(5)?,
+                ))
+            },
         )
-        .optional()?
-    {
-        if page.version_number < existing_ver {
-            return Ok(false);
+        .optional()?;
+
+    if resolved_space_key.is_empty() {
+        if let Some((_, _, _, _, ref ex_sk, _)) = existing {
+            if !ex_sk.trim().is_empty() {
+                resolved_space_key = ex_sk.clone();
+            }
         }
-        if page.version_number == existing_ver
+    }
+    if resolved_space_key.is_empty() && !incoming_space_id.is_empty() {
+        if let Some(sk) = conn
+            .query_row(
+                "SELECT key FROM spaces WHERE site_id = ?1 AND id = ?2",
+                params![site_id, incoming_space_id],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()?
+        {
+            if !sk.trim().is_empty() {
+                resolved_space_key = sk;
+            }
+        }
+    }
+    if resolved_space_key.is_empty() {
+        if let Some(pid) = incoming_parent {
+            if let Some(sk) = conn
+                .query_row(
+                    "SELECT space_key FROM pages WHERE site_id = ?1 AND id = ?2",
+                    params![site_id, pid],
+                    |row| row.get::<_, String>(0),
+                )
+                .optional()?
+            {
+                if !sk.trim().is_empty() {
+                    resolved_space_key = sk;
+                }
+            }
+        }
+    }
+
+    if let Some((
+        existing_ver,
+        existing_updated,
+        existing_parent,
+        existing_space_id,
+        existing_space_key,
+        existing_web_url,
+    )) = existing
+    {
+        let existing_parent_nonempty = existing_parent
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty());
+        let version_missing = page.version_number <= 0 && existing_ver > 0;
+        let version_older = page.version_number > 0 && page.version_number < existing_ver;
+        let same_version_older_time = page.version_number == existing_ver
             && !existing_updated.trim().is_empty()
             && !page.updated_at.trim().is_empty()
             && crate::storage::jira::compare_updated_at(&page.updated_at, &existing_updated)
-                == std::cmp::Ordering::Less
-        {
-            return Ok(false);
+                == std::cmp::Ordering::Less;
+
+        if version_missing || version_older || same_version_older_time {
+            // Keep content/version monotonic, while enriching hierarchy and space metadata separately.
+            let next_parent: Option<&str> = match parent_mode {
+                ParentUpdateMode::Authoritative if version_missing => incoming_parent,
+                _ if version_missing && incoming_parent.is_some() => incoming_parent,
+                _ if existing_parent_nonempty.is_none() => incoming_parent,
+                _ => existing_parent_nonempty,
+            };
+            let next_space_id =
+                if existing_space_id.trim().is_empty() && !incoming_space_id.is_empty() {
+                    incoming_space_id
+                } else {
+                    existing_space_id.as_str()
+                };
+            let next_space_key =
+                if existing_space_key.trim().is_empty() && !resolved_space_key.is_empty() {
+                    resolved_space_key.as_str()
+                } else {
+                    existing_space_key.as_str()
+                };
+            let next_web_url =
+                if existing_web_url.trim().is_empty() && !page.web_url.trim().is_empty() {
+                    page.web_url.trim()
+                } else {
+                    existing_web_url.as_str()
+                };
+
+            let space_key_changed = next_space_key != existing_space_key;
+            let hierarchy_changed = next_parent != existing_parent_nonempty
+                || next_space_id != existing_space_id
+                || space_key_changed
+                || next_web_url != existing_web_url;
+            if hierarchy_changed {
+                conn.execute(
+                    "UPDATE pages SET parent_id = ?1, space_id = ?2, space_key = ?3, web_url = ?4 WHERE site_id = ?5 AND id = ?6",
+                    params![
+                        next_parent,
+                        next_space_id,
+                        next_space_key,
+                        next_web_url,
+                        site_id,
+                        &page.id,
+                    ],
+                )?;
+            }
+            return Ok(UpsertPageRowOutcome {
+                applied: false,
+                fts_needs_refresh: space_key_changed,
+            });
         }
     }
+
+    let authoritative_flag = if parent_mode == ParentUpdateMode::Authoritative {
+        1i32
+    } else {
+        0i32
+    };
 
     conn.execute(
         "
@@ -781,24 +1057,28 @@ fn upsert_page_row(conn: &Connection, site_id: &str, page: &PageSummary) -> Resu
             ?8, ?9, ?10, ?11, ?12, ?13
         )
         ON CONFLICT(site_id, id) DO UPDATE SET
-            space_id = excluded.space_id,
-            space_key = excluded.space_key,
-            parent_id = excluded.parent_id,
-            title = excluded.title,
-            status = excluded.status,
-            version_number = excluded.version_number,
+            space_id = CASE WHEN excluded.space_id != '' THEN excluded.space_id ELSE pages.space_id END,
+            space_key = CASE WHEN excluded.space_key != '' THEN excluded.space_key ELSE pages.space_key END,
+            parent_id = CASE
+                WHEN ?14 != 0 THEN excluded.parent_id
+                WHEN excluded.parent_id IS NOT NULL AND excluded.parent_id != '' THEN excluded.parent_id
+                ELSE pages.parent_id
+            END,
+            title = CASE WHEN excluded.title != '' THEN excluded.title ELSE pages.title END,
+            status = CASE WHEN excluded.status != '' THEN excluded.status ELSE pages.status END,
+            version_number = CASE WHEN excluded.version_number > 0 THEN excluded.version_number ELSE pages.version_number END,
             author_name = COALESCE(excluded.author_name, pages.author_name),
-            updated_at = excluded.updated_at,
-            position = excluded.position,
+            updated_at = CASE WHEN excluded.updated_at != '' THEN excluded.updated_at ELSE pages.updated_at END,
+            position = CASE WHEN ?14 != 0 OR excluded.position != 0 THEN excluded.position ELSE pages.position END,
             has_children = CASE WHEN excluded.has_children != 0 THEN 1 ELSE pages.has_children END,
-            web_url = excluded.web_url
+            web_url = CASE WHEN excluded.web_url != '' THEN excluded.web_url ELSE pages.web_url END
         ",
         params![
             site_id,
             page.id,
-            page.space_id,
-            page.space_key,
-            page.parent_id,
+            incoming_space_id,
+            resolved_space_key,
+            incoming_parent,
             page.title,
             page.status,
             page.version_number,
@@ -807,9 +1087,13 @@ fn upsert_page_row(conn: &Connection, site_id: &str, page: &PageSummary) -> Resu
             page.position,
             if page.has_children { 1i32 } else { 0i32 },
             page.web_url,
+            authoritative_flag,
         ],
     )?;
-    Ok(true)
+    Ok(UpsertPageRowOutcome {
+        applied: true,
+        fts_needs_refresh: true,
+    })
 }
 
 fn refresh_page_fts(
@@ -1211,5 +1495,86 @@ mod tests {
                 .len(),
             1
         );
+    }
+
+    #[test]
+    fn regression_atlassian_bug_02_storage_hierarchy_enrichment_separate_from_version_guard() {
+        let storage = Storage::open_in_memory().unwrap();
+        // v3 detail cached without parent_id yet
+        let mut p_v3 = sample_page("301", None, "V3 Page", 1);
+        p_v3.version_number = 3;
+        p_v3.updated_at = "2026-11-18T12:00:00Z".into();
+        let d_v3 = PageDetail {
+            summary: p_v3.clone(),
+            body_markdown: "Authoritative v3 body".into(),
+            ..Default::default()
+        };
+        storage.upsert_page_detail_for_site("cloud", &d_v3).unwrap();
+
+        // Live child listing without version/space_key enriches parent_id without downgrading v3 body/version
+        let child_listing = PageSummary {
+            id: "301".into(),
+            space_id: "5001".into(),
+            space_key: String::new(),
+            parent_id: Some("100".into()),
+            title: "Stale Child Title".into(),
+            status: "current".into(),
+            version_number: 0,
+            author_name: None,
+            updated_at: String::new(),
+            position: 2,
+            has_children: false,
+            web_url: String::new(),
+        };
+        storage
+            .upsert_pages_for_site("cloud", &[child_listing])
+            .unwrap();
+        let detail = storage
+            .get_page_detail_for_site("cloud", "301")
+            .unwrap()
+            .unwrap();
+        assert_eq!(detail.summary.version_number, 3);
+        assert_eq!(detail.summary.title, "V3 Page");
+        assert_eq!(detail.summary.parent_id.as_deref(), Some("100"));
+        assert_eq!(detail.summary.space_key, "ENG");
+        assert_eq!(detail.body_markdown, "Authoritative v3 body");
+        assert!(!storage.is_page_detail_stale_for_site("cloud", "301").unwrap());
+
+        // CQL search with missing parent_id and empty space_id preserves parent_id="100" and space_id="sp-1"
+        let search_hit = PageSummary {
+            id: "301".into(),
+            space_id: String::new(),
+            space_key: "ENG".into(),
+            parent_id: None,
+            title: "V3 Page".into(),
+            status: "current".into(),
+            version_number: 3,
+            author_name: None,
+            updated_at: "2026-11-18T12:00:00Z".into(),
+            position: 0,
+            has_children: false,
+            web_url: String::new(),
+        };
+        storage.upsert_pages_for_site("cloud", &[search_hit]).unwrap();
+        let detail_after_search = storage
+            .get_page_detail_for_site("cloud", "301")
+            .unwrap()
+            .unwrap();
+        assert_eq!(detail_after_search.summary.parent_id.as_deref(), Some("100"));
+        assert_eq!(detail_after_search.summary.space_id, "sp-1");
+
+        // Authoritative root listing clears parent_id when page is moved to root
+        let moved_root = PageSummary {
+            parent_id: None,
+            ..detail_after_search.summary.clone()
+        };
+        storage
+            .upsert_authoritative_pages_for_site("cloud", &[moved_root])
+            .unwrap();
+        let detail_root = storage
+            .get_page_detail_for_site("cloud", "301")
+            .unwrap()
+            .unwrap();
+        assert_eq!(detail_root.summary.parent_id, None);
     }
 }

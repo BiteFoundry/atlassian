@@ -769,6 +769,17 @@ impl AppConfig {
         self.enabled_sites().into_iter().next()
     }
 
+    /// Resolves the effective target site profile in priority order:
+    /// explicit `active_site` (`--site`), configured `default_site`, then first enabled/legacy site.
+    pub fn resolved_site_profile(&self) -> Option<SiteProfile> {
+        if let Some(ref active_id) = self.active_site {
+            if let Some(site) = self.find_effective_site(active_id) {
+                return Some(site);
+            }
+        }
+        self.default_site_profile()
+    }
+
     /// Resolves OAuth 2.0 (3LO) client ID (`ATLASSIAN_OAUTH_CLIENT_ID` env var takes precedence).
     pub fn effective_oauth_client_id(&self) -> Option<String> {
         if let Ok(env_val) = std::env::var("ATLASSIAN_OAUTH_CLIENT_ID") {
@@ -910,7 +921,7 @@ pub fn normalize_base_url(raw: &str) -> String {
 }
 
 /// Normalizes a URL or host string for case-insensitive site matching (strips scheme and trailing slashes).
-fn normalize_url_for_match(raw: &str) -> String {
+pub(crate) fn normalize_url_for_match(raw: &str) -> String {
     let trimmed = normalize_base_url(raw).to_ascii_lowercase();
     trimmed
         .strip_prefix("https://")
