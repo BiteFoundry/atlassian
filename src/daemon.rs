@@ -1,4 +1,4 @@
-//! Lightweight single-instance background sync daemon for Atlassian (`jira daemon` / `confluence daemon`).
+//! Lightweight single-instance background sync daemon for Atlassian (`atlassian daemon` / `confluence daemon`).
 //!
 //! Manages PID/lockfile coordination, authenticated local IPC (Windows named pipe / Unix domain socket /
 //! loopback TCP fallback), broadcast `CoreEvent` streaming to attached TUI clients, and `SyncCommand` forwarding.
@@ -1168,7 +1168,7 @@ async fn ensure_daemon_started_at(cfg: &AppConfig, paths: &DaemonPaths) -> Resul
             if !exit.success() {
                 let auth = AuthManager::new(&cfg.profile);
                 if !auth.is_logged_in() {
-                    bail!("Not logged in. Run 'jira login' or 'confluence login' first.");
+                    bail!("Not logged in. Run 'atlassian login' or 'confluence login' first.");
                 }
                 bail!("Background daemon exited unexpectedly (exit: {exit})");
             }
@@ -1361,7 +1361,7 @@ async fn try_connect_tui_at(cfg: &AppConfig, paths: &DaemonPaths) -> Option<TuiD
 pub async fn run_daemon_foreground(cfg: AppConfig) -> Result<()> {
     let auth = AuthManager::new(&cfg.profile);
     if !auth.is_logged_in() {
-        bail!("Not logged in. Run 'jira login' or 'confluence login' first.");
+        bail!("Not logged in. Run 'atlassian login' or 'confluence login' first.");
     }
 
     let db_path = crate::config::cache_db_path(&cfg.profile);

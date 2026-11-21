@@ -1053,7 +1053,7 @@ impl AppState {
     /// Triggers Cloud OAuth 2.0 (3LO) `accessible-resources` site discovery in the background.
     pub fn request_discover_cloud_sites(&self, ui: &mut UiState) {
         if tokio::runtime::Handle::try_current().is_err() {
-            ui.info("Run `jira login --oauth` or `jira sites discover` to discover Cloud sites");
+            ui.info("Run `atlassian login --oauth` or `atlassian sites discover` to discover Cloud sites");
             return;
         }
         // Check if any configured account already holds Cloud OAuth credentials.
@@ -1131,7 +1131,7 @@ impl AppState {
         }
 
         ui.info(
-            "No OAuth session found. Run `jira login --oauth --client-id <ID>` to discover Cloud sites.",
+            "No OAuth session found. Run `atlassian login --oauth --client-id <ID>` to discover Cloud sites.",
         );
     }
 
@@ -1496,7 +1496,7 @@ impl AppState {
             return;
         }
         if !self.auth.is_logged_in() || self.config.site_url.trim().is_empty() {
-            ui.info("Offline cache mode (run `jira login` to connect)");
+            ui.info("Offline cache mode (run `atlassian login` to connect)");
             return;
         }
         ui.tasks.begin("Initial sync");

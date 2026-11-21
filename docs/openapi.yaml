@@ -1,9 +1,9 @@
 openapi: 3.1.0
 info:
-  title: jira / confluence HTTP JSON API
+  title: Jira / Confluence HTTP JSON API
   version: 0.1.0
   description: |
-    Local HTTP/JSON contract exposed by `jira serve` or `confluence serve` (alias `api`).
+    Local HTTP/JSON contract exposed by `atlassian serve` or `confluence serve` (alias `api`).
 
     Backed by Atlassian Jira Platform, Jira Agile, and Confluence REST APIs
     (Cloud and Data Center), local SQLite WAL/FTS5 caching, and the background

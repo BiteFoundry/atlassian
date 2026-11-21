@@ -1,7 +1,7 @@
 #!/usr/bin/env sh
-# Unix launcher for confluence (sets ATLASSIAN_PERSONA=confluence and delegates to ./jira).
+# Unix launcher for confluence (sets ATLASSIAN_PERSONA=confluence and delegates to ./atlassian).
 set -eu
 
 ROOT=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 export ATLASSIAN_PERSONA=confluence
-exec "$ROOT/jira" "$@"
+exec "$ROOT/atlassian" "$@"

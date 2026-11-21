@@ -1066,7 +1066,7 @@ impl AuthManager {
         auth_base: &str,
     ) -> Result<StoredCredentials> {
         let creds = self.load_credentials()?.ok_or_else(|| {
-            anyhow!("Not signed in. Run `jira login` or `confluence login` first.")
+            anyhow!("Not signed in. Run `atlassian login` or `confluence login` first.")
         })?;
         if !creds.is_expired_within(OAUTH_REFRESH_MARGIN_SECS) {
             return Ok(creds);
@@ -1074,7 +1074,7 @@ impl AuthManager {
 
         let _guard = self.refresh_lock.lock().await;
         let current = self.load_credentials()?.ok_or_else(|| {
-            anyhow!("Not signed in. Run `jira login` or `confluence login` first.")
+            anyhow!("Not signed in. Run `atlassian login` or `confluence login` first.")
         })?;
         if !current.is_expired_within(OAUTH_REFRESH_MARGIN_SECS) {
             return Ok(current);
@@ -1096,7 +1096,7 @@ impl AuthManager {
     ) -> Result<StoredCredentials> {
         let _guard = self.refresh_lock.lock().await;
         let current = self.load_credentials()?.ok_or_else(|| {
-            anyhow!("Not signed in. Run `jira login` or `confluence login` first.")
+            anyhow!("Not signed in. Run `atlassian login` or `confluence login` first.")
         })?;
         if !current.is_oauth() {
             return Ok(current);
@@ -1180,7 +1180,7 @@ impl AuthManager {
 
     pub fn authorization_header(&self) -> Result<String> {
         let creds = self.load_credentials()?.ok_or_else(|| {
-            anyhow!("Not signed in. Run `jira login` or `confluence login` first.")
+            anyhow!("Not signed in. Run `atlassian login` or `confluence login` first.")
         })?;
         Ok(creds.authorization_header())
     }

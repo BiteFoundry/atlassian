@@ -6,8 +6,8 @@
 node_modules/
 npm-debug.log*
 *.tgz
-npm/*/bin/jira
-npm/*/bin/jira.exe
+npm/*/bin/
 
 # local release staging
 /dist-release/
+npm/*/LICENSE

@@ -288,7 +288,7 @@ impl AtlassianClient {
         if !api_base.is_empty() {
             return Ok(api_base);
         }
-        bail!("Atlassian site URL is not configured. Run `jira login --site <URL>` or set ATLASSIAN_SITE_URL.");
+        bail!("Atlassian site URL is not configured. Run `atlassian login --site <URL>` or set ATLASSIAN_SITE_URL.");
     }
 
     pub(crate) fn require_confluence_root(&self) -> Result<String> {
@@ -571,7 +571,7 @@ impl AtlassianClient {
 
     async fn resolve_auth_header(&self) -> Result<(String, Option<String>)> {
         let creds = self.auth.load_credentials()?.ok_or_else(|| {
-            anyhow!("Not signed in. Run `jira login` or `confluence login` first.")
+            anyhow!("Not signed in. Run `atlassian login` or `confluence login` first.")
         })?;
         match creds {
             StoredCredentials::CloudOAuth { .. } => {

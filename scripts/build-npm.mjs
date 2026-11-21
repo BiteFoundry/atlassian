@@ -20,33 +20,33 @@ const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 export const TARGETS = {
   'x86_64-pc-windows-msvc': {
     package: 'atlassian-win32-x64',
-    source: 'jira.exe',
-    binary: 'jira.exe',
+    source: 'atlassian.exe',
+    binary: 'atlassian.exe',
   },
   'aarch64-pc-windows-msvc': {
     package: 'atlassian-win32-arm64',
-    source: 'jira.exe',
-    binary: 'jira.exe',
+    source: 'atlassian.exe',
+    binary: 'atlassian.exe',
   },
   'x86_64-apple-darwin': {
     package: 'atlassian-darwin-x64',
-    source: 'jira',
-    binary: 'jira',
+    source: 'atlassian',
+    binary: 'atlassian',
   },
   'aarch64-apple-darwin': {
     package: 'atlassian-darwin-arm64',
-    source: 'jira',
-    binary: 'jira',
+    source: 'atlassian',
+    binary: 'atlassian',
   },
   'x86_64-unknown-linux-gnu': {
     package: 'atlassian-linux-x64',
-    source: 'jira',
-    binary: 'jira',
+    source: 'atlassian',
+    binary: 'atlassian',
   },
   'aarch64-unknown-linux-gnu': {
     package: 'atlassian-linux-arm64',
-    source: 'jira',
-    binary: 'jira',
+    source: 'atlassian',
+    binary: 'atlassian',
   },
 };
 
@@ -127,7 +127,7 @@ function copyBinary(source, packageDir, binary) {
   const destination = path.join(binDir, binary);
   fs.mkdirSync(binDir, { recursive: true });
   fs.copyFileSync(source, destination);
-  if (binary !== 'jira.exe') fs.chmodSync(destination, 0o755);
+  if (binary !== 'atlassian.exe') fs.chmodSync(destination, 0o755);
   return destination;
 }
 
@@ -154,6 +154,7 @@ function build(triple) {
     return { triple, ok: false, reason: `missing package manifest: ${packageJson}` };
   }
 
+  fs.copyFileSync(path.join(ROOT, 'LICENSE'), path.join(packageDir, 'LICENSE'));
   const destination = copyBinary(source, packageDir, mapping.binary);
   return {
     triple,

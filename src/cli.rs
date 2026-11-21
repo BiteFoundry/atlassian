@@ -1,4 +1,4 @@
-//! Dual-persona (`jira` / `confluence` / `conf`) CLI parser and command dispatcher.
+//! Dual-persona (`atlassian` / `confluence` / `conf`) CLI parser and command dispatcher.
 
 use std::{
     io::{self, IsTerminal, Write},
@@ -12,7 +12,7 @@ use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use crate::{
     atlassian::{
-        body::{BodyEdit, TextReplacement},
+        body::{BodyEdit, SectionReplacement, TextReplacement},
         client::is_not_found_error,
         AtlassianClient, SiteClientPool,
     },
@@ -54,7 +54,7 @@ impl From<DeploymentArg> for DeploymentKind {
 
 #[derive(Parser, Debug)]
 #[command(
-    name = "jira",
+    name = "atlassian",
     version,
     about = "Native terminal client for Atlassian Jira & Confluence",
     long_about = "Native terminal client for Atlassian Cloud and Data Center (Jira · Agile · Confluence).\nRun without arguments to check login status and launch the TUI."
@@ -99,6 +99,23 @@ pub struct EditBodyArgs {
     /// Replace one unique text occurrence in place
     #[arg(long, num_args = 2, value_names = ["OLD", "NEW"], conflicts_with_all = ["body", "body_file", "append", "append_file"])]
     replace: Option<Vec<String>>,
+    /// Preview the computed changes without saving
+    #[arg(long)]
+    dry_run: bool,
+}
+
+#[derive(clap::Args, Debug)]
+pub struct PageBodyArgs {
+    #[command(flatten)]
+    body: EditBodyArgs,
+    /// Replace the section under an exact top-level heading on a Confluence Cloud ADF page
+    #[arg(
+        long,
+        num_args = 2,
+        value_names = ["HEADING", "MARKDOWN"],
+        conflicts_with_all = ["body", "body_file", "append", "append_file", "replace"]
+    )]
+    replace_section: Option<Vec<String>>,
 }
 
 impl EditBodyArgs {
@@ -456,7 +473,7 @@ pub enum Command {
     },
     /// Open a Jira issue web URL in the default browser
     Open { key: String },
-    /// Confluence command namespace (`jira wiki <subcmd>`)
+    /// Confluence command namespace (`atlassian wiki <subcmd>`)
     #[command(visible_alias = "conf")]
     Wiki {
         #[command(subcommand)]
@@ -640,7 +657,7 @@ pub enum ConfluenceCommand {
         #[arg(long)]
         title: Option<String>,
         #[command(flatten)]
-        body: EditBodyArgs,
+        body: PageBodyArgs,
         /// Current page version from view (required for body edits)
         #[arg(long = "prev-version")]
         prev_version: Option<i32>,
@@ -820,7 +837,7 @@ pub enum WikiCommand {
         #[arg(long)]
         title: Option<String>,
         #[command(flatten)]
-        body: EditBodyArgs,
+        body: PageBodyArgs,
         /// Current page version from view (required for body edits)
         #[arg(long = "prev-version")]
         prev_version: Option<i32>,
@@ -1158,7 +1175,7 @@ pub async fn run() -> Result<()> {
     let persona = Persona::detect();
     match persona {
         Persona::Jira => {
-            let cli: Cli = parse_cli_with_stack("jira");
+            let cli: Cli = parse_cli_with_stack("atlassian");
             let site_override = cli.site.clone();
             Box::pin(dispatch_jira_cli(&mut cfg, persona, site_override, cli.command)).await
         }
@@ -1205,7 +1222,7 @@ fn apply_site_override(cfg: &AppConfig, site_override: Option<&str>) -> Result<A
             .collect();
         if available.is_empty() {
             bail!(
-                "Site '{raw}' not found (no sites configured). Run `jira sites add <URL>` or `jira login --oauth` first."
+                "Site '{raw}' not found (no sites configured). Run `atlassian sites add <URL>` or `atlassian login --oauth` first."
             );
         }
         bail!(
@@ -1508,8 +1525,8 @@ async fn dispatch_jira_cli(
         }
         Some(Command::Mcp) => {
             let scoped = apply_site_override(cfg, site_override.as_deref())?;
-            let (_auth, client, storage) = open_runtime(&scoped, false)?;
-            Box::pin(crate::mcp::run(scoped, client, storage)).await
+            let (_auth, client) = open_client(&scoped, false)?;
+            Box::pin(crate::mcp::run_deferred(scoped, client)).await
         }
     }
 }
@@ -1761,8 +1778,8 @@ async fn dispatch_confluence_cli(
         }
         Some(ConfluenceCommand::Mcp) => {
             let scoped = apply_site_override(cfg, site_override.as_deref())?;
-            let (_auth, client, storage) = open_runtime(&scoped, false)?;
-            Box::pin(crate::mcp::run(scoped, client, storage)).await
+            let (_auth, client) = open_client(&scoped, false)?;
+            Box::pin(crate::mcp::run_deferred(scoped, client)).await
         }
     }
 }
@@ -2066,6 +2083,11 @@ fn open_runtime(
     require_login: bool,
 ) -> Result<(AuthManager, AtlassianClient, Storage)> {
     let storage = Storage::open(&config::cache_db_path(&cfg.profile))?;
+    let (auth, client) = open_client(cfg, require_login)?;
+    Ok((auth, client, storage))
+}
+
+fn open_client(cfg: &AppConfig, require_login: bool) -> Result<(AuthManager, AtlassianClient)> {
     if let Ok(pool) = SiteClientPool::from_config(cfg) {
         if let Some(target_site) = cfg
             .active_site
@@ -2080,12 +2102,12 @@ fn open_runtime(
                         "Authentication required for site '{}' (account '{}'). Run `{} login --oauth` or `{} login --url {} --email <email>`.",
                         target_site.id,
                         target_site.account_id,
-                        Persona::detect().as_str(),
-                        Persona::detect().as_str(),
+                        Persona::detect().command_name(),
+                        Persona::detect().command_name(),
                         target_site.site_url,
                     );
                 }
-                return Ok((auth, client, storage));
+                return Ok((auth, client));
             }
         }
     }
@@ -2094,11 +2116,11 @@ fn open_runtime(
     if require_login && !auth.is_logged_in() {
         bail!(
             "로그인이 필요합니다. 먼저 `{} login --url https://<site>.atlassian.net --email <email>` 을 실행하세요.",
-            Persona::detect().as_str()
+            Persona::detect().command_name()
         );
     }
     let client = AtlassianClient::new(cfg.clone(), auth.clone())?;
-    Ok((auth, client, storage))
+    Ok((auth, client))
 }
 
 async fn cmd_tui(cfg: &mut AppConfig, persona: Persona) -> Result<()> {
@@ -2118,7 +2140,7 @@ async fn cmd_tui(cfg: &mut AppConfig, persona: Persona) -> Result<()> {
     };
 
     if !has_any_auth || !has_any_site {
-        let bin = persona.as_str();
+        let bin = persona.command_name();
         println!("저장된 Atlassian 로그인 정보가 없습니다.");
         println!("빠른 로그인 예시: {bin} login --oauth  또는  {bin} login --url https://<site>.atlassian.net --email <email>");
         if !io::stdin().is_terminal() {
@@ -2588,7 +2610,7 @@ async fn cmd_login_cloud_account(
             println!("Registered site '{}' ({}) using account '{account_id}'.", site.id, site.site_url);
         } else {
             println!(
-                "Attach any Cloud site with: jira sites add https://<site>.atlassian.net --account {account_id}"
+                "Attach any Cloud site with: atlassian sites add https://<site>.atlassian.net --account {account_id}"
             );
         }
     }
@@ -2641,7 +2663,7 @@ async fn cmd_sites(cfg: &mut AppConfig, action: SitesCommand) -> Result<()> {
                     }))?
                 );
             } else if sites.is_empty() {
-                println!("No Atlassian sites registered. Run `jira login --oauth` or `jira sites add <URL>`.");
+                println!("No Atlassian sites registered. Run `atlassian login --oauth` or `atlassian sites add <URL>`.");
             } else {
                 println!(
                     "{:<16} {:<18} {:<12} {:<10} {:<8} {:<8} {}",
@@ -2827,7 +2849,7 @@ async fn cmd_sites(cfg: &mut AppConfig, action: SitesCommand) -> Result<()> {
                     .or_else(|| cfg.effective_oauth_client_id())
                     .ok_or_else(|| {
                         anyhow::anyhow!(
-                            "No OAuth credentials found for account '{candidate_account}'. Run `jira login --oauth --client-id <ID>` first."
+                            "No OAuth credentials found for account '{candidate_account}'. Run `atlassian login --oauth --client-id <ID>` first."
                         )
                     })?;
                 let resolved_secret = client_secret
@@ -3685,8 +3707,14 @@ async fn cmd_issue_edit(
     labels: Option<Vec<String>>,
     json_out: bool,
 ) -> Result<()> {
+    let dry_run = body.dry_run;
     let (full, append, replacement) = body.read()?;
-    let edit = BodyEdit::from_inputs(full.as_deref(), append.as_deref(), replacement.as_ref())?;
+    let edit = BodyEdit::from_inputs(
+        full.as_deref(),
+        append.as_deref(),
+        replacement.as_ref(),
+        None,
+    )?;
     if summary.is_none()
         && edit.is_none()
         && priority.is_none()
@@ -3696,7 +3724,7 @@ async fn cmd_issue_edit(
         bail!("수정할 필드를 하나 이상 지정하세요 (`--summary`, `--body`, `--append`, `--replace` 등).");
     }
 
-    let (_auth, client, storage) = open_runtime(cfg, true)?;
+    let (_auth, client) = open_client(cfg, true)?;
     let site_id = client.site_id();
     let assignee_id = match assignee.as_deref().map(str::trim) {
         None => None,
@@ -3712,6 +3740,11 @@ async fn cmd_issue_edit(
         assignee_id,
         labels,
     };
+    if dry_run {
+        let preview = client.preview_issue_edit(key, &patch, edit).await?;
+        return print_edit_preview(site_id, preview);
+    }
+    let storage = Storage::open(&config::cache_db_path(&cfg.profile))?;
     let updated = client.edit_issue(key, &patch, edit).await?;
     let _ = storage.upsert_issue_detail_for_site(site_id, &updated);
 
@@ -4003,7 +4036,7 @@ async fn cmd_issue_open(cfg: &AppConfig, key: &str) -> Result<()> {
     } else if !cfg.site_url.trim().is_empty() {
         format!("{}/browse/{key}", cfg.jira_base_url())
     } else {
-        bail!("웹 URL을 구성할 수 없습니다. 먼저 `jira login` 을 실행하세요.");
+        bail!("웹 URL을 구성할 수 없습니다. 먼저 `atlassian login` 을 실행하세요.");
     };
     open::that(&url).with_context(|| format!("브라우저 열기 실패: {url}"))?;
     println!("브라우저에서 열었습니다: {url}");
@@ -4253,15 +4286,35 @@ async fn cmd_page_edit(
     cfg: &AppConfig,
     page_id: &str,
     title: Option<String>,
-    body: EditBodyArgs,
+    body: PageBodyArgs,
     prev_version: Option<i32>,
     message: Option<String>,
     json_out: bool,
 ) -> Result<()> {
-    let (full, append, replacement) = body.read()?;
-    let edit = BodyEdit::from_inputs(full.as_deref(), append.as_deref(), replacement.as_ref())?;
-    let (_auth, client, storage) = open_runtime(cfg, true)?;
+    let dry_run = body.body.dry_run;
+    let (full, append, replacement) = body.body.read()?;
+    let section = body.replace_section.map(|values| {
+        let mut values = values.into_iter();
+        SectionReplacement {
+            heading: values.next().expect("clap requires HEADING"),
+            markdown: values.next().expect("clap requires MARKDOWN"),
+        }
+    });
+    let edit = BodyEdit::from_inputs(
+        full.as_deref(),
+        append.as_deref(),
+        replacement.as_ref(),
+        section.as_ref(),
+    )?;
+    let (_auth, client) = open_client(cfg, true)?;
     let site_id = client.site_id();
+    if dry_run {
+        let preview = client
+            .preview_page_edit(page_id, title, edit, prev_version, message)
+            .await?;
+        return print_edit_preview(site_id, preview);
+    }
+    let storage = Storage::open(&config::cache_db_path(&cfg.profile))?;
     let updated = client
         .edit_page(page_id, title, edit, prev_version, message)
         .await?;
@@ -4278,6 +4331,16 @@ async fn cmd_page_edit(
             updated.summary.id, updated.summary.title, updated.summary.version_number
         );
     }
+    Ok(())
+}
+
+fn print_edit_preview(site_id: &str, preview: Value) -> Result<()> {
+    println!(
+        "{}",
+        serde_json::to_string_pretty(
+            &json!({ "ok": true, "site_id": site_id, "dry_run": true, "preview": preview })
+        )?
+    );
     Ok(())
 }
 
@@ -5164,7 +5227,7 @@ mod tests {
             }
         ));
 
-        // Cross-mounted Confluence under `jira wiki` and alias `jira conf`
+        // Cross-mounted Confluence under `atlassian wiki` and alias `atlassian conf`
         let cli = Cli::try_parse_from(["jira", "wiki", "spaces", "--refresh"]).unwrap();
         assert!(matches!(
             cli.command.unwrap(),

@@ -1,4 +1,4 @@
-//! Local HTTP JSON API (`jira serve` / `confluence serve`, default `127.0.0.1:8789`) powered by `axum`.
+//! Local HTTP JSON API (`atlassian serve` / `confluence serve`, default `127.0.0.1:8789`) powered by `axum`.
 
 use std::{net::SocketAddr, sync::Arc};
 
@@ -904,6 +904,7 @@ async fn patch_issue(
         patch.description_markdown.as_deref(),
         body.append_markdown.as_deref(),
         body.replace_text.as_ref(),
+        None,
     )
     .map_err(anyhow::Error::from)?;
     if patch.summary.is_none()
@@ -1206,6 +1207,7 @@ async fn update_page(
         body.body_markdown.as_deref(),
         body.append_markdown.as_deref(),
         body.replace_text.as_ref(),
+        None,
     )
     .map_err(anyhow::Error::from)?;
     let (target_site, client) =

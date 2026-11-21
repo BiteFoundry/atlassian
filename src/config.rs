@@ -155,7 +155,7 @@ impl ImageProtocolPreference {
     }
 }
 
-/// Binary invocation persona (`jira` vs `confluence` / `conf`).
+/// Binary invocation persona (`atlassian` vs `confluence` / `conf`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "lowercase")]
 pub enum Persona {
@@ -172,7 +172,7 @@ impl Persona {
             if trimmed == "confluence" || trimmed == "conf" || trimmed == "wiki" {
                 return Self::Confluence;
             }
-            if trimmed == "jira" {
+            if trimmed == "jira" || trimmed == "atlassian" {
                 return Self::Jira;
             }
         }
@@ -190,6 +190,13 @@ impl Persona {
     pub fn as_str(self) -> &'static str {
         match self {
             Self::Jira => "jira",
+            Self::Confluence => "confluence",
+        }
+    }
+
+    pub fn command_name(self) -> &'static str {
+        match self {
+            Self::Jira => "atlassian",
             Self::Confluence => "confluence",
         }
     }
@@ -375,7 +382,7 @@ pub struct AppConfig {
     /// Download destination directory for attachments.
     #[serde(default)]
     pub download_dir: Option<PathBuf>,
-    /// GitHub repository (`owner/repo`) for `jira update` / `confluence update`.
+    /// GitHub repository (`owner/repo`) for `atlassian update` / `confluence update`.
     pub github_repo: String,
     /// Active profile name (`default` unless overridden).
     pub profile: String,

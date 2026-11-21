@@ -1,5 +1,5 @@
 #!/usr/bin/env sh
-# Unix launcher for jira (analogous to jira.cmd on Windows).
+# Unix launcher for atlassian (analogous to atlassian.cmd on Windows).
 #
 # Uses prebuilt release binary if present, attempts `gh release download` from
 # BiteFoundry/atlassian when available, and falls back to `cargo build --release`.
@@ -7,7 +7,7 @@ set -eu
 
 ROOT=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 TARGET_DIR=${CARGO_TARGET_DIR:-"$ROOT/target"}
-BIN="$TARGET_DIR/release/jira"
+BIN="$TARGET_DIR/release/atlassian"
 
 if [ ! -x "$BIN" ] && command -v gh >/dev/null 2>&1; then
     OS=$(uname -s)

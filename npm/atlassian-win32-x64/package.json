@@ -1,7 +1,7 @@
 {
   "name": "@bitefoundry/atlassian-win32-x64",
-  "version": "0.3.5",
-  "description": "Prebuilt jira binary for Windows x64",
+  "version": "0.4.0",
+  "description": "Prebuilt atlassian binary for Windows x64",
   "license": "MIT",
   "os": [
     "win32"

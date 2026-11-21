@@ -3,5 +3,5 @@ chcp 65001 >nul
 setlocal
 set "ROOT=%~dp0"
 set "ATLASSIAN_PERSONA=confluence"
-call "%ROOT%jira.cmd" %*
+call "%ROOT%atlassian.cmd" %*
 exit /b %errorlevel%

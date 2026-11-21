@@ -6,9 +6,9 @@ binary and exec it, so there is no compiler, Node native addon, or postinstall
 download step.
 
 The Rust crate is named `atlassian-cli` and produces a single unified binary
-(`jira` / `jira.exe`) that powers Jira (`jira`) and Confluence (`confluence` /
+(`atlassian` / `atlassian.exe`) that powers Jira (`atlassian`) and Confluence (`confluence` /
 `conf`, via `ATLASSIAN_PERSONA=confluence`). The npm package is scoped as
-`@bitefoundry/atlassian` and installs **all three** commands (`jira`, `confluence`,
+`@bitefoundry/atlassian` and installs **all three** commands (`atlassian`, `confluence`,
 and `conf`).
 
 ## Install and run
@@ -19,24 +19,24 @@ npx @bitefoundry/atlassian --version
 npx --yes -p @bitefoundry/atlassian confluence --version
 npx --yes -p @bitefoundry/atlassian conf --version
 
-# global install (installs `jira`, `confluence`, and `conf`)
+# global install (installs `atlassian`, `confluence`, and `conf`)
 npm install -g @bitefoundry/atlassian
-jira --version
+atlassian --version
 confluence --version
 conf --version
 
 # project-local
 npm install @bitefoundry/atlassian
-npx jira boards
+npx atlassian boards
 npx confluence spaces
 npx conf pages --space ENG
 ```
 
 All three commands share the exact same Atlassian authentication (Cloud API
 Token or Data Center PAT), SQLite WAL + FTS5 cache (`cache.db`), HTTP JSON API
-(`jira serve`), and MCP server (`jira mcp`):
+(`atlassian serve`), and MCP server (`atlassian mcp`):
 
-- `jira login`, `jira projects`, `jira boards`, `jira issues`, `jira view`, `jira create`, `jira transition`, `jira tui`, `jira serve`, `jira mcp`, `jira update`
+- `atlassian login`, `atlassian projects`, `atlassian boards`, `atlassian issues`, `atlassian view`, `atlassian create`, `atlassian transition`, `atlassian tui`, `atlassian serve`, `atlassian mcp`, `atlassian update`
 - `confluence`, `conf`, `confluence spaces`, `confluence pages`, `confluence view`, `confluence create`, `confluence edit`, `confluence search`, `confluence update`
 
 ## Supported platforms
@@ -55,9 +55,9 @@ source with Cargo; there is no musl package yet.
 
 ## How resolution works
 
-`bin/jira.js`, `bin/confluence.js`, and `bin/conf.js` look up
+`bin/atlassian.js`, `bin/confluence.js`, and `bin/conf.js` look up
 `@bitefoundry/atlassian-<platform>-<arch>` through `require.resolve`, then execute
-`node_modules/@bitefoundry/atlassian-<platform>-<arch>/bin/jira` (or `jira.exe` on
+`node_modules/@bitefoundry/atlassian-<platform>-<arch>/bin/atlassian` (or `atlassian.exe` on
 Windows) with `stdio: 'inherit'`. `bin/confluence.js` and `bin/conf.js` set
 `ATLASSIAN_PERSONA=confluence` before spawning the binary so the unified
 executable boots directly in Confluence mode. Signals (`SIGINT`, `SIGTERM`,
@@ -69,24 +69,24 @@ skipped), the launcher prints the supported platforms and the
 ## Layout
 
 ```text
-package.json                     # @bitefoundry/atlassian launcher package (bin: jira, confluence, conf)
-bin/jira.js                      # jira launcher
+package.json                     # @bitefoundry/atlassian launcher package (bin: atlassian, confluence, conf)
+bin/atlassian.js                      # atlassian launcher
 bin/confluence.js                # confluence launcher (sets ATLASSIAN_PERSONA=confluence)
 bin/conf.js                      # conf launcher (sets ATLASSIAN_PERSONA=confluence)
-jira / jira.cmd                  # repo-local Jira launchers
+atlassian / atlassian.cmd                  # repo-local Jira launchers
 confluence / confluence.cmd      # repo-local Confluence launchers
 conf / conf.cmd                  # repo-local short Confluence launchers
 npm/atlassian-<platform>/        # one package per platform
   package.json                   # os/cpu/files, same version as root
   README.md                      # platform package README
-  bin/jira[.exe]                 # added by scripts/build-npm.mjs, never committed
-scripts/build-npm.mjs            # copy target/<triple>/release/jira[.exe]
+  bin/atlassian[.exe]                 # added by scripts/build-npm.mjs, never committed
+scripts/build-npm.mjs            # copy target/<triple>/release/atlassian[.exe]
 scripts/sync-version.mjs         # Cargo.toml version -> all package.json files
 scripts/install-profile.ps1      # PowerShell $PROFILE + $HOME\Tools\bin installer
 .github/workflows/release.yml    # tag-triggered build, publish, GitHub Release
 ```
 
-Binaries are gitignored (`npm/*/bin/jira*`). A clean checkout has empty platform
+Binaries are gitignored (`npm/*/bin/atlassian*`). A clean checkout has empty platform
 `bin/` directories until a build or `npm run build:npm` runs.
 
 ## Versioning
@@ -121,7 +121,7 @@ by pushing a `v*` tag (or manually via `workflow_dispatch`).
    commit, and push `v<version>`.
 3. The workflow builds six targets, stages binaries into the platform
    packages, uploads artifacts, publishes each platform package, publishes the
-   root package, and creates a GitHub Release with the archives, `jira.exe`,
+   root package, and creates a GitHub Release with the archives, `atlassian.exe`,
    and `SHA256SUMS.txt`.
 
 The publish job verifies that the tag matches the package version and that all
@@ -142,7 +142,7 @@ npm publish --access public
 ```sh
 # stage the current host binary (Windows example)
 node scripts/build-npm.mjs --target x86_64-pc-windows-msvc
-node bin/jira.js --version
+node bin/atlassian.js --version
 node bin/confluence.js --version
 node bin/conf.js --version
 

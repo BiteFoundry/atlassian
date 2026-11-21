@@ -1,39 +1,41 @@
-# `jira` / `confluence` MCP Server
+# `atlassian` / `confluence` MCP Server
 
-`jira mcp` or `confluence mcp` (alias `mcp-server`) runs a [Model Context Protocol](https://modelcontextprotocol.io/) server over **stdio** using newline-delimited JSON-RPC 2.0. Call `tools/list` to discover the active tool schemas. The server covers Atlassian Jira, Jira Agile, Confluence, and unified search/sync to MCP-compatible clients such as Claude Code, Claude Desktop, and Codex.
+`atlassian mcp` or `confluence mcp` (alias `mcp-server`) runs a [Model Context Protocol](https://modelcontextprotocol.io/) server over **stdio** using newline-delimited JSON-RPC 2.0. Call `tools/list` to discover the active tool schemas. The server covers Atlassian Jira, Jira Agile, Confluence, and unified search/sync to MCP-compatible clients such as Claude Code, Claude Desktop, and Codex.
 
 ## Requirements
 
-1. Build or install the `jira` binary (and optional `confluence` / `conf` copy/symlink for persona auto-detection):
+1. Build or install the `atlassian` binary (and optional `confluence` / `conf` copy/symlink for persona auto-detection):
    ```bash
    cargo build --release
    ```
 2. Authenticate once (the MCP server never prompts interactively on stdin):
    ```bash
-   jira login --url https://acme.atlassian.net --email you@acme.com
+   atlassian login --url https://acme.atlassian.net --email you@acme.com
    # or for Data Center with PAT:
-   jira login --url https://jira.company.com --deployment datacenter --pat <PAT>
+   atlassian login --url https://jira.company.com --deployment datacenter --pat <PAT>
    ```
-3. Ensure `jira` (e.g. `target/release/jira.exe` on Windows or on `PATH`) is accessible to your MCP host.
+3. Ensure `atlassian` (e.g. `target/release/atlassian.exe` on Windows or on `PATH`) is accessible to your MCP host.
 
 ## Starting manually
 
 ```bash
-jira mcp            # stdio: one JSON-RPC 2.0 object per line
+atlassian mcp            # stdio: one JSON-RPC 2.0 object per line
 confluence mcp      # same tool catalog under the confluence persona
-jira mcp-server     # alias
+atlassian mcp-server     # alias
 ```
 
 `stdout` strictly carries single-line JSON-RPC 2.0 messages; diagnostics and startup warnings are written to `stderr` only.
 
 ## Client configuration
 
+When upgrading from 0.3.x, change `{"command":"jira","args":["mcp"]}` to `{"command":"atlassian","args":["mcp"]}`. For an absolute executable path on Windows, replace `jira.exe` with `atlassian.exe`.
+
 ### Claude Code
 
 ```bash
-claude mcp add atlassian -- jira mcp
+claude mcp add atlassian -- atlassian mcp
 # or using the confluence persona / explicit Windows binary path:
-claude mcp add atlassian -- C:\Users\me\source\atlassian\target\release\jira.exe mcp
+claude mcp add atlassian -- C:\Users\me\source\atlassian\target\release\atlassian.exe mcp
 ```
 
 ### Claude Desktop
@@ -44,7 +46,7 @@ claude mcp add atlassian -- C:\Users\me\source\atlassian\target\release\jira.exe
 {
   "mcpServers": {
     "atlassian": {
-      "command": "jira",
+      "command": "atlassian",
       "args": ["mcp"]
     }
   }
@@ -57,7 +59,7 @@ On Windows with an explicit executable path (or `confluence` persona):
 {
   "mcpServers": {
     "atlassian": {
-      "command": "C:\\Users\\me\\source\\atlassian\\target\\release\\jira.exe",
+      "command": "C:\\Users\\me\\source\\atlassian\\target\\release\\atlassian.exe",
       "args": ["mcp"]
     }
   }
@@ -70,7 +72,7 @@ On Windows with an explicit executable path (or `confluence` persona):
 
 ```toml
 [mcp_servers.atlassian]
-command = "jira"
+command = "atlassian"
 args = ["mcp"]
 ```
 
@@ -106,7 +108,7 @@ args = ["mcp"]
 | `search_jira_issues` | `jql?`, `query?`, `project?`, `limit?` (1..1000), `page_token?`, `offline?` (bool) | `{ "jql": "...", "issues": [...], ... }` or offline `{ "offline": true, "hits"\|"issues": [...] }` |
 | `get_jira_issue` | `key` (string), `offline?` (bool), `compact?` (bool) | `{ "issue": {...} }` |
 | `create_jira_issue` | `project_key`, `summary`, `issue_type?`, `description_markdown?`, `priority?`, `assignee_id?`, `labels?`, `parent_key?` | `{ "ok": true, "issue": {...} }` |
-| `update_jira_issue` | `key`, `summary?`, `description_markdown?`, `append_markdown?`, `replace_text?`, `priority?`, `assignee_id?` (`string\|null`), `labels?` | `{ "ok": true, "issue": {...} }` |
+| `update_jira_issue` | `key`, `summary?`, `description_markdown?`, `append_markdown?`, `replace_text?`, `priority?`, `assignee_id?` (`string\|null`), `labels?`, `dry_run?` (bool) | Updated `issue` or a `preview` |
 | `list_jira_transitions` | `key` (string) | `{ "key": "...", "transitions": [...] }` |
 | `transition_jira_issue` | `key`, `transition`, `comment_markdown?` | `{ "ok": true, "key": "...", "transition": "..." }` |
 | `assign_jira_issue` | `key`, `assignee_id?` (`string\|null`, `"me"` resolves current user) | `{ "ok": true, "key": "...", "assignee_id": ... }` |
@@ -128,7 +130,7 @@ args = ["mcp"]
 | `list_child_pages` | `page_id`, `offline?` (bool) | `{ "parent_id": "...", "pages": [...] }` |
 | `get_confluence_page` | `page_id`, `offline?` (bool), `compact?` (bool) | `{ "page": {...} }` |
 | `create_confluence_page` | `space_id_or_key`, `title`, `body_markdown?`, `parent_id?` | `{ "ok": true, "page": {...} }` |
-| `update_confluence_page` | `page_id`, `title?`, `body_markdown?`, `append_markdown?`, `replace_text?`, `prev_version?`, `version_message?` | `{ "ok": true, "page": {...} }` |
+| `update_confluence_page` | `page_id`, `title?`, `body_markdown?`, `append_markdown?`, `replace_text?`, `replace_section?`, `prev_version?`, `version_message?`, `dry_run?` (bool) | Updated `page` or a `preview` |
 | `add_confluence_comment` | `page_id`, `body_markdown` | `{ "ok": true, "comment": {...} }` |
 | `search_confluence_pages` | `query?`, `cql?`, `remote?` (bool), `limit?` (1..1000) | `{ "remote": ..., "hits"\|"pages": [...] }` |
 | `delete_confluence_page` | `page_id`, `confirm` (must be literal `true`) | `{ "ok": true, "page_id": "..." }` |
@@ -148,9 +150,25 @@ args = ["mcp"]
 
 ## Read and edit bodies
 
-- Pass `compact: true` to keep the full Markdown and the issue key, summary, and status or the page ID, title, space, and version. Both live and offline reads use the same shape.
+- `get_jira_issue` and `get_confluence_page` default to `compact: true` for live and offline reads. Both return full Markdown. An issue includes its key, summary, and status, and a page includes its ID, title, space, and version. Set `compact: false` to keep the full response shape used by earlier versions.
 - Pass one of the body fields when editing. Use `description_markdown` for a full Jira description or `body_markdown` for a full Confluence body. `append_markdown` adds a fragment to the native body. `replace_text` accepts an object with `old_text` and `new_text` and requires one match in a single source text node.
-- Pass the current `page.version_number` from a compact read or `page.summary.version_number` from a full read as `prev_version` for any Confluence body edit. For a page at version 7, call `update_confluence_page` with `{"page_id":"40211","prev_version":7,"append_markdown":"Confirm monitoring before rollout."}`.
+- Pass the current `page.version_number` from a compact read or `page.summary.version_number` from a full read as `prev_version` for any Confluence body edit.
+- Use `replace_section: {"heading":"Rollout","markdown":"Verify the canary."}` on a Confluence Cloud ADF page. The heading text needs an exact, unique match among top-level headings. The edit keeps that heading and replaces the content up to the next heading at the same or a higher level, or the end of the page. An empty Markdown string removes that content.
+- Set `dry_run: true` on either update tool to compute the pending edit against the live item. The response includes `preview.changed` and `preview.changes`. Confluence also returns the current and proposed version numbers. Body changes include the native `representation`, `before`, and `after`. When present, `start` is a zero-based top-level ADF node index or UTF-8 byte offset into a wiki or storage string. The preview performs zero remote writes and leaves the detail cache untouched.
+
+Preview a section edit on page `40211` at version 7 with `update_confluence_page`.
+
+```json
+{
+  "page_id": "40211",
+  "prev_version": 7,
+  "replace_section": {
+    "heading": "Rollout",
+    "markdown": "Verify the canary."
+  },
+  "dry_run": true
+}
+```
 
 ## Incremental Jira and Confluence operations
 

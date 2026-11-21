@@ -5,7 +5,7 @@ use std::{ops::Range, sync::LazyLock};
 use anyhow::{Context, Result};
 use regex::Regex;
 use serde::Deserialize;
-use serde_json::Value;
+use serde_json::{json, Value};
 use thiserror::Error;
 
 use crate::adf::{markdown_to_adf, markdown_to_jira_wiki, markdown_to_storage_xhtml, xml_escape};
@@ -26,11 +26,19 @@ pub struct TextReplacement {
     pub(crate) new_text: String,
 }
 
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct SectionReplacement {
+    pub(crate) heading: String,
+    pub(crate) markdown: String,
+}
+
 #[derive(Clone, Copy)]
 pub(crate) enum BodyEdit<'a> {
     Full(&'a str),
     Append(&'a str),
     Replace(&'a TextReplacement),
+    Section(&'a SectionReplacement),
 }
 
 impl<'a> BodyEdit<'a> {
@@ -38,17 +46,22 @@ impl<'a> BodyEdit<'a> {
         full: Option<&'a str>,
         append: Option<&'a str>,
         replace: Option<&'a TextReplacement>,
+        section: Option<&'a SectionReplacement>,
     ) -> Result<Option<Self>, BodyEditError> {
-        match (full, append, replace) {
-            (None, None, None) => Ok(None),
-            (Some(text), None, None) => Ok(Some(Self::Full(text))),
-            (None, Some(text), None) => Ok(Some(Self::Append(text))),
-            (None, None, Some(edit)) if edit.old_text.trim().is_empty() => {
+        match (full, append, replace, section) {
+            (None, None, None, None) => Ok(None),
+            (Some(text), None, None, None) => Ok(Some(Self::Full(text))),
+            (None, Some(text), None, None) => Ok(Some(Self::Append(text))),
+            (None, None, Some(edit), None) if edit.old_text.trim().is_empty() => {
                 Err(BodyEditError("old_text must contain non-whitespace text"))
             }
-            (None, None, Some(edit)) => Ok(Some(Self::Replace(edit))),
+            (None, None, Some(edit), None) => Ok(Some(Self::Replace(edit))),
+            (None, None, None, Some(edit)) if edit.heading.trim().is_empty() => {
+                Err(BodyEditError("heading must contain non-whitespace text"))
+            }
+            (None, None, None, Some(edit)) => Ok(Some(Self::Section(edit))),
             _ => Err(BodyEditError(
-                "specify one body operation: full replacement, append, or text replacement",
+                "specify one body operation: full replacement, append, text replacement, or section replacement",
             )),
         }
     }
@@ -101,6 +114,18 @@ impl<'a> BodyEdit<'a> {
                     node["text"] = Value::String(text);
                 }
             }
+            Self::Section(edit) => {
+                let content = original["content"].as_array_mut().unwrap();
+                let range = section_body_range(content, &edit.heading)?;
+                let mut fragment = markdown_to_adf(&edit.markdown);
+                let replacement = fragment["content"]
+                    .as_array_mut()
+                    .context("invalid ADF fragment")?;
+                if content[range.clone()] == replacement[..] {
+                    return Ok(None);
+                }
+                content.splice(range, replacement.drain(..));
+            }
             Self::Full(_) => unreachable!(),
         }
         Ok(Some(original))
@@ -114,6 +139,10 @@ impl<'a> BodyEdit<'a> {
                 Ok((!fragment.trim().is_empty()).then(|| format!("{original}{fragment}")))
             }
             Self::Replace(edit) => replace_storage_text(original, edit),
+            Self::Section(_) => Err(BodyEditError(
+                "section replacement requires a Confluence Cloud ADF page",
+            )
+            .into()),
         }
     }
 
@@ -133,7 +162,103 @@ impl<'a> BodyEdit<'a> {
                     .then(|| format!("{original}{separator}{fragment}")))
             }
             Self::Replace(edit) => replace_wiki_text(original, edit),
+            Self::Section(_) => Err(BodyEditError(
+                "section replacement requires a Confluence Cloud ADF page",
+            )
+            .into()),
         }
+    }
+}
+
+fn heading_level(node: &Value) -> Option<u64> {
+    (node["type"] == "heading")
+        .then(|| node.pointer("/attrs/level").and_then(Value::as_u64))
+        .flatten()
+}
+
+fn section_body_range(content: &[Value], heading: &str) -> Result<Range<usize>> {
+    let mut matches = content.iter().enumerate().filter_map(|(index, node)| {
+        let level = heading_level(node)?;
+        let text: String = node["content"]
+            .as_array()?
+            .iter()
+            .map(|inline| match inline["type"].as_str() {
+                Some("text") => inline["text"].as_str(),
+                Some("hardBreak") => Some("\n"),
+                Some("mention" | "emoji") => inline.pointer("/attrs/text").and_then(Value::as_str),
+                _ => None,
+            })
+            .collect::<Option<_>>()?;
+        (text == heading).then_some((index, level))
+    });
+    let (index, level) = matches
+        .next()
+        .ok_or(BodyEditError("top-level heading was not found"))?;
+    if matches.next().is_some() {
+        return Err(BodyEditError("top-level heading matches more than one section").into());
+    }
+    let start = index + 1;
+    let end = content[start..]
+        .iter()
+        .position(|node| heading_level(node).is_some_and(|next| next <= level))
+        .map_or(content.len(), |next| start + next);
+    Ok(start..end)
+}
+
+/// Return the contiguous portion of the native body replaced by a write.
+pub(crate) fn body_change(representation: &str, before: &Value, after: &Value) -> Value {
+    let same_adf_attributes = representation == "atlas_doc_format"
+        && before
+            .as_object()
+            .zip(after.as_object())
+            .is_some_and(|(a, b)| {
+                a.iter()
+                    .filter(|(key, _)| *key != "content")
+                    .eq(b.iter().filter(|(key, _)| *key != "content"))
+            });
+    match (
+        before["content"].as_array(),
+        after["content"].as_array(),
+        before.as_str(),
+        after.as_str(),
+    ) {
+        (Some(before), Some(after), _, _) if same_adf_attributes => {
+            let start = before.iter().zip(after).take_while(|(a, b)| a == b).count();
+            let unchanged_end = before[start..]
+                .iter()
+                .rev()
+                .zip(after[start..].iter().rev())
+                .take_while(|(a, b)| a == b)
+                .count();
+            json!({
+                "representation": representation,
+                "start": start,
+                "before": before[start..before.len() - unchanged_end],
+                "after": after[start..after.len() - unchanged_end],
+            })
+        }
+        (_, _, Some(before), Some(after)) => {
+            let start: usize = before
+                .chars()
+                .zip(after.chars())
+                .take_while(|(a, b)| a == b)
+                .map(|(character, _)| character.len_utf8())
+                .sum();
+            let unchanged_end: usize = before[start..]
+                .chars()
+                .rev()
+                .zip(after[start..].chars().rev())
+                .take_while(|(a, b)| a == b)
+                .map(|(character, _)| character.len_utf8())
+                .sum();
+            json!({
+                "representation": representation,
+                "start": start,
+                "before": &before[start..before.len() - unchanged_end],
+                "after": &after[start..after.len() - unchanged_end],
+            })
+        }
+        _ => json!({ "representation": representation, "before": before, "after": after }),
     }
 }
 

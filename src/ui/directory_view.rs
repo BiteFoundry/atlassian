@@ -288,7 +288,7 @@ fn draw_connected_sites(
     frame.render_widget(
         Paragraph::new(Span::styled(
             truncate_width(
-                " Ctrl+S switch site · jira sites add / jira login --oauth",
+                " Ctrl+S switch site · atlassian sites add / atlassian login --oauth",
                 w,
             ),
             Style::default().fg(theme.muted).add_modifier(Modifier::DIM),
@@ -1006,7 +1006,7 @@ mod tests {
         assert!(text.contains("○ Off"), "missing disabled state:\n{text}");
         assert!(text.contains("Synced 2m ago"), "missing sync status:\n{text}");
         assert!(
-            text.contains("Ctrl+S switch site") && text.contains("jira login --oauth"),
+            text.contains("Ctrl+S switch site") && text.contains("atlassian login --oauth"),
             "missing site management hint:\n{text}"
         );
         assert!(text.contains("Jira Projects (1)"), "missing projects:\n{text}");

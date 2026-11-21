@@ -1,7 +1,7 @@
 {
   "name": "@bitefoundry/atlassian-darwin-x64",
-  "version": "0.3.5",
-  "description": "Prebuilt jira binary for macOS x64",
+  "version": "0.4.0",
+  "description": "Prebuilt atlassian binary for macOS x64",
   "license": "MIT",
   "os": [
     "darwin"

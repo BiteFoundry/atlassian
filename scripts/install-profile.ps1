@@ -1,16 +1,16 @@
 <#
 .SYNOPSIS
-    Idempotently installs `jira`, `confluence`, and `conf` terminal launchers on any Windows PC.
+    Idempotently installs `atlassian`, `confluence`, and `conf` terminal launchers on any Windows PC.
 
 .DESCRIPTION
-    1. Ensures <RepoRoot>\target\release\jira.exe exists (downloads the prebuilt
+    1. Ensures <RepoRoot>\target\release\atlassian.exe exists (downloads the prebuilt
        release binary from GitHub `BiteFoundry/atlassian` via `gh` when missing, so
        Rust/Cargo is NOT required on target PCs).
-    2. Registers/updates `# >>> atlassian launcher >>>` (`function jira`,
+    2. Registers/updates `# >>> atlassian launcher >>>` (`function atlassian`,
        `function confluence`, and `function conf`) in PowerShell $PROFILE. All three
-       commands share the single `jira.exe` binary, with `confluence` and `conf`
+       commands share the single `atlassian.exe` binary, with `confluence` and `conf`
        setting `ATLASSIAN_PERSONA=confluence` for the invocation.
-    3. If $HOME\Tools\bin exists, also writes `jira.cmd`, `confluence.cmd`, and
+    3. If $HOME\Tools\bin exists, also writes `atlassian.cmd`, `confluence.cmd`, and
        `conf.cmd` shims there so already-open shells find all three commands.
 
 .EXAMPLE
@@ -35,14 +35,14 @@ $resolvedRoot = if (Test-Path -LiteralPath $RepoRoot) {
 }
 
 $releaseDir = Join-Path $resolvedRoot 'target\release'
-$releaseExe = Join-Path $releaseDir 'jira.exe'
+$releaseExe = Join-Path $releaseDir 'atlassian.exe'
 
 if (-not (Test-Path -LiteralPath $releaseExe)) {
     $gh = Get-Command gh -ErrorAction SilentlyContinue
-    if ($gh -and $PSCmdlet.ShouldProcess($releaseExe, 'Download prebuilt jira.exe from BiteFoundry/atlassian GitHub Release')) {
-        Write-Output "[atlassian] Downloading prebuilt jira.exe from BiteFoundry/atlassian GitHub Release..."
+    if ($gh -and $PSCmdlet.ShouldProcess($releaseExe, 'Download prebuilt atlassian.exe from BiteFoundry/atlassian GitHub Release')) {
+        Write-Output "[atlassian] Downloading prebuilt atlassian.exe from BiteFoundry/atlassian GitHub Release..."
         New-Item -ItemType Directory -Force -Path $releaseDir | Out-Null
-        & $gh.Source release download -R 'BiteFoundry/atlassian' --pattern 'jira.exe' --dir $releaseDir --clobber
+        & $gh.Source release download -R 'BiteFoundry/atlassian' --pattern 'atlassian.exe' --dir $releaseDir --clobber
     }
 }
 
@@ -53,14 +53,14 @@ $endMarker = '# <<< atlassian launcher <<<'
 $block = @"
 $startMarker
 # Opens the unified Atlassian Jira + Confluence terminal client (CLI/TUI) from anywhere.
-function jira {
+function atlassian {
     `$root = '$escapedRoot'
-    `$exe = Join-Path `$root 'target\release\jira.exe'
+    `$exe = Join-Path `$root 'target\release\atlassian.exe'
     if (-not (Test-Path -LiteralPath `$exe)) {
         if (Get-Command gh -ErrorAction SilentlyContinue) {
             `$relDir = Split-Path -Parent `$exe
             New-Item -ItemType Directory -Force -Path `$relDir | Out-Null
-            gh release download -R 'BiteFoundry/atlassian' --pattern 'jira.exe' --dir `$relDir --clobber 2>`$null
+            gh release download -R 'BiteFoundry/atlassian' --pattern 'atlassian.exe' --dir `$relDir --clobber 2>`$null
         }
     }
     if (-not (Test-Path -LiteralPath `$exe)) {
@@ -75,7 +75,7 @@ function confluence {
     `$prevPersona = `$env:ATLASSIAN_PERSONA
     `$env:ATLASSIAN_PERSONA = 'confluence'
     try {
-        jira @args
+        atlassian @args
     } finally {
         if (`$null -eq `$prevPersona) {
             Remove-Item Env:ATLASSIAN_PERSONA -ErrorAction SilentlyContinue
@@ -90,7 +90,7 @@ function conf {
     `$prevPersona = `$env:ATLASSIAN_PERSONA
     `$env:ATLASSIAN_PERSONA = 'confluence'
     try {
-        jira @args
+        atlassian @args
     } finally {
         if (`$null -eq `$prevPersona) {
             Remove-Item Env:ATLASSIAN_PERSONA -ErrorAction SilentlyContinue
@@ -141,7 +141,14 @@ if ($updated -ne $existing) {
 
 $toolsBin = Join-Path $HOME 'Tools\bin'
 if (Test-Path -LiteralPath $toolsBin) {
-    foreach ($cmdName in @('jira.cmd', 'confluence.cmd', 'conf.cmd')) {
+    $oldShim = Join-Path $toolsBin 'jira.cmd'
+    $oldContent = "@echo off`r`nchcp 65001 >nul`r`n`"$resolvedRoot\jira.cmd`" %*`r`n"
+    if ((Test-Path -LiteralPath $oldShim -PathType Leaf) -and
+        ([IO.File]::ReadAllText($oldShim) -ceq $oldContent) -and
+        $PSCmdlet.ShouldProcess($oldShim, 'Remove old Jira launcher')) {
+        Remove-Item -LiteralPath $oldShim
+    }
+    foreach ($cmdName in @('atlassian.cmd', 'confluence.cmd', 'conf.cmd')) {
         $shimPath = Join-Path $toolsBin $cmdName
         $shimContent = "@echo off`r`nchcp 65001 >nul`r`n`"$resolvedRoot\$cmdName`" %*`r`n"
         if ($PSCmdlet.ShouldProcess($shimPath, "Write PATH shim $cmdName")) {

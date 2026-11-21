@@ -1,4 +1,4 @@
 #!/usr/bin/env node
 'use strict';
 
-require('./jira.js').launch('confluence', 'confluence');
+require('./atlassian.js').launch('confluence', 'confluence');

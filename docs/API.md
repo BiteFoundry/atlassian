@@ -1,24 +1,24 @@
 # `jira` / `confluence` HTTP JSON API
 
-Local HTTP/JSON server for AI agents, scripts, and integrations. Exposed by `jira serve` or `confluence serve` (alias `api`), backed by Atlassian REST APIs (Cloud & Data Center), local SQLite WAL/FTS5 caching, and the background sync engine (`sync::spawn_sync_engine`).
+Local HTTP/JSON server for AI agents, scripts, and integrations. Exposed by `atlassian serve` or `confluence serve` (alias `api`), backed by Atlassian REST APIs (Cloud & Data Center), local SQLite WAL/FTS5 caching, and the background sync engine (`sync::spawn_sync_engine`).
 
 Both binary personas (`jira` and `confluence` / `conf`) mount the complete unified Jira, Jira Agile, Confluence, and cross-product search route surface on the same HTTP server.
 
 ## Starting the server
 
 ```bash
-jira serve                      # http://127.0.0.1:8789
+atlassian serve                      # http://127.0.0.1:8789
 confluence serve                # same API server under the confluence persona
-jira serve --port 9000          # custom port
-jira serve --bind 127.0.0.1 --port 8789
-jira serve --token secret123    # require Authorization: Bearer secret123
-jira api                        # alias for `serve`
+atlassian serve --port 9000          # custom port
+atlassian serve --bind 127.0.0.1 --port 8789
+atlassian serve --token secret123    # require Authorization: Bearer secret123
+atlassian api                        # alias for `serve`
 ```
 
 - `--bind` defaults to `127.0.0.1` (loopback only).
 - `--port` defaults to `8789`.
 - `--token` is optional; when set, every endpoint except `GET /health` requires `Authorization: Bearer <token>`.
-- Requires an existing login (`jira login` or `confluence login`) for live/remote endpoints; `?offline=true` routes and local `/search` read directly from SQLite.
+- Requires an existing login (`atlassian login` or `confluence login`) for live/remote endpoints; `?offline=true` routes and local `/search` read directly from SQLite.
 - On startup, `serve` spawns the background sync engine and requests `SyncCommand::RefreshAll`.
 
 ## Conventions

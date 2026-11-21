@@ -14,7 +14,7 @@ use crate::{
         parse_adf_value, parse_jira_wiki, parse_storage_xhtml,
     },
     atlassian::{
-        body::{same_markdown, BodyEdit, BodyEditError},
+        body::{body_change, same_markdown, BodyEdit, BodyEditError},
         client::{
             first_nonempty_str, json_id_to_string, parse_attachment_item, parse_user_summary,
             HttpStatusError,
@@ -56,6 +56,12 @@ const ISSUE_REVISION_FIELDS: &str = "summary,status,priority,issuetype,assignee,
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct IssueSubresourceStatus {
     pub remote_links_ok: bool,
+}
+
+struct IssueEditPlan {
+    fields: Map<String, Value>,
+    original_description: Value,
+    current: Option<IssueDetail>,
 }
 
 impl AtlassianClient {
@@ -431,11 +437,55 @@ impl AtlassianClient {
         patch: &IssueUpdate,
         body: Option<BodyEdit<'_>>,
     ) -> Result<IssueDetail> {
+        let plan = self.prepare_issue_edit(key, patch, body).await?;
+        if !plan.fields.is_empty() {
+            let url = self.issue_edit_url(key)?;
+            self.put_json_empty(&url, &json!({ "fields": plan.fields }))
+                .await?;
+        } else if let Some(detail) = plan.current {
+            return Ok(detail);
+        }
+
+        self.get_issue(key).await
+    }
+
+    pub(crate) async fn preview_issue_edit(
+        &self,
+        key: &str,
+        patch: &IssueUpdate,
+        body: Option<BodyEdit<'_>>,
+    ) -> Result<Value> {
+        let mut plan = self.prepare_issue_edit(key, patch, body).await?;
+        if body.is_none() || matches!(body, Some(BodyEdit::Append(md)) if md.trim().is_empty()) {
+            self.get_issue_revision(key).await?;
+        }
+        if let Some(description) = plan.fields.get_mut("description") {
+            let representation = match self.deployment() {
+                DeploymentKind::Cloud => "atlas_doc_format",
+                DeploymentKind::DataCenter => "wiki",
+            };
+            *description = body_change(representation, &plan.original_description, description);
+        }
+        Ok(json!({
+            "key": key,
+            "changed": !plan.fields.is_empty(),
+            "changes": plan.fields,
+        }))
+    }
+
+    fn issue_edit_url(&self, key: &str) -> Result<String> {
         let base = self.require_site_url()?;
         let ver = self.jira_api_version();
         let encoded_key = urlencoding::encode(key);
-        let url = format!("{base}/rest/api/{ver}/issue/{encoded_key}");
+        Ok(format!("{base}/rest/api/{ver}/issue/{encoded_key}"))
+    }
 
+    async fn prepare_issue_edit(
+        &self,
+        key: &str,
+        patch: &IssueUpdate,
+        body: Option<BodyEdit<'_>>,
+    ) -> Result<IssueEditPlan> {
         let mut fields = Map::new();
         if let Some(ref summary) = patch.summary {
             fields.insert("summary".into(), Value::String(summary.clone()));
@@ -458,10 +508,16 @@ impl AtlassianClient {
         }
 
         let mut current = None;
+        let mut original_description = Value::Null;
         let description = match body {
             Some(BodyEdit::Full(md)) => {
                 let detail = self.get_issue(key).await?;
                 let changed = !same_markdown(md, &detail.description_markdown);
+                original_description = match self.deployment() {
+                    DeploymentKind::Cloud => serde_json::from_str(&detail.description_raw)
+                        .unwrap_or_else(|_| json!(detail.description_raw)),
+                    DeploymentKind::DataCenter => json!(detail.description_raw),
+                };
                 current = Some(detail);
                 changed.then(|| match self.deployment() {
                     DeploymentKind::Cloud => markdown_to_adf(md),
@@ -470,6 +526,7 @@ impl AtlassianClient {
             }
             Some(BodyEdit::Append(md)) if md.trim().is_empty() => None,
             Some(edit) => {
+                let url = self.issue_edit_url(key)?;
                 let source: Value = self
                     .get_json(&format!("{url}?fields=description&expand=renderedFields"))
                     .await?;
@@ -490,7 +547,9 @@ impl AtlassianClient {
                         } else {
                             description.clone()
                         };
-                        edit.adf(original)?
+                        let updated = edit.adf(original.clone())?;
+                        original_description = original;
+                        updated
                     }
                     DeploymentKind::DataCenter => {
                         let original = if description.is_null() {
@@ -500,6 +559,7 @@ impl AtlassianClient {
                                 .as_str()
                                 .ok_or(BodyEditError("Jira did not return a wiki description"))?
                         };
+                        original_description = json!(original);
                         edit.wiki(original)?.map(Value::String)
                     }
                 }
@@ -509,14 +569,11 @@ impl AtlassianClient {
         if let Some(description) = description {
             fields.insert("description".into(), description);
         }
-        if !fields.is_empty() {
-            self.put_json_empty(&url, &json!({ "fields": fields }))
-                .await?;
-        } else if let Some(detail) = current {
-            return Ok(detail);
-        }
-
-        self.get_issue(key).await
+        Ok(IssueEditPlan {
+            fields,
+            original_description,
+            current,
+        })
     }
 
     pub async fn delete_issue(&self, key: &str) -> Result<()> {

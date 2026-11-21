@@ -12,7 +12,7 @@ use crate::{
         markdown_to_storage_xhtml, parse_adf_str, parse_storage_xhtml,
     },
     atlassian::{
-        body::{same_markdown, BodyEdit, BodyEditError},
+        body::{body_change, same_markdown, BodyEdit, BodyEditError},
         client::{
             first_nonempty_str, join_url, json_id_to_string, parse_attachment_item, HttpStatusError,
         },
@@ -510,6 +510,82 @@ impl AtlassianClient {
         prev_version: Option<i32>,
         version_message: Option<String>,
     ) -> Result<PageDetail> {
+        let (current, patch) = self
+            .prepare_page_edit(page_id, title, body, prev_version, version_message)
+            .await?;
+        match patch {
+            Some(patch) => self.update_page(page_id, &patch).await,
+            None => Ok(current),
+        }
+    }
+
+    pub(crate) async fn preview_page_edit(
+        &self,
+        page_id: &str,
+        title: Option<String>,
+        body: Option<BodyEdit<'_>>,
+        prev_version: Option<i32>,
+        version_message: Option<String>,
+    ) -> Result<Value> {
+        let (current, patch) = self
+            .prepare_page_edit(page_id, title, body, prev_version, version_message)
+            .await?;
+        let mut changes = Map::new();
+        let prev_version = current.summary.version_number;
+        let mut next_version = prev_version;
+        if let Some(patch) = &patch {
+            let payload = self.page_update_payload(page_id, patch)?;
+            next_version = prev_version + 1;
+            if patch.title != current.summary.title {
+                changes.insert("title".into(), payload["title"].clone());
+            }
+            if patch.version_message.is_some() {
+                changes.insert(
+                    "version_message".into(),
+                    payload["version"]["message"].clone(),
+                );
+            }
+            let body = match self.deployment() {
+                DeploymentKind::Cloud => &payload["body"],
+                DeploymentKind::DataCenter => &payload["body"]["storage"],
+            };
+            let representation = body["representation"].as_str().unwrap_or_default();
+            let raw = body["value"].as_str().unwrap_or_default();
+            if raw != current.body_raw || representation != current.body_representation {
+                let native_body = |format: &str, raw: &str| {
+                    if format == "atlas_doc_format" {
+                        serde_json::from_str(raw).unwrap_or_else(|_| json!(raw))
+                    } else {
+                        json!(raw)
+                    }
+                };
+                changes.insert(
+                    "body".into(),
+                    body_change(
+                        representation,
+                        &native_body(&current.body_representation, &current.body_raw),
+                        &native_body(representation, raw),
+                    ),
+                );
+            }
+        }
+        Ok(json!({
+            "page_id": page_id,
+            "changed": patch.is_some(),
+            "prev_version": prev_version,
+            "next_version": next_version,
+            "changes": changes,
+        }))
+    }
+
+    async fn prepare_page_edit(
+        &self,
+        page_id: &str,
+        title: Option<String>,
+        body: Option<BodyEdit<'_>>,
+        prev_version: Option<i32>,
+        version_message: Option<String>,
+    ) -> Result<(PageDetail, Option<PageUpdate>)> {
         if title.is_none() && body.is_none() && version_message.is_none() {
             return Err(BodyEditError("at least one page change must be provided").into());
         }
@@ -522,6 +598,12 @@ impl AtlassianClient {
             ).into());
         }
 
+        if matches!(body, Some(BodyEdit::Section(_))) && self.deployment() != DeploymentKind::Cloud
+        {
+            return Err(
+                BodyEditError("section replacement requires a Confluence Cloud ADF page").into(),
+            );
+        }
         let (current, _) = self.fetch_page(page_id, true).await?;
         let version = current.summary.version_number;
         let prev_version = prev_version.filter(|&v| v > 0).unwrap_or(version);
@@ -572,14 +654,24 @@ impl AtlassianClient {
         };
         if !body_changed && patch.title == current.summary.title && patch.version_message.is_none()
         {
-            return Ok(current);
+            return Ok((current, None));
         }
-        self.update_page(page_id, &patch).await
+        Ok((current, Some(patch)))
     }
 
     pub async fn update_page(&self, page_id: &str, patch: &PageUpdate) -> Result<PageDetail> {
         let conf_root = self.require_confluence_root()?;
         let encoded_id = urlencoding::encode(page_id.trim());
+        let url = match self.deployment() {
+            DeploymentKind::Cloud => format!("{conf_root}/api/v2/pages/{encoded_id}"),
+            DeploymentKind::DataCenter => format!("{conf_root}/rest/api/content/{encoded_id}"),
+        };
+        let payload = self.page_update_payload(page_id, patch)?;
+        let _: Value = self.put_json(&url, &payload).await?;
+        self.get_page(page_id).await
+    }
+
+    fn page_update_payload(&self, page_id: &str, patch: &PageUpdate) -> Result<Value> {
         let next_version = patch.prev_version.checked_add(1).ok_or(BodyEditError(
             "prev_version exceeds the supported version range",
         ))?;
@@ -603,7 +695,7 @@ impl AtlassianClient {
                             .context("ADF 직렬화 실패")?,
                     ),
                 };
-                let payload = json!({
+                Ok(json!({
                     "id": page_id,
                     "status": "current",
                     "title": patch.title,
@@ -615,16 +707,14 @@ impl AtlassianClient {
                         "number": next_version,
                         "message": version_message,
                     }
-                });
-                let url = format!("{conf_root}/api/v2/pages/{encoded_id}");
-                let _: Value = self.put_json(&url, &payload).await?;
+                }))
             }
             DeploymentKind::DataCenter => {
                 let storage_html = match patch.body_raw_passthrough.as_deref() {
                     Some(raw) => raw.to_string(),
                     None => markdown_to_storage_xhtml(&patch.body_markdown),
                 };
-                let payload = json!({
+                Ok(json!({
                     "id": page_id,
                     "type": "page",
                     "title": patch.title,
@@ -638,13 +728,9 @@ impl AtlassianClient {
                             "representation": "storage",
                         }
                     }
-                });
-                let url = format!("{conf_root}/rest/api/content/{encoded_id}");
-                let _: Value = self.put_json(&url, &payload).await?;
+                }))
             }
         }
-
-        self.get_page(page_id).await
     }
 
     pub async fn delete_page(&self, page_id: &str) -> Result<()> {

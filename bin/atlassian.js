@@ -15,7 +15,7 @@ const SUPPORTED = [
   'linux-arm64',
 ];
 
-function launch(commandName = 'jira', persona = process.env.ATLASSIAN_PERSONA || 'jira') {
+function launch(commandName = 'atlassian', persona = process.env.ATLASSIAN_PERSONA || 'jira') {
   function fail(message) {
     process.stderr.write(`${commandName}: ${message}\n`);
     process.exit(1);
@@ -25,7 +25,7 @@ function launch(commandName = 'jira', persona = process.env.ATLASSIAN_PERSONA ||
   const arch = process.arch;
   const platformKey = `${platform}-${arch}`;
   const packageName = `@bitefoundry/atlassian-${platformKey}`;
-  const binaryName = platform === 'win32' ? 'jira.exe' : 'jira';
+  const binaryName = platform === 'win32' ? 'atlassian.exe' : 'atlassian';
 
   let packageDir = null;
   try {
@@ -38,7 +38,7 @@ function launch(commandName = 'jira', persona = process.env.ATLASSIAN_PERSONA ||
 
   if (!binaryPath || !fs.existsSync(binaryPath)) {
     const fallbackNpx =
-      commandName === 'jira'
+      commandName === 'atlassian'
         ? '  npx --yes @bitefoundry/atlassian'
         : `  npx --yes -p @bitefoundry/atlassian ${commandName}`;
     const lines = [
@@ -115,5 +115,5 @@ function launch(commandName = 'jira', persona = process.env.ATLASSIAN_PERSONA ||
 module.exports = { launch };
 
 if (require.main === module) {
-  launch('jira', process.env.ATLASSIAN_PERSONA || 'jira');
+  launch('atlassian', process.env.ATLASSIAN_PERSONA || 'jira');
 }

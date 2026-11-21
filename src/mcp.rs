@@ -10,6 +10,7 @@
 use std::{
     io::Write,
     path::{Path, PathBuf},
+    sync::LazyLock,
 };
 
 use anyhow::Result;
@@ -18,11 +19,11 @@ use tokio::io::{AsyncBufReadExt, BufReader};
 
 use crate::{
     atlassian::{
-        body::{BodyEdit, TextReplacement},
+        body::{BodyEdit, SectionReplacement, TextReplacement},
         client::is_not_found_error,
         AtlassianClient, SiteClientPool,
     },
-    config::AppConfig,
+    config::{self, AppConfig},
     img_preview,
     models::{FederatedSearchHit, IssueUpdate, OutgoingIssue, OutgoingPage},
     serve::{clamp_limit, escape_jql_str, issue_to_hit, looks_like_query_expr, page_to_hit},
@@ -39,10 +40,24 @@ const INVALID_REQUEST: i64 = -32600;
 const METHOD_NOT_FOUND: i64 = -32601;
 
 /// Run the stdio MCP server until stdin reaches EOF.
-pub async fn run(
-    config: AppConfig,
-    client: AtlassianClient,
-    storage: Storage,
+pub async fn run(config: AppConfig, client: AtlassianClient, storage: Storage) -> Result<()> {
+    run_with_storage(&config, &client, |_| Ok(&storage)).await
+}
+
+pub(crate) async fn run_deferred(config: AppConfig, client: AtlassianClient) -> Result<()> {
+    let cache = LazyLock::new(|| Storage::open(&config::cache_db_path(&config.profile)));
+    let preview = LazyLock::new(Storage::open_in_memory);
+    run_with_storage(&config, &client, |dry_run| {
+        let storage = if dry_run { &*preview } else { &*cache };
+        storage.as_ref().map_err(|error| error.to_string())
+    })
+    .await
+}
+
+async fn run_with_storage<'a>(
+    config: &AppConfig,
+    client: &AtlassianClient,
+    mut get_storage: impl FnMut(bool) -> Result<&'a Storage, String>,
 ) -> Result<()> {
     eprintln!(
         "{SERVER_NAME} MCP server ready (protocol {LATEST_PROTOCOL_VERSION}, deployment={}, site={})",
@@ -65,9 +80,14 @@ pub async fn run(
             continue;
         }
 
-        if let Some(response) =
-            handle_rpc_line_with_bootstrap(&config, &client, &storage, trimmed, &mut bootstrap_pending)
-                .await
+        if let Some(response) = handle_rpc_line_with_bootstrap(
+            config,
+            client,
+            &mut get_storage,
+            trimmed,
+            &mut bootstrap_pending,
+        )
+        .await
         {
             stdout.write_all(encode_message(&response).as_bytes())?;
             stdout.flush()?;
@@ -130,13 +150,13 @@ pub async fn handle_rpc_line(
     storage: &Storage,
     line: &str,
 ) -> Option<Value> {
-    handle_rpc_line_with_bootstrap(config, client, storage, line, &mut false).await
+    handle_rpc_line_with_bootstrap(config, client, |_| Ok(storage), line, &mut false).await
 }
 
-async fn handle_rpc_line_with_bootstrap(
+async fn handle_rpc_line_with_bootstrap<'a>(
     config: &AppConfig,
     client: &AtlassianClient,
-    storage: &Storage,
+    get_storage: impl FnOnce(bool) -> Result<&'a Storage, String>,
     line: &str,
     bootstrap_pending: &mut bool,
 ) -> Option<Value> {
@@ -171,8 +191,13 @@ async fn handle_rpc_line_with_bootstrap(
                 .cloned()
                 .unwrap_or_else(|| json!({}));
 
-            let outcome = match validate_tool_args(name, &arguments) {
-                Ok(()) => {
+            let outcome = match validate_tool_args(name, &arguments).and_then(|()| {
+                let is_edit_preview =
+                    matches!(name, "update_jira_issue" | "update_confluence_page")
+                        && arguments.get("dry_run").and_then(Value::as_bool) == Some(true);
+                get_storage(is_edit_preview)
+            }) {
+                Ok(storage) => {
                     if *bootstrap_pending
                         && tool_uses_current_site_cache(config, client, name, &arguments)
                     {
@@ -589,7 +614,7 @@ async fn call_tool(
         "get_jira_issue" => {
             let key = args.required_str("key")?;
             let offline = args.optional_bool("offline")?.unwrap_or(false);
-            let compact = args.optional_bool("compact")?.unwrap_or(false);
+            let compact = args.optional_bool("compact")?.unwrap_or(true);
             if offline {
                 let target_site =
                     resolve_mcp_single_site_id(config, client, site_arg.as_deref())?;
@@ -665,9 +690,13 @@ async fn call_tool(
             let key = args.required_str("key")?;
             let summary = args.optional_str("summary")?;
             let (full, append, replacement) = args.body_inputs("description_markdown")?;
-            let edit =
-                BodyEdit::from_inputs(full.as_deref(), append.as_deref(), replacement.as_ref())
-                    .map_err(|e| e.to_string())?;
+            let edit = BodyEdit::from_inputs(
+                full.as_deref(),
+                append.as_deref(),
+                replacement.as_ref(),
+                None,
+            )
+            .map_err(|e| e.to_string())?;
             let priority = args.optional_str("priority")?;
             let assignee_id = args.optional_nullable_str("assignee_id")?;
             let labels = args.optional_str_array_opt("labels")?;
@@ -681,6 +710,15 @@ async fn call_tool(
                 assignee_id,
                 labels,
             };
+            if args.optional_bool("dry_run")?.unwrap_or(false) {
+                let preview = target_client
+                    .preview_issue_edit(&key, &patch, edit)
+                    .await
+                    .map_err(format_error)?;
+                return Ok(
+                    json!({ "ok": true, "site_id": target_site, "dry_run": true, "preview": preview }),
+                );
+            }
             let detail = target_client
                 .edit_issue(&key, &patch, edit)
                 .await
@@ -943,7 +981,7 @@ async fn call_tool(
         "get_confluence_page" => {
             let page_id = args.required_str("page_id")?;
             let offline = args.optional_bool("offline")?.unwrap_or(false);
-            let compact = args.optional_bool("compact")?.unwrap_or(false);
+            let compact = args.optional_bool("compact")?.unwrap_or(true);
             if offline {
                 let target_site =
                     resolve_mcp_single_site_id(config, client, site_arg.as_deref())?;
@@ -1011,14 +1049,28 @@ async fn call_tool(
             let page_id = args.required_str("page_id")?;
             let title = args.optional_str("title")?;
             let (full, append, replacement) = args.body_inputs("body_markdown")?;
-            let edit =
-                BodyEdit::from_inputs(full.as_deref(), append.as_deref(), replacement.as_ref())
-                    .map_err(|e| e.to_string())?;
+            let section = args.section_replacement()?;
+            let edit = BodyEdit::from_inputs(
+                full.as_deref(),
+                append.as_deref(),
+                replacement.as_ref(),
+                section.as_ref(),
+            )
+            .map_err(|e| e.to_string())?;
             let prev_version = args.page_version()?;
             let version_message = args.optional_str("version_message")?;
 
             let (target_site, target_client) =
                 resolve_mcp_client(config, client, site_arg.as_deref())?;
+            if args.optional_bool("dry_run")?.unwrap_or(false) {
+                let preview = target_client
+                    .preview_page_edit(&page_id, title, edit, prev_version, version_message)
+                    .await
+                    .map_err(format_error)?;
+                return Ok(
+                    json!({ "ok": true, "site_id": target_site, "dry_run": true, "preview": preview }),
+                );
+            }
             let detail = target_client
                 .edit_page(&page_id, title, edit, prev_version, version_message)
                 .await
@@ -1406,11 +1458,19 @@ pub(crate) fn validate_tool_args(name: &str, arguments: &Value) -> Result<(), St
         }
         "update_jira_issue" => {
             let _ = args.required_str("key")?;
+            let _ = args.optional_bool("dry_run")?;
+            if args.get("replace_section")?.is_some() {
+                return Err("section replacement requires a Confluence Cloud ADF page".to_string());
+            }
             let summary = args.optional_str("summary")?;
             let (full, append, replacement) = args.body_inputs("description_markdown")?;
-            let edit =
-                BodyEdit::from_inputs(full.as_deref(), append.as_deref(), replacement.as_ref())
-                    .map_err(|e| e.to_string())?;
+            let edit = BodyEdit::from_inputs(
+                full.as_deref(),
+                append.as_deref(),
+                replacement.as_ref(),
+                None,
+            )
+            .map_err(|e| e.to_string())?;
             let priority = args.optional_str("priority")?;
             let assignee = args.optional_nullable_str("assignee_id")?;
             let labels = args.optional_str_array_opt("labels")?;
@@ -1483,11 +1543,17 @@ pub(crate) fn validate_tool_args(name: &str, arguments: &Value) -> Result<(), St
         }
         "update_confluence_page" => {
             let _ = args.required_str("page_id")?;
+            let _ = args.optional_bool("dry_run")?;
             let title = args.optional_str("title")?;
             let (full, append, replacement) = args.body_inputs("body_markdown")?;
-            let edit =
-                BodyEdit::from_inputs(full.as_deref(), append.as_deref(), replacement.as_ref())
-                    .map_err(|e| e.to_string())?;
+            let section = args.section_replacement()?;
+            let edit = BodyEdit::from_inputs(
+                full.as_deref(),
+                append.as_deref(),
+                replacement.as_ref(),
+                section.as_ref(),
+            )
+            .map_err(|e| e.to_string())?;
             let version = args.page_version()?;
             let message = args.optional_str("version_message")?;
             if title.is_none() && edit.is_none() && message.is_none() {
@@ -1825,6 +1891,15 @@ impl<'a> Args<'a> {
         ))
     }
 
+    fn section_replacement(&self) -> Result<Option<SectionReplacement>, String> {
+        self.get("replace_section")?
+            .map(|value| {
+                serde_json::from_value(value.clone())
+                    .map_err(|error| format!("invalid replace_section: {error}"))
+            })
+            .transpose()
+    }
+
     fn page_version(&self) -> Result<Option<i32>, String> {
         self.optional_i64("prev_version")?
             .map(|version| {
@@ -2069,13 +2144,13 @@ fn tool_catalog() -> Vec<Value> {
         }),
         json!({
             "name": "get_jira_issue",
-            "description": "Get full Jira issue details including description, subtasks, links, attachments, and comments.",
+            "description": "Get the Jira issue key, summary, status, and full Markdown description. Use compact: false for links, attachments, comments, and the full issue structure.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
                     "key": { "type": "string", "minLength": 1 },
                     "offline": { "type": "boolean", "default": false },
-                    "compact": { "type": "boolean", "default": false, "description": "Return identifying fields and the full Markdown body." }
+                    "compact": { "type": "boolean", "default": true, "description": "Set false for the full response structure." }
                 },
                 "required": ["key"],
                 "additionalProperties": false
@@ -2102,7 +2177,7 @@ fn tool_catalog() -> Vec<Value> {
         }),
         json!({
             "name": "update_jira_issue",
-            "description": "Update issue fields. Choose at most one body operation: full Markdown replacement, append, or unique text replacement.",
+            "description": "Update Jira issue fields. Choose one body operation per request. Set dry_run to preview the changes.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -2111,6 +2186,7 @@ fn tool_catalog() -> Vec<Value> {
                     "description_markdown": { "type": "string", "description": "Replace the entire body." },
                     "append_markdown": { "type": "string", "description": "Append without converting the original body." },
                     "replace_text": text_replacement.clone(),
+                    "dry_run": { "type": "boolean", "default": false, "description": "Preview the computed changes without saving." },
                     "priority": { "type": "string" },
                     "assignee_id": { "type": ["string", "null"] },
                     "labels": { "type": "array", "items": { "type": "string" } }
@@ -2263,13 +2339,13 @@ fn tool_catalog() -> Vec<Value> {
         }),
         json!({
             "name": "get_confluence_page",
-            "description": "Get full Confluence page content (Markdown + blocks + TOC + comments + attachments).",
+            "description": "Get page identifiers, version, and full Markdown. Use compact: false for native body, blocks, TOC, comments, and attachments.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
                     "page_id": { "type": "string", "minLength": 1 },
                     "offline": { "type": "boolean", "default": false },
-                    "compact": { "type": "boolean", "default": false, "description": "Return identifying fields and the full Markdown body." }
+                    "compact": { "type": "boolean", "default": true, "description": "Set false for the full response structure." }
                 },
                 "required": ["page_id"],
                 "additionalProperties": false
@@ -2292,7 +2368,7 @@ fn tool_catalog() -> Vec<Value> {
         }),
         json!({
             "name": "update_confluence_page",
-            "description": "Update a Confluence page. Choose at most one body operation and pass prev_version from get_confluence_page for any body edit.",
+            "description": "Update a Confluence page. Choose one body operation per request and pass its current prev_version. Set dry_run to preview the changes.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -2301,6 +2377,17 @@ fn tool_catalog() -> Vec<Value> {
                     "body_markdown": { "type": "string", "description": "Replace the entire body." },
                     "append_markdown": { "type": "string", "description": "Append without converting the original body." },
                     "replace_text": text_replacement.clone(),
+                    "replace_section": {
+                        "type": "object",
+                        "description": "Replace content under an exact top-level heading on a Confluence Cloud ADF page.",
+                        "properties": {
+                            "heading": { "type": "string", "minLength": 1 },
+                            "markdown": { "type": "string" }
+                        },
+                        "required": ["heading", "markdown"],
+                        "additionalProperties": false
+                    },
+                    "dry_run": { "type": "boolean", "default": false, "description": "Preview the computed changes without saving." },
                     "prev_version": { "type": "integer", "minimum": 1 },
                     "version_message": { "type": "string" }
                 },
@@ -2492,7 +2579,7 @@ mod tests {
             assert!(handle_rpc_line_with_bootstrap(
                 &cfg,
                 &client,
-                &storage,
+                |_| Ok(&storage),
                 &line.to_string(),
                 &mut pending,
             )
@@ -2516,7 +2603,7 @@ mod tests {
         let response = handle_rpc_line_with_bootstrap(
             &cfg,
             &client,
-            &storage,
+            |_| Ok(&storage),
             r#"{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"list_projects"}}"#,
             &mut pending,
         )
@@ -2630,6 +2717,7 @@ mod tests {
             .map(|tool| tool["name"].as_str().expect("tool name"))
             .collect();
         assert_eq!(catalog.len(), tools.len(), "duplicate MCP tool name");
+        assert_eq!(catalog.len(), 37);
         assert_eq!(catalog, documented);
         assert!(
             tools.iter().any(|t| t["name"] == "list_sites"),
@@ -2843,8 +2931,8 @@ mod tests {
                 serde_json::from_str(resp["result"]["content"][0]["text"].as_str().unwrap())
                     .unwrap();
             match tool {
-                "get_jira_issue" => assert_eq!(payload["issue"]["summary"]["key"], "ENG-7"),
-                "get_confluence_page" => assert_eq!(payload["page"]["summary"]["id"], "501"),
+                "get_jira_issue" => assert_eq!(payload["issue"]["key"], "ENG-7"),
+                "get_confluence_page" => assert_eq!(payload["page"]["id"], "501"),
                 "search_confluence_pages" => {
                     assert_eq!(payload["hits"][0]["id_or_key"], "501")
                 }

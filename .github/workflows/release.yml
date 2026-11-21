@@ -78,16 +78,16 @@ jobs:
 
       - name: Verify Linux GLIBC <= 2.28 compatibility
         if: matrix.os == 'ubuntu-latest'
-        run: node scripts/verify-glibc.mjs "target/${{ matrix.target }}/release/jira" --max 2.28
+        run: node scripts/verify-glibc.mjs "target/${{ matrix.target }}/release/atlassian" --max 2.28
 
       - name: Smoke test binary on AlmaLinux 8 container
         if: matrix.target == 'x86_64-unknown-linux-gnu'
         shell: bash
         run: |
           set -euo pipefail
-          docker run --rm -v "$PWD/target/x86_64-unknown-linux-gnu/release:/work:ro" almalinux:8 /work/jira --version
-          docker run --rm -v "$PWD/target/x86_64-unknown-linux-gnu/release:/work:ro" almalinux:8 /work/jira --help >/dev/null
-          docker run --rm -e ATLASSIAN_PERSONA=confluence -v "$PWD/target/x86_64-unknown-linux-gnu/release:/work:ro" almalinux:8 /work/jira --version
+          docker run --rm -v "$PWD/target/x86_64-unknown-linux-gnu/release:/work:ro" almalinux:8 /work/atlassian --version
+          docker run --rm -v "$PWD/target/x86_64-unknown-linux-gnu/release:/work:ro" almalinux:8 /work/atlassian --help >/dev/null
+          docker run --rm -e ATLASSIAN_PERSONA=confluence -v "$PWD/target/x86_64-unknown-linux-gnu/release:/work:ro" almalinux:8 /work/atlassian --version
 
       - name: Build release binary
         if: matrix.os != 'ubuntu-latest'
@@ -104,12 +104,13 @@ jobs:
           name="atlassian-${version}-${{ matrix.target }}"
           mkdir -p release-staging
           if [ "${{ matrix.archive }}" = "zip" ]; then
-            7z a "release-staging/${name}.zip" "target/${{ matrix.target }}/release/jira.exe"
+            7z a "release-staging/${name}.zip" "target/${{ matrix.target }}/release/atlassian.exe" LICENSE
             if [ "${{ matrix.target }}" = "x86_64-pc-windows-msvc" ]; then
-              cp "target/${{ matrix.target }}/release/jira.exe" "release-staging/jira.exe"
+              cp LICENSE release-staging/LICENSE
+              cp "target/${{ matrix.target }}/release/atlassian.exe" "release-staging/atlassian.exe"
             fi
           else
-            tar -czf "release-staging/${name}.tar.gz" -C "target/${{ matrix.target }}/release" jira
+            tar -czf "release-staging/${name}.tar.gz" LICENSE -C "target/${{ matrix.target }}/release" atlassian
           fi
 
       - name: Stage npm artifact directory
@@ -183,15 +184,15 @@ jobs:
             fi
           done
 
-          test -f bin/jira.js
+          test -f bin/atlassian.js
           test -f bin/confluence.js
           test -f bin/conf.js
-          test -f dist/atlassian-win32-x64/bin/jira.exe
-          test -f dist/atlassian-win32-arm64/bin/jira.exe
-          test -f dist/atlassian-darwin-x64/bin/jira
-          test -f dist/atlassian-darwin-arm64/bin/jira
-          test -f dist/atlassian-linux-x64/bin/jira
-          test -f dist/atlassian-linux-arm64/bin/jira
+          test -f dist/atlassian-win32-x64/bin/atlassian.exe
+          test -f dist/atlassian-win32-arm64/bin/atlassian.exe
+          test -f dist/atlassian-darwin-x64/bin/atlassian
+          test -f dist/atlassian-darwin-arm64/bin/atlassian
+          test -f dist/atlassian-linux-x64/bin/atlassian
+          test -f dist/atlassian-linux-arm64/bin/atlassian
 
       - name: Publish platform packages
         env:
@@ -215,6 +216,8 @@ jobs:
     needs: build
     runs-on: ubuntu-latest
     steps:
+      - uses: actions/checkout@v5
+
       - uses: actions/download-artifact@v4
         with:
           path: release-assets
@@ -231,7 +234,7 @@ jobs:
       - name: Prepare release notes
         shell: bash
         run: |
-          echo 'Single unified binary (`jira` / `jira.exe`) powers `jira`, `confluence`, and `conf` (`ATLASSIAN_PERSONA=confluence`).' > release-body.md
+          echo 'Single unified binary (`atlassian` / `atlassian.exe`) powers `atlassian`, `confluence`, and `conf` (`ATLASSIAN_PERSONA=confluence`).' > release-body.md
           if [ -f "release-notes/${GITHUB_REF_NAME}.md" ]; then
             echo >> release-body.md
             cat "release-notes/${GITHUB_REF_NAME}.md" >> release-body.md

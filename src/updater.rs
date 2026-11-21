@@ -324,40 +324,40 @@ fn select_platform_asset_for<'a>(
         ("windows", "x86_64") => vec![
             format!("atlassian-{latest}-x86_64-pc-windows-msvc.zip"),
             "atlassian-x86_64-pc-windows-msvc.zip".to_string(),
-            "jira.exe".to_string(),
             "atlassian.exe".to_string(),
+            "jira.exe".to_string(),
         ],
         ("windows", "aarch64") => vec![
             format!("atlassian-{latest}-aarch64-pc-windows-msvc.zip"),
             "atlassian-aarch64-pc-windows-msvc.zip".to_string(),
-            "jira.exe".to_string(),
             "atlassian.exe".to_string(),
+            "jira.exe".to_string(),
         ],
         ("macos", "x86_64") => vec![
             format!("atlassian-{latest}-x86_64-apple-darwin.tar.gz"),
             "atlassian-x86_64-apple-darwin.tar.gz".to_string(),
-            "jira".to_string(),
             "atlassian".to_string(),
+            "jira".to_string(),
         ],
         ("macos", "aarch64") => vec![
             format!("atlassian-{latest}-aarch64-apple-darwin.tar.gz"),
             "atlassian-aarch64-apple-darwin.tar.gz".to_string(),
-            "jira".to_string(),
             "atlassian".to_string(),
+            "jira".to_string(),
         ],
         ("linux", "x86_64") => vec![
             format!("atlassian-{latest}-x86_64-unknown-linux-gnu.tar.gz"),
             format!("atlassian-{latest}-x86_64-unknown-linux-musl.tar.gz"),
             "atlassian-x86_64-unknown-linux-gnu.tar.gz".to_string(),
-            "jira".to_string(),
             "atlassian".to_string(),
+            "jira".to_string(),
         ],
         ("linux", "aarch64") => vec![
             format!("atlassian-{latest}-aarch64-unknown-linux-gnu.tar.gz"),
             format!("atlassian-{latest}-aarch64-unknown-linux-musl.tar.gz"),
             "atlassian-aarch64-unknown-linux-gnu.tar.gz".to_string(),
-            "jira".to_string(),
             "atlassian".to_string(),
+            "jira".to_string(),
         ],
         _ => vec![if os == "windows" {
             "jira.exe".to_string()
@@ -456,12 +456,8 @@ fn extract_binary_from_asset(asset_name: &str, asset_bytes: &[u8]) -> Result<Vec
         bail!("아카이브 압축 해제 실패 ({asset_name}): 종료 코드 {status}");
     }
 
-    let primary_bin = if cfg!(windows) { "jira.exe" } else { "jira" };
-    let fallback_bin = if cfg!(windows) {
-        "atlassian.exe"
-    } else {
-        "atlassian"
-    };
+    let primary_bin = if cfg!(windows) { "atlassian.exe" } else { "atlassian" };
+    let fallback_bin = if cfg!(windows) { "jira.exe" } else { "jira" };
     let found = find_file_recursive(&extract_dir, primary_bin)
         .or_else(|| find_file_recursive(&extract_dir, fallback_bin))
         .ok_or_else(|| {
