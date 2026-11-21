@@ -2,12 +2,14 @@
 
 # `@bitefoundry/atlassian`
 
-**Unified Atlassian Jira & Confluence native terminal client & AI agent toolkit — CLI · TUI · HTTP API · MCP.**
+**Read and edit Jira issues and Confluence pages from the terminal. Connect agents through MCP, including a read-only mode.**
 
 [![npm version](https://img.shields.io/npm/v/%40bitefoundry%2Fatlassian?style=flat-square&color=0052CC)](https://www.npmjs.com/package/@bitefoundry/atlassian)
 [![platforms](https://img.shields.io/badge/platform-Windows%20%7C%20macOS%20%7C%20Linux-24292F?style=flat-square)](docs/NPM.md)
 [![Rust & Ratatui](https://img.shields.io/badge/built%20with-Rust%20%2B%20Ratatui-DEA584?style=flat-square&logo=rust)](https://github.com/BiteFoundry/atlassian/blob/master/Cargo.toml)
-[![License: MIT](https://img.shields.io/badge/license-MIT-00875A?style=flat-square)](package.json)
+[![License: MIT](https://img.shields.io/badge/license-MIT-00875A?style=flat-square)](LICENSE)
+
+[BiteFoundry](https://bitefoundry.dev/#app-atlassian) · [Latest release notes](https://github.com/BiteFoundry/atlassian/releases/latest)
 
 <br />
 
@@ -45,6 +47,12 @@ atlassian login --oauth --client-id "$ATLASSIAN_OAUTH_CLIENT_ID"
 atlassian          # Jira Kanban Board & Issue Explorer
 confluence    # Confluence Space Tree & Wiki Reader (alias: conf)
 ```
+
+```sh
+atlassian view ENG-42 --json
+```
+
+Read a Jira issue in compact JSON. Use `atlassian wiki view 40211 --json` for a Confluence page. Both report omitted fields and include a hint for retrieving full detail. For full detail, add `--full` in the CLI or pass `compact: false` to `get_jira_issue` in MCP.
 
 ---
 
