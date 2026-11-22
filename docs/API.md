@@ -172,7 +172,7 @@ curl "http://127.0.0.1:8789/issues?jql=project%20%3D%20ENG&limit=20&start_at=20"
 
 ### `POST /issues`
 
-Creates a new Jira issue (`OutgoingIssue`). `project_key` and `summary` are required; `issue_type` defaults to `"Task"`.
+Creates a new Jira issue (`OutgoingIssue`). `project_key` and `summary` are required; `issue_type` defaults to `"Task"`. `assignee_id` accepts an account ID, `"me"`, or a display name/email (resolved when the ID is rejected).
 
 ```bash
 curl -X POST http://127.0.0.1:8789/issues \
@@ -204,7 +204,7 @@ Fetches full issue details (`IssueDetail`: metadata, Markdown description, subta
 
 ### `PATCH /issues/{key}`
 
-Updates at least one issue field. Omit `assignee_id` to keep the current assignee, pass `null` to unassign, or pass an account ID to assign.
+Updates at least one issue field. Omit `assignee_id` to keep the current assignee, pass `null` to unassign, pass `"me"` for the current user, or pass an account ID (or display name/email, resolved when the ID is rejected).
 
 Choose one body operation. `description_markdown` replaces the full description, `append_markdown` adds a fragment to the native description, and `replace_text: {"old_text":"…","new_text":"…"}` replaces one unique occurrence inside a single text node. The latter two preserve surrounding native content. Blank appends and unchanged Markdown skip the description write. Missing, ambiguous, and cross-node replacements return HTTP 400.
 

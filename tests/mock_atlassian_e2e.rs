@@ -4477,8 +4477,10 @@ async fn regression_atlassian_05_collection_paging_and_controls() {
         )
         .await;
         assert!(is_err);
+        let parsed_err: Value = serde_json::from_str(err_msg.as_str().unwrap()).unwrap();
+        assert_eq!(parsed_err["ok"], false);
         assert_eq!(
-            err_msg.as_str().unwrap(),
+            parsed_err["error"]["message"].as_str().unwrap(),
             "cursor must be a non-negative integer offset taken from next_cursor"
         );
         assert_eq!(

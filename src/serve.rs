@@ -27,6 +27,7 @@ use crate::{
         FederatedSearchHit, IssueSummary, IssueUpdate, OutgoingIssue, OutgoingPage, PageSummary,
         SearchHitKind, UnifiedSearchHit,
     },
+    resolver::resolve_rejected_assignee,
     storage::Storage,
     sync::{self, SiteSyncTarget, SyncCommand},
 };
@@ -835,21 +836,54 @@ async fn create_issue(
 
     let (target_site, client) =
         resolve_site_client(&state, query.site.as_deref().or(body.site.as_deref()))?;
-    let outgoing = OutgoingIssue {
+    let (assignee_id, raw_assignee) = match body.assignee_id.as_deref().map(str::trim) {
+        None | Some("") => (None, None),
+        Some(raw) if raw.eq_ignore_ascii_case("me") => {
+            let me = client.get_myself().await?;
+            (Some(me.id), None)
+        }
+        Some(raw) => (Some(raw.to_string()), Some(raw.to_string())),
+    };
+    let mut outgoing = OutgoingIssue {
         project_key: project_key.to_string(),
         issue_type,
         summary: summary.to_string(),
         description_markdown: body.description_markdown,
         priority: body.priority.filter(|s| !s.trim().is_empty()),
-        assignee_id: body.assignee_id.filter(|s| !s.trim().is_empty()),
+        assignee_id,
         labels: body.labels,
         parent_key: body.parent_key.filter(|s| !s.trim().is_empty()),
     };
 
-    let detail = client.create_issue(&outgoing).await?;
+    let mut resolved_assignee = None;
+    let detail = match client.create_issue(&outgoing).await {
+        Ok(detail) => detail,
+        Err(err) => {
+            if let Some(raw) = raw_assignee.as_deref() {
+                match resolve_rejected_assignee(&client, project_key, raw, &err, true).await {
+                    Some(Ok(user)) => {
+                        outgoing.assignee_id = Some(user.id.clone());
+                        resolved_assignee = Some(user);
+                        client.create_issue(&outgoing).await?
+                    }
+                    Some(Err(ambig)) => return Err(ambig.into()),
+                    None => return Err(err.into()),
+                }
+            } else {
+                return Err(err.into());
+            }
+        }
+    };
     let _ = state.storage.upsert_issue_detail_for_site(&target_site, &detail);
 
-    Ok(Json(json!({ "ok": true, "site_id": target_site, "issue": detail })))
+    let mut payload = json!({ "ok": true, "site_id": target_site, "issue": detail });
+    if let Some(user) = resolved_assignee {
+        payload["resolved_assignee"] = json!({
+            "id": user.id,
+            "display_name": user.display_name,
+        });
+    }
+    Ok(Json(payload))
 }
 
 async fn get_issue(
@@ -910,7 +944,7 @@ async fn patch_issue(
     if key.is_empty() {
         return Err(ApiError::bad_request("issue key must not be empty"));
     }
-    let patch = body.update;
+    let mut patch = body.update;
     let edit = BodyEdit::from_inputs(
         patch.description_markdown.as_deref(),
         body.append_markdown.as_deref(),
@@ -931,12 +965,57 @@ async fn patch_issue(
 
     let (target_site, client) =
         resolve_site_client(&state, query.site.as_deref().or(body.site.as_deref()))?;
-    let detail = client.edit_issue(key, &patch, edit).await?;
+    let raw_assignee = match patch.assignee_id.take() {
+        Some(Some(raw)) => {
+            let trimmed = raw.trim();
+            if trimmed.is_empty() {
+                patch.assignee_id = Some(None);
+                None
+            } else if trimmed.eq_ignore_ascii_case("me") {
+                let me = client.get_myself().await?;
+                patch.assignee_id = Some(Some(me.id));
+                None
+            } else {
+                patch.assignee_id = Some(Some(trimmed.to_string()));
+                Some(trimmed.to_string())
+            }
+        }
+        other => {
+            patch.assignee_id = other;
+            None
+        }
+    };
+    let mut resolved_assignee = None;
+    let detail = match client.edit_issue(key, &patch, edit).await {
+        Ok(detail) => detail,
+        Err(err) => {
+            if let Some(raw) = raw_assignee.as_deref() {
+                match resolve_rejected_assignee(&client, key, raw, &err, true).await {
+                    Some(Ok(user)) => {
+                        patch.assignee_id = Some(Some(user.id.clone()));
+                        resolved_assignee = Some(user);
+                        client.edit_issue(key, &patch, edit).await?
+                    }
+                    Some(Err(ambig)) => return Err(ambig.into()),
+                    None => return Err(err.into()),
+                }
+            } else {
+                return Err(err.into());
+            }
+        }
+    };
     let _ = state
         .storage
         .upsert_issue_detail_for_site(&target_site, &detail);
 
-    Ok(Json(json!({ "ok": true, "site_id": target_site, "issue": detail })))
+    let mut payload = json!({ "ok": true, "site_id": target_site, "issue": detail });
+    if let Some(user) = resolved_assignee {
+        payload["resolved_assignee"] = json!({
+            "id": user.id,
+            "display_name": user.display_name,
+        });
+    }
+    Ok(Json(payload))
 }
 
 async fn delete_issue(
@@ -983,16 +1062,25 @@ async fn transition_issue(
     }
     let (target_site, client) =
         resolve_site_client(&state, query.site.as_deref().or(body.site.as_deref()))?;
-    client
+    let executed = client
         .transition_issue(key, transition, body.comment.as_deref())
         .await?;
     refresh_issue_cache_after_write(&client, &state.storage, &target_site, key).await;
-    Ok(Json(json!({
+    let transition_id = executed
+        .as_ref()
+        .map(|t| t.id.as_str())
+        .unwrap_or(transition);
+    let mut payload = json!({
         "ok": true,
         "site_id": target_site,
         "key": key,
         "transition": transition,
-    })))
+        "transition_id": transition_id,
+    });
+    if let Some(tr) = executed {
+        payload["to_status"] = json!(tr.to_status.name);
+    }
+    Ok(Json(payload))
 }
 
 async fn assign_issue(
@@ -1007,23 +1095,45 @@ async fn assign_issue(
     }
     let (target_site, client) =
         resolve_site_client(&state, query.site.as_deref().or(body.site.as_deref()))?;
-    let resolved = match body.assignee_id.as_deref().map(str::trim) {
-        None | Some("") => None,
+    let (mut resolved, raw_assignee) = match body.assignee_id.as_deref().map(str::trim) {
+        None | Some("") => (None, None),
         Some(raw) if raw.eq_ignore_ascii_case("me") => {
             let me = client.get_myself().await?;
-            Some(me.id)
+            (Some(me.id), None)
         }
-        Some(raw) => Some(raw.to_string()),
+        Some(raw) => (Some(raw.to_string()), Some(raw.to_string())),
     };
 
-    client.assign_issue(key, resolved.as_deref()).await?;
+    let mut resolved_assignee = None;
+    if let Err(err) = client.assign_issue(key, resolved.as_deref()).await {
+        if let Some(raw) = raw_assignee.as_deref() {
+            match resolve_rejected_assignee(&client, key, raw, &err, false).await {
+                Some(Ok(user)) => {
+                    resolved = Some(user.id.clone());
+                    resolved_assignee = Some(user);
+                    client.assign_issue(key, resolved.as_deref()).await?;
+                }
+                Some(Err(ambig)) => return Err(ambig.into()),
+                None => return Err(err.into()),
+            }
+        } else {
+            return Err(err.into());
+        }
+    }
     refresh_issue_cache_after_write(&client, &state.storage, &target_site, key).await;
-    Ok(Json(json!({
+    let mut payload = json!({
         "ok": true,
         "site_id": target_site,
         "key": key,
         "assignee_id": resolved,
-    })))
+    });
+    if let Some(user) = resolved_assignee {
+        payload["resolved_assignee"] = json!({
+            "id": user.id,
+            "display_name": user.display_name,
+        });
+    }
+    Ok(Json(payload))
 }
 
 async fn list_issue_comments(

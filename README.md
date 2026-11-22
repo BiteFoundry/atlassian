@@ -124,6 +124,8 @@ atlassian update --check
 
 Add `--dry-run` to print the pending changes as JSON before saving.
 
+When a `--json` command fails at runtime, `stdout` emits a single JSON error object (`{"ok": false, "error": {"code", "message", "http_status"?, "details"?}}`) alongside the `stderr` message with exit code `1`. Argument parsing errors exit with code `2` and print parser diagnostics to `stderr` only. Write commands (`create`, `edit`, `wiki create`, `wiki edit`) return compact JSON by default; pass `--json --full` (or `compact: false` in MCP) for the full structure.
+
 If you are upgrading from 0.3.x, change shell commands such as `jira view ENG-101 --json` to `atlassian view ENG-101 --json`. In MCP settings, change `"command": "jira"` to `"command": "atlassian"` and keep the `mcp` argument.
 
 If you are upgrading from 0.5.x, `atlassian view --json` and `conf view --json` now return compact JSON by default (with `omitted` counts and a `hint`). Pass `--full` (for example `atlassian view ENG-101 --json --full`) in scripts that expect the full structure. `projects --json`, `boards --json`, and MCP `list_projects` / `list_boards` default to 50 items with `has_more` and `next_cursor`; pass `--limit 1000` / `limit: 1000` and continue with `cursor` when needed. `has_children` on page summaries can now be `null` when unknown.

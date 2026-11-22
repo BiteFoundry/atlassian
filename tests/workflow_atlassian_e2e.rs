@@ -139,6 +139,86 @@ async fn upstream(
         }))
         .into_response();
     }
+    if route == format!("{jira}/user/assignable/search") && get {
+        let q = query
+            .get("query")
+            .or_else(|| query.get("username"))
+            .map(|s| s.to_lowercase())
+            .unwrap_or_default();
+        let all_users = [
+            json!({
+                "accountId": "acc-test",
+                "displayName": "Test User",
+                "emailAddress": "test@example.invalid",
+                "active": true
+            }),
+            json!({
+                "accountId": "acc-bob",
+                "displayName": "Bob Lee",
+                "emailAddress": "bob.lee@example.invalid",
+                "active": true
+            }),
+            json!({
+                "accountId": "acc-bob2",
+                "displayName": "Bob Park",
+                "emailAddress": "bob.park@example.invalid",
+                "active": true
+            }),
+        ];
+        let matched: Vec<Value> = all_users
+            .into_iter()
+            .filter(|u| {
+                q.is_empty()
+                    || u["displayName"]
+                        .as_str()
+                        .unwrap_or("")
+                        .to_lowercase()
+                        .contains(&q)
+                    || u["emailAddress"]
+                        .as_str()
+                        .unwrap_or("")
+                        .to_lowercase()
+                        .contains(&q)
+            })
+            .collect();
+        return Json(Value::Array(matched)).into_response();
+    }
+    if route == format!("{jira}/issue") && method == Method::POST {
+        let fields = body["fields"].as_object().unwrap();
+        if let Some(assignee) = fields.get("assignee").and_then(|v| v.as_object()) {
+            let id = assignee
+                .get("id")
+                .or_else(|| assignee.get("accountId"))
+                .or_else(|| assignee.get("name"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            if !matches!(id, "acc-test" | "acc-bob" | "acc-bob2") {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(json!({
+                        "errorMessages": [],
+                        "errors": { "assignee": "Specify a valid value for assignee" }
+                    })),
+                )
+                    .into_response();
+            }
+            state.fields["assignee"] = json!({
+                "accountId": id,
+                "displayName": match id {
+                    "acc-bob" => "Bob Lee",
+                    "acc-bob2" => "Bob Park",
+                    _ => "Test User",
+                }
+            });
+        }
+        if let Some(summary) = fields.get("summary") {
+            state.fields["summary"] = summary.clone();
+        }
+        if let Some(description) = fields.get("description") {
+            state.fields["description"] = description.clone();
+        }
+        return (StatusCode::CREATED, Json(json!({ "id": "1001", "key": "ATL-1" }))).into_response();
+    }
 
     if route == format!("{jira}/issueLink") && method == Method::POST {
         assert_eq!(
@@ -179,6 +259,45 @@ async fn upstream(
             }
             return Json(json!([])).into_response();
         }
+        if key == "ATL-1/assignee" && method == Method::PUT {
+            let id = body
+                .get("accountId")
+                .or_else(|| body.get("name"))
+                .and_then(|v| v.as_str());
+            match id {
+                None => {
+                    state.fields["assignee"] = Value::Null;
+                    return StatusCode::NO_CONTENT.into_response();
+                }
+                Some(uid) if matches!(uid, "acc-test" | "acc-bob" | "acc-bob2") => {
+                    state.fields["assignee"] = json!({
+                        "accountId": uid,
+                        "displayName": match uid {
+                            "acc-bob" => "Bob Lee",
+                            "acc-bob2" => "Bob Park",
+                            _ => "Test User",
+                        }
+                    });
+                    return StatusCode::NO_CONTENT.into_response();
+                }
+                Some(unknown) => {
+                    return (
+                        StatusCode::NOT_FOUND,
+                        Json(json!({
+                            "errorMessages": [format!("User '{unknown}' does not exist")]
+                        })),
+                    )
+                        .into_response();
+                }
+            }
+        }
+        if get && key == "ATL-99999" {
+            return (
+                StatusCode::NOT_FOUND,
+                Json(json!({ "errorMessages": ["Issue does not exist"] })),
+            )
+                .into_response();
+        }
         if get {
             let mut fields = state.fields.clone();
             if key == "ATL-3" {
@@ -196,8 +315,30 @@ async fn upstream(
             let fields = body["fields"].as_object().unwrap();
             assert!(fields
                 .keys()
-                .all(|name| matches!(name.as_str(), "parent" | "description" | "summary")
-                    || name.starts_with("customfield_")));
+                .all(|name| matches!(
+                    name.as_str(),
+                    "parent" | "description" | "summary" | "assignee"
+                ) || name.starts_with("customfield_")));
+            if let Some(assignee) = fields.get("assignee") {
+                if !assignee.is_null() {
+                    let id = assignee
+                        .get("id")
+                        .or_else(|| assignee.get("accountId"))
+                        .or_else(|| assignee.get("name"))
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("");
+                    if !matches!(id, "acc-test" | "acc-bob" | "acc-bob2") {
+                        return (
+                            StatusCode::BAD_REQUEST,
+                            Json(json!({
+                                "errorMessages": [],
+                                "errors": { "assignee": "Specify a valid value for assignee" }
+                            })),
+                        )
+                            .into_response();
+                    }
+                }
+            }
             for (name, value) in fields {
                 state.fields[name] = value.clone();
             }
@@ -251,6 +392,21 @@ async fn upstream(
         });
         state.attachments.push(attachment.clone());
         return Json(json!({"results": [attachment]})).into_response();
+    }
+    if route == "/wiki/api/v2/spaces" && state.cloud && get {
+        return Json(json!({
+            "results": [{ "id": "77", "key": "ENG", "name": "Engineering", "type": "global" }]
+        }))
+        .into_response();
+    }
+    if route == "/wiki/api/v2/pages" && state.cloud && method == Method::POST {
+        if let Some(title) = body["title"].as_str() {
+            state.page_title = title.to_owned();
+        }
+        if let Some(val) = body["body"]["value"].as_str() {
+            state.page_body = val.to_owned();
+        }
+        return Json(state.page("701")).into_response();
     }
     if let Some(page) = route.strip_prefix(if state.cloud {
         "/wiki/api/v2/pages/"
@@ -1121,6 +1277,7 @@ async fn confluence_cloud_section_edit_preserves_native_nodes_and_checks_heading
                 "Deploy safely",
                 "Replacement",
                 "--json",
+                "--full",
             ],
             true,
         )
@@ -1299,6 +1456,7 @@ async fn confluence_cloud_layout_column_section_edit_previews_saves_and_rejects_
                 "Column rollout",
                 "- updated item",
                 "--json",
+                "--full",
             ],
             true,
         )
@@ -1323,7 +1481,7 @@ async fn confluence_cloud_layout_column_section_edit_previews_saves_and_rejects_
     let saved_right = mock
         .mcp(
             "update_confluence_page",
-            json!({"page_id":"701","prev_version":8,
+            json!({"page_id":"701","prev_version":8,"compact":false,
                 "replace_section":{"heading":"Right notes","markdown":"Right updated"}}),
             true,
         )
@@ -1377,6 +1535,7 @@ async fn built_cli_handles_hyphen_text_payloads_and_rejects_missing_value_before
                 "--append",
                 "- 첫째 항목\n- 둘째 항목",
                 "--json",
+                "--full",
             ],
             true,
         )
@@ -1445,6 +1604,7 @@ async fn built_cli_handles_hyphen_text_payloads_and_rejects_missing_value_before
                 "--append",
                 "- 항목 A\n- 항목 B",
                 "--json",
+                "--full",
             ],
             true,
         )
@@ -1551,7 +1711,7 @@ async fn mcp_read_only_filters_catalog_blocks_writes_and_keeps_default_mode_work
     let updated = mock
         .mcp(
             "update_jira_issue",
-            json!({"key": "ATL-1", "summary": "Allowed in full mode"}),
+            json!({"key": "ATL-1", "summary": "Allowed in full mode", "compact": false}),
             true,
         )
         .await;
@@ -2070,6 +2230,8 @@ async fn regression_atlassian_bug_07_site_auth_doctor_logout_consistency() {
     assert!(ok, "whoami after S2 login failed: {err}");
     assert_eq!(who2["site_url"], s2_url);
     assert_eq!(who2["user"]["display_name"], "Site Two User");
+    assert!(who2["credential_account"].is_string(), "{who2}");
+    assert!(who2.get("account_id").is_none(), "{who2}");
     assert_eq!(s1_hits.load(Ordering::SeqCst), 0, "default whoami must not hit S1");
     assert_eq!(s2_hits.load(Ordering::SeqCst), 1, "default whoami must hit S2");
 
@@ -2337,6 +2499,7 @@ async fn regression_atlassian_bug_13_multi_site_sync_failure_propagation() {
     assert_eq!(code_json, 1, "all-failed multi-site sync --json must exit 1; stdout={out_json}");
     let parsed: Value = serde_json::from_str(&out_json).expect("preserved JSON summary on stdout");
     assert_eq!(parsed["ok"], false);
+    assert_eq!(parsed["error"]["code"], "sync_failed");
     assert!(parsed["summary"].as_str().unwrap().contains("0/2"));
     let sites_arr = parsed["sites"].as_array().unwrap();
     assert_eq!(sites_arr.len(), 2);
@@ -2656,6 +2819,7 @@ async fn regression_atlassian_bug_08_full_body_adf_roundtrip_and_no_empty_text()
                 "--body",
                 &edited_md,
                 "--json",
+                "--full",
             ],
             true,
         )
@@ -2979,6 +3143,279 @@ async fn cli_view_json_is_compact_and_full_restores_structure() {
 
         assert!(mock.state.lock().unwrap().writes.is_empty());
     }
+}
+
+#[tokio::test]
+async fn write_responses_are_compact_by_default_and_full_restores_structure() {
+    let mock = Harness::new(true).await;
+
+    let created_compact = mock
+        .cli(
+            &[
+                "create",
+                "--project",
+                "ATL",
+                "--summary",
+                "Compact create",
+                "--body",
+                "# Heading\n\nBody text",
+                "--json",
+            ],
+            true,
+        )
+        .await;
+    assert_eq!(created_compact["ok"], true);
+    assert!(created_compact["site_id"].is_string());
+    assert_eq!(created_compact["issue"]["key"], "ATL-1");
+    assert!(created_compact["issue"]["summary"].is_string());
+    assert!(created_compact["issue"].get("description_raw").is_none());
+    assert!(created_compact["issue"].get("description_blocks").is_none());
+    assert!(created_compact["issue"].get("description_markdown").is_none());
+
+    let created_full = mock
+        .cli(
+            &[
+                "create",
+                "--project",
+                "ATL",
+                "--summary",
+                "Full create",
+                "--body",
+                "# Heading\n\nBody text",
+                "--json",
+                "--full",
+            ],
+            true,
+        )
+        .await;
+    assert!(created_full["issue"]["description_raw"].is_string());
+
+    let edited_compact = mock
+        .cli(
+            &[
+                "wiki",
+                "edit",
+                "701",
+                "--prev-version",
+                "7",
+                "--append",
+                "More text",
+                "--json",
+            ],
+            true,
+        )
+        .await;
+    assert_eq!(edited_compact["ok"], true);
+    assert!(edited_compact["site_id"].is_string());
+    assert_eq!(edited_compact["page"]["id"], "701");
+    assert_eq!(edited_compact["page"]["version_number"], 8);
+    assert!(edited_compact["page"].get("body_raw").is_none());
+    assert!(edited_compact["page"].get("blocks").is_none());
+    assert!(edited_compact["page"].get("body_markdown").is_none());
+
+    let edited_full = mock
+        .cli(
+            &[
+                "wiki",
+                "edit",
+                "701",
+                "--prev-version",
+                "8",
+                "--append",
+                "Even more text",
+                "--json",
+                "--full",
+            ],
+            true,
+        )
+        .await;
+    assert!(edited_full["page"]["body_raw"].is_string());
+
+    let mcp_compact = mock
+        .mcp(
+            "create_confluence_page",
+            json!({
+                "space_id_or_key": "ENG",
+                "title": "MCP Compact",
+                "body_markdown": "# Title\n\nContent"
+            }),
+            true,
+        )
+        .await;
+    assert_eq!(mcp_compact["ok"], true);
+    assert_eq!(mcp_compact["page"]["id"], "701");
+    assert!(mcp_compact["page"]["version_number"].is_number());
+    assert!(mcp_compact["page"].get("body_raw").is_none());
+    assert!(mcp_compact["page"].get("blocks").is_none());
+    assert!(mcp_compact["page"].get("body_markdown").is_none());
+
+    let mcp_full = mock
+        .mcp(
+            "create_confluence_page",
+            json!({
+                "space_id_or_key": "ENG",
+                "title": "MCP Full",
+                "body_markdown": "# Title\n\nContent",
+                "compact": false
+            }),
+            true,
+        )
+        .await;
+    assert!(mcp_full["page"]["body_raw"].is_string());
+}
+
+#[tokio::test]
+async fn assignee_resolution_handles_me_name_fallback_ambiguity_and_exact_id() {
+    let mock = Harness::new(true).await;
+    let search_count = || {
+        mock.state
+            .lock()
+            .unwrap()
+            .requests
+            .iter()
+            .filter(|(_, p)| p.contains("/user/assignable/search"))
+            .count()
+    };
+
+    // 1. Exact ID succeeds with 0 search requests.
+    let exact = mock
+        .cli(&["assign", "ATL-1", "--to", "acc-bob", "--json"], true)
+        .await;
+    assert_eq!(exact["ok"], true);
+    assert!(exact["site_id"].is_string());
+    assert_eq!(exact["assignee_id"], "acc-bob");
+    assert!(exact.get("resolved_assignee").is_none());
+    assert_eq!(search_count(), 0);
+
+    // 2. Display name fails initial PUT, searches once, retries with acc-bob, succeeds.
+    let by_name = mock
+        .cli(&["assign", "ATL-1", "--to", "Bob Lee", "--json"], true)
+        .await;
+    assert_eq!(by_name["ok"], true);
+    assert_eq!(by_name["assignee_id"], "acc-bob");
+    assert_eq!(by_name["resolved_assignee"]["id"], "acc-bob");
+    assert_eq!(by_name["resolved_assignee"]["display_name"], "Bob Lee");
+    assert_eq!(search_count(), 1);
+    assert_eq!(mock.state.lock().unwrap().fields["assignee"]["accountId"], "acc-bob");
+
+    // 3. Ambiguous name ("Bob" -> Bob Lee & Bob Park) fails with ambiguous_user and leaves assignee unchanged.
+    let ambig_out = tokio::time::timeout(
+        Duration::from_secs(20),
+        mock.process()
+            .args(["assign", "ATL-1", "--to", "Bob", "--json"])
+            .output(),
+    )
+    .await
+    .expect("CLI timed out")
+    .unwrap();
+    assert_eq!(ambig_out.status.code(), Some(1));
+    let ambig_json: Value = serde_json::from_slice(&ambig_out.stdout).unwrap();
+    assert_eq!(ambig_json["ok"], false);
+    assert_eq!(ambig_json["error"]["code"], "ambiguous_user");
+    assert_eq!(
+        ambig_json["error"]["details"]["candidates"]
+            .as_array()
+            .unwrap()
+            .len(),
+        2
+    );
+    assert_eq!(mock.state.lock().unwrap().fields["assignee"]["accountId"], "acc-bob");
+
+    // 4. MCP create_jira_issue and update_jira_issue resolve assignee_id: "me" to acc-test.
+    let mcp_created = mock
+        .mcp(
+            "create_jira_issue",
+            json!({"project_key": "ATL", "summary": "MCP me create", "assignee_id": "me"}),
+            true,
+        )
+        .await;
+    assert_eq!(mcp_created["ok"], true);
+    assert_eq!(
+        mock.state.lock().unwrap().fields["assignee"]["accountId"],
+        "acc-test"
+    );
+
+    let mcp_updated = mock
+        .mcp(
+            "update_jira_issue",
+            json!({"key": "ATL-1", "assignee_id": "me"}),
+            true,
+        )
+        .await;
+    assert_eq!(mcp_updated["ok"], true);
+    let last_put = mock
+        .state
+        .lock()
+        .unwrap()
+        .writes
+        .iter()
+        .rev()
+        .find(|(m, p, _)| m == "PUT" && p == "/rest/api/3/issue/ATL-1")
+        .unwrap()
+        .2
+        .clone();
+    assert_eq!(last_put["fields"]["assignee"]["id"], "acc-test");
+}
+
+#[tokio::test]
+async fn json_errors_emit_structured_stdout_and_mcp_error_json() {
+    let mock = Harness::new(true).await;
+
+    let run_cli_raw = |args: &[&str]| {
+        let mut cmd = mock.process();
+        cmd.args(args);
+        async move {
+            tokio::time::timeout(Duration::from_secs(20), cmd.output())
+                .await
+                .expect("CLI timed out")
+                .unwrap()
+        }
+    };
+
+    // 1. 404 with --json emits structured JSON object on stdout + exit 1.
+    let not_found = run_cli_raw(&["view", "ATL-99999", "--json"]).await;
+    assert_eq!(not_found.status.code(), Some(1));
+    let nf_json: Value = serde_json::from_slice(&not_found.stdout).unwrap();
+    assert_eq!(nf_json["ok"], false);
+    assert_eq!(nf_json["error"]["code"], "not_found");
+    assert_eq!(nf_json["error"]["http_status"], 404);
+    assert!(!not_found.stderr.is_empty());
+
+    // 2. Version conflict with --json emits conflict + http_status 409.
+    let conflict = run_cli_raw(&[
+        "wiki",
+        "edit",
+        "701",
+        "--prev-version",
+        "1",
+        "--append",
+        "stale",
+        "--json",
+    ])
+    .await;
+    assert_eq!(conflict.status.code(), Some(1));
+    let conflict_json: Value = serde_json::from_slice(&conflict.stdout).unwrap();
+    assert_eq!(conflict_json["ok"], false);
+    assert_eq!(conflict_json["error"]["code"], "conflict");
+    assert_eq!(conflict_json["error"]["http_status"], 409);
+
+    // 3. Same 404 without --json keeps stdout empty.
+    let text_nf = run_cli_raw(&["view", "ATL-99999"]).await;
+    assert_eq!(text_nf.status.code(), Some(1));
+    assert!(
+        text_nf.stdout.is_empty(),
+        "text mode error must not write stdout: {}",
+        String::from_utf8_lossy(&text_nf.stdout)
+    );
+
+    // 4. MCP get_jira_issue 404 returns structured JSON in content[0].text with isError: true.
+    let mcp_err_text = mock
+        .mcp("get_jira_issue", json!({"key": "ATL-99999"}), false)
+        .await;
+    let mcp_err: Value = serde_json::from_str(mcp_err_text.as_str().unwrap()).unwrap();
+    assert_eq!(mcp_err["ok"], false);
+    assert_eq!(mcp_err["error"]["code"], "not_found");
+    assert_eq!(mcp_err["error"]["http_status"], 404);
 }
 
 #[tokio::test]

@@ -15,11 +15,12 @@ use reqwest::{
     Method, StatusCode,
 };
 use serde::{de::DeserializeOwned, Serialize};
-use serde_json::Value;
+use serde_json::{json, Value};
 use thiserror::Error;
 use url::Url;
 
 use crate::{
+    atlassian::body::BodyEditError,
     auth::{AuthManager, StoredCredentials, DEFAULT_OAUTH_API_BASE, DEFAULT_OAUTH_AUTH_BASE},
     config::{normalize_base_url, AppConfig, DeploymentKind, SiteProfile},
     models::{AttachmentItem, UserSummary},
@@ -35,6 +36,64 @@ pub(crate) struct HttpStatusError {
     pub status: StatusCode,
     pub message: String,
     pub body: String,
+}
+
+#[derive(Debug, Error)]
+#[error("{message}")]
+pub(crate) struct CodedError {
+    pub code: &'static str,
+    pub message: String,
+    pub details: Option<Value>,
+}
+
+/// Builds the structured error object: `{"code","message","http_status"?,"details"?}`.
+pub(crate) fn error_payload(err: &anyhow::Error) -> Value {
+    let message = format!("{err:#}");
+    if let Some(coded) = err.downcast_ref::<CodedError>() {
+        let mut obj = serde_json::Map::new();
+        obj.insert("code".to_string(), json!(coded.code));
+        obj.insert("message".to_string(), json!(message));
+        if let Some(details) = &coded.details {
+            obj.insert("details".to_string(), details.clone());
+        }
+        return Value::Object(obj);
+    }
+    if let Some(http) = err.downcast_ref::<HttpStatusError>() {
+        let code = match http.status {
+            StatusCode::BAD_REQUEST => "bad_request",
+            StatusCode::UNAUTHORIZED => "unauthorized",
+            StatusCode::FORBIDDEN => "forbidden",
+            StatusCode::NOT_FOUND => "not_found",
+            StatusCode::CONFLICT => "conflict",
+            StatusCode::TOO_MANY_REQUESTS => "rate_limited",
+            _ => "http_error",
+        };
+        let mut obj = serde_json::Map::new();
+        obj.insert("code".to_string(), json!(code));
+        obj.insert("message".to_string(), json!(message));
+        obj.insert("http_status".to_string(), json!(http.status.as_u16()));
+        if let Some(field_errors) = serde_json::from_str::<Value>(&http.body)
+            .ok()
+            .and_then(|v| v.get("errors").and_then(|e| e.as_object()).cloned())
+            .filter(|map| !map.is_empty())
+        {
+            obj.insert(
+                "details".to_string(),
+                json!({ "field_errors": Value::Object(field_errors) }),
+            );
+        }
+        return Value::Object(obj);
+    }
+    if err.downcast_ref::<BodyEditError>().is_some() {
+        return json!({
+            "code": "invalid_input",
+            "message": message,
+        });
+    }
+    json!({
+        "code": "error",
+        "message": message,
+    })
 }
 
 pub(crate) fn http_status_code(err: &anyhow::Error) -> Option<StatusCode> {
@@ -288,7 +347,7 @@ impl AtlassianClient {
         if !api_base.is_empty() {
             return Ok(api_base);
         }
-        bail!("Atlassian site URL is not configured. Run `atlassian login --site <URL>` or set ATLASSIAN_SITE_URL.");
+        bail!("Atlassian site URL is not configured. Run `atlassian login --url <URL>` or set ATLASSIAN_SITE_URL.");
     }
 
     pub(crate) fn require_confluence_root(&self) -> Result<String> {
@@ -300,7 +359,7 @@ impl AtlassianClient {
         if !api_base.trim().is_empty() {
             return Ok(api_base);
         }
-        bail!("Confluence URL is not configured. Run `confluence login --site <URL>` or set ATLASSIAN_CONFLUENCE_URL.");
+        bail!("Confluence URL is not configured. Run `confluence login --url <URL>` or set ATLASSIAN_CONFLUENCE_URL.");
     }
 
     pub async fn get_myself(&self) -> Result<UserSummary> {

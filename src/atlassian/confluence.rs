@@ -2,7 +2,7 @@
 
 use std::collections::{HashMap, HashSet};
 
-use anyhow::{anyhow, bail, Context, Result};
+use anyhow::{bail, Context, Result};
 use regex::Regex;
 use serde_json::{json, Map, Value};
 
@@ -1400,12 +1400,32 @@ impl AtlassianClient {
                 return Ok((id.clone(), Some(key.clone())));
             }
         }
-        let spaces = self.list_spaces(250).await?;
-        let found = spaces
-            .iter()
-            .find(|s| s.key.eq_ignore_ascii_case(trimmed) || s.id == trimmed)
-            .ok_or_else(|| anyhow!("Confluence 스페이스 '{}'을(를) 찾을 수 없습니다.", trimmed))?;
-        Ok((found.id.clone(), Some(found.key.clone())))
+        let mut cursor: Option<String> = None;
+        let mut seen = HashSet::new();
+        loop {
+            let page = self.list_spaces_page(250, cursor.as_deref()).await?;
+            if let Some(found) = page
+                .items
+                .iter()
+                .find(|s| s.key.eq_ignore_ascii_case(trimmed) || s.id == trimmed)
+            {
+                return Ok((found.id.clone(), Some(found.key.clone())));
+            }
+            let mut added = 0usize;
+            for space in &page.items {
+                if seen.insert(space.id.clone()) {
+                    added += 1;
+                }
+            }
+            if added == 0 {
+                break;
+            }
+            match page.next_cursor {
+                Some(next) => cursor = Some(next),
+                None => break,
+            }
+        }
+        bail!("Confluence 스페이스 '{}'을(를) 찾을 수 없습니다.", trimmed)
     }
 }
 
@@ -2242,5 +2262,91 @@ mod tests {
         assert_eq!(dr2.items[0].id, "203");
         assert_eq!(dr2.has_more, Some(false));
         assert_eq!(dr2.next_cursor, None);
+    }
+
+    #[tokio::test]
+    async fn cloud_space_key_resolution_follows_next_pages() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let space_requests = Arc::new(AtomicUsize::new(0));
+        let sr = space_requests.clone();
+
+        let app = Router::new()
+            .route(
+                "/wiki/api/v2/spaces",
+                get(move |Query(q): Query<HashMap<String, String>>| {
+                    let sr = sr.clone();
+                    async move {
+                        sr.fetch_add(1, Ordering::SeqCst);
+                        match q.get("cursor").map(String::as_str) {
+                            None => Json(json!({
+                                "results": [{ "id": "101", "key": "ENG", "name": "Engineering", "type": "global" }],
+                                "_links": { "next": "/wiki/api/v2/spaces?limit=250&cursor=page2" }
+                            })),
+                            Some("page2") => Json(json!({
+                                "results": [{ "id": "202", "key": "LATE", "name": "Late Space", "type": "global" }]
+                            })),
+                            _ => Json(json!({ "results": [] })),
+                        }
+                    }
+                }),
+            )
+            .route(
+                "/wiki/api/v2/spaces/101/pages",
+                get(|| async {
+                    Json(json!({
+                        "results": [
+                            { "id": "1001", "spaceId": "101", "parentId": null, "title": "Eng Home", "status": "current", "version": { "number": 1 } }
+                        ]
+                    }))
+                }),
+            )
+            .route(
+                "/wiki/api/v2/spaces/202/pages",
+                get(|| async {
+                    Json(json!({
+                        "results": [
+                            { "id": "2001", "spaceId": "202", "parentId": null, "title": "Late Home", "status": "current", "version": { "number": 1 } }
+                        ]
+                    }))
+                }),
+            );
+
+        let base_url = spawn_router(app).await;
+        let wiki_url = format!("{base_url}/wiki");
+
+        // Page-1 key resolves in exactly 1 spaces request.
+        let eng_client = make_client(&base_url, &wiki_url, DeploymentKind::Cloud);
+        let eng_pages = eng_client
+            .list_space_root_pages_page("ENG", 50, None)
+            .await
+            .unwrap();
+        assert_eq!(eng_pages.items.len(), 1);
+        assert_eq!(eng_pages.items[0].id, "1001");
+        assert_eq!(space_requests.load(Ordering::SeqCst), 1);
+
+        // Page-2 key follows cursor and resolves successfully.
+        space_requests.store(0, Ordering::SeqCst);
+        let late_client = make_client(&base_url, &wiki_url, DeploymentKind::Cloud);
+        let late_pages = late_client
+            .list_space_root_pages_page("LATE", 50, None)
+            .await
+            .unwrap();
+        assert_eq!(late_pages.items.len(), 1);
+        assert_eq!(late_pages.items[0].id, "2001");
+        assert_eq!(late_pages.items[0].space_key, "LATE");
+        assert_eq!(space_requests.load(Ordering::SeqCst), 2);
+
+        // Missing key returns the not-found error.
+        let missing_err = late_client
+            .list_space_root_pages_page("NOPE", 50, None)
+            .await
+            .unwrap_err();
+        assert!(
+            missing_err
+                .to_string()
+                .contains("Confluence 스페이스 'NOPE'을(를) 찾을 수 없습니다."),
+            "{missing_err}"
+        );
     }
 }

@@ -20,7 +20,7 @@ use tokio::io::{AsyncBufReadExt, BufReader};
 use crate::{
     atlassian::{
         body::{BodyEdit, SectionReplacement, TextReplacement},
-        client::is_not_found_error,
+        client::{error_payload, is_not_found_error},
         AtlassianClient, SiteClientPool,
     },
     config::{self, AppConfig},
@@ -29,6 +29,7 @@ use crate::{
         parse_offset_cursor, slice_page, FederatedSearchHit, IssueUpdate, OutgoingIssue,
         OutgoingPage,
     },
+    resolver::resolve_rejected_assignee,
     serve::{
         clamp_limit, escape_jql_str, issue_to_hit, looks_like_cql_expr, looks_like_jql_expr,
         page_to_hit,
@@ -277,9 +278,9 @@ async fn handle_rpc_line_with_bootstrap<'a>(
                             && tool_uses_current_site_cache(config, client, name, &arguments)
                         {
                             *bootstrap_pending = false;
-                            bootstrap_if_empty(config, client, storage).await;
+                            Box::pin(bootstrap_if_empty(config, client, storage)).await;
                         }
-                        call_tool(config, client, storage, name, &arguments).await
+                        Box::pin(call_tool(config, client, storage, name, &arguments)).await
                     }
                     Err(error) => Err(error),
                 }
@@ -778,13 +779,22 @@ async fn call_tool(
                 .unwrap_or_else(|| "Task".to_string());
             let description_markdown = args.optional_text("description_markdown")?.unwrap_or_default();
             let priority = args.optional_str("priority")?;
-            let assignee_id = args.optional_str("assignee_id")?;
+            let raw_assignee = args.optional_str("assignee_id")?;
             let labels = args.optional_str_array("labels")?;
             let parent_key = args.optional_str("parent_key")?;
+            let compact = args.optional_bool("compact")?.unwrap_or(true);
 
             let (target_site, target_client) =
                 resolve_mcp_client(config, client, site_arg.as_deref())?;
-            let req = OutgoingIssue {
+            let (assignee_id, raw_for_fallback) = match raw_assignee.as_deref() {
+                Some(v) if v.eq_ignore_ascii_case("me") => {
+                    let me = target_client.get_myself().await.map_err(format_error)?;
+                    (Some(me.id), None)
+                }
+                Some(v) => (Some(v.to_string()), Some(v.to_string())),
+                None => (None, None),
+            };
+            let mut req = OutgoingIssue {
                 project_key,
                 issue_type,
                 summary,
@@ -794,12 +804,48 @@ async fn call_tool(
                 labels,
                 parent_key,
             };
-            let detail = target_client
-                .create_issue(&req)
-                .await
-                .map_err(format_error)?;
+            let mut resolved_assignee = None;
+            let detail = match Box::pin(target_client.create_issue(&req)).await {
+                Ok(detail) => detail,
+                Err(err) => {
+                    if let Some(raw) = raw_for_fallback.as_deref() {
+                        match Box::pin(resolve_rejected_assignee(
+                            &target_client,
+                            &req.project_key,
+                            raw,
+                            &err,
+                            true,
+                        ))
+                        .await
+                        {
+                            Some(Ok(user)) => {
+                                req.assignee_id = Some(user.id.clone());
+                                resolved_assignee = Some(user);
+                                Box::pin(target_client.create_issue(&req))
+                                    .await
+                                    .map_err(format_error)?
+                            }
+                            Some(Err(ambig)) => return Err(format_error(ambig)),
+                            None => return Err(format_error(err)),
+                        }
+                    } else {
+                        return Err(format_error(err));
+                    }
+                }
+            };
             let _ = storage.upsert_issue_detail_for_site(&target_site, &detail);
-            Ok(json!({ "ok": true, "site_id": target_site, "issue": detail }))
+            let mut payload = json!({
+                "ok": true,
+                "site_id": target_site,
+                "issue": if compact { detail.write_output() } else { detail.output(false) },
+            });
+            if let Some(user) = resolved_assignee {
+                payload["resolved_assignee"] = json!({
+                    "id": user.id,
+                    "display_name": user.display_name,
+                });
+            }
+            Ok(payload)
         }
 
         "update_jira_issue" => {
@@ -812,14 +858,23 @@ async fn call_tool(
                 replacement.as_ref(),
                 None,
             )
-            .map_err(|e| e.to_string())?;
+            .map_err(|e| format_error(e.into()))?;
             let priority = args.optional_str("priority")?;
-            let assignee_id = args.optional_nullable_str("assignee_id")?;
+            let raw_assignee = args.optional_nullable_str("assignee_id")?;
             let labels = args.optional_str_array_opt("labels")?;
+            let compact = args.optional_bool("compact")?.unwrap_or(true);
 
             let (target_site, target_client) =
                 resolve_mcp_client(config, client, site_arg.as_deref())?;
-            let patch = IssueUpdate {
+            let (assignee_id, raw_for_fallback) = match raw_assignee {
+                Some(Some(v)) if v.eq_ignore_ascii_case("me") => {
+                    let me = target_client.get_myself().await.map_err(format_error)?;
+                    (Some(Some(me.id)), None)
+                }
+                Some(Some(v)) => (Some(Some(v.clone())), Some(v)),
+                other => (other, None),
+            };
+            let mut patch = IssueUpdate {
                 summary,
                 description_markdown: None,
                 priority,
@@ -835,12 +890,48 @@ async fn call_tool(
                     json!({ "ok": true, "site_id": target_site, "dry_run": true, "preview": preview }),
                 );
             }
-            let detail = target_client
-                .edit_issue(&key, &patch, edit)
-                .await
-                .map_err(format_error)?;
+            let mut resolved_assignee = None;
+            let detail = match Box::pin(target_client.edit_issue(&key, &patch, edit)).await {
+                Ok(detail) => detail,
+                Err(err) => {
+                    if let Some(raw) = raw_for_fallback.as_deref() {
+                        match Box::pin(resolve_rejected_assignee(
+                            &target_client,
+                            &key,
+                            raw,
+                            &err,
+                            true,
+                        ))
+                        .await
+                        {
+                            Some(Ok(user)) => {
+                                patch.assignee_id = Some(Some(user.id.clone()));
+                                resolved_assignee = Some(user);
+                                Box::pin(target_client.edit_issue(&key, &patch, edit))
+                                    .await
+                                    .map_err(format_error)?
+                            }
+                            Some(Err(ambig)) => return Err(format_error(ambig)),
+                            None => return Err(format_error(err)),
+                        }
+                    } else {
+                        return Err(format_error(err));
+                    }
+                }
+            };
             let _ = storage.upsert_issue_detail_for_site(&target_site, &detail);
-            Ok(json!({ "ok": true, "site_id": target_site, "issue": detail }))
+            let mut payload = json!({
+                "ok": true,
+                "site_id": target_site,
+                "issue": if compact { detail.write_output() } else { detail.output(false) },
+            });
+            if let Some(user) = resolved_assignee {
+                payload["resolved_assignee"] = json!({
+                    "id": user.id,
+                    "display_name": user.display_name,
+                });
+            }
+            Ok(payload)
         }
 
         "list_jira_transitions" => {
@@ -860,17 +951,26 @@ async fn call_tool(
             let comment = args.optional_text("comment_markdown")?;
             let (target_site, target_client) =
                 resolve_mcp_client(config, client, site_arg.as_deref())?;
-            target_client
+            let executed = target_client
                 .transition_issue(&key, &transition, comment.as_deref())
                 .await
                 .map_err(format_error)?;
             refresh_mcp_issue_cache(&target_client, storage, &target_site, &key).await;
-            Ok(json!({
+            let transition_id = executed
+                .as_ref()
+                .map(|t| t.id.as_str())
+                .unwrap_or(transition.as_str());
+            let mut payload = json!({
                 "ok": true,
                 "site_id": target_site,
                 "key": key,
                 "transition": transition,
-            }))
+                "transition_id": transition_id,
+            });
+            if let Some(tr) = executed {
+                payload["to_status"] = json!(tr.to_status.name);
+            }
+            Ok(payload)
         }
 
         "assign_jira_issue" => {
@@ -878,25 +978,55 @@ async fn call_tool(
             let raw_assignee = args.optional_str("assignee_id")?;
             let (target_site, target_client) =
                 resolve_mcp_client(config, client, site_arg.as_deref())?;
-            let resolved = match raw_assignee.as_deref() {
-                None => None,
+            let (mut resolved, raw_for_fallback) = match raw_assignee.as_deref() {
+                None => (None, None),
                 Some(v) if v.eq_ignore_ascii_case("me") => {
                     let me = target_client.get_myself().await.map_err(format_error)?;
-                    Some(me.id)
+                    (Some(me.id), None)
                 }
-                Some(v) => Some(v.to_string()),
+                Some(v) => (Some(v.to_string()), Some(v.to_string())),
             };
-            target_client
-                .assign_issue(&key, resolved.as_deref())
-                .await
-                .map_err(format_error)?;
+            let mut resolved_assignee = None;
+            if let Err(err) = Box::pin(target_client.assign_issue(&key, resolved.as_deref())).await
+            {
+                if let Some(raw) = raw_for_fallback.as_deref() {
+                    match Box::pin(resolve_rejected_assignee(
+                        &target_client,
+                        &key,
+                        raw,
+                        &err,
+                        false,
+                    ))
+                    .await
+                    {
+                        Some(Ok(user)) => {
+                            resolved = Some(user.id.clone());
+                            resolved_assignee = Some(user);
+                            Box::pin(target_client.assign_issue(&key, resolved.as_deref()))
+                                .await
+                                .map_err(format_error)?;
+                        }
+                        Some(Err(ambig)) => return Err(format_error(ambig)),
+                        None => return Err(format_error(err)),
+                    }
+                } else {
+                    return Err(format_error(err));
+                }
+            }
             refresh_mcp_issue_cache(&target_client, storage, &target_site, &key).await;
-            Ok(json!({
+            let mut payload = json!({
                 "ok": true,
                 "site_id": target_site,
                 "key": key,
                 "assignee_id": resolved,
-            }))
+            });
+            if let Some(user) = resolved_assignee {
+                payload["resolved_assignee"] = json!({
+                    "id": user.id,
+                    "display_name": user.display_name,
+                });
+            }
+            Ok(payload)
         }
 
         "add_jira_comment" => {
@@ -1183,6 +1313,7 @@ async fn call_tool(
             let parent_id = args.optional_str("parent_id")?;
             let title = args.required_str("title")?;
             let body_markdown = args.optional_text("body_markdown")?.unwrap_or_default();
+            let compact = args.optional_bool("compact")?.unwrap_or(true);
 
             let (target_site, target_client) =
                 resolve_mcp_client(config, client, site_arg.as_deref())?;
@@ -1197,7 +1328,11 @@ async fn call_tool(
                 .await
                 .map_err(format_error)?;
             let _ = storage.upsert_page_detail_for_site(&target_site, &detail);
-            Ok(json!({ "ok": true, "site_id": target_site, "page": detail }))
+            Ok(json!({
+                "ok": true,
+                "site_id": target_site,
+                "page": if compact { detail.write_output() } else { detail.output(false) },
+            }))
         }
 
         "update_confluence_page" => {
@@ -1211,9 +1346,10 @@ async fn call_tool(
                 replacement.as_ref(),
                 section.as_ref(),
             )
-            .map_err(|e| e.to_string())?;
+            .map_err(|e| format_error(e.into()))?;
             let prev_version = args.page_version()?;
             let version_message = args.optional_str("version_message")?;
+            let compact = args.optional_bool("compact")?.unwrap_or(true);
 
             let (target_site, target_client) =
                 resolve_mcp_client(config, client, site_arg.as_deref())?;
@@ -1231,7 +1367,11 @@ async fn call_tool(
                 .await
                 .map_err(format_error)?;
             let _ = storage.upsert_page_detail_for_site(&target_site, &detail);
-            Ok(json!({ "ok": true, "site_id": target_site, "page": detail }))
+            Ok(json!({
+                "ok": true,
+                "site_id": target_site,
+                "page": if compact { detail.write_output() } else { detail.output(false) },
+            }))
         }
 
         "add_confluence_comment" => {
@@ -1633,11 +1773,13 @@ pub(crate) fn validate_tool_args(name: &str, arguments: &Value) -> Result<(), St
             let _ = args.optional_str("assignee_id")?;
             let _ = args.optional_str_array("labels")?;
             let _ = args.optional_str("parent_key")?;
+            let _ = args.optional_bool("compact")?;
             Ok(())
         }
         "update_jira_issue" => {
             let _ = args.required_str("key")?;
             let _ = args.optional_bool("dry_run")?;
+            let _ = args.optional_bool("compact")?;
             if args.get("replace_section")?.is_some() {
                 return Err("section replacement requires a Confluence Cloud ADF page".to_string());
             }
@@ -1724,11 +1866,13 @@ pub(crate) fn validate_tool_args(name: &str, arguments: &Value) -> Result<(), St
             let _ = args.required_str("title")?;
             let _ = args.optional_str("parent_id")?;
             let _ = args.optional_text("body_markdown")?;
+            let _ = args.optional_bool("compact")?;
             Ok(())
         }
         "update_confluence_page" => {
             let _ = args.required_str("page_id")?;
             let _ = args.optional_bool("dry_run")?;
+            let _ = args.optional_bool("compact")?;
             let title = args.optional_str("title")?;
             let (full, append, replacement) = args.body_inputs("body_markdown")?;
             let section = args.section_replacement()?;
@@ -1927,15 +2071,41 @@ fn tool_result(outcome: Result<Value, String>) -> Value {
                 "isError": false,
             })
         }
-        Err(err) => json!({
-            "content": [{ "type": "text", "text": err }],
-            "isError": true,
-        }),
+        Err(err) => {
+            let is_structured_error = serde_json::from_str::<Value>(&err)
+                .ok()
+                .and_then(|v| {
+                    v.as_object()
+                        .and_then(|o| o.get("ok"))
+                        .and_then(Value::as_bool)
+                })
+                == Some(false);
+            let text = if is_structured_error {
+                err
+            } else {
+                let payload = json!({
+                    "ok": false,
+                    "error": {
+                        "code": "error",
+                        "message": err,
+                    },
+                });
+                serde_json::to_string_pretty(&payload).unwrap_or_else(|_| payload.to_string())
+            };
+            json!({
+                "content": [{ "type": "text", "text": text }],
+                "isError": true,
+            })
+        }
     }
 }
 
 fn format_error(err: anyhow::Error) -> String {
-    format!("{err:#}")
+    let payload = json!({
+        "ok": false,
+        "error": error_payload(&err),
+    });
+    serde_json::to_string_pretty(&payload).unwrap_or_else(|_| payload.to_string())
 }
 
 pub(crate) fn normalize_abs_path(path: &Path) -> String {
@@ -2392,9 +2562,10 @@ fn tool_catalog() -> Vec<Value> {
                     "summary": { "type": "string", "minLength": 1 },
                     "description_markdown": { "type": "string" },
                     "priority": { "type": "string" },
-                    "assignee_id": { "type": "string" },
+                    "assignee_id": { "type": "string", "description": "Account ID or 'me'; a display name or email is resolved when the ID is rejected." },
                     "labels": { "type": "array", "items": { "type": "string" } },
-                    "parent_key": { "type": "string" }
+                    "parent_key": { "type": "string" },
+                    "compact": { "type": "boolean", "default": true, "description": "Set false for the full response structure." }
                 },
                 "required": ["project_key", "summary"],
                 "additionalProperties": false
@@ -2413,8 +2584,9 @@ fn tool_catalog() -> Vec<Value> {
                     "replace_text": text_replacement.clone(),
                     "dry_run": { "type": "boolean", "default": false, "description": "Preview the computed changes without saving." },
                     "priority": { "type": "string" },
-                    "assignee_id": { "type": ["string", "null"] },
-                    "labels": { "type": "array", "items": { "type": "string" } }
+                    "assignee_id": { "type": ["string", "null"], "description": "Account ID or 'me'; a display name or email is resolved when the ID is rejected." },
+                    "labels": { "type": "array", "items": { "type": "string" }, "description": "Replaces all labels; pass [] to clear." },
+                    "compact": { "type": "boolean", "default": true, "description": "Set false for the full response structure." }
                 },
                 "required": ["key"],
                 "additionalProperties": false
@@ -2589,7 +2761,8 @@ fn tool_catalog() -> Vec<Value> {
                     "space_id_or_key": { "type": "string", "minLength": 1 },
                     "parent_id": { "type": "string" },
                     "title": { "type": "string", "minLength": 1 },
-                    "body_markdown": { "type": "string" }
+                    "body_markdown": { "type": "string" },
+                    "compact": { "type": "boolean", "default": true, "description": "Set false for the full response structure." }
                 },
                 "required": ["space_id_or_key", "title"],
                 "additionalProperties": false
@@ -2618,7 +2791,8 @@ fn tool_catalog() -> Vec<Value> {
                     },
                     "dry_run": { "type": "boolean", "default": false, "description": "Preview the computed changes without saving." },
                     "prev_version": { "type": "integer", "minimum": 1 },
-                    "version_message": { "type": "string" }
+                    "version_message": { "type": "string" },
+                    "compact": { "type": "boolean", "default": true, "description": "Set false for the full response structure." }
                 },
                 "required": ["page_id"],
                 "additionalProperties": false

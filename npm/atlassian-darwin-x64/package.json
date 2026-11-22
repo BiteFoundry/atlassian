@@ -1,6 +1,6 @@
 {
   "name": "@bitefoundry/atlassian-darwin-x64",
-  "version": "0.6.0",
+  "version": "0.7.0",
   "description": "Prebuilt atlassian binary for macOS x64",
   "license": "MIT",
   "os": [

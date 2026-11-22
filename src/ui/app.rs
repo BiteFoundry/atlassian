@@ -2347,7 +2347,7 @@ impl AppState {
         let key_owned = key.to_string();
         tokio::spawn(async move {
             match client.transition_issue(&key_owned, &tr.id, None).await {
-                Ok(()) => {
+                Ok(_) => {
                     let _ = tx.send(UiMsg::IssueTransitioned {
                         key: key_owned.clone(),
                         to_status: tr.to_status.clone(),

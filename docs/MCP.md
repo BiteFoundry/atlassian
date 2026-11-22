@@ -96,7 +96,7 @@ args = ["mcp"]
 - **Notifications**: requests without `id` or methods starting with `notifications/` (such as `notifications/initialized`) emit no response.
 - **`ping`**: returns `{}`.
 - **Error codes**: `-32700` parse error, `-32600` invalid JSON-RPC envelope, `-32601` method not found.
-- **`tools/call`**: returns `{ "content": [{ "type": "text", "text": "<pretty JSON>" }], "isError": false }` on success, or `"isError": true` with an error message on validation or API failures.
+- **`tools/call`**: returns `{ "content": [{ "type": "text", "text": "<pretty JSON>" }], "isError": false }` on success, or `"isError": true` with structured JSON `{ "ok": false, "error": { "code", "message", "http_status"?, "details"? } }` on validation or API failures.
 
 ## Tools
 
@@ -111,11 +111,11 @@ args = ["mcp"]
 | `get_board_issues` | `board_id` (int), `sprint_id?` (int), `limit?` (1..1000, default 50), `cursor?` (string), `offline?` (bool) | `{ "board_id": ..., "sprint_id": ..., "issues": [...], "returned": ..., "has_more": ..., "next_cursor": ... }` |
 | `search_jira_issues` | `jql?`, `query?`, `project?`, `limit?` (1..1000), `page_token?` (Cloud), `start_at?` (Data Center, >= 0), `offline?` (bool) | `{ "jql": "...", "issues": [...], "next_page_token": ..., "next_start_at": ..., "total": ... }` or offline `{ "offline": true, "hits"\|"issues": [...] }` |
 | `get_jira_issue` | `key` (string), `offline?` (bool), `compact?` (bool) | `{ "issue": {...} }` |
-| `create_jira_issue` | `project_key`, `summary`, `issue_type?`, `description_markdown?`, `priority?`, `assignee_id?`, `labels?`, `parent_key?` | `{ "ok": true, "issue": {...} }` |
-| `update_jira_issue` | `key`, `summary?`, `description_markdown?`, `append_markdown?`, `replace_text?`, `priority?`, `assignee_id?` (`string\|null`), `labels?`, `dry_run?` (bool) | Updated `issue` or a `preview` |
+| `create_jira_issue` | `project_key`, `summary`, `issue_type?`, `description_markdown?`, `priority?`, `assignee_id?` (`"me"`, account ID, or display name/email), `labels?`, `parent_key?`, `compact?` (bool, default true) | `{ "ok": true, "site_id": "...", "issue": { "key", "summary", "status", "web_url" } }` (or full detail when `compact: false`) |
+| `update_jira_issue` | `key`, `summary?`, `description_markdown?`, `append_markdown?`, `replace_text?`, `priority?`, `assignee_id?` (`string\|null`, `"me"` or name/email), `labels?` (replaces all labels; `[]` clears), `dry_run?` (bool), `compact?` (bool, default true) | Compact updated `issue` (or full detail when `compact: false`) or a `preview` |
 | `list_jira_transitions` | `key` (string) | `{ "key": "...", "transitions": [...] }` |
-| `transition_jira_issue` | `key`, `transition`, `comment_markdown?` | `{ "ok": true, "key": "...", "transition": "..." }` |
-| `assign_jira_issue` | `key`, `assignee_id?` (`string\|null`, `"me"` resolves current user) | `{ "ok": true, "key": "...", "assignee_id": ... }` |
+| `transition_jira_issue` | `key`, `transition`, `comment_markdown?` | `{ "ok": true, "site_id": "...", "key": "...", "transition": "...", "transition_id": "...", "to_status"?: "..." }` |
+| `assign_jira_issue` | `key`, `assignee_id?` (`string\|null`, `"me"`, account ID, or display name/email) | `{ "ok": true, "site_id": "...", "key": "...", "assignee_id": ..., "resolved_assignee"?: {...} }` |
 | `add_jira_comment` | `key`, `body_markdown` | `{ "ok": true, "comment": {...} }` |
 | `upload_jira_attachment` | `key`, `path` (local file path) | `{ "ok": true, "key": "...", "attachments": [...] }` |
 | `delete_jira_issue` | `key`, `confirm` (must be literal `true`) | `{ "ok": true, "key": "..." }` |
@@ -133,8 +133,8 @@ args = ["mcp"]
 | `list_space_pages` | `space_key`, `limit?` (1..1000, default 50), `cursor?` (string), `offline?` (bool) | `{ "space_key": "...", "pages": [...], "returned": ..., "has_more": ..., "next_cursor": ... }` |
 | `list_child_pages` | `page_id`, `limit?` (1..1000, default 100), `cursor?` (string), `offline?` (bool) | `{ "parent_id": "...", "pages": [...], "returned": ..., "has_more": ..., "next_cursor": ... }` |
 | `get_confluence_page` | `page_id`, `offline?` (bool), `compact?` (bool) | `{ "page": {...} }` |
-| `create_confluence_page` | `space_id_or_key`, `title`, `body_markdown?`, `parent_id?` | `{ "ok": true, "page": {...} }` |
-| `update_confluence_page` | `page_id`, `title?`, `body_markdown?`, `append_markdown?`, `replace_text?`, `replace_section?`, `prev_version?`, `version_message?`, `dry_run?` (bool) | Updated `page` or a `preview` |
+| `create_confluence_page` | `space_id_or_key`, `title`, `body_markdown?`, `parent_id?`, `compact?` (bool, default true) | `{ "ok": true, "site_id": "...", "page": { "id", "title", "space_id", "space_key", "version_number", "web_url" } }` (or full detail when `compact: false`) |
+| `update_confluence_page` | `page_id`, `title?`, `body_markdown?`, `append_markdown?`, `replace_text?`, `replace_section?`, `prev_version?`, `version_message?`, `dry_run?` (bool), `compact?` (bool, default true) | Compact updated `page` (or full detail when `compact: false`) or a `preview` |
 | `add_confluence_comment` | `page_id`, `body_markdown` | `{ "ok": true, "comment": {...} }` |
 | `search_confluence_pages` | `query?`, `cql?`, `remote?` (bool), `limit?` (1..1000) | `{ "remote": ..., "hits"\|"pages": [...] }` |
 

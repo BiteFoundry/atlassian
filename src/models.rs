@@ -420,6 +420,15 @@ impl IssueDetail {
             "hint": hint,
         })
     }
+
+    pub(crate) fn write_output(&self) -> serde_json::Value {
+        serde_json::json!({
+            "key": self.summary.key,
+            "summary": self.summary.summary,
+            "status": self.summary.status,
+            "web_url": self.summary.web_url,
+        })
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -622,6 +631,17 @@ impl PageDetail {
                 "fields": PAGE_COMPACT_OMITTED_FIELDS,
             },
             "hint": hint,
+        })
+    }
+
+    pub(crate) fn write_output(&self) -> serde_json::Value {
+        serde_json::json!({
+            "id": self.summary.id,
+            "title": self.summary.title,
+            "space_id": self.summary.space_id,
+            "space_key": self.summary.space_key,
+            "version_number": self.summary.version_number,
+            "web_url": self.summary.web_url,
         })
     }
 }

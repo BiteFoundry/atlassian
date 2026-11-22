@@ -6,10 +6,15 @@
 use std::collections::{HashMap, HashSet};
 
 use anyhow::{bail, Result};
+use reqwest::StatusCode;
 use serde::{Deserialize, Serialize};
+use serde_json::{json, Value};
 
 use crate::{
-    atlassian::AtlassianClient,
+    atlassian::{
+        client::{CodedError, HttpStatusError},
+        AtlassianClient,
+    },
     models::{BoardSummary, ProjectSummary, SpaceSummary, UserSummary},
     storage::Storage,
 };
@@ -949,6 +954,68 @@ pub async fn resolve_user(
     let me = api.get_myself().await?;
     let merged = merge_users(cached, vec![me]);
     resolve_user_from_slice(&merged, q)
+}
+
+/// 서버가 담당자 값을 거부한 뒤 이름·이메일로 한 번 찾아본다.
+/// `None`이면 호출자는 원래 오류를 그대로 반환한다.
+pub(crate) async fn resolve_rejected_assignee(
+    client: &AtlassianClient,
+    scope_key: &str,
+    raw: &str,
+    err: &anyhow::Error,
+    require_assignee_field: bool,
+) -> Option<Result<UserSummary>> {
+    let http_err = err.downcast_ref::<HttpStatusError>()?;
+    if !matches!(
+        http_err.status,
+        StatusCode::BAD_REQUEST | StatusCode::NOT_FOUND
+    ) {
+        return None;
+    }
+    if require_assignee_field {
+        let has_assignee_error = serde_json::from_str::<Value>(&http_err.body)
+            .ok()
+            .and_then(|v| v.get("errors").and_then(|e| e.as_object()).cloned())
+            .is_some_and(|obj| obj.contains_key("assignee"));
+        if !has_assignee_error {
+            return None;
+        }
+    }
+    let q = raw.trim();
+    if q.is_empty() {
+        return None;
+    }
+    let users = client.search_assignable_users(scope_key, q).await.ok()?;
+    match users.len() {
+        0 => None,
+        1 => Some(Ok(users.into_iter().next().unwrap())),
+        _ => match resolve_user_from_slice(&users, q) {
+            Ok(user) => Some(Ok(user)),
+            Err(_) => {
+                let refs: Vec<&UserSummary> = users.iter().collect();
+                let candidates: Vec<Value> = users
+                    .iter()
+                    .map(|u| {
+                        json!({
+                            "id": u.id,
+                            "display_name": u.display_name,
+                            "email": u.email,
+                        })
+                    })
+                    .collect();
+                Some(Err(CodedError {
+                    code: "ambiguous_user",
+                    message: format!(
+                        "'{q}'에 해당하는 사용자가 {}명입니다. accountId로 지정하세요:\n{}",
+                        users.len(),
+                        format_user_candidates(&refs),
+                    ),
+                    details: Some(json!({ "candidates": candidates })),
+                }
+                .into()))
+            }
+        },
+    }
 }
 
 fn is_self_alias(q: &str) -> bool {

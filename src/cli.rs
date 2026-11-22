@@ -14,7 +14,7 @@ use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 use crate::{
     atlassian::{
         body::{BodyEdit, SectionReplacement, TextReplacement},
-        client::is_not_found_error,
+        client::{error_payload, is_not_found_error},
         AtlassianClient, SiteClientPool,
     },
     auth::{
@@ -29,6 +29,7 @@ use crate::{
         parse_offset_cursor, slice_page, AttachmentItem, BoardSummary, IssueDetail, IssueSummary,
         IssueUpdate, OutgoingIssue, OutgoingPage, PageDetail, SprintSummary, StatusCategory,
     },
+    resolver::resolve_rejected_assignee,
     serve::{self, ServeOptions},
     storage::{SiteRecord, Storage},
     sync::{self, SiteSyncTarget},
@@ -36,6 +37,26 @@ use crate::{
 };
 
 const DELETE_JSON_REQUIRES_YES: &str = "Deleting in --json mode requires passing --yes.";
+
+#[derive(Debug, thiserror::Error)]
+#[error("{0}")]
+struct JsonReported(String);
+
+pub fn report_error(err: &anyhow::Error) {
+    eprintln!("오류: {err:#}");
+    if err.downcast_ref::<JsonReported>().is_some() {
+        return;
+    }
+    if std::env::args_os().skip(1).any(|a| a == "--json") {
+        let payload = json!({
+            "ok": false,
+            "error": error_payload(err),
+        });
+        if let Ok(text) = serde_json::to_string_pretty(&payload) {
+            println!("{text}");
+        }
+    }
+}
 
 #[derive(ValueEnum, Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DeploymentArg {
@@ -110,7 +131,7 @@ pub struct EditBodyArgs {
         conflicts_with_all = ["body", "body_file", "append", "append_file"]
     )]
     replace: Option<Vec<String>>,
-    /// Preview the computed changes without saving
+    /// Preview the computed changes without saving (always prints JSON)
     #[arg(long)]
     dry_run: bool,
 }
@@ -406,6 +427,7 @@ pub enum Command {
     /// Create a new Jira issue
     #[command(visible_alias = "new")]
     Create {
+        /// Project key (default: config default_project)
         #[arg(long)]
         project: Option<String>,
         #[arg(long = "type", default_value = "Task")]
@@ -418,14 +440,20 @@ pub enum Command {
         body_file: Option<PathBuf>,
         #[arg(long)]
         priority: Option<String>,
+        /// Account ID, "me", or a display name / email (resolved when the ID is rejected)
         #[arg(long)]
         assignee: Option<String>,
+        /// Label to set (repeat for several)
         #[arg(long = "label")]
         label: Vec<String>,
+        /// Parent issue key
         #[arg(long)]
         parent: Option<String>,
         #[arg(long)]
         json: bool,
+        /// Return the full structure: native body, blocks, comments, attachments
+        #[arg(long, requires = "json")]
+        full: bool,
     },
     /// Edit fields of an existing Jira issue
     Edit {
@@ -436,12 +464,17 @@ pub enum Command {
         body: EditBodyArgs,
         #[arg(long)]
         priority: Option<String>,
+        /// Account ID, "me", "none" (unassign), or a display name / email (resolved when the ID is rejected)
         #[arg(long)]
         assignee: Option<String>,
+        /// Replace all labels with the given set (repeat for several)
         #[arg(long = "label")]
         label: Option<Vec<String>>,
         #[arg(long)]
         json: bool,
+        /// Return the full structure: native body, blocks, comments, attachments
+        #[arg(long, requires = "json")]
+        full: bool,
     },
     /// Transition a Jira issue workflow status or list available transitions
     #[command(visible_alias = "move")]
@@ -458,6 +491,7 @@ pub enum Command {
     /// Assign or unassign a Jira issue (supports `--to me`)
     Assign {
         key: String,
+        /// Account ID, "me", or a display name / email (resolved when the ID is rejected)
         #[arg(long)]
         to: Option<String>,
         #[arg(long)]
@@ -711,6 +745,9 @@ pub enum ConfluenceCommand {
         body_file: Option<PathBuf>,
         #[arg(long)]
         json: bool,
+        /// Return the full structure: native body, blocks, comments, attachments
+        #[arg(long, requires = "json")]
+        full: bool,
     },
     /// Edit a Confluence page
     Edit {
@@ -719,13 +756,16 @@ pub enum ConfluenceCommand {
         title: Option<String>,
         #[command(flatten)]
         body: PageBodyArgs,
-        /// Current page version from view (required for body edits)
+        /// Current page version from view (required for body edits; optional for title/message-only edits)
         #[arg(long = "prev-version")]
         prev_version: Option<i32>,
         #[arg(long, allow_hyphen_values = true)]
         message: Option<String>,
         #[arg(long)]
         json: bool,
+        /// Return the full structure: native body, blocks, comments, attachments
+        #[arg(long, requires = "json")]
+        full: bool,
     },
     /// Add a Markdown comment to a Confluence page
     Comment {
@@ -907,6 +947,9 @@ pub enum WikiCommand {
         body_file: Option<PathBuf>,
         #[arg(long)]
         json: bool,
+        /// Return the full structure: native body, blocks, comments, attachments
+        #[arg(long, requires = "json")]
+        full: bool,
     },
     /// Edit a Confluence page
     Edit {
@@ -915,13 +958,16 @@ pub enum WikiCommand {
         title: Option<String>,
         #[command(flatten)]
         body: PageBodyArgs,
-        /// Current page version from view (required for body edits)
+        /// Current page version from view (required for body edits; optional for title/message-only edits)
         #[arg(long = "prev-version")]
         prev_version: Option<i32>,
         #[arg(long, allow_hyphen_values = true)]
         message: Option<String>,
         #[arg(long)]
         json: bool,
+        /// Return the full structure: native body, blocks, comments, attachments
+        #[arg(long, requires = "json")]
+        full: bool,
     },
     /// Add a comment to a Confluence page
     Comment {
@@ -1071,6 +1117,7 @@ pub enum JiraSubcommand {
     /// Create a new Jira issue
     #[command(visible_alias = "new")]
     Create {
+        /// Project key (default: config default_project)
         #[arg(long)]
         project: Option<String>,
         #[arg(long = "type", default_value = "Task")]
@@ -1083,14 +1130,20 @@ pub enum JiraSubcommand {
         body_file: Option<PathBuf>,
         #[arg(long)]
         priority: Option<String>,
+        /// Account ID, "me", or a display name / email (resolved when the ID is rejected)
         #[arg(long)]
         assignee: Option<String>,
+        /// Label to set (repeat for several)
         #[arg(long = "label")]
         label: Vec<String>,
+        /// Parent issue key
         #[arg(long)]
         parent: Option<String>,
         #[arg(long)]
         json: bool,
+        /// Return the full structure: native body, blocks, comments, attachments
+        #[arg(long, requires = "json")]
+        full: bool,
     },
     /// Edit a Jira issue
     Edit {
@@ -1101,12 +1154,17 @@ pub enum JiraSubcommand {
         body: EditBodyArgs,
         #[arg(long)]
         priority: Option<String>,
+        /// Account ID, "me", "none" (unassign), or a display name / email (resolved when the ID is rejected)
         #[arg(long)]
         assignee: Option<String>,
+        /// Replace all labels with the given set (repeat for several)
         #[arg(long = "label")]
         label: Option<Vec<String>>,
         #[arg(long)]
         json: bool,
+        /// Return the full structure: native body, blocks, comments, attachments
+        #[arg(long, requires = "json")]
+        full: bool,
     },
     /// Transition a Jira issue status
     #[command(visible_alias = "move")]
@@ -1123,6 +1181,7 @@ pub enum JiraSubcommand {
     /// Assign or unassign a Jira issue
     Assign {
         key: String,
+        /// Account ID, "me", or a display name / email (resolved when the ID is rejected)
         #[arg(long)]
         to: Option<String>,
         #[arg(long)]
@@ -1764,6 +1823,7 @@ async fn dispatch_jira_cli(
             label,
             parent,
             json,
+            full,
         }) => {
             let scoped = apply_site_override(cfg, site_override.as_deref())?;
             Box::pin(cmd_issue_create(
@@ -1778,6 +1838,7 @@ async fn dispatch_jira_cli(
                 label,
                 parent.as_deref(),
                 json,
+                full,
             ))
             .await
         }
@@ -1789,10 +1850,11 @@ async fn dispatch_jira_cli(
             assignee,
             label,
             json,
+            full,
         }) => {
             let scoped = apply_site_override(cfg, site_override.as_deref())?;
             Box::pin(cmd_issue_edit(
-                &scoped, &key, summary, body, priority, assignee, label, json,
+                &scoped, &key, summary, body, priority, assignee, label, json, full,
             ))
             .await
         }
@@ -2055,6 +2117,7 @@ async fn dispatch_confluence_cli(
             body,
             body_file,
             json,
+            full,
         }) => {
             let scoped = apply_site_override(cfg, site_override.as_deref())?;
             Box::pin(cmd_page_create(
@@ -2065,6 +2128,7 @@ async fn dispatch_confluence_cli(
                 body.as_deref(),
                 body_file.as_deref(),
                 json,
+                full,
             ))
             .await
         }
@@ -2075,6 +2139,7 @@ async fn dispatch_confluence_cli(
             prev_version,
             message,
             json,
+            full,
         }) => {
             let scoped = apply_site_override(cfg, site_override.as_deref())?;
             Box::pin(cmd_page_edit(
@@ -2085,6 +2150,7 @@ async fn dispatch_confluence_cli(
                 prev_version,
                 message,
                 json,
+                full,
             ))
             .await
         }
@@ -2254,6 +2320,7 @@ async fn dispatch_wiki_subcommand(cfg: &AppConfig, command: WikiCommand) -> Resu
             body,
             body_file,
             json,
+            full,
         } => {
             Box::pin(cmd_page_create(
                 cfg,
@@ -2263,6 +2330,7 @@ async fn dispatch_wiki_subcommand(cfg: &AppConfig, command: WikiCommand) -> Resu
                 body.as_deref(),
                 body_file.as_deref(),
                 json,
+                full,
             ))
             .await
         }
@@ -2273,6 +2341,7 @@ async fn dispatch_wiki_subcommand(cfg: &AppConfig, command: WikiCommand) -> Resu
             prev_version,
             message,
             json,
+            full,
         } => {
             Box::pin(cmd_page_edit(
                 cfg,
@@ -2282,6 +2351,7 @@ async fn dispatch_wiki_subcommand(cfg: &AppConfig, command: WikiCommand) -> Resu
                 prev_version,
                 message,
                 json,
+                full,
             ))
             .await
         }
@@ -2415,6 +2485,7 @@ async fn dispatch_jira_subcommand(cfg: &AppConfig, command: JiraSubcommand) -> R
             label,
             parent,
             json,
+            full,
         } => {
             Box::pin(cmd_issue_create(
                 cfg,
@@ -2428,6 +2499,7 @@ async fn dispatch_jira_subcommand(cfg: &AppConfig, command: JiraSubcommand) -> R
                 label,
                 parent.as_deref(),
                 json,
+                full,
             ))
             .await
         }
@@ -2439,9 +2511,10 @@ async fn dispatch_jira_subcommand(cfg: &AppConfig, command: JiraSubcommand) -> R
             assignee,
             label,
             json,
+            full,
         } => {
             Box::pin(cmd_issue_edit(
-                cfg, &key, summary, body, priority, assignee, label, json,
+                cfg, &key, summary, body, priority, assignee, label, json, full,
             ))
             .await
         }
@@ -2931,7 +3004,7 @@ async fn cmd_login(
                 "deployment": effective_deployment,
                 "site_url": effective_site_url,
                 "confluence_url": effective_conf_url,
-                "account_id": account_id,
+                "credential_account": account_id,
                 "user": me,
             }))?
         );
@@ -3672,7 +3745,7 @@ async fn cmd_whoami(cfg: &AppConfig, persona: Persona, json_out: bool) -> Result
             serde_json::to_string_pretty(&json!({
                 "persona": persona.as_str(),
                 "site_id": client.site_id(),
-                "account_id": auth.profile(),
+                "credential_account": auth.profile(),
                 "deployment": effective_deployment,
                 "site_url": effective_site_url,
                 "confluence_url": effective_conf_url,
@@ -3738,7 +3811,7 @@ async fn cmd_doctor(
                 "persona": persona.as_str(),
                 "profile": cfg.profile,
                 "site_id": client.site_id(),
-                "account_id": auth.profile(),
+                "credential_account": auth.profile(),
                 "deployment": effective_deployment,
                 "site_url": effective_site_url,
                 "confluence_url": effective_conf_url,
@@ -4245,6 +4318,7 @@ async fn cmd_issue_create(
     labels: Vec<String>,
     parent: Option<&str>,
     json_out: bool,
+    full: bool,
 ) -> Result<()> {
     let project_key = project
         .or(cfg.default_project.as_deref())
@@ -4255,13 +4329,13 @@ async fn cmd_issue_create(
 
     let (_auth, client, storage) = open_runtime(cfg, true)?;
     let site_id = client.site_id();
-    let assignee_id = match assignee.map(str::trim) {
-        Some(v) if v.eq_ignore_ascii_case("me") => Some(client.get_myself().await?.id),
-        Some(v) if !v.is_empty() => Some(v.to_string()),
-        _ => None,
+    let (assignee_id, raw_assignee) = match assignee.map(str::trim) {
+        Some(v) if v.eq_ignore_ascii_case("me") => (Some(client.get_myself().await?.id), None),
+        Some(v) if !v.is_empty() => (Some(v.to_string()), Some(v.to_string())),
+        _ => (None, None),
     };
 
-    let req = OutgoingIssue {
+    let mut req = OutgoingIssue {
         project_key: project_key.to_string(),
         issue_type: issue_type.to_string(),
         summary: summary.to_string(),
@@ -4271,14 +4345,40 @@ async fn cmd_issue_create(
         labels,
         parent_key: parent.map(str::to_string),
     };
-    let created = client.create_issue(&req).await?;
+    let mut resolved_assignee = None;
+    let created = match client.create_issue(&req).await {
+        Ok(created) => created,
+        Err(err) => {
+            if let Some(raw) = raw_assignee.as_deref() {
+                match resolve_rejected_assignee(&client, project_key, raw, &err, true).await {
+                    Some(Ok(user)) => {
+                        req.assignee_id = Some(user.id.clone());
+                        resolved_assignee = Some(user);
+                        client.create_issue(&req).await?
+                    }
+                    Some(Err(ambig)) => return Err(ambig),
+                    None => return Err(err),
+                }
+            } else {
+                return Err(err);
+            }
+        }
+    };
     let _ = storage.upsert_issue_detail_for_site(site_id, &created);
 
     if json_out {
-        println!(
-            "{}",
-            serde_json::to_string_pretty(&json!({ "ok": true, "issue": created }))?
-        );
+        let mut payload = json!({
+            "ok": true,
+            "site_id": site_id,
+            "issue": if full { created.output(false) } else { created.write_output() },
+        });
+        if let Some(user) = resolved_assignee {
+            payload["resolved_assignee"] = json!({
+                "id": user.id,
+                "display_name": user.display_name,
+            });
+        }
+        println!("{}", serde_json::to_string_pretty(&payload)?);
     } else {
         println!(
             "이슈 생성 완료: {} — {} ({})",
@@ -4384,6 +4484,7 @@ async fn dispatch_jira_workflow(cfg: &AppConfig, command: JiraWorkflow) -> Resul
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn cmd_issue_edit(
     cfg: &AppConfig,
     key: &str,
@@ -4393,11 +4494,12 @@ async fn cmd_issue_edit(
     assignee: Option<String>,
     labels: Option<Vec<String>>,
     json_out: bool,
+    full: bool,
 ) -> Result<()> {
     let dry_run = body.dry_run;
-    let (full, append, replacement) = body.read()?;
+    let (full_body, append, replacement) = body.read()?;
     let edit = BodyEdit::from_inputs(
-        full.as_deref(),
+        full_body.as_deref(),
         append.as_deref(),
         replacement.as_ref(),
         None,
@@ -4413,14 +4515,16 @@ async fn cmd_issue_edit(
 
     let (_auth, client) = open_client(cfg, true)?;
     let site_id = client.site_id();
-    let assignee_id = match assignee.as_deref().map(str::trim) {
-        None => None,
-        Some("") | Some("none") | Some("unassign") => Some(None),
-        Some(v) if v.eq_ignore_ascii_case("me") => Some(Some(client.get_myself().await?.id)),
-        Some(v) => Some(Some(v.to_string())),
+    let (assignee_id, raw_assignee) = match assignee.as_deref().map(str::trim) {
+        None => (None, None),
+        Some("") | Some("none") | Some("unassign") => (Some(None), None),
+        Some(v) if v.eq_ignore_ascii_case("me") => {
+            (Some(Some(client.get_myself().await?.id)), None)
+        }
+        Some(v) => (Some(Some(v.to_string())), Some(v.to_string())),
     };
 
-    let patch = IssueUpdate {
+    let mut patch = IssueUpdate {
         summary,
         description_markdown: None,
         priority,
@@ -4432,14 +4536,40 @@ async fn cmd_issue_edit(
         return print_edit_preview(site_id, preview);
     }
     let storage = Storage::open(&config::cache_db_path(&cfg.profile))?;
-    let updated = client.edit_issue(key, &patch, edit).await?;
+    let mut resolved_assignee = None;
+    let updated = match client.edit_issue(key, &patch, edit).await {
+        Ok(updated) => updated,
+        Err(err) => {
+            if let Some(raw) = raw_assignee.as_deref() {
+                match resolve_rejected_assignee(&client, key, raw, &err, true).await {
+                    Some(Ok(user)) => {
+                        patch.assignee_id = Some(Some(user.id.clone()));
+                        resolved_assignee = Some(user);
+                        client.edit_issue(key, &patch, edit).await?
+                    }
+                    Some(Err(ambig)) => return Err(ambig),
+                    None => return Err(err),
+                }
+            } else {
+                return Err(err);
+            }
+        }
+    };
     let _ = storage.upsert_issue_detail_for_site(site_id, &updated);
 
     if json_out {
-        println!(
-            "{}",
-            serde_json::to_string_pretty(&json!({ "ok": true, "issue": updated }))?
-        );
+        let mut payload = json!({
+            "ok": true,
+            "site_id": site_id,
+            "issue": if full { updated.output(false) } else { updated.write_output() },
+        });
+        if let Some(user) = resolved_assignee {
+            payload["resolved_assignee"] = json!({
+                "id": user.id,
+                "display_name": user.display_name,
+            });
+        }
+        println!("{}", serde_json::to_string_pretty(&payload)?);
     } else {
         println!(
             "이슈 수정 완료: {} — {}",
@@ -4458,6 +4588,7 @@ async fn cmd_issue_transition(
     json_out: bool,
 ) -> Result<()> {
     let (_auth, client, storage) = open_runtime(cfg, true)?;
+    let site_id = client.site_id();
 
     if list || status.is_none() {
         let transitions = client.list_transitions(key).await?;
@@ -4478,18 +4609,25 @@ async fn cmd_issue_transition(
     }
 
     let target = status.unwrap();
-    client.transition_issue(key, target, comment).await?;
+    let executed = client.transition_issue(key, target, comment).await?;
     refresh_cli_issue_cache(&client, &storage, key).await;
 
     if json_out {
-        println!(
-            "{}",
-            serde_json::to_string_pretty(&json!({
-                "ok": true,
-                "key": key,
-                "transition": target,
-            }))?
-        );
+        let transition_id = executed
+            .as_ref()
+            .map(|t| t.id.as_str())
+            .unwrap_or_else(|| target.trim());
+        let mut payload = json!({
+            "ok": true,
+            "site_id": site_id,
+            "key": key,
+            "transition": target,
+            "transition_id": transition_id,
+        });
+        if let Some(tr) = executed {
+            payload["to_status"] = json!(tr.to_status.name);
+        }
+        println!("{}", serde_json::to_string_pretty(&payload)?);
     } else {
         println!("{key}: '{target}'(으)로 상태 전환했습니다.");
     }
@@ -4507,28 +4645,57 @@ async fn cmd_issue_assign(
         bail!("`--to <USER_OR_ME>` 또는 `--unassign` 을 지정하세요.");
     }
     let (_auth, client, storage) = open_runtime(cfg, true)?;
-    let target_id = if unassign {
-        None
+    let site_id = client.site_id();
+    let (mut target_id, raw_assignee) = if unassign {
+        (None, None)
     } else {
         let raw = to.unwrap().trim();
         if raw.eq_ignore_ascii_case("me") {
-            Some(client.get_myself().await?.id)
+            (Some(client.get_myself().await?.id), None)
         } else {
-            Some(raw.to_string())
+            (
+                Some(raw.to_string()),
+                (!raw.is_empty()).then(|| raw.to_string()),
+            )
         }
     };
 
-    client.assign_issue(key, target_id.as_deref()).await?;
+    let mut resolved_assignee = None;
+    if let Err(err) = client.assign_issue(key, target_id.as_deref()).await {
+        if let Some(raw) = raw_assignee.as_deref() {
+            match resolve_rejected_assignee(&client, key, raw, &err, false).await {
+                Some(Ok(user)) => {
+                    target_id = Some(user.id.clone());
+                    resolved_assignee = Some(user);
+                    client.assign_issue(key, target_id.as_deref()).await?;
+                }
+                Some(Err(ambig)) => return Err(ambig),
+                None => return Err(err),
+            }
+        } else {
+            return Err(err);
+        }
+    }
     refresh_cli_issue_cache(&client, &storage, key).await;
 
     if json_out {
+        let mut payload = json!({
+            "ok": true,
+            "site_id": site_id,
+            "key": key,
+            "assignee_id": target_id,
+        });
+        if let Some(user) = resolved_assignee {
+            payload["resolved_assignee"] = json!({
+                "id": user.id,
+                "display_name": user.display_name,
+            });
+        }
+        println!("{}", serde_json::to_string_pretty(&payload)?);
+    } else if let Some(user) = resolved_assignee {
         println!(
-            "{}",
-            serde_json::to_string_pretty(&json!({
-                "ok": true,
-                "key": key,
-                "assignee_id": target_id,
-            }))?
+            "{key}: 담당자를 '{}'({})(으)로 지정했습니다.",
+            user.display_name, user.id
         );
     } else if let Some(uid) = target_id {
         println!("{key}: 담당자를 '{uid}'(으)로 지정했습니다.");
@@ -4959,6 +5126,7 @@ async fn cmd_page_view(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn cmd_page_create(
     cfg: &AppConfig,
     space: Option<&str>,
@@ -4967,6 +5135,7 @@ async fn cmd_page_create(
     body: Option<&str>,
     body_file: Option<&Path>,
     json_out: bool,
+    full: bool,
 ) -> Result<()> {
     let space_id_or_key = space
         .or(cfg.default_space_key.as_deref())
@@ -4989,7 +5158,11 @@ async fn cmd_page_create(
     if json_out {
         println!(
             "{}",
-            serde_json::to_string_pretty(&json!({ "ok": true, "page": created }))?
+            serde_json::to_string_pretty(&json!({
+                "ok": true,
+                "site_id": site_id,
+                "page": if full { created.output(false) } else { created.write_output() },
+            }))?
         );
     } else {
         println!(
@@ -5044,6 +5217,7 @@ async fn dispatch_confluence_workflow(cfg: &AppConfig, command: ConfluenceWorkfl
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn cmd_page_edit(
     cfg: &AppConfig,
     page_id: &str,
@@ -5052,9 +5226,10 @@ async fn cmd_page_edit(
     prev_version: Option<i32>,
     message: Option<String>,
     json_out: bool,
+    full: bool,
 ) -> Result<()> {
     let dry_run = body.body.dry_run;
-    let (full, append, replacement) = body.body.read()?;
+    let (full_body, append, replacement) = body.body.read()?;
     let section = body.replace_section.map(|values| {
         let mut values = values.into_iter();
         SectionReplacement {
@@ -5063,7 +5238,7 @@ async fn cmd_page_edit(
         }
     });
     let edit = BodyEdit::from_inputs(
-        full.as_deref(),
+        full_body.as_deref(),
         append.as_deref(),
         replacement.as_ref(),
         section.as_ref(),
@@ -5085,7 +5260,11 @@ async fn cmd_page_edit(
     if json_out {
         println!(
             "{}",
-            serde_json::to_string_pretty(&json!({ "ok": true, "site_id": site_id, "page": updated }))?
+            serde_json::to_string_pretty(&json!({
+                "ok": true,
+                "site_id": site_id,
+                "page": if full { updated.output(false) } else { updated.write_output() },
+            }))?
         );
     } else {
         println!(
@@ -5397,16 +5576,37 @@ async fn cmd_sync(cfg: &AppConfig, site_filter: Option<&str>, json_out: bool) ->
         .await;
         let counts = storage.cache_counts()?;
         let all_failed = outcome.total_sites > 0 && outcome.succeeded_sites == 0;
+        let all_failed_msg = if all_failed {
+            let reasons: Vec<String> = outcome
+                .per_site
+                .iter()
+                .map(|s| {
+                    let reason = s.error.as_deref().unwrap_or(s.summary.as_str());
+                    format!("{}: {reason}", s.site_id)
+                })
+                .collect();
+            Some(format!(
+                "Sync failed for all sites ({}): {}",
+                outcome.summary,
+                reasons.join("; ")
+            ))
+        } else {
+            None
+        };
         if json_out {
-            println!(
-                "{}",
-                serde_json::to_string_pretty(&json!({
-                    "ok": outcome.succeeded_sites > 0,
-                    "summary": outcome.summary,
-                    "sites": outcome.per_site,
-                    "counts": counts,
-                }))?
-            );
+            let mut payload = json!({
+                "ok": outcome.succeeded_sites > 0,
+                "summary": outcome.summary,
+                "sites": outcome.per_site,
+                "counts": counts,
+            });
+            if let Some(ref msg) = all_failed_msg {
+                payload["error"] = json!({
+                    "code": "sync_failed",
+                    "message": msg,
+                });
+            }
+            println!("{}", serde_json::to_string_pretty(&payload)?);
         } else {
             if all_failed {
                 println!("Sync failed: {}", outcome.summary);
@@ -5425,20 +5625,11 @@ async fn cmd_sync(cfg: &AppConfig, site_filter: Option<&str>, json_out: bool) ->
                 counts.projects, counts.boards, counts.issues, counts.spaces, counts.pages
             );
         }
-        if all_failed {
-            let reasons: Vec<String> = outcome
-                .per_site
-                .iter()
-                .map(|s| {
-                    let reason = s.error.as_deref().unwrap_or(s.summary.as_str());
-                    format!("{}: {reason}", s.site_id)
-                })
-                .collect();
-            bail!(
-                "Sync failed for all sites ({}): {}",
-                outcome.summary,
-                reasons.join("; ")
-            );
+        if let Some(msg) = all_failed_msg {
+            if json_out {
+                return Err(JsonReported(msg).into());
+            }
+            bail!("{msg}");
         }
         return Ok(());
     }

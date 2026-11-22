@@ -17,7 +17,7 @@ use crate::{
         body::{body_change, same_markdown, BodyEdit, BodyEditError},
         client::{
             first_nonempty_str, json_id_to_string, offset_page_state, parse_attachment_item,
-            parse_user_summary, HttpStatusError,
+            parse_user_summary, CodedError, HttpStatusError,
         },
         AtlassianClient,
     },
@@ -892,7 +892,7 @@ impl AtlassianClient {
         key: &str,
         transition_id_or_name: &str,
         comment_markdown: Option<&str>,
-    ) -> Result<()> {
+    ) -> Result<Option<IssueTransition>> {
         let base = self.require_site_url()?;
         let ver = self.jira_api_version();
         let encoded_key = urlencoding::encode(key);
@@ -901,29 +901,61 @@ impl AtlassianClient {
             bail!("전환(transition) ID 또는 이름을 입력하세요.");
         }
 
-        let resolved_id = if target.chars().all(|c| c.is_ascii_digit()) {
-            target.to_string()
+        let (resolved_id, selected) = if target.chars().all(|c| c.is_ascii_digit()) {
+            (target.to_string(), None)
         } else {
             let transitions = self.list_transitions(key).await?;
-            transitions
-                .iter()
-                .find(|t| t.id == target)
-                .or_else(|| {
+            let chosen = if let Some(exact_id) = transitions.iter().find(|t| t.id == target) {
+                exact_id.clone()
+            } else {
+                let by_name: Vec<&IssueTransition> = transitions
+                    .iter()
+                    .filter(|t| t.name.eq_ignore_ascii_case(target))
+                    .collect();
+                let matches = if !by_name.is_empty() {
+                    by_name
+                } else {
                     transitions
                         .iter()
-                        .find(|t| t.name.eq_ignore_ascii_case(target))
-                })
-                .or_else(|| {
-                    transitions
-                        .iter()
-                        .find(|t| t.to_status.name.eq_ignore_ascii_case(target))
-                })
-                .map(|t| t.id.clone())
-                .ok_or_else(|| {
-                    anyhow!(
-                        "이슈 {key}에서 전환 '{target}'을(를) 찾을 수 없습니다."
-                    )
-                })?
+                        .filter(|t| t.to_status.name.eq_ignore_ascii_case(target))
+                        .collect()
+                };
+                match matches.as_slice() {
+                    [only] => (*only).clone(),
+                    [] => {
+                        return Err(anyhow!(
+                            "이슈 {key}에서 전환 '{target}'을(를) 찾을 수 없습니다."
+                        ));
+                    }
+                    many => {
+                        let list = many
+                            .iter()
+                            .map(|t| format!("[{}] {} -> {}", t.id, t.name, t.to_status.name))
+                            .collect::<Vec<_>>()
+                            .join(", ");
+                        let candidates: Vec<Value> = many
+                            .iter()
+                            .map(|t| {
+                                json!({
+                                    "id": t.id,
+                                    "name": t.name,
+                                    "to_status": t.to_status.name,
+                                })
+                            })
+                            .collect();
+                        return Err(CodedError {
+                            code: "ambiguous_transition",
+                            message: format!(
+                                "이슈 {key}에서 '{target}'에 해당하는 전환이 {}개입니다. 전환 ID로 지정하세요: {list}",
+                                many.len()
+                            ),
+                            details: Some(json!({ "candidates": candidates })),
+                        }
+                        .into());
+                    }
+                }
+            };
+            (chosen.id.clone(), Some(chosen))
         };
 
         let url = format!("{base}/rest/api/{ver}/issue/{encoded_key}/transitions");
@@ -934,7 +966,7 @@ impl AtlassianClient {
             self.add_issue_comment(key, comment).await?;
         }
 
-        Ok(())
+        Ok(selected)
     }
 
     pub async fn assign_issue(&self, key: &str, assignee_id: Option<&str>) -> Result<()> {
@@ -1878,12 +1910,15 @@ mod tests {
         assert!(created.linked_pages.iter().any(|p| p.page_id == "998877"));
 
         // Transition by status name ("done") + comment
-        client
+        let by_name = client
             .transition_issue("ENG-42", "done", Some("Closing out"))
             .await
             .unwrap();
+        assert_eq!(by_name.as_ref().map(|t| t.id.as_str()), Some("21"));
+        assert_eq!(by_name.as_ref().map(|t| t.to_status.name.as_str()), Some("Done"));
         // Transition by numeric ID without comment
-        client.transition_issue("ENG-42", "11", None).await.unwrap();
+        let by_id = client.transition_issue("ENG-42", "11", None).await.unwrap();
+        assert!(by_id.is_none());
         assert_eq!(
             *transition_called.lock().unwrap(),
             vec!["21".to_string(), "11".to_string()]
@@ -1911,6 +1946,71 @@ mod tests {
         assert_eq!(filters[0].name, "My Bugs");
 
         client.delete_issue("ENG-42").await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn transition_issue_rejects_ambiguous_target_without_posting() {
+        let posted: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+        let posted_c = posted.clone();
+
+        let app = Router::new().route(
+            "/rest/api/3/issue/KAN-10/transitions",
+            get(|| async {
+                Json(json!({
+                    "transitions": [
+                        { "id": "41", "name": "Submit for Review", "to": { "id": "3", "name": "Review", "statusCategory": { "key": "indeterminate" } } },
+                        { "id": "42", "name": "Fast-Track Review", "to": { "id": "3", "name": "Review", "statusCategory": { "key": "indeterminate" } } },
+                        { "id": "51", "name": "Close", "to": { "id": "4", "name": "Done", "statusCategory": { "key": "done" } } }
+                    ]
+                }))
+            })
+            .post(move |Json(body): Json<Value>| {
+                let posted_c = posted_c.clone();
+                async move {
+                    if let Some(id) = body.pointer("/transition/id").and_then(|v| v.as_str()) {
+                        posted_c.lock().unwrap().push(id.to_string());
+                    }
+                    StatusCode::NO_CONTENT
+                }
+            }),
+        );
+
+        let base_url = spawn_router(app).await;
+        let client = make_client(&base_url, DeploymentKind::Cloud);
+
+        // Ambiguous target status name fails with CodedError and posts 0 times.
+        let err = client
+            .transition_issue("KAN-10", "Review", None)
+            .await
+            .unwrap_err();
+        let payload = crate::atlassian::client::error_payload(&err);
+        assert_eq!(payload["code"], "ambiguous_transition");
+        assert_eq!(
+            payload["message"],
+            "이슈 KAN-10에서 'Review'에 해당하는 전환이 2개입니다. 전환 ID로 지정하세요: [41] Submit for Review -> Review, [42] Fast-Track Review -> Review"
+        );
+        assert_eq!(payload["details"]["candidates"].as_array().unwrap().len(), 2);
+        assert_eq!(payload["details"]["candidates"][0]["id"], "41");
+        assert_eq!(payload["details"]["candidates"][1]["id"], "42");
+        assert!(posted.lock().unwrap().is_empty());
+
+        // Numeric ID posts once without ambiguity.
+        let by_id = client.transition_issue("KAN-10", "42", None).await.unwrap();
+        assert!(by_id.is_none());
+        assert_eq!(*posted.lock().unwrap(), vec!["42".to_string()]);
+
+        // Unique transition/status name posts once and returns the selected transition.
+        let by_name = client
+            .transition_issue("KAN-10", "Done", None)
+            .await
+            .unwrap()
+            .expect("name lookup returns selected transition");
+        assert_eq!(by_name.id, "51");
+        assert_eq!(by_name.to_status.name, "Done");
+        assert_eq!(
+            *posted.lock().unwrap(),
+            vec!["42".to_string(), "51".to_string()]
+        );
     }
 
     #[tokio::test]
