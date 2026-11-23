@@ -8,6 +8,7 @@ pub mod confluence_view;
 pub mod directory_view;
 pub mod doc_view;
 pub mod event;
+pub mod filter;
 pub mod hitmap;
 pub mod issue_view;
 pub mod keymap;
@@ -19,7 +20,7 @@ pub mod text_edit;
 pub mod theme;
 pub mod toast;
 
-use std::{sync::OnceLock, time::Instant};
+use std::{ops::Range, sync::OnceLock, time::Instant};
 
 use ratatui::{
     layout::{Constraint, Direction, Layout, Rect},
@@ -131,6 +132,28 @@ pub(crate) fn fill_surface(frame: &mut Frame, area: Rect, style: Style) {
         return;
     }
     frame.render_widget(Block::default().style(style), area);
+}
+
+/// Scroll offset and on-screen row range for a list of `len` rows shown `height`
+/// rows at a time: moves `scroll` as little as needed to keep `selected` in view,
+/// and never past the last full page when the list or the viewport shrinks.
+pub fn visible_window(
+    selected: usize,
+    scroll: usize,
+    height: usize,
+    len: usize,
+) -> (usize, Range<usize>) {
+    if height == 0 || len == 0 {
+        return (0, 0..0);
+    }
+    let selected = selected.min(len - 1);
+    let mut scroll = scroll.min(len.saturating_sub(height));
+    if selected < scroll {
+        scroll = selected;
+    } else if selected >= scroll + height {
+        scroll = selected + 1 - height;
+    }
+    (scroll, scroll..(scroll + height).min(len))
 }
 
 pub fn draw(frame: &mut Frame, app: &AppState, ui: &mut UiState) -> Option<(u16, u16)> {
@@ -692,6 +715,27 @@ mod tests {
         });
 
         (app, ui)
+    }
+
+    #[test]
+    fn visible_window_keeps_selection_in_view() {
+        // Top: a selection above the window pulls it up.
+        assert_eq!(visible_window(0, 5, 10, 100), (0, 0..10));
+        assert_eq!(visible_window(3, 5, 10, 100), (3, 3..13));
+        // A selection inside the window leaves it where it is.
+        assert_eq!(visible_window(8, 5, 10, 100), (5, 5..15));
+        // Bottom: a selection below the window pushes it down just enough.
+        assert_eq!(visible_window(250, 0, 10, 300), (241, 241..251));
+        assert_eq!(visible_window(299, 0, 10, 300), (290, 290..300));
+        assert_eq!(visible_window(500, 0, 10, 300), (290, 290..300));
+        // Shrink: a shorter list or viewport never leaves the window past the end.
+        assert_eq!(visible_window(19, 50, 10, 20), (10, 10..20));
+        assert_eq!(visible_window(2, 50, 10, 20), (2, 2..12));
+        assert_eq!(visible_window(15, 10, 3, 40), (13, 13..16));
+        assert_eq!(visible_window(4, 7, 10, 5), (0, 0..5));
+        // Nothing to show.
+        assert_eq!(visible_window(0, 3, 10, 0), (0, 0..0));
+        assert_eq!(visible_window(5, 3, 0, 10), (0, 0..0));
     }
 
     fn render_buffer_text(app: &AppState, ui: &mut UiState, width: u16, height: u16) -> String {

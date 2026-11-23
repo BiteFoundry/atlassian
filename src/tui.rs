@@ -1012,6 +1012,7 @@ pub async fn run_with_persona(
         ui_tx,
     );
     app.load_cached_initial();
+    app.apply_default_selection(&mut ui);
     app.spawn_bootstrap(&mut ui);
     app.sync_open_item_watch(&ui);
 

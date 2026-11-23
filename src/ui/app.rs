@@ -35,6 +35,7 @@ use crate::{
     sync::{self, MultiSiteSyncOutcome, SiteSyncTarget, SyncController},
     ui::{
         directory_view::ConnectedSiteRow,
+        filter::space_match_score,
         hitmap::HitMap,
         keymap::Keymap,
         notification,
@@ -154,6 +155,8 @@ pub struct BoardUiState {
     pub col_scroll: usize,
     pub drawer_open: bool,
     pub detail_scroll: u16,
+    /// Set once the user picks a board, so reloads keep their selection.
+    pub user_moved_board: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -192,13 +195,39 @@ pub struct MyWorkUiState {
 
 #[derive(Debug, Clone, Default)]
 pub struct ConfluenceUiState {
+    /// Index into `AppState::spaces` (not into the filtered rows).
     pub selected_space: usize,
+    /// First SPACES pane row on screen; follows `selected_space` when drawn.
+    pub space_scroll: usize,
+    /// Incremental SPACES filter (`/` in the SPACES section; leading `~` = personal).
+    pub space_filter: TextBuffer,
+    pub space_filter_active: bool,
+    /// Set once the user picks a space, so reloads keep their selection.
+    pub user_moved_space: bool,
     pub selected_tree_row: usize,
     /// `0` = Space selector, `1` = Page tree inside left nav.
     pub nav_section: usize,
     pub toc_open: bool,
     pub selected_toc: usize,
     pub reader_scroll: u16,
+}
+
+/// One row of the SPACES pane, in display order.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SpacePaneRow {
+    /// Collapsible site group header (multi-site All Sites mode) and its listed spaces.
+    SiteHeader {
+        site_id: String,
+        spaces: usize,
+        collapsed: bool,
+    },
+    /// Index into `AppState::spaces`.
+    Space(usize),
+}
+
+/// `UiState::collapsed_site_groups` key of a site's group in the SPACES pane.
+pub fn space_group_key(site_id: &str) -> String {
+    format!("wiki:{site_id}")
 }
 
 #[derive(Debug, Clone, Default)]
@@ -463,6 +492,8 @@ impl UiState {
         }
         matches!(self.focus, PaneFocus::JqlBar | PaneFocus::SearchBar)
             || (self.active_tab == WorkspaceTab::Issues && self.issue_ui.local_filter_active)
+            || (self.active_tab == WorkspaceTab::Confluence
+                && self.confluence_ui.space_filter_active)
     }
 
     pub fn push_overlay(&mut self, overlay: Overlay) {
@@ -1004,9 +1035,10 @@ impl AppState {
                 }
                 self.load_cached_initial();
                 self.refresh_local_search(&ui.search_ui.query.text);
-                ui.board_ui.selected_board = 0;
                 ui.issue_ui.selected_issue = 0;
-                ui.confluence_ui.selected_space = 0;
+                ui.board_ui.user_moved_board = false;
+                ui.confluence_ui.user_moved_space = false;
+                self.apply_default_selection(ui);
                 self.sync_open_item_watch(ui);
                 ui.success("Scope: All Sites (Federated)");
             }
@@ -1021,9 +1053,10 @@ impl AppState {
                 }
                 self.load_cached_initial();
                 self.refresh_local_search(&ui.search_ui.query.text);
-                ui.board_ui.selected_board = 0;
                 ui.issue_ui.selected_issue = 0;
-                ui.confluence_ui.selected_space = 0;
+                ui.board_ui.user_moved_board = false;
+                ui.confluence_ui.user_moved_space = false;
+                self.apply_default_selection(ui);
                 self.sync_open_item_watch(ui);
                 ui.success(format!("Active site: {label}"));
             }
@@ -1205,8 +1238,9 @@ impl AppState {
                 if let Ok(boards) = self.storage.list_boards_for_site(site_id, None) {
                     self.board_site_ids = vec![site_id.clone(); boards.len()];
                     self.boards = boards;
-                    if let Some(first_board) = self.boards.first() {
-                        let bid = first_board.id;
+                    if let Some(default_board) = self.boards.get(self.resolve_default_board_index())
+                    {
+                        let bid = default_board.id;
                         self.board_issue_site_id = Some(site_id.clone());
                         if let Ok(sprints) = self.storage.list_sprints_for_site(site_id, bid) {
                             self.sprints = sprints;
@@ -1332,13 +1366,14 @@ impl AppState {
                 if let Ok(spaces) = self.storage.list_spaces_for_site(site_id) {
                     self.space_site_ids = vec![site_id.clone(); spaces.len()];
                     self.spaces = spaces;
-                    if let Some(first_space) = self.spaces.first() {
+                    if let Some(default_space) = self.spaces.get(self.resolve_default_space_index())
+                    {
                         if let Ok(roots) = self
                             .storage
-                            .list_space_root_pages_for_site(site_id, &first_space.key)
+                            .list_space_root_pages_for_site(site_id, &default_space.key)
                         {
                             self.root_pages_by_space
-                                .insert(SiteKey::new(site_id, &first_space.key), roots);
+                                .insert(SiteKey::new(site_id, &default_space.key), roots);
                         }
                     }
                 }
@@ -1366,18 +1401,22 @@ impl AppState {
                         .collect();
                     self.board_site_ids = filtered.iter().map(|(s, _)| s.clone()).collect();
                     self.boards = filtered.into_iter().map(|(_, b)| b).collect();
-                    if let (Some(first_board), Some(first_sid)) =
-                        (self.boards.first(), self.board_site_ids.first())
-                    {
-                        let bid = first_board.id;
-                        self.board_issue_site_id = Some(first_sid.clone());
-                        if let Ok(sprints) = self.storage.list_sprints_for_site(first_sid, bid) {
+                    let default_idx = self.resolve_default_board_index();
+                    if let (Some(default_board), Some(board_sid)) = (
+                        self.boards.get(default_idx),
+                        self.board_site_ids.get(default_idx),
+                    ) {
+                        let bid = default_board.id;
+                        self.board_issue_site_id = Some(board_sid.clone());
+                        if let Ok(sprints) = self.storage.list_sprints_for_site(board_sid, bid) {
                             self.sprints = sprints;
                         }
-                        if let Ok(bi) = self
-                            .storage
-                            .list_board_issues_for_site(first_sid, bid, None, BOARD_ISSUE_VIEW_CAP)
-                        {
+                        if let Ok(bi) = self.storage.list_board_issues_for_site(
+                            board_sid,
+                            bid,
+                            None,
+                            BOARD_ISSUE_VIEW_CAP,
+                        ) {
                             self.board_issues = bi;
                         }
                     }
@@ -1490,15 +1529,17 @@ impl AppState {
                         .collect();
                     self.space_site_ids = filtered.iter().map(|(s, _)| s.clone()).collect();
                     self.spaces = filtered.into_iter().map(|(_, s)| s).collect();
-                    if let (Some(first_space), Some(first_sid)) =
-                        (self.spaces.first(), self.space_site_ids.first())
-                    {
+                    let default_idx = self.resolve_default_space_index();
+                    if let (Some(default_space), Some(space_sid)) = (
+                        self.spaces.get(default_idx),
+                        self.space_site_ids.get(default_idx),
+                    ) {
                         if let Ok(roots) = self
                             .storage
-                            .list_space_root_pages_for_site(first_sid, &first_space.key)
+                            .list_space_root_pages_for_site(space_sid, &default_space.key)
                         {
                             self.root_pages_by_space
-                                .insert(SiteKey::new(first_sid, &first_space.key), roots);
+                                .insert(SiteKey::new(space_sid, &default_space.key), roots);
                         }
                     }
                 }
@@ -1851,6 +1892,174 @@ impl AppState {
         self.active_space_site_id(ui)
             .map(str::to_string)
             .unwrap_or_else(|| self.effective_site_id_and_client().0)
+    }
+
+    /// Index of `config.default_space_key` in `spaces` (case-insensitive; the entry on
+    /// `config.resolved_site_profile()` wins when several sites have the key), else `0`.
+    pub fn resolve_default_space_index(&self) -> usize {
+        let Some(key) = self
+            .config
+            .default_space_key
+            .as_deref()
+            .map(str::trim)
+            .filter(|k| !k.is_empty())
+        else {
+            return 0;
+        };
+        self.default_index_on_site(self.spaces.len(), &self.space_site_ids, |i| {
+            self.spaces[i].key.eq_ignore_ascii_case(key)
+        })
+        .unwrap_or(0)
+    }
+
+    /// Index of `config.default_board_id`, else of the first board of
+    /// `config.default_project` (the order of the sync's default board), else `0`.
+    pub fn resolve_default_board_index(&self) -> usize {
+        let by_id = self.config.default_board_id.and_then(|bid| {
+            self.default_index_on_site(self.boards.len(), &self.board_site_ids, |i| {
+                self.boards[i].id == bid
+            })
+        });
+        let by_project = || {
+            let project = self
+                .config
+                .default_project
+                .as_deref()
+                .map(str::trim)
+                .filter(|p| !p.is_empty())?;
+            self.default_index_on_site(self.boards.len(), &self.board_site_ids, |i| {
+                self.boards[i]
+                    .project_key
+                    .as_deref()
+                    .is_some_and(|k| k.eq_ignore_ascii_case(project))
+            })
+        };
+        by_id.or_else(by_project).unwrap_or(0)
+    }
+
+    /// First index in `0..len` matching `pred`, preferring one whose site in `site_ids`
+    /// is `config.resolved_site_profile()` (keys and ids repeat across sites).
+    fn default_index_on_site(
+        &self,
+        len: usize,
+        site_ids: &[String],
+        pred: impl Fn(usize) -> bool,
+    ) -> Option<usize> {
+        let preferred = self.config.resolved_site_profile().map(|s| s.id);
+        let mut first = None;
+        for i in (0..len).filter(|&i| pred(i)) {
+            let on_preferred = preferred
+                .as_deref()
+                .is_some_and(|p| site_ids.get(i).is_some_and(|s| s.eq_ignore_ascii_case(p)));
+            if on_preferred {
+                return Some(i);
+            }
+            first.get_or_insert(i);
+        }
+        first
+    }
+
+    /// Points the board and SPACES selections at the configured defaults unless the
+    /// user already picked one, so a background reload never yanks the cursor.
+    pub fn apply_default_selection(&self, ui: &mut UiState) {
+        if !ui.board_ui.user_moved_board {
+            ui.board_ui.selected_board = self.resolve_default_board_index();
+        }
+        if !ui.confluence_ui.user_moved_space {
+            ui.confluence_ui.selected_space = self.resolve_default_space_index();
+        }
+    }
+
+    /// Indices into `spaces` matching the SPACES filter, best match first, then
+    /// cached order (pinned first); every space in cached order without a filter.
+    fn filtered_space_indices(&self, ui: &UiState) -> Vec<usize> {
+        let query = ui.confluence_ui.space_filter.text.trim();
+        if query.is_empty() {
+            return (0..self.spaces.len()).collect();
+        }
+        let mut scored: Vec<(u32, usize)> = self
+            .spaces
+            .iter()
+            .enumerate()
+            .filter_map(|(i, sp)| space_match_score(query, sp).map(|score| (score, i)))
+            .collect();
+        scored.sort_by(|a, b| b.0.cmp(&a.0).then(a.1.cmp(&b.1)));
+        scored.into_iter().map(|(_, i)| i).collect()
+    }
+
+    /// SPACES pane rows in display order: the filtered spaces, grouped under
+    /// collapsible site headers in multi-site All Sites mode.
+    pub fn space_pane_rows(&self, ui: &UiState) -> Vec<SpacePaneRow> {
+        let matches = self.filtered_space_indices(ui);
+        if !self.is_multi_site_all_mode() {
+            return matches.into_iter().map(SpacePaneRow::Space).collect();
+        }
+        let mut site_order: Vec<String> = Vec::new();
+        let enabled = self.config.enabled_sites().into_iter().map(|s| s.id);
+        for sid in enabled.chain(self.space_site_ids.iter().cloned()) {
+            if !site_order.iter().any(|s| s.eq_ignore_ascii_case(&sid)) {
+                site_order.push(sid);
+            }
+        }
+        let mut rows = Vec::new();
+        for site_id in site_order {
+            let group: Vec<usize> = matches
+                .iter()
+                .copied()
+                .filter(|&i| {
+                    self.space_site_ids
+                        .get(i)
+                        .is_some_and(|s| s.eq_ignore_ascii_case(&site_id))
+                })
+                .collect();
+            if group.is_empty() {
+                continue;
+            }
+            let collapsed = ui
+                .collapsed_site_groups
+                .contains(&space_group_key(&site_id));
+            rows.push(SpacePaneRow::SiteHeader {
+                site_id,
+                spaces: group.len(),
+                collapsed,
+            });
+            if !collapsed {
+                rows.extend(group.into_iter().map(SpacePaneRow::Space));
+            }
+        }
+        rows
+    }
+
+    /// Indices into `spaces` the SPACES pane lists, in display order; navigation
+    /// steps over these while `selected_space` stays an index into `spaces`.
+    pub fn visible_space_indices(&self, ui: &UiState) -> Vec<usize> {
+        self.space_pane_rows(ui)
+            .into_iter()
+            .filter_map(|row| match row {
+                SpacePaneRow::Space(i) => Some(i),
+                SpacePaneRow::SiteHeader { .. } => None,
+            })
+            .collect()
+    }
+
+    /// Selects the first listed space when the SPACES filter hides the selected one.
+    pub fn keep_space_selection_visible(&self, ui: &mut UiState) {
+        let visible = self.visible_space_indices(ui);
+        if !visible.contains(&ui.confluence_ui.selected_space) {
+            if let Some(&first) = visible.first() {
+                ui.confluence_ui.selected_space = first;
+            }
+        }
+    }
+
+    /// Whether personal space `space_key` (`~<account id or username>`) belongs to the
+    /// signed-in user on `site_id`; `None` without a cached identity for that site.
+    pub fn personal_space_owner_is_me(&self, site_id: &str, space_key: &str) -> Option<bool> {
+        let owner = space_key.trim().strip_prefix('~')?.trim();
+        let (site, client) = self.site_id_and_client_for(Some(site_id));
+        let me = self.known_me_for_site(&site, &client)?;
+        let me_id = me.id.trim();
+        Some(!me_id.is_empty() && owner.eq_ignore_ascii_case(me_id))
     }
 
     pub fn selected_issue_key(&self, ui: &UiState) -> Option<String> {
@@ -4323,6 +4532,7 @@ impl AppState {
                     self.sync_summary = summary.clone();
                     ui.tasks.finish("Initial sync", None);
                     self.load_cached_initial();
+                    self.apply_default_selection(ui);
                     ui.success(&summary);
                     self.notify_desktop("Atlassian Sync Complete", &summary);
                 }
@@ -5030,6 +5240,7 @@ impl AppState {
                 self.sync_summary = outcome.summary.clone();
                 ui.tasks.finish("Sync all sites", None);
                 self.load_cached_initial();
+                self.apply_default_selection(ui);
                 self.maybe_refresh_open_items_after_sync(ui);
                 ui.success(outcome.summary);
             }
@@ -6629,5 +6840,165 @@ mod tests {
         }
 
         srv.abort();
+    }
+
+    fn board(id: i64, project: &str) -> BoardSummary {
+        BoardSummary {
+            id,
+            name: format!("Board {id}"),
+            board_type: "scrum".into(),
+            project_key: Some(project.into()),
+            ..Default::default()
+        }
+    }
+
+    #[tokio::test]
+    async fn default_space_index_prefers_configured_key() {
+        let (mut app, _ui) = two_site_app();
+        app.site_scope = SiteScope::All;
+        app.config.active_site = None;
+        app.spaces = vec![space("AAA"), space("ENG"), space("ENG")];
+        app.space_site_ids = vec!["site-b".into(), "site-b".into(), "site-a".into()];
+        assert_eq!(app.resolve_default_space_index(), 0, "nothing configured");
+
+        app.config.default_space_key = Some(" eng ".into());
+        assert_eq!(
+            app.resolve_default_space_index(),
+            2,
+            "case-insensitive key on the configured site (site-a)"
+        );
+        app.config.default_site = Some("site-b".into());
+        assert_eq!(app.resolve_default_space_index(), 1, "site-b's ENG");
+        app.config.default_site = Some("site-a".into());
+        app.space_site_ids = vec!["site-a".into(), "site-b".into(), "site-c".into()];
+        assert_eq!(
+            app.resolve_default_space_index(),
+            1,
+            "first ENG without a site match"
+        );
+
+        app.config.default_space_key = Some("NOPE".into());
+        assert_eq!(app.resolve_default_space_index(), 0, "unknown key");
+    }
+
+    #[tokio::test]
+    async fn default_board_index_prefers_board_id_then_project() {
+        let (mut app, _ui) = two_site_app();
+        app.boards = vec![
+            board(1, "OPS"),
+            board(2, "ENG"),
+            board(42, "WEB"),
+            board(5, "ENG"),
+        ];
+        app.board_site_ids = vec!["site-a".into(); 4];
+        assert_eq!(app.resolve_default_board_index(), 0, "nothing configured");
+
+        app.config.default_project = Some("eng".into());
+        assert_eq!(
+            app.resolve_default_board_index(),
+            1,
+            "first board of the project"
+        );
+        app.config.default_board_id = Some(42);
+        assert_eq!(
+            app.resolve_default_board_index(),
+            2,
+            "board id beats project"
+        );
+        app.config.default_board_id = Some(999);
+        assert_eq!(
+            app.resolve_default_board_index(),
+            1,
+            "missing id falls back to project"
+        );
+        app.config.default_project = Some("NONE".into());
+        assert_eq!(app.resolve_default_board_index(), 0);
+    }
+
+    #[tokio::test]
+    async fn site_switch_selects_default_space_not_zero() {
+        let (mut app, mut ui) = two_site_app();
+        app.config.default_space_key = Some("OPS".into());
+        app.storage
+            .upsert_spaces_for_site("site-b", &[space("API"), space("ENG"), space("OPS")])
+            .unwrap();
+        app.storage
+            .upsert_boards_for_site("site-b", &[board(7, "API"), board(8, "OPS")])
+            .unwrap();
+        app.config.default_project = Some("OPS".into());
+        // The user had moved on site A; a site switch starts from the defaults.
+        ui.confluence_ui.user_moved_space = true;
+        ui.board_ui.user_moved_board = true;
+
+        app.apply_site_switcher_command(SiteSwitcherCommand::SelectSite("site-b".into()), &mut ui);
+        assert_eq!(ui.confluence_ui.selected_space, 2);
+        assert_eq!(app.active_space(&ui).unwrap().key, "OPS");
+        assert_eq!(app.active_board(&ui).unwrap().id, 8);
+
+        // A background reload keeps a selection the user made.
+        ui.confluence_ui.selected_space = 1;
+        ui.confluence_ui.user_moved_space = true;
+        app.load_cached_initial();
+        app.apply_default_selection(&mut ui);
+        assert_eq!(ui.confluence_ui.selected_space, 1);
+
+        // All Sites: the default site's OPS, after site-a's rows.
+        app.storage
+            .upsert_spaces_for_site("site-a", &[space("OPS"), space("ZED")])
+            .unwrap();
+        app.config.default_site = Some("site-b".into());
+        app.apply_site_switcher_command(SiteSwitcherCommand::SelectAllSites, &mut ui);
+        let idx = ui.confluence_ui.selected_space;
+        assert_eq!(idx, 4, "site-a: OPS, ZED; site-b: API, ENG, OPS");
+        assert_eq!(app.active_space(&ui).unwrap().key, "OPS");
+        assert_eq!(app.active_space_site_id(&ui), Some("site-b"));
+    }
+
+    #[tokio::test]
+    async fn preload_reads_root_pages_of_default_space() {
+        let (mut app, mut ui) = two_site_app();
+        app.config.default_space_key = Some("OPS".into());
+        app.storage
+            .upsert_spaces_for_site("site-a", &[space("ENG"), space("OPS")])
+            .unwrap();
+        app.storage
+            .upsert_spaces_for_site("site-b", &[space("OPS")])
+            .unwrap();
+        app.storage
+            .upsert_authoritative_pages_for_site("site-a", &[page("10", "OPS", "A ops home")])
+            .unwrap();
+        app.storage
+            .upsert_authoritative_pages_for_site("site-a", &[page("11", "ENG", "A eng home")])
+            .unwrap();
+        app.storage
+            .upsert_authoritative_pages_for_site("site-b", &[page("20", "OPS", "B ops home")])
+            .unwrap();
+
+        // Single site (site-a): the default space's roots, not the first space's.
+        app.load_cached_initial();
+        assert!(app
+            .root_pages_by_space
+            .contains_key(&SiteKey::new("site-a", "OPS")));
+        assert!(!app
+            .root_pages_by_space
+            .contains_key(&SiteKey::new("site-a", "ENG")));
+        app.apply_default_selection(&mut ui);
+        assert_eq!(app.current_confluence_tree(&ui)[0].page.title, "A ops home");
+
+        // All Sites with site-b as the default site: site-b's OPS.
+        app.root_pages_by_space.clear();
+        app.site_scope = SiteScope::All;
+        app.config.active_site = None;
+        app.config.default_site = Some("site-b".into());
+        app.load_cached_initial();
+        assert!(app
+            .root_pages_by_space
+            .contains_key(&SiteKey::new("site-b", "OPS")));
+        assert!(!app
+            .root_pages_by_space
+            .contains_key(&SiteKey::new("site-a", "ENG")));
+        app.apply_default_selection(&mut ui);
+        assert_eq!(app.active_space_site_id(&ui), Some("site-b"));
+        assert_eq!(app.current_confluence_tree(&ui)[0].page.title, "B ops home");
     }
 }

@@ -421,6 +421,7 @@ const HELP_SECTIONS: [(&str, &[(&str, &str)]); 4] = [
         "Confluence Wiki & Media",
         &[
             ("Space / → / ←", "Expand (lazy-load) or collapse page tree node"),
+            ("/ (in SPACES)", "Filter spaces (~ = personal) · Esc clears, then closes"),
             ("t / e / n / c", "Toggle TOC / Edit page / New child page / Comment"),
             ("A / v / H / h", "Attachments / Images / HTML Preview / Inline hrefs"),
             ("u / Ctrl+F / d / o", "Link extractor / File picker / Download / Browser"),

@@ -14,14 +14,19 @@ use crate::{
     ui::{
         app::{AppState, ExternalEditorTarget, UiState},
         doc_view::{truncate_width, wrap_plain_text},
+        filter::is_personal_space_key,
         hitmap::HitMap,
         keymap::Action,
         overlays::{
             centered_rect, modal_block, read_clipboard_text, sanitize_single_line, OverlayOutcome,
         },
         text_edit::TextBuffer,
+        theme::Theme,
     },
 };
+
+/// Footer prompt after the first submit into someone else's personal space.
+const FOREIGN_SPACE_CONFIRM: &str = "Press again to create in someone else's personal space";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PageFormField {
@@ -46,6 +51,14 @@ pub struct PageFormOverlay {
     pub site_id: Option<String>,
     pub prev_version: i32,
     pub space_key: String,
+    /// Display name of the target space, shown in the personal space banner.
+    pub space_name: Option<String>,
+    /// New page in a personal space (`~` key or `personal` space type).
+    pub personal_space: bool,
+    /// Whether that personal space is the signed-in user's own; `None` when unknown.
+    pub personal_owner_is_me: Option<bool>,
+    /// Set by the first submit into someone else's personal space; the next submits.
+    foreign_space_confirm_pending: bool,
     pub parent_id: Option<String>,
     pub title: TextBuffer,
     pub body: TextBuffer,
@@ -59,11 +72,16 @@ pub struct PageFormOverlay {
 
 impl PageFormOverlay {
     pub fn new_page(space_key: impl Into<String>, parent_id: Option<String>) -> Self {
+        let space_key = space_key.into();
         Self {
             edit_page_id: None,
             site_id: None,
             prev_version: 0,
-            space_key: space_key.into(),
+            personal_space: is_personal_space_key(&space_key),
+            space_key,
+            space_name: None,
+            personal_owner_is_me: None,
+            foreign_space_confirm_pending: false,
             parent_id,
             title: TextBuffer::new(),
             body: TextBuffer::new(),
@@ -82,6 +100,10 @@ impl PageFormOverlay {
             site_id: None,
             prev_version: detail.summary.version_number,
             space_key: detail.summary.space_key.clone(),
+            space_name: None,
+            personal_space: false,
+            personal_owner_is_me: None,
+            foreign_space_confirm_pending: false,
             parent_id: detail.summary.parent_id.clone(),
             title: TextBuffer::from_text(detail.summary.title.clone()),
             body: TextBuffer::from_text(detail.body_markdown.clone()),
@@ -149,6 +171,43 @@ impl PageFormOverlay {
         true
     }
 
+    /// Banner for a new page in a personal space: its text, and `true` when it is a
+    /// warning (someone else's space, or an owner that cannot be told) rather than
+    /// the user's own space.
+    pub fn personal_space_banner(&self) -> Option<(String, bool)> {
+        if self.edit_page_id.is_some() || !self.personal_space {
+            return None;
+        }
+        let key = self.space_key.trim();
+        let name = self
+            .space_name
+            .as_deref()
+            .map(str::trim)
+            .filter(|n| !n.is_empty())
+            .map(|n| format!(" ({n})"))
+            .unwrap_or_default();
+        Some(if self.personal_owner_is_me == Some(true) {
+            (
+                format!("Personal space {key}{name} — your own personal space."),
+                false,
+            )
+        } else {
+            (
+                format!(
+                    "⚠ Personal space {key}{name} — pages here are visible in that person's space."
+                ),
+                true,
+            )
+        })
+    }
+
+    /// New page in a personal space known to belong to someone else.
+    fn needs_foreign_space_confirm(&self) -> bool {
+        self.edit_page_id.is_none()
+            && self.personal_space
+            && self.personal_owner_is_me == Some(false)
+    }
+
     pub fn has_unsent_content(&self) -> bool {
         !self.title.text.trim().is_empty() || !self.body.text.trim().is_empty()
     }
@@ -204,6 +263,10 @@ impl PageFormOverlay {
                 if self.title.text.trim().is_empty() {
                     self.error = Some("Please enter a page title".to_string());
                     self.field = PageFormField::Title;
+                    return OverlayOutcome::Handled;
+                }
+                if self.needs_foreign_space_confirm() && !self.foreign_space_confirm_pending {
+                    self.foreign_space_confirm_pending = true;
                     return OverlayOutcome::Handled;
                 }
                 OverlayOutcome::Dispatch(Action::Submit)
@@ -269,7 +332,10 @@ impl PageFormOverlay {
         ui: &UiState,
         _hitmap: &mut HitMap,
     ) {
-        let theme = &ui.theme;
+        self.render(frame, area, &ui.theme);
+    }
+
+    fn render(&self, frame: &mut Frame, area: Rect, theme: &Theme) {
         let rect = centered_rect(
             area,
             82.min(area.width.saturating_sub(4)).max(34),
@@ -291,18 +357,39 @@ impl PageFormOverlay {
         let block = modal_block(modal_title, theme, true);
         let inner = block.inner(rect);
         frame.render_widget(block, rect);
-        if inner.width == 0 || inner.height < 6 {
+        let banner = self.personal_space_banner();
+        let banner_h = u16::from(banner.is_some());
+        if inner.width == 0 || inner.height < 6 + banner_h {
             return;
         }
 
-        let chunks = Layout::default()
+        let rows = Layout::default()
             .direction(Direction::Vertical)
             .constraints([
+                Constraint::Length(banner_h),
                 Constraint::Length(2),
                 Constraint::Min(3),
                 Constraint::Length(1),
             ])
             .split(inner);
+        let chunks = &rows[1..];
+
+        if let Some((text, warning)) = banner {
+            let style = if warning {
+                Style::default()
+                    .fg(theme.warning)
+                    .add_modifier(Modifier::BOLD)
+            } else {
+                theme.muted_style()
+            };
+            frame.render_widget(
+                Paragraph::new(Span::styled(
+                    truncate_width(&format!(" {text}"), rows[0].width as usize),
+                    style,
+                )),
+                rows[0],
+            );
+        }
 
         let title_active = self.field == PageFormField::Title;
         let title_line = Line::from(vec![
@@ -359,6 +446,16 @@ impl PageFormOverlay {
             Line::from(Span::styled(
                 format!(" Error: {err}"),
                 Style::default().fg(theme.error),
+            ))
+        } else if self.foreign_space_confirm_pending {
+            Line::from(Span::styled(
+                truncate_width(
+                    &format!(" {FOREIGN_SPACE_CONFIRM}"),
+                    chunks[2].width as usize,
+                ),
+                Style::default()
+                    .fg(theme.warning)
+                    .add_modifier(Modifier::BOLD),
             ))
         } else {
             Line::from(Span::styled(
@@ -434,5 +531,112 @@ mod tests {
         assert_eq!(form_v2.prev_version, 1);
         assert_eq!(form_v2.body.text, "Local v1 draft edit");
         assert!(form_v2.error.as_deref().unwrap_or("").contains("v1"));
+    }
+
+    fn render_text(form: &PageFormOverlay) -> String {
+        use ratatui::{backend::TestBackend, Terminal};
+        let mut terminal = Terminal::new(TestBackend::new(100, 30)).unwrap();
+        let theme = Theme::midnight_dark();
+        terminal.draw(|f| form.render(f, f.area(), &theme)).unwrap();
+        let buf = terminal.backend().buffer();
+        let mut out = String::new();
+        for y in 0..buf.area.height {
+            for x in 0..buf.area.width {
+                out.push_str(buf[(x, y)].symbol());
+            }
+            out.push('\n');
+        }
+        out
+    }
+
+    #[test]
+    fn personal_space_banner_shown_for_tilde_key() {
+        let mut form = PageFormOverlay::new_page("~jdoe", None);
+        form.space_name = Some("John Doe".into());
+        assert!(form.personal_space);
+
+        let (text, warning) = form.personal_space_banner().expect("banner for a ~ key");
+        assert_eq!(
+            text,
+            "⚠ Personal space ~jdoe (John Doe) — pages here are visible in that person's space."
+        );
+        assert!(warning, "unknown owner is shown as a warning");
+        let screen = render_text(&form);
+        assert!(
+            screen.contains("⚠ Personal space ~jdoe (John Doe)"),
+            "banner under the modal title:\n{screen}"
+        );
+
+        // The user's own personal space: muted banner, no warning sign.
+        form.personal_owner_is_me = Some(true);
+        let (text, warning) = form.personal_space_banner().unwrap();
+        assert!(!warning);
+        assert_eq!(
+            text,
+            "Personal space ~jdoe (John Doe) — your own personal space."
+        );
+        let screen = render_text(&form);
+        assert!(screen.contains("Personal space ~jdoe (John Doe) — your own personal space."));
+        assert!(!screen.contains('⚠'));
+    }
+
+    #[test]
+    fn foreign_personal_space_requires_second_confirm() {
+        let mut form = PageFormOverlay::new_page("~asmith", None);
+        form.personal_owner_is_me = Some(false);
+        form.handle(&Action::Paste("Meeting notes".into()));
+
+        assert_eq!(form.handle(&Action::Submit), OverlayOutcome::Handled);
+        let screen = render_text(&form);
+        assert!(
+            screen.contains(FOREIGN_SPACE_CONFIRM),
+            "confirm prompt:\n{screen}"
+        );
+        assert_eq!(
+            form.handle(&Action::Submit),
+            OverlayOutcome::Dispatch(Action::Submit),
+            "second submit creates the page"
+        );
+
+        // Own or unknown owner: a single submit, as for any space.
+        for owner in [Some(true), None] {
+            let mut form = PageFormOverlay::new_page("~asmith", None);
+            form.personal_owner_is_me = owner;
+            form.handle(&Action::Paste("Meeting notes".into()));
+            assert_eq!(
+                form.handle(&Action::Submit),
+                OverlayOutcome::Dispatch(Action::Submit),
+                "owner {owner:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn no_banner_for_regular_space_or_edit() {
+        let form = PageFormOverlay::new_page("ENG", Some("55".into()));
+        assert!(form.personal_space_banner().is_none());
+        assert!(!render_text(&form).contains("Personal space"));
+
+        // Editing a page that lives in someone else's personal space.
+        let detail = PageDetail {
+            summary: crate::models::PageSummary {
+                id: "77".into(),
+                space_key: "~asmith".into(),
+                title: "Their page".into(),
+                version_number: 4,
+                ..Default::default()
+            },
+            body_markdown: "body".into(),
+            ..Default::default()
+        };
+        let mut edit = PageFormOverlay::edit_page(&detail);
+        edit.personal_owner_is_me = Some(false);
+        assert!(edit.personal_space_banner().is_none());
+        assert!(!render_text(&edit).contains("Personal space"));
+        assert_eq!(
+            edit.handle(&Action::Submit),
+            OverlayOutcome::Dispatch(Action::Submit),
+            "edits need no extra confirmation"
+        );
     }
 }

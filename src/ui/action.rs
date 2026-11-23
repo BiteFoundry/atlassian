@@ -5,6 +5,7 @@ use crate::{
     models::{CrossRefTarget, SearchHitKind},
     ui::{
         app::{AppState, PaneFocus, SiteKey, UiState, WorkspaceTab},
+        filter::is_personal_space,
         hitmap::{ButtonId, HitTarget},
         keymap::Action,
         overlays::{
@@ -281,6 +282,11 @@ pub fn dispatch(action: Action, app: &mut AppState, ui: &mut UiState) -> bool {
             WorkspaceTab::Issues => {
                 ui.issue_ui.local_filter_active = true;
             }
+            WorkspaceTab::Confluence
+                if ui.focus == PaneFocus::Nav && ui.confluence_ui.nav_section == 0 =>
+            {
+                ui.confluence_ui.space_filter_active = true;
+            }
             WorkspaceTab::Search => {
                 ui.focus = PaneFocus::SearchBar;
             }
@@ -353,6 +359,7 @@ pub fn dispatch(action: Action, app: &mut AppState, ui: &mut UiState) -> bool {
 fn switch_tab(tab: WorkspaceTab, app: &mut AppState, ui: &mut UiState) {
     ui.active_tab = tab;
     ui.issue_ui.local_filter_active = false;
+    ui.confluence_ui.space_filter_active = false;
     match tab {
         WorkspaceTab::MyWork => {
             ui.focus = PaneFocus::Main;
@@ -405,12 +412,6 @@ fn cycle_focus(ui: &mut UiState, forward: bool) {
 }
 
 fn handle_inline_text_action(action: Action, app: &mut AppState, ui: &mut UiState) -> bool {
-    if action == Action::CloseOverlay {
-        ui.issue_ui.local_filter_active = false;
-        ui.focus = PaneFocus::Main;
-        return false;
-    }
-
     if action == Action::PasteClipboard {
         if let Some(text) = overlays::read_clipboard_text() {
             let cleaned = overlays::sanitize_single_line(&text);
@@ -418,6 +419,17 @@ fn handle_inline_text_action(action: Action, app: &mut AppState, ui: &mut UiStat
                 return handle_inline_text_action(Action::Paste(cleaned), app, ui);
             }
         }
+        return false;
+    }
+
+    if ui.active_tab == WorkspaceTab::Confluence && ui.confluence_ui.space_filter_active {
+        handle_space_filter_action(action, app, ui);
+        return false;
+    }
+
+    if action == Action::CloseOverlay {
+        ui.issue_ui.local_filter_active = false;
+        ui.focus = PaneFocus::Main;
         return false;
     }
 
@@ -512,6 +524,79 @@ fn handle_inline_text_action(action: Action, app: &mut AppState, ui: &mut UiStat
         _ => {}
     }
     false
+}
+
+/// Keys while the SPACES filter is active: text edits narrow the list, `Up`/`Down`
+/// move within it, `Enter` opens the selected space and keeps the query, `Esc`
+/// clears the query first and closes the filter when it is already empty.
+fn handle_space_filter_action(action: Action, app: &mut AppState, ui: &mut UiState) {
+    let buf = &mut ui.confluence_ui.space_filter;
+    let before = buf.text.clone();
+    match action {
+        Action::CloseOverlay => {
+            if buf.text.is_empty() {
+                ui.confluence_ui.space_filter_active = false;
+            } else {
+                buf.clear();
+            }
+        }
+        Action::Input(ch) => buf.insert_char(ch),
+        Action::Backspace => buf.backspace(),
+        Action::Delete => buf.delete(),
+        Action::CursorLeft => buf.move_left(),
+        Action::CursorRight => buf.move_right(),
+        Action::CursorHome => buf.move_home(),
+        Action::CursorEnd => buf.move_end(),
+        Action::Paste(s) => buf.insert_str(&overlays::sanitize_single_line(&s)),
+        Action::CursorUp => step_space_selection(app, ui, -1),
+        Action::CursorDown => step_space_selection(app, ui, 1),
+        Action::Submit => {
+            ui.confluence_ui.space_filter_active = false;
+            ui.focus = PaneFocus::Nav;
+            ui.confluence_ui.nav_section = 0;
+            let selected = ui.confluence_ui.selected_space;
+            if app.visible_space_indices(ui).contains(&selected) {
+                open_selected_space(app, ui);
+            }
+        }
+        _ => {}
+    }
+    if ui.confluence_ui.space_filter.text != before {
+        let prev = ui.confluence_ui.selected_space;
+        app.keep_space_selection_visible(ui);
+        if ui.confluence_ui.selected_space != prev {
+            ui.confluence_ui.user_moved_space = true;
+        }
+    }
+}
+
+/// Moves the SPACES selection `dy` rows within the listed (filtered) spaces.
+fn step_space_selection(app: &AppState, ui: &mut UiState, dy: i32) {
+    let visible = app.visible_space_indices(ui);
+    if visible.is_empty() {
+        return;
+    }
+    let next = match visible
+        .iter()
+        .position(|&i| i == ui.confluence_ui.selected_space)
+    {
+        Some(pos) => step_index(pos, dy, visible.len()),
+        None => 0,
+    };
+    ui.confluence_ui.selected_space = visible[next];
+    ui.confluence_ui.user_moved_space = true;
+}
+
+/// Loads the page tree of the selected space (`Enter` in the SPACES section).
+fn open_selected_space(app: &mut AppState, ui: &mut UiState) {
+    let site_id = app
+        .space_site_ids
+        .get(ui.confluence_ui.selected_space)
+        .cloned();
+    if let Some(sp) = app.spaces.get(ui.confluence_ui.selected_space).cloned() {
+        ui.confluence_ui.selected_tree_row = 0;
+        app.request_space_root_pages_for_site(ui, site_id.as_deref(), &sp.key);
+    }
 }
 
 fn dispatch_active_overlay(action: Action, app: &mut AppState, ui: &mut UiState) -> bool {
@@ -978,12 +1063,19 @@ fn handle_mouse_click(row: u16, col: u16, app: &mut AppState, ui: &mut UiState) 
     let Some(target) = ui.hitmap.hit(row, col) else {
         return false;
     };
+    if !matches!(
+        target,
+        HitTarget::SpaceItem(_) | HitTarget::SiteGroupHeader(_)
+    ) {
+        ui.confluence_ui.space_filter_active = false;
+    }
     match target {
         HitTarget::Tab(idx) => switch_tab(WorkspaceTab::from_index(idx), app, ui),
         HitTarget::BoardItem(idx) => {
             ui.focus = PaneFocus::Nav;
             ui.board_ui.nav_section = 0;
             ui.board_ui.selected_board = idx;
+            ui.board_ui.user_moved_board = true;
             if let Some(b) = app.boards.get(idx) {
                 app.request_board_load(ui, b.id, None);
             }
@@ -1058,6 +1150,7 @@ fn handle_mouse_click(row: u16, col: u16, app: &mut AppState, ui: &mut UiState) 
             ui.focus = PaneFocus::Nav;
             ui.confluence_ui.nav_section = 0;
             ui.confluence_ui.selected_space = idx;
+            ui.confluence_ui.user_moved_space = true;
             ui.confluence_ui.selected_tree_row = 0;
             let site_id = app.space_site_ids.get(idx).cloned();
             if let Some(sp) = app.spaces.get(idx).cloned() {
@@ -1141,6 +1234,7 @@ fn move_direction(app: &mut AppState, ui: &mut UiState, dy: i32, dx: i32) {
                     if ui.board_ui.nav_section == 0 {
                         let len = app.boards.len();
                         ui.board_ui.selected_board = step_index(ui.board_ui.selected_board, dy, len);
+                        ui.board_ui.user_moved_board = true;
                     } else {
                         let len = app.sprints.len();
                         ui.board_ui.selected_sprint = step_index(ui.board_ui.selected_sprint, dy, len);
@@ -1216,9 +1310,7 @@ fn move_direction(app: &mut AppState, ui: &mut UiState, dy: i32, dx: i32) {
             PaneFocus::Nav => {
                 if dy != 0 {
                     if ui.confluence_ui.nav_section == 0 {
-                        let len = app.spaces.len();
-                        ui.confluence_ui.selected_space =
-                            step_index(ui.confluence_ui.selected_space, dy, len);
+                        step_space_selection(app, ui, dy);
                     } else {
                         let len = app.current_confluence_tree(ui).len();
                         ui.confluence_ui.selected_tree_row =
@@ -1271,6 +1363,11 @@ fn move_direction(app: &mut AppState, ui: &mut UiState, dy: i32, dx: i32) {
 fn handle_mouse_scroll(delta: i32, row: u16, col: u16, app: &mut AppState, ui: &mut UiState) {
     let step = if delta < 0 { -1 } else { 1 };
     match ui.hitmap.hit(row, col) {
+        // The wheel over the SPACES rows moves the space selection even while the
+        // page tree section has the keyboard.
+        Some(HitTarget::SpaceItem(_)) if ui.active_tab == WorkspaceTab::Confluence => {
+            step_space_selection(app, ui, step);
+        }
         Some(
             HitTarget::NavPane
             | HitTarget::BoardItem(_)
@@ -1399,11 +1496,7 @@ fn activate_selection(app: &mut AppState, ui: &mut UiState) {
         WorkspaceTab::Confluence => match ui.focus {
             PaneFocus::Nav => {
                 if ui.confluence_ui.nav_section == 0 {
-                    let site_id = app.space_site_ids.get(ui.confluence_ui.selected_space).cloned();
-                    if let Some(sp) = app.spaces.get(ui.confluence_ui.selected_space).cloned() {
-                        ui.confluence_ui.selected_tree_row = 0;
-                        app.request_space_root_pages_for_site(ui, site_id.as_deref(), &sp.key);
-                    }
+                    open_selected_space(app, ui);
                 } else {
                     let site_id = app.active_space_site_id(ui).map(str::to_string);
                     let tree = app.current_confluence_tree(ui);
@@ -1458,6 +1551,7 @@ fn activate_selection(app: &mut AppState, ui: &mut UiState) {
             } else if let Some(sp) = app.spaces.get(ui.directory_ui.selected_space).cloned() {
                 if let Some(pos) = app.spaces.iter().position(|s| s.key == sp.key) {
                     ui.confluence_ui.selected_space = pos;
+                    ui.confluence_ui.user_moved_space = true;
                 }
                 ui.active_tab = WorkspaceTab::Confluence;
                 app.request_space_root_pages(ui, &sp.key);
@@ -1534,6 +1628,19 @@ fn open_new_item(app: &AppState, ui: &mut UiState) {
             })
             .map(|p| p.summary.id.clone());
         let mut form = PageFormOverlay::new_page(space_key, parent_id);
+        // Personal space warning (ENT-PERSONAL): the selected space's name and type,
+        // and whether it is the signed-in user's own space on that site.
+        let selected = app
+            .active_space(ui)
+            .filter(|s| s.key.eq_ignore_ascii_case(&form.space_key));
+        form.space_name = selected
+            .map(|s| s.name.trim().to_string())
+            .filter(|n| !n.is_empty());
+        form.personal_space |= selected.is_some_and(is_personal_space);
+        if form.personal_space {
+            form.personal_owner_is_me =
+                app.personal_space_owner_is_me(&space_site, &form.space_key);
+        }
         form.site_id = Some(space_site);
         if let Some(saved) = app.drafts.get(&form.draft_key()) {
             if form.apply_draft_raw(saved) {
@@ -2347,5 +2454,232 @@ mod tests {
             }
             other => panic!("expected auto-routed HtmlPreview overlay, got {other:?}"),
         }
+    }
+
+    fn key_action(ui: &UiState, code: crossterm::event::KeyCode) -> Option<Action> {
+        crate::ui::event::key_to_action(
+            crossterm::event::KeyEvent::new(code, crossterm::event::KeyModifiers::NONE),
+            ui.active_tab,
+            ui.focus,
+            ui.has_overlay(),
+            ui.accepts_text_input(),
+            &ui.keymap,
+        )
+    }
+
+    /// Confluence tab, SPACES section focused, three spaces (one personal).
+    fn spaces_section(app: &mut AppState, ui: &mut UiState) {
+        let sp = |key: &str, name: &str, space_type: &str| SpaceSummary {
+            id: format!("id-{key}"),
+            key: key.into(),
+            name: name.into(),
+            space_type: space_type.into(),
+            ..Default::default()
+        };
+        app.spaces = vec![
+            sp("ENG", "Engineering", "global"),
+            sp("OPS", "Operations", "global"),
+            sp("~jdoe", "John Doe", "personal"),
+        ];
+        ui.active_tab = WorkspaceTab::Confluence;
+        ui.focus = PaneFocus::Nav;
+        ui.confluence_ui.nav_section = 0;
+        ui.confluence_ui.selected_space = 0;
+    }
+
+    #[tokio::test]
+    async fn slash_activates_space_filter_only_in_spaces_section() {
+        use crossterm::event::KeyCode;
+        let (mut app, mut ui, _dir) = test_app_and_ui();
+        spaces_section(&mut app, &mut ui);
+
+        // Page tree section: `/` keeps opening unified search.
+        ui.confluence_ui.nav_section = 1;
+        let slash = key_action(&ui, KeyCode::Char('/')).unwrap();
+        assert_eq!(slash, Action::FocusFilter);
+        dispatch(slash, &mut app, &mut ui);
+        assert!(!ui.confluence_ui.space_filter_active);
+        assert_eq!(ui.active_tab, WorkspaceTab::Search);
+
+        // Reader focus with the SPACES section remembered: still unified search.
+        spaces_section(&mut app, &mut ui);
+        ui.focus = PaneFocus::Main;
+        dispatch(Action::FocusFilter, &mut app, &mut ui);
+        assert!(!ui.confluence_ui.space_filter_active);
+        assert_eq!(ui.active_tab, WorkspaceTab::Search);
+
+        // SPACES section focused: `/` opens the inline space filter.
+        spaces_section(&mut app, &mut ui);
+        dispatch(
+            key_action(&ui, KeyCode::Char('/')).unwrap(),
+            &mut app,
+            &mut ui,
+        );
+        assert!(ui.confluence_ui.space_filter_active);
+        assert!(ui.accepts_text_input());
+        assert_eq!(ui.active_tab, WorkspaceTab::Confluence);
+        assert_eq!(ui.focus, PaneFocus::Nav);
+
+        // Leaving the tab (a tab click) closes it.
+        switch_tab(WorkspaceTab::Board, &mut app, &mut ui);
+        assert!(!ui.confluence_ui.space_filter_active);
+        assert!(!ui.accepts_text_input());
+    }
+
+    #[tokio::test]
+    async fn esc_clears_then_closes_space_filter() {
+        use crossterm::event::KeyCode;
+        let (mut app, mut ui, _dir) = test_app_and_ui();
+        spaces_section(&mut app, &mut ui);
+        dispatch(Action::FocusFilter, &mut app, &mut ui);
+        for ch in "ops".chars() {
+            dispatch(
+                key_action(&ui, KeyCode::Char(ch)).unwrap(),
+                &mut app,
+                &mut ui,
+            );
+        }
+        assert_eq!(app.visible_space_indices(&ui), vec![1]);
+        assert_eq!(
+            ui.confluence_ui.selected_space, 1,
+            "filtered-out selection moves to the match"
+        );
+
+        let esc = key_action(&ui, KeyCode::Esc).unwrap();
+        assert_eq!(esc, Action::CloseOverlay);
+        dispatch(esc, &mut app, &mut ui);
+        assert_eq!(
+            ui.confluence_ui.space_filter.text, "",
+            "first Esc clears the query"
+        );
+        assert!(
+            ui.confluence_ui.space_filter_active,
+            "and keeps the filter open"
+        );
+        assert_eq!(app.visible_space_indices(&ui), vec![0, 1, 2]);
+
+        dispatch(key_action(&ui, KeyCode::Esc).unwrap(), &mut app, &mut ui);
+        assert!(
+            !ui.confluence_ui.space_filter_active,
+            "second Esc closes it"
+        );
+        assert!(!ui.accepts_text_input());
+        assert_eq!(ui.confluence_ui.selected_space, 1, "selection is kept");
+        assert_eq!(ui.active_tab, WorkspaceTab::Confluence);
+        assert_eq!(ui.focus, PaneFocus::Nav);
+    }
+
+    #[tokio::test]
+    async fn typing_in_space_filter_does_not_trigger_shortcuts() {
+        use crossterm::event::KeyCode;
+        let (mut app, mut ui, _dir) = test_app_and_ui();
+        spaces_section(&mut app, &mut ui);
+        dispatch(
+            key_action(&ui, KeyCode::Char('/')).unwrap(),
+            &mut app,
+            &mut ui,
+        );
+
+        // `n` new page, `q` quit, `m` transition, `r` sync, `1` tab, `e` edit.
+        for ch in "nqmr1e".chars() {
+            let act = key_action(&ui, KeyCode::Char(ch)).unwrap();
+            assert_eq!(act, Action::Input(ch));
+            assert!(!dispatch(act, &mut app, &mut ui), "`{ch}` must not quit");
+        }
+        assert_eq!(ui.confluence_ui.space_filter.text, "nqmr1e");
+        assert!(ui.overlays.is_empty(), "no form or overlay opened");
+        assert_eq!(ui.active_tab, WorkspaceTab::Confluence);
+        assert!(!app.syncing, "`r` did not start a sync");
+
+        // Up/Down move within the matches; Enter opens the selection and keeps the query.
+        for _ in 0..6 {
+            dispatch(
+                key_action(&ui, KeyCode::Backspace).unwrap(),
+                &mut app,
+                &mut ui,
+            );
+        }
+        dispatch(
+            key_action(&ui, KeyCode::Char('o')).unwrap(),
+            &mut app,
+            &mut ui,
+        );
+        assert_eq!(
+            app.visible_space_indices(&ui),
+            vec![1, 2],
+            "OPS, then John Doe"
+        );
+        dispatch(key_action(&ui, KeyCode::Down).unwrap(), &mut app, &mut ui);
+        assert_eq!(ui.confluence_ui.selected_space, 2);
+        dispatch(key_action(&ui, KeyCode::Up).unwrap(), &mut app, &mut ui);
+        assert_eq!(ui.confluence_ui.selected_space, 1);
+        dispatch(key_action(&ui, KeyCode::Enter).unwrap(), &mut app, &mut ui);
+        assert!(!ui.confluence_ui.space_filter_active);
+        assert_eq!(ui.confluence_ui.space_filter.text, "o");
+        assert!(
+            ui.tasks.running().any(|t| t.label == "Space OPS"),
+            "OPS is loading"
+        );
+
+        // Closed: letters are shortcuts again, and j/k still step within the matches.
+        assert_eq!(key_action(&ui, KeyCode::Char('n')), Some(Action::NewItem));
+        dispatch(Action::MoveDown, &mut app, &mut ui);
+        assert_eq!(ui.confluence_ui.selected_space, 2);
+        dispatch(Action::MoveDown, &mut app, &mut ui);
+        assert_eq!(ui.confluence_ui.selected_space, 2, "ENG is filtered out");
+    }
+
+    #[tokio::test]
+    async fn new_page_form_flags_personal_space_owner() {
+        let (mut app, mut ui, _dir) = test_app_and_ui();
+        spaces_section(&mut app, &mut ui);
+        app.spaces.push(SpaceSummary {
+            id: "id-asmith".into(),
+            key: "~asmith".into(),
+            name: "Anna Smith".into(),
+            space_type: "personal".into(),
+            ..Default::default()
+        });
+        app.active_page = None;
+
+        let open = |app: &mut AppState, ui: &mut UiState, idx: usize| {
+            ui.confluence_ui.selected_space = idx;
+            dispatch(Action::NewItem, app, ui);
+            let form = match ui.overlays.last() {
+                Some(Overlay::PageForm(f)) => (
+                    f.personal_space,
+                    f.personal_owner_is_me,
+                    f.space_name.clone(),
+                ),
+                other => panic!("expected page form, got {other:?}"),
+            };
+            ui.pop_overlay();
+            form
+        };
+
+        assert_eq!(
+            open(&mut app, &mut ui, 0),
+            (false, None, Some("Engineering".into()))
+        );
+        assert_eq!(
+            open(&mut app, &mut ui, 2),
+            (true, None, Some("John Doe".into())),
+            "no cached identity: owner unknown"
+        );
+        app.me = Some(crate::models::UserSummary {
+            id: "JDOE".into(),
+            display_name: "John Doe".into(),
+            ..Default::default()
+        });
+        assert_eq!(
+            open(&mut app, &mut ui, 2).1,
+            Some(true),
+            "own space, case-insensitive"
+        );
+        assert_eq!(
+            open(&mut app, &mut ui, 3).1,
+            Some(false),
+            "someone else's space"
+        );
     }
 }
