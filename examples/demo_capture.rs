@@ -49,8 +49,31 @@ use tokio::sync::mpsc;
 const WIDTH: u16 = 120;
 const HEIGHT: u16 = 34;
 
-const RENDERER_SCRIPT: &str = r"C:\Users\user\.gemini\antigravity-cli\brain\f9e7f082-6ac8-4e73-9827-8af29ccd4ff4\scratch\render_tui_gif.py";
-const PREVIEW_DIR: &str = r"C:\Users\user\.gemini\antigravity-cli\brain\f9e7f082-6ac8-4e73-9827-8af29ccd4ff4\scratch\gif-previews\atlassian";
+/// GIF renderer script: `DEMO_RENDERER_SCRIPT`, else `<repo>/scripts/render_tui_gif.py`.
+///
+/// The renderer is not part of this repository; the fallback documents where it would go.
+fn renderer_script() -> PathBuf {
+    std::env::var_os("DEMO_RENDERER_SCRIPT")
+        .filter(|v| !v.is_empty())
+        .map(PathBuf::from)
+        .unwrap_or_else(|| {
+            Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("scripts")
+                .join("render_tui_gif.py")
+        })
+}
+
+/// Per-frame PNG preview directory: `DEMO_PREVIEW_DIR`, else `<repo>/target/demo-previews`.
+fn preview_dir() -> PathBuf {
+    std::env::var_os("DEMO_PREVIEW_DIR")
+        .filter(|v| !v.is_empty())
+        .map(PathBuf::from)
+        .unwrap_or_else(|| {
+            Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("target")
+                .join("demo-previews")
+        })
+}
 
 fn color_to_json(c: Color) -> Value {
     match c {
@@ -1229,14 +1252,30 @@ async fn main() {
         std::fs::create_dir_all(parent).expect("create assets dir");
     }
 
-    let status = Command::new("python")
-        .arg(RENDERER_SCRIPT)
+    let renderer = renderer_script();
+    if !renderer.is_file() {
+        eprintln!(
+            "renderer not found at {}; set DEMO_RENDERER_SCRIPT=<path to render_tui_gif.py>. Frames kept at {}",
+            renderer.display(),
+            temp_json.display()
+        );
+        std::process::exit(2);
+    }
+    let previews = preview_dir();
+    std::fs::create_dir_all(&previews).expect("create demo preview dir");
+    let python = std::env::var("DEMO_PYTHON")
+        .ok()
+        .filter(|v| !v.trim().is_empty())
+        .unwrap_or_else(|| "python".to_string());
+
+    let status = Command::new(&python)
+        .arg(&renderer)
         .arg(&temp_json)
         .arg(&output_gif)
         .arg("--preview-png")
-        .arg(PREVIEW_DIR)
+        .arg(&previews)
         .status()
-        .expect("invoke render_tui_gif.py");
+        .unwrap_or_else(|err| panic!("invoke {python} {}: {err}", renderer.display()));
 
     assert!(
         status.success(),
