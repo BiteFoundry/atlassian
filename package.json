@@ -1,8 +1,13 @@
 {
   "name": "@bitefoundry/atlassian",
   "version": "0.8.1",
+  "mcpName": "io.github.BiteFoundry/atlassian",
   "description": "Unified Atlassian Jira & Confluence native terminal client & AI agent toolkit (CLI, TUI, HTTP API, MCP)",
   "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/BiteFoundry/atlassian.git"
+  },
   "bin": {
     "atlassian": "bin/atlassian.js",
     "confluence": "bin/confluence.js",

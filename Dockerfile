@@ -22,7 +22,8 @@ LABEL org.opencontainers.image.title="atlassian" \
       org.opencontainers.image.source="https://github.com/BiteFoundry/atlassian" \
       org.opencontainers.image.documentation="https://github.com/BiteFoundry/atlassian#readme" \
       org.opencontainers.image.version="${ATLASSIAN_VERSION}" \
-      org.opencontainers.image.licenses="MIT"
+      org.opencontainers.image.licenses="MIT" \
+      io.modelcontextprotocol.server.name="io.github.BiteFoundry/atlassian"
 
 RUN apt-get update \
  && apt-get install -y --no-install-recommends ca-certificates curl \

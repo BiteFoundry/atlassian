@@ -1,0 +1,41 @@
+{
+  "$schema": "https://static.modelcontextprotocol.io/schemas/2025-12-11/server.schema.json",
+  "name": "io.github.BiteFoundry/atlassian",
+  "title": "Atlassian (Jira & Confluence)",
+  "description": "Jira & Confluence MCP server, CLI, and TUI in Rust with compact Markdown reads and read-only mode.",
+  "version": "0.8.1",
+  "websiteUrl": "https://bitefoundry.dev/#app-atlassian",
+  "repository": {
+    "url": "https://github.com/BiteFoundry/atlassian",
+    "source": "github"
+  },
+  "packages": [
+    {
+      "registryType": "oci",
+      "identifier": "ghcr.io/bitefoundry/atlassian:0.8.1",
+      "transport": {
+        "type": "stdio"
+      },
+      "environmentVariables": [
+        {
+          "name": "ATLASSIAN_SITE_URL",
+          "description": "Base URL of your Jira/Confluence site (e.g. https://acme.atlassian.net).",
+          "isRequired": false,
+          "isSecret": false
+        },
+        {
+          "name": "ATLASSIAN_EMAIL",
+          "description": "Account email for Atlassian Cloud API token authentication.",
+          "isRequired": false,
+          "isSecret": false
+        },
+        {
+          "name": "ATLASSIAN_API_TOKEN",
+          "description": "Atlassian Cloud API token.",
+          "isRequired": false,
+          "isSecret": true
+        }
+      ]
+    }
+  ]
+}
