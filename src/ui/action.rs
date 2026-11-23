@@ -2047,7 +2047,10 @@ mod tests {
         }
         dispatch(Action::Submit, &mut app, &mut ui);
         assert!(app.drafts.get("issue:new:ATL").is_some());
-        app.handle_ui_msg(&mut ui, UiMsg::IssueActionFailed("HTTP 500".into()));
+        app.handle_ui_msg(&mut ui, UiMsg::IssueActionFailed {
+                task_label: "Create issue".into(),
+                error: "HTTP 500".into(),
+            });
         assert!(app.drafts.get("issue:new:ATL").is_some());
         let created_issue = app.active_issue.clone().unwrap();
         app.handle_ui_msg(
@@ -2075,7 +2078,10 @@ mod tests {
         }
         dispatch(Action::Submit, &mut app, &mut ui);
         assert!(app.drafts.get("page:new:ENG:900").is_some());
-        app.handle_ui_msg(&mut ui, UiMsg::PageActionFailed("HTTP 409 Conflict".into()));
+        app.handle_ui_msg(&mut ui, UiMsg::PageActionFailed {
+                task_label: "Create page".into(),
+                error: "HTTP 409 Conflict".into(),
+            });
         assert!(app.drafts.get("page:new:ENG:900").is_some());
         let created_page = app.active_page.clone().unwrap();
         app.handle_ui_msg(

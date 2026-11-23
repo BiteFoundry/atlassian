@@ -229,13 +229,19 @@ pub enum UiMsg {
         sprints: Vec<SprintSummary>,
         issues: Vec<IssueSummary>,
     },
-    BoardLoadFailed(String),
+    BoardLoadFailed {
+        board_id: i64,
+        error: String,
+    },
     IssuesLoaded {
         site_id: String,
         issues: Vec<IssueSummary>,
         label: String,
     },
-    IssuesLoadFailed(String),
+    IssuesLoadFailed {
+        label: String,
+        error: String,
+    },
     SavedFiltersLoaded(Vec<SavedFilter>),
     IssueDetailLoaded {
         seq: Option<u64>,
@@ -266,7 +272,10 @@ pub enum UiMsg {
         task_label: String,
         error: String,
     },
-    IssueActionFailed(String),
+    IssueActionFailed {
+        task_label: String,
+        error: String,
+    },
     TransitionsLoaded {
         issue_key: String,
         transitions: Result<Vec<IssueTransition>, String>,
@@ -293,6 +302,7 @@ pub enum UiMsg {
     ChildPagesLoaded {
         site_id: String,
         parent_id: String,
+        task_label: String,
         children: Result<Vec<PageSummary>, String>,
     },
     PageDetailLoaded {
@@ -308,7 +318,10 @@ pub enum UiMsg {
         toast: String,
         clear_draft_key: Option<String>,
     },
-    PageActionFailed(String),
+    PageActionFailed {
+        task_label: String,
+        error: String,
+    },
     MyWorkLoaded {
         issues: Vec<IssueSummary>,
         issue_site_ids: Vec<String>,
@@ -343,6 +356,7 @@ pub enum UiMsg {
     HtmlAttachmentLoaded {
         title: String,
         source_url: String,
+        task_label: String,
         result: Result<String, String>,
     },
     PreviewImageSniffedAsHtml {
@@ -351,7 +365,10 @@ pub enum UiMsg {
         html: String,
     },
     HtmlServed(Result<String, String>),
-    AttachmentDownloaded(Result<DownloadedFile, String>),
+    AttachmentDownloaded {
+        task_label: String,
+        result: Result<DownloadedFile, String>,
+    },
     AttachmentUploaded {
         site_id: String,
         issue_key: Option<String>,
@@ -2103,7 +2120,10 @@ impl AppState {
                     });
                 }
                 Err(e) => {
-                    let _ = tx.send(UiMsg::BoardLoadFailed(e.to_string()));
+                    let _ = tx.send(UiMsg::BoardLoadFailed {
+                        board_id,
+                        error: e.to_string(),
+                    });
                 }
             }
         });
@@ -2128,7 +2148,10 @@ impl AppState {
                     });
                 }
                 Err(e) => {
-                    let _ = tx.send(UiMsg::IssuesLoadFailed(e.to_string()));
+                    let _ = tx.send(UiMsg::IssuesLoadFailed {
+                        label,
+                        error: e.to_string(),
+                    });
                 }
             }
         });
@@ -2650,9 +2673,10 @@ impl AppState {
                         });
                     }
                     Err(e) => {
-                        let _ = tx.send(UiMsg::IssueActionFailed(format!(
-                            "Failed to update issue (draft preserved): {e}"
-                        )));
+                        let _ = tx.send(UiMsg::IssueActionFailed {
+                            task_label: format!("Update {key}"),
+                            error: format!("Failed to update issue (draft preserved): {e}"),
+                        });
                     }
                 }
             });
@@ -2682,9 +2706,10 @@ impl AppState {
                         });
                     }
                     Err(e) => {
-                        let _ = tx.send(UiMsg::IssueActionFailed(format!(
-                            "Failed to create issue (draft preserved): {e}"
-                        )));
+                        let _ = tx.send(UiMsg::IssueActionFailed {
+                            task_label: "Create issue".to_string(),
+                            error: format!("Failed to create issue (draft preserved): {e}"),
+                        });
                     }
                 }
             });
@@ -2913,7 +2938,8 @@ impl AppState {
         if tokio::runtime::Handle::try_current().is_err() {
             return;
         }
-        ui.tasks.begin(format!("Child pages: {}", page.title));
+        let task_label = format!("Child pages: {}", page.title);
+        ui.tasks.begin(&task_label);
         let storage = self.storage.clone();
         let tx = self.ui_tx.clone();
         let pid = page.id.clone();
@@ -2923,6 +2949,7 @@ impl AppState {
                     let _ = tx.send(UiMsg::ChildPagesLoaded {
                         site_id,
                         parent_id: pid,
+                        task_label,
                         children: Ok(children),
                     });
                 }
@@ -2930,6 +2957,7 @@ impl AppState {
                     let _ = tx.send(UiMsg::ChildPagesLoaded {
                         site_id,
                         parent_id: pid,
+                        task_label,
                         children: Err(e.to_string()),
                     });
                 }
@@ -3245,9 +3273,10 @@ impl AppState {
                         });
                     }
                     Err(e) => {
-                        let _ = tx.send(UiMsg::PageActionFailed(format!(
-                            "Failed to update page (draft preserved): {e}"
-                        )));
+                        let _ = tx.send(UiMsg::PageActionFailed {
+                            task_label: "Update page".to_string(),
+                            error: format!("Failed to update page (draft preserved): {e}"),
+                        });
                     }
                 }
             });
@@ -3271,9 +3300,10 @@ impl AppState {
                         });
                     }
                     Err(e) => {
-                        let _ = tx.send(UiMsg::PageActionFailed(format!(
-                            "Failed to create page (draft preserved): {e}"
-                        )));
+                        let _ = tx.send(UiMsg::PageActionFailed {
+                            task_label: "Create page".to_string(),
+                            error: format!("Failed to create page (draft preserved): {e}"),
+                        });
                     }
                 }
             });
@@ -3556,7 +3586,8 @@ impl AppState {
             return;
         }
         let dest = self.config.resolved_download_dir();
-        ui.tasks.begin(format!("Download: {}", att.filename));
+        let task_label = format!("Download: {}", att.filename);
+        ui.tasks.begin(&task_label);
         let explicit_site = if ui.active_tab == WorkspaceTab::Confluence {
             self.active_page_site_id.as_deref()
         } else {
@@ -3571,7 +3602,10 @@ impl AppState {
                 .download_attachment(&att, &dest)
                 .await
                 .map_err(|e| e.to_string());
-            let _ = tx.send(UiMsg::AttachmentDownloaded(res));
+            let _ = tx.send(UiMsg::AttachmentDownloaded {
+                task_label,
+                result: res,
+            });
         });
     }
 
@@ -3647,7 +3681,8 @@ impl AppState {
         let client = self.client.clone();
         let tx = self.ui_tx.clone();
         let source_url = att.content_url.clone();
-        ui.tasks.begin(format!("HTML: {}", att.filename));
+        let task_label = format!("HTML: {}", att.filename);
+        ui.tasks.begin(&task_label);
         tokio::spawn(async move {
             let result = match client.fetch_attachment_bytes(&att).await {
                 Ok(bytes) => Ok(String::from_utf8_lossy(&bytes).into_owned()),
@@ -3656,6 +3691,7 @@ impl AppState {
             let _ = tx.send(UiMsg::HtmlAttachmentLoaded {
                 title,
                 source_url,
+                task_label,
                 result,
             });
         });
@@ -4153,8 +4189,10 @@ impl AppState {
                 ui.board_ui.selected_col = 0;
                 ui.board_ui.selected_row = 0;
             }
-            UiMsg::BoardLoadFailed(err) => {
-                ui.error(format!("Failed to load board: {err}"));
+            UiMsg::BoardLoadFailed { board_id, error } => {
+                ui.tasks
+                    .finish(&format!("Board #{board_id}"), Some(error.clone()));
+                ui.error(format!("Failed to load board: {error}"));
             }
             UiMsg::IssuesLoaded {
                 site_id,
@@ -4172,8 +4210,9 @@ impl AppState {
                     self.request_issue_detail_for_site(ui, Some(&site_id), &first.key);
                 }
             }
-            UiMsg::IssuesLoadFailed(err) => {
-                ui.error(format!("JQL search failed: {err}"));
+            UiMsg::IssuesLoadFailed { label, error } => {
+                ui.tasks.finish(&format!("JQL: {label}"), Some(error.clone()));
+                ui.error(format!("JQL search failed: {error}"));
             }
             UiMsg::SavedFiltersLoaded(filters) => {
                 let mut combined = builtin_filters();
@@ -4380,9 +4419,10 @@ impl AppState {
                 ui.error(&error);
                 self.notify_desktop("Atlassian Jira Error", &error);
             }
-            UiMsg::IssueActionFailed(err) => {
-                ui.error(&err);
-                self.notify_desktop("Atlassian Jira Error", &err);
+            UiMsg::IssueActionFailed { task_label, error } => {
+                ui.tasks.finish(&task_label, Some(error.clone()));
+                ui.error(&error);
+                self.notify_desktop("Atlassian Jira Error", &error);
             }
             UiMsg::TransitionsLoaded {
                 issue_key,
@@ -4482,7 +4522,8 @@ impl AppState {
                 space_key,
                 pages,
             } => {
-                ui.tasks.finish(&format!("Space {space_key}"), None);
+                ui.tasks
+                    .finish(&format!("Space {space_key}"), pages.as_ref().err().cloned());
                 if !self.site_scope.matches(&site_id) {
                     return;
                 }
@@ -4504,8 +4545,12 @@ impl AppState {
             UiMsg::ChildPagesLoaded {
                 site_id,
                 parent_id,
+                task_label,
                 children,
             } => {
+                // Finish before the scope check: a site switch while the
+                // request was in flight must not leave the spinner running.
+                ui.tasks.finish(&task_label, children.as_ref().err().cloned());
                 if !self.site_scope.matches(&site_id) {
                     return;
                 }
@@ -4668,9 +4713,10 @@ impl AppState {
                 ui.success(&toast);
                 self.notify_desktop_page(&sk, &title);
             }
-            UiMsg::PageActionFailed(err) => {
-                ui.error(&err);
-                self.notify_desktop("Atlassian Confluence Error", &err);
+            UiMsg::PageActionFailed { task_label, error } => {
+                ui.tasks.finish(&task_label, Some(error.clone()));
+                ui.error(&error);
+                self.notify_desktop("Atlassian Confluence Error", &error);
             }
             UiMsg::MyWorkLoaded {
                 issues,
@@ -4832,13 +4878,10 @@ impl AppState {
             UiMsg::HtmlAttachmentLoaded {
                 title,
                 source_url,
+                task_label,
                 result,
             } => {
-                let task_name = title
-                    .rsplit(" — ")
-                    .next()
-                    .unwrap_or(&title);
-                ui.tasks.finish(&format!("HTML: {task_name}"), None);
+                ui.tasks.finish(&task_label, result.as_ref().err().cloned());
                 if let Some(Overlay::HtmlPreview(ov)) = ui.overlays.last_mut() {
                     if !source_url.is_empty() {
                         ov.source_url = source_url;
@@ -4886,13 +4929,14 @@ impl AppState {
                     ui.error(format!("Failed to serve HTML locally: {err}"));
                 }
             },
-            UiMsg::AttachmentDownloaded(res) => match res {
+            UiMsg::AttachmentDownloaded { task_label, result } => match result {
                 Ok(file) => {
-                    ui.tasks.finish(&format!("Download: {}", file.filename), None);
+                    ui.tasks.finish(&task_label, None);
                     ui.success(format!("Saved: {}", file.path.display()));
                     self.notify_desktop("Atlassian Download", &format!("Saved {}", file.filename));
                 }
                 Err(e) => {
+                    ui.tasks.finish(&task_label, Some(e.clone()));
                     ui.error(format!("Download failed: {e}"));
                     self.notify_desktop("Atlassian Download Failed", &e);
                 }
@@ -5118,6 +5162,127 @@ mod tests {
                 category: cat,
             },
             ..Default::default()
+        }
+    }
+
+    fn two_site_app() -> (AppState, UiState) {
+        let mut cfg = AppConfig::default();
+        cfg.sites = ["site-a", "site-b"]
+            .iter()
+            .map(|id| SiteProfile {
+                id: (*id).into(),
+                name: id.to_uppercase(),
+                site_url: format!("https://{id}.example.com"),
+                deployment: DeploymentKind::Cloud,
+                account_id: "default".into(),
+                enabled: true,
+                ..Default::default()
+            })
+            .collect();
+        cfg.default_site = Some("site-a".into());
+        cfg.active_site = Some("site-a".into());
+        let auth = AuthManager::new("w8-tasks");
+        let client = AtlassianClient::new(cfg.clone(), auth.clone()).unwrap();
+        let storage = Storage::open_in_memory().unwrap();
+        let (core_tx, _core_rx) = mpsc::unbounded_channel();
+        let sync_ctrl =
+            sync::spawn_sync_engine(cfg.clone(), client.clone(), storage.clone(), core_tx);
+        let (ui_tx, _ui_rx) = mpsc::unbounded_channel();
+        let app = AppState::new_with_persona(
+            cfg.clone(),
+            Persona::Jira,
+            auth,
+            client,
+            storage,
+            sync_ctrl,
+            ui_tx,
+        );
+        let ui = UiState::from_config_with_persona(&cfg, Persona::Jira);
+        (app, ui)
+    }
+
+    #[tokio::test]
+    async fn child_pages_loaded_finishes_task_even_when_scope_changed() {
+        let (mut app, mut ui) = two_site_app();
+        app.site_scope = SiteScope::Only("site-a".into());
+        ui.tasks.begin("Child pages: Runbook");
+        // The user switched to site-a while a site-b request was in flight.
+        app.handle_ui_msg(
+            &mut ui,
+            UiMsg::ChildPagesLoaded {
+                site_id: "site-b".into(),
+                parent_id: "42".into(),
+                task_label: "Child pages: Runbook".into(),
+                children: Ok(vec![]),
+            },
+        );
+        assert!(
+            ui.tasks.first_running().is_none(),
+            "out-of-scope child-pages result must still finish its task"
+        );
+        assert!(!app.page_children_map.contains_key("42"));
+    }
+
+    #[tokio::test]
+    async fn failed_requests_finish_their_tasks() {
+        let (mut app, mut ui) = two_site_app();
+        let cases: Vec<(&str, UiMsg)> = vec![
+            (
+                "Board #7",
+                UiMsg::BoardLoadFailed {
+                    board_id: 7,
+                    error: "HTTP 500".into(),
+                },
+            ),
+            (
+                "JQL: Mine",
+                UiMsg::IssuesLoadFailed {
+                    label: "Mine".into(),
+                    error: "HTTP 400".into(),
+                },
+            ),
+            (
+                "Update ATL-1",
+                UiMsg::IssueActionFailed {
+                    task_label: "Update ATL-1".into(),
+                    error: "HTTP 500".into(),
+                },
+            ),
+            (
+                "Create page",
+                UiMsg::PageActionFailed {
+                    task_label: "Create page".into(),
+                    error: "HTTP 409".into(),
+                },
+            ),
+            (
+                "Download: a.pdf",
+                UiMsg::AttachmentDownloaded {
+                    task_label: "Download: a.pdf".into(),
+                    result: Err("HTTP 404".into()),
+                },
+            ),
+            (
+                "HTML: report.html",
+                UiMsg::HtmlAttachmentLoaded {
+                    title: "Page — report.html".into(),
+                    source_url: String::new(),
+                    task_label: "HTML: report.html".into(),
+                    result: Err("HTTP 403".into()),
+                },
+            ),
+        ];
+        for (label, msg) in cases {
+            ui.tasks.begin(label);
+            app.handle_ui_msg(&mut ui, msg);
+            assert!(
+                ui.tasks.running().all(|t| t.label != label),
+                "{label} still running after its failure message"
+            );
+            assert!(
+                ui.tasks.last().unwrap().display().contains("failed"),
+                "{label} should be shown as failed"
+            );
         }
     }
 

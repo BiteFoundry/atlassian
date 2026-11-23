@@ -125,7 +125,13 @@ pub enum TaskState {
 pub struct TaskStatus {
     pub label: String,
     pub state: TaskState,
+    pub started: Instant,
 }
+
+/// A running task older than this is treated as leaked: no request the TUI
+/// starts has a timeout above 30 s, so a task still "running" after two
+/// minutes lost its finishing message and must not keep the spinner alive.
+pub const STALE_TASK_AFTER: Duration = Duration::from_secs(120);
 
 impl TaskStatus {
     pub fn display(&self) -> String {
@@ -139,6 +145,10 @@ impl TaskStatus {
     pub fn running(&self) -> bool {
         matches!(self.state, TaskState::Running)
     }
+
+    fn is_stale_running(&self, now: Instant) -> bool {
+        self.running() && now.saturating_duration_since(self.started) >= STALE_TASK_AFTER
+    }
 }
 
 #[derive(Debug, Default)]
@@ -149,14 +159,25 @@ pub struct TaskBoard {
 impl TaskBoard {
     pub fn begin(&mut self, label: impl Into<String>) {
         let label = label.into();
+        let now = Instant::now();
+        self.purge_stale(now);
         self.tasks.retain(|t| t.label != label);
         self.tasks.push(TaskStatus {
             label,
             state: TaskState::Running,
+            started: now,
         });
     }
 
     pub fn finish(&mut self, label: &str, error: Option<String>) {
+        let now = Instant::now();
+        self.purge_stale(now);
+        let started = self
+            .tasks
+            .iter()
+            .find(|t| t.label == label)
+            .map(|t| t.started)
+            .unwrap_or(now);
         self.tasks.retain(|t| t.label != label);
         self.tasks.push(TaskStatus {
             label: label.to_string(),
@@ -164,6 +185,7 @@ impl TaskBoard {
                 Some(err) => TaskState::Failed(err),
                 None => TaskState::Done,
             },
+            started,
         });
         let mut done = 0usize;
         let mut keep = Vec::with_capacity(self.tasks.len());
@@ -180,7 +202,14 @@ impl TaskBoard {
     }
 
     pub fn running(&self) -> impl Iterator<Item = &TaskStatus> {
-        self.tasks.iter().filter(|t| t.running())
+        let now = Instant::now();
+        self.tasks
+            .iter()
+            .filter(move |t| t.running() && !t.is_stale_running(now))
+    }
+
+    fn purge_stale(&mut self, now: Instant) {
+        self.tasks.retain(|t| !t.is_stale_running(now));
     }
 
     pub fn first_running(&self) -> Option<&TaskStatus> {
@@ -228,5 +257,35 @@ mod tests {
         assert_eq!(board.last().unwrap().display(), "Sync done");
         board.finish("Sync", Some("timeout".into()));
         assert_eq!(board.last().unwrap().display(), "Sync failed: timeout");
+    }
+
+    #[test]
+    fn task_board_expires_stale_running_tasks() {
+        let mut board = TaskBoard::default();
+        let old = Instant::now()
+            .checked_sub(STALE_TASK_AFTER + Duration::from_secs(1))
+            .expect("monotonic clock far enough from boot");
+        board.tasks.push(TaskStatus {
+            label: "Child pages: Leaked".into(),
+            state: TaskState::Running,
+            started: old,
+        });
+        // A leaked task no longer counts as running work.
+        assert!(board.first_running().is_none());
+
+        // Fresh work is still reported, and the next begin purges the leak.
+        board.begin("Sync");
+        assert_eq!(board.first_running().unwrap().label, "Sync");
+        assert_eq!(board.tasks.len(), 1);
+
+        // finish also purges, and a stale Done entry is kept (only running expires).
+        board.tasks.push(TaskStatus {
+            label: "Old leak".into(),
+            state: TaskState::Running,
+            started: old,
+        });
+        board.finish("Sync", None);
+        assert!(board.tasks.iter().all(|t| t.label != "Old leak"));
+        assert_eq!(board.last().unwrap().display(), "Sync done");
     }
 }
