@@ -208,6 +208,24 @@ fn heading_matches(node: &Value, target_trimmed: &str, target_normalized: &str) 
     plain == target_trimmed || markdown == target_trimmed || plain == target_normalized
 }
 
+/// True for a `layoutSection` with a column that directly holds a heading of `level` or above.
+///
+/// Such a layout starts sibling sections (`section_body_range` resolves those headings), so it
+/// is not part of the section before it.
+fn layout_contains_heading_at_or_above(node: &Value, level: u64) -> bool {
+    node["type"] == "layoutSection"
+        && node["content"].as_array().is_some_and(|columns| {
+            columns.iter().any(|column| {
+                column["type"] == "layoutColumn"
+                    && column["content"].as_array().is_some_and(|children| {
+                        children
+                            .iter()
+                            .any(|child| heading_level(child).is_some_and(|next| next <= level))
+                    })
+            })
+        })
+}
+
 fn section_range_in_container(
     content: &[Value],
     heading_index: usize,
@@ -216,7 +234,10 @@ fn section_range_in_container(
     let start = heading_index + 1;
     let end = content[start..]
         .iter()
-        .position(|node| heading_level(node).is_some_and(|next| next <= level))
+        .position(|node| {
+            heading_level(node).is_some_and(|next| next <= level)
+                || layout_contains_heading_at_or_above(node, level)
+        })
         .map_or(content.len(), |next| start + next);
     start..end
 }
@@ -1074,5 +1095,158 @@ mod tests {
             dup_col_err.to_string().contains("more than one section"),
             "{dup_col_err:#}"
         );
+    }
+
+    fn heading_node(text: &str, level: u64) -> Value {
+        json!({
+            "type": "heading",
+            "attrs": { "level": level },
+            "content": [{ "type": "text", "text": text }]
+        })
+    }
+
+    fn paragraph_node(text: &str) -> Value {
+        json!({
+            "type": "paragraph",
+            "content": [{ "type": "text", "text": text }]
+        })
+    }
+
+    fn layout_node(columns: Vec<Vec<Value>>) -> Value {
+        let columns: Vec<Value> = columns
+            .into_iter()
+            .map(|content| {
+                json!({
+                    "type": "layoutColumn",
+                    "attrs": { "width": 50 },
+                    "content": content
+                })
+            })
+            .collect();
+        json!({
+            "type": "layoutSection",
+            "attrs": { "localId": "ls-1" },
+            "content": columns
+        })
+    }
+
+    /// `H2 Overview`, `Intro`, then `layout`, then `H2 End` and its paragraph.
+    fn overview_layout_end_doc(layout: Value) -> Value {
+        json!({
+            "version": 1,
+            "type": "doc",
+            "content": [
+                heading_node("Overview", 2),
+                paragraph_node("Intro"),
+                layout,
+                heading_node("End", 2),
+                paragraph_node("Tail")
+            ]
+        })
+    }
+
+    fn layout_with_sibling_sections() -> Value {
+        layout_node(vec![
+            vec![heading_node("Details", 2), paragraph_node("Details body")],
+            vec![heading_node("Risks", 2), paragraph_node("Risks body")],
+        ])
+    }
+
+    fn replace_overview(doc: &Value) -> Value {
+        let edit = SectionReplacement {
+            heading: "Overview".into(),
+            markdown: "New intro".into(),
+        };
+        BodyEdit::Section(&edit).adf(doc.clone()).unwrap().unwrap()
+    }
+
+    fn new_intro_nodes() -> Vec<Value> {
+        markdown_to_adf("New intro")["content"]
+            .as_array()
+            .unwrap()
+            .clone()
+    }
+
+    #[test]
+    fn adf_replace_section_stops_before_layout_with_same_level_headings() {
+        let doc = overview_layout_end_doc(layout_with_sibling_sections());
+        let original = doc["content"].as_array().unwrap();
+
+        let updated = replace_overview(&doc);
+        let content = updated["content"].as_array().unwrap();
+        let intro = new_intro_nodes();
+        assert_eq!(content.len(), original.len() - 1 + intro.len());
+        assert_eq!(content[0], original[0]);
+        assert_eq!(content[1..1 + intro.len()], intro[..]);
+        // The layout and both of its columns survive untouched, and so does the next section.
+        assert_eq!(content[1 + intro.len()..], original[2..]);
+        assert!(!updated.to_string().contains("\"Intro\""));
+
+        // The same edit is now a no-op.
+        let edit = SectionReplacement {
+            heading: "Overview".into(),
+            markdown: "New intro".into(),
+        };
+        assert!(BodyEdit::Section(&edit).adf(updated).unwrap().is_none());
+    }
+
+    #[test]
+    fn adf_replace_section_keeps_layout_without_headings_inside_section() {
+        // A layout holding only paragraphs is content of the section, so it is replaced with it.
+        let doc = overview_layout_end_doc(layout_node(vec![
+            vec![paragraph_node("Left")],
+            vec![paragraph_node("Right")],
+        ]));
+        let original = doc["content"].as_array().unwrap();
+
+        let updated = replace_overview(&doc);
+        let content = updated["content"].as_array().unwrap();
+        let intro = new_intro_nodes();
+        assert_eq!(content[0], original[0]);
+        assert_eq!(content[1..1 + intro.len()], intro[..]);
+        assert_eq!(content[1 + intro.len()..], original[3..]);
+        assert!(content.iter().all(|node| node["type"] != "layoutSection"));
+    }
+
+    #[test]
+    fn adf_replace_section_keeps_layout_with_deeper_headings_inside_section() {
+        // H3 headings in the columns are subsections of the H2 section, so the layout goes with it.
+        let doc = overview_layout_end_doc(layout_node(vec![
+            vec![heading_node("Sub A", 3), paragraph_node("A body")],
+            vec![heading_node("Sub B", 3), paragraph_node("B body")],
+        ]));
+        let original = doc["content"].as_array().unwrap();
+
+        let updated = replace_overview(&doc);
+        let content = updated["content"].as_array().unwrap();
+        let intro = new_intro_nodes();
+        assert_eq!(content[0], original[0]);
+        assert_eq!(content[1..1 + intro.len()], intro[..]);
+        assert_eq!(content[1 + intro.len()..], original[3..]);
+        assert!(content.iter().all(|node| node["type"] != "layoutSection"));
+    }
+
+    #[test]
+    fn adf_read_section_matches_replace_boundary() {
+        let doc = overview_layout_end_doc(layout_with_sibling_sections());
+        let content = doc["content"].as_array().unwrap();
+
+        // The resolver that every section operation shares returns only `Intro` for `Overview`.
+        let SectionTarget::TopLevel(range) = section_body_range(content, "Overview").unwrap()
+        else {
+            panic!("Overview is a top-level section");
+        };
+        assert_eq!(content[range], [paragraph_node("Intro")]);
+
+        // A heading inside the layout still resolves to its own column section.
+        let SectionTarget::LayoutColumn {
+            section_index,
+            column_index,
+            range,
+        } = section_body_range(content, "Risks").unwrap()
+        else {
+            panic!("Risks is a layout-column section");
+        };
+        assert_eq!((section_index, column_index, range), (2, 1, 1..2));
     }
 }
