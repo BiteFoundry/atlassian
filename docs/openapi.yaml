@@ -18,6 +18,15 @@ info:
     must be `127.0.0.1`, `localhost` or `[::1]`. Requests without an
     `Origin` header are not affected.
 
+    Every endpoint except `GET /health` accepts `site` (a configured site
+    ID, name, or URL; writes with a JSON body also read it from the body).
+    Without it, an endpoint uses the site given at launch with `--site` (or
+    saved by the TUI site switcher), else the default site; `GET /search`
+    and `POST /sync` cover every site unless such a launch or TUI site is
+    set. An unknown `site` returns `404`, except on `GET /search` and
+    `POST /sync`, which return `400`. Write endpoints refuse `site=all`
+    with `400`.
+
     All errors return `{"error": "<message>"}` with an appropriate HTTP status.
 servers:
   - url: http://127.0.0.1:8789
@@ -184,7 +193,7 @@ paths:
         - name: cursor
           in: query
           required: false
-          description: `next_cursor` of the previous answer. Absent for the first page. An offset on Data Center and for offline reads; an opaque Atlassian cursor on Cloud Confluence.
+          description: "`next_cursor` of the previous answer. Absent for the first page. An offset on Data Center and for offline reads; an opaque Atlassian cursor on Cloud Confluence."
           schema:
             type: string
         - name: offline
@@ -203,12 +212,10 @@ paths:
                 required: [board_id, issues]
                 properties:
                   has_more:
-                    type: boolean
-                    nullable: true
+                    type: [boolean, "null"]
                     description: True when another page exists; null when the server gave no way to tell.
                   next_cursor:
-                    type: string
-                    nullable: true
+                    type: [string, "null"]
                     description: Pass as `cursor` to read the next page.
                   board_id:
                     type: integer
@@ -606,7 +613,7 @@ paths:
         - name: cursor
           in: query
           required: false
-          description: `next_cursor` of the previous answer. Absent for the first page. An offset on Data Center and for offline reads; an opaque Atlassian cursor on Cloud Confluence.
+          description: "`next_cursor` of the previous answer. Absent for the first page. An offset on Data Center and for offline reads; an opaque Atlassian cursor on Cloud Confluence."
           schema:
             type: string
       responses:
@@ -619,12 +626,10 @@ paths:
                 required: [spaces]
                 properties:
                   has_more:
-                    type: boolean
-                    nullable: true
+                    type: [boolean, "null"]
                     description: True when another page exists; null when the server gave no way to tell.
                   next_cursor:
-                    type: string
-                    nullable: true
+                    type: [string, "null"]
                     description: Pass as `cursor` to read the next page.
                   spaces:
                     type: array
@@ -653,7 +658,7 @@ paths:
         - name: cursor
           in: query
           required: false
-          description: `next_cursor` of the previous answer. Absent for the first page. An offset on Data Center and for offline reads; an opaque Atlassian cursor on Cloud Confluence.
+          description: "`next_cursor` of the previous answer. Absent for the first page. An offset on Data Center and for offline reads; an opaque Atlassian cursor on Cloud Confluence."
           schema:
             type: string
         - name: offline
@@ -672,12 +677,10 @@ paths:
                 required: [space, pages]
                 properties:
                   has_more:
-                    type: boolean
-                    nullable: true
+                    type: [boolean, "null"]
                     description: True when another page exists; null when the server gave no way to tell.
                   next_cursor:
-                    type: string
-                    nullable: true
+                    type: [string, "null"]
                     description: Pass as `cursor` to read the next page.
                   space:
                     type: string
@@ -835,7 +838,7 @@ paths:
         - name: cursor
           in: query
           required: false
-          description: `next_cursor` of the previous answer. Absent for the first page. An offset on Data Center and for offline reads; an opaque Atlassian cursor on Cloud Confluence.
+          description: "`next_cursor` of the previous answer. Absent for the first page. An offset on Data Center and for offline reads; an opaque Atlassian cursor on Cloud Confluence."
           schema:
             type: string
         - name: offline
@@ -854,12 +857,10 @@ paths:
                 required: [parent_id, pages]
                 properties:
                   has_more:
-                    type: boolean
-                    nullable: true
+                    type: [boolean, "null"]
                     description: True when another page exists; null when the server gave no way to tell.
                   next_cursor:
-                    type: string
-                    nullable: true
+                    type: [string, "null"]
                     description: Pass as `cursor` to read the next page.
                   parent_id:
                     type: string
@@ -963,6 +964,7 @@ paths:
             minimum: 1
             maximum: 1000
             default: 30
+        - $ref: "#/components/parameters/Site"
       responses:
         "200":
           description: Search hits
@@ -976,6 +978,9 @@ paths:
                     type: string
                   scope:
                     type: string
+                  site_id:
+                    type: [string, "null"]
+                    description: The resolved site scope; null means every site. A cache search covers this scope; a remote search queries the named site, else the server's site.
                   remote:
                     type: boolean
                   hits:
@@ -990,6 +995,14 @@ paths:
     post:
       tags: [sync]
       summary: Trigger full Jira & Confluence workspace sync
+      description: >-
+        Every enabled site is synced when more than one is enabled and the
+        request covers every site: `site=all`, or no `site` while no site was
+        chosen at launch (`--site`) or in the TUI. That answer carries `sites`
+        (one entry per site) instead of `site_id`, and `ok` is true when at
+        least one site synced. Otherwise the one resolved site is synced.
+      parameters:
+        - $ref: "#/components/parameters/Site"
       responses:
         "200":
           description: Sync summary and cache counts
@@ -1001,10 +1014,20 @@ paths:
                 properties:
                   ok:
                     type: boolean
+                  site_id:
+                    type: string
+                    description: The synced site (one-site sync only).
                   summary:
                     type: string
+                  sites:
+                    type: array
+                    description: One entry per site (every-site sync only).
+                    items:
+                      $ref: "#/components/schemas/SiteSyncResult"
                   counts:
                     $ref: "#/components/schemas/CacheCounts"
+        "400":
+          $ref: "#/components/responses/BadRequest"
         "401":
           $ref: "#/components/responses/Unauthorized"
 components:
@@ -1012,6 +1035,20 @@ components:
     bearerAuth:
       type: http
       scheme: bearer
+  parameters:
+    Site:
+      name: site
+      in: query
+      required: false
+      description: >-
+        Configured site ID, name, or URL; `all` means every site. Without it,
+        the site given at launch with `--site` (or saved by the TUI site
+        switcher) applies when one is set, else every site. A remote search
+        (`remote=true`) always queries one site: the named site, else the
+        server's site. An unknown site returns `400` with
+        `unknown site '<name>'; configured sites: ...`.
+      schema:
+        type: string
   responses:
     BadRequest:
       description: Invalid request input
@@ -1131,6 +1168,11 @@ components:
         board_id:
           type: integer
           format: int64
+          description: The board the sprint was listed under.
+        origin_board_id:
+          type: integer
+          format: int64
+          description: The board that owns the sprint (Jira `originBoardId`); differs from `board_id` for a sprint shared across boards. Omitted when unknown.
         name:
           type: string
         state:
@@ -1502,3 +1544,35 @@ components:
           type: integer
         pages:
           type: integer
+    SiteSyncResult:
+      type: object
+      required: [site_id, site_name, site_url, succeeded, summary]
+      properties:
+        site_id:
+          type: string
+        site_name:
+          type: string
+        site_url:
+          type: string
+        succeeded:
+          type: boolean
+        attempted_steps:
+          type: integer
+        succeeded_steps:
+          type: integer
+        skipped_steps:
+          type: integer
+        projects:
+          type: integer
+        boards:
+          type: integer
+        issues:
+          type: integer
+        spaces:
+          type: integer
+        summary:
+          type: string
+        error:
+          type: [string, "null"]
+        circuit_open:
+          type: boolean

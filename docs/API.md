@@ -21,16 +21,18 @@ atlassian api                        # alias for `serve`
 - `--token` is optional on a loopback bind; when set, every endpoint except `GET /health` requires `Authorization: Bearer <token>`.
 - `--cors-origin <ORIGIN>` (repeatable) allows one exact browser origin such as `http://localhost:5173`. The default is none, and `*` is rejected.
 - Requires an existing login (`atlassian login` or `confluence login`) for live/remote endpoints; `?offline=true` routes and local `/search` read directly from SQLite.
-- On startup, `serve` spawns the background sync engine and requests `SyncCommand::RefreshAll`.
+- On startup, `serve` spawns the background sync engine and requests `SyncCommand::RefreshAll`. With more than one enabled site, the engine keeps every enabled site in sync.
 
 ## Conventions
 
 - All responses are JSON (`Content-Type: application/json`).
-- Errors use `{"error": "<message>"}` with HTTP `400`, `401`, `403`, `404`, or `500`.
+- Errors use `{"error": "<message>"}` with HTTP `400`, `401`, `403`, `404`, `409`, or `500`.
 - `limit` defaults to `50` (`30` for `/search`) and is clamped to `1..=1000`. Live board issue queries return at most `100` items per call and live space root page queries return at most `250` items per call.
 - Browser access is closed by default. A request with an `Origin` header gets `403` unless that origin was passed with `--cors-origin` (or is the server's own origin); this includes requests that never send a CORS preflight, such as a plain `GET` or a form `POST`. Allowed origins receive CORS headers for `GET`, `POST`, `PUT`, `PATCH`, `DELETE` with `Authorization` and `Content-Type`.
 - On a loopback bind the `Host` header must be `127.0.0.1`, `localhost`, or `[::1]` (any port); other names get `403`. This stops DNS rebinding from a web page.
 - Requests without an `Origin` header (curl, scripts, agents) are not affected by either check.
+- `site` (query parameter; writes with a JSON body also read it from the body) targets one configured site by ID, name, or URL. Without it, a request goes to the site given at launch with `--site` (or `ATLASSIAN_SITE`), else the site saved by the TUI site switcher, else the default site. An unknown site returns `404` (`site not found: '<name>'`). Write endpoints (`POST`, `PATCH`, `PUT`, `DELETE`) refuse `site=all` with `400` (`site 'all' cannot be used for a write; name one site (...)`); other single-site reads treat `all` as the server's site.
+- `GET /search` and `POST /sync` resolve `site` strictly: `site=all` covers every site, no `site` covers the launch or TUI site when one is set and every site otherwise, and an unknown site returns `400` (`unknown site '<name>'; configured sites: a, b`).
 
 ---
 
@@ -333,7 +335,7 @@ Lists footer comments on a Confluence page, or adds a Markdown comment (`{"body_
 
 ### `GET /search?q=...&scope=all|jira|confluence&remote=false&limit=30`
 
-Searches across Jira issues and Confluence pages.
+Searches across Jira issues and Confluence pages. `site_id` in the answer is the resolved site scope (see `site` under [Conventions](#conventions)); `null` means every site. A cache search covers that scope, while a remote search (`remote=true`) always queries one site: the named one, else the server's site.
 
 - `remote=false` (default): searches local SQLite FTS5 (`issues_fts` / `pages_fts` + Korean short-query fallback).
 - `remote=true`: executes Jira JQL (`text ~ "..."` for plain text, or compatible leading standard-field JQL such as `project = FLS` / `status IN (...)`) and/or Confluence CQL (`text ~ "..."` for plain text, or compatible leading standard-field CQL such as `space = ENG`). Phrases containing `and`/`or`/`=`/`~` (e.g. `read and write`, `timeout=30`) are treated as plain text. For custom raw JQL expressions, use `GET /issues?jql=customField%20%3D%20%22value%22`.
@@ -343,6 +345,7 @@ Searches across Jira issues and Confluence pages.
 {
   "query": "Architecture",
   "scope": "all",
+  "site_id": null,
   "remote": false,
   "hits": []
 }
@@ -350,11 +353,12 @@ Searches across Jira issues and Confluence pages.
 
 ### `POST /sync`
 
-Runs `sync::bootstrap_workspace` synchronously and returns the summary plus `Storage::cache_counts()`.
+Runs `sync::bootstrap_workspace_for_site` synchronously and returns the summary plus `Storage::cache_counts()`. With more than one enabled site, a request that covers every site (`site=all`, or no `site` and no launch or TUI site) syncs every enabled site and answers `sites` (one result per site with `site_id`, `succeeded`, `error`, and item counts) instead of `site_id`; `ok` is `true` when at least one site synced. Otherwise the one resolved site is synced.
 
 ```json
 {
   "ok": true,
+  "site_id": "acme",
   "summary": "Sync complete",
   "counts": {
     "projects": 3,
