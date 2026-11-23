@@ -184,11 +184,43 @@ pub(crate) fn sanitize_windows_filename(raw: &str) -> String {
         trimmed.to_string()
     };
 
-    let stem = name.split('.').next().unwrap_or("");
+    // Windows ignores trailing spaces in the stem, so `CON .txt` still names the device.
+    let stem = name
+        .split('.')
+        .next()
+        .unwrap_or("")
+        .trim_end_matches([' ', '.']);
     if is_windows_reserved_name(stem) {
         name = format!("_{name}");
     }
-    name
+    cap_filename_bytes(name)
+}
+
+/// Longest file name, in bytes, that the common file systems accept.
+const MAX_FILENAME_BYTES: usize = 255;
+
+/// Shortens the stem on a character boundary so that the name fits and keeps its extension.
+fn cap_filename_bytes(name: String) -> String {
+    if name.len() <= MAX_FILENAME_BYTES {
+        return name;
+    }
+    let (stem, extension) = match name.rfind('.') {
+        Some(dot) if dot > 0 && name.len() - dot < MAX_FILENAME_BYTES => name.split_at(dot),
+        _ => (name.as_str(), ""),
+    };
+    let mut end = (MAX_FILENAME_BYTES - extension.len()).min(stem.len());
+    while !stem.is_char_boundary(end) {
+        end -= 1;
+    }
+    let mut stem = &stem[..end];
+    if extension.is_empty() {
+        // The cut must not leave the trailing dot or space that Windows strips.
+        stem = stem.trim_end_matches(['.', ' ']);
+        if stem.is_empty() {
+            return "attachment".to_string();
+        }
+    }
+    format!("{stem}{extension}")
 }
 
 fn is_windows_reserved_name(stem: &str) -> bool {
@@ -291,6 +323,29 @@ mod tests {
         assert_eq!(sanitize_windows_filename("report:final?.pdf"), "report_final_.pdf");
         assert_eq!(sanitize_windows_filename("CON.txt"), "_CON.txt");
         assert_eq!(sanitize_windows_filename("   ...  "), "attachment");
+    }
+
+    #[test]
+    fn sanitize_filename_handles_reserved_stem_with_trailing_space() {
+        // Windows ignores trailing spaces in the stem, so `CON .txt` still names the console device.
+        assert_eq!(sanitize_windows_filename("CON .txt"), "_CON .txt");
+        assert_eq!(sanitize_windows_filename("nul  .tar.gz"), "_nul  .tar.gz");
+        assert_eq!(sanitize_windows_filename("CONSOLE .txt"), "CONSOLE .txt");
+    }
+
+    #[test]
+    fn sanitize_filename_caps_length_at_255_bytes() {
+        let ascii = sanitize_windows_filename(&format!("{}.png", "a".repeat(300)));
+        assert_eq!(ascii.len(), 255);
+        assert_eq!(ascii, format!("{}.png", "a".repeat(251)));
+
+        // A multi-byte stem is cut on a character boundary and keeps the extension.
+        let korean = sanitize_windows_filename(&format!("{}.pdf", "가".repeat(100)));
+        assert!(korean.len() <= 255);
+        assert_eq!(korean, format!("{}.pdf", "가".repeat(83)));
+
+        assert_eq!(sanitize_windows_filename(&"b".repeat(400)), "b".repeat(255));
+        assert_eq!(sanitize_windows_filename("report.final.pdf"), "report.final.pdf");
     }
 
     #[tokio::test]

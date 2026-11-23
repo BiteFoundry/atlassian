@@ -498,6 +498,13 @@ impl StartupLockGuard {
     async fn acquire(path: &Path) -> Result<Self> {
         ensure_parent(path)?;
         let deadline = Instant::now() + Duration::from_secs(3);
+        let unavailable = |err: &io::Error| {
+            anyhow!(
+                "Could not acquire daemon startup lock {}: another process holds it or it cannot be removed ({err}). Delete the file manually or retry.",
+                path.display()
+            )
+        };
+        let mut removed_after_deadline = false;
         loop {
             match OpenOptions::new().write(true).create_new(true).open(path) {
                 Ok(mut file) => {
@@ -507,20 +514,30 @@ impl StartupLockGuard {
                     });
                 }
                 Err(err) if err.kind() == io::ErrorKind::AlreadyExists => {
+                    if removed_after_deadline {
+                        return Err(unavailable(&err));
+                    }
                     if let Ok(meta) = fs::metadata(path) {
                         if let Ok(modified) = meta.modified() {
+                            // A stale lock that cannot be removed falls through to the sleep below.
                             if SystemTime::now()
                                 .duration_since(modified)
                                 .unwrap_or_default()
                                 >= LOCK_STALE_AGE
+                                && fs::remove_file(path).is_ok()
                             {
-                                let _ = fs::remove_file(path);
                                 continue;
                             }
                         }
                     }
                     if Instant::now() >= deadline {
-                        let _ = fs::remove_file(path);
+                        // One removal and one more `create_new`; never retry without yielding.
+                        match fs::remove_file(path) {
+                            Ok(()) => {}
+                            Err(err) if err.kind() == io::ErrorKind::NotFound => {}
+                            Err(err) => return Err(unavailable(&err)),
+                        }
+                        removed_after_deadline = true;
                         continue;
                     }
                     tokio::time::sleep(Duration::from_millis(40)).await;
@@ -2276,6 +2293,70 @@ mod tests {
                 cmd: Some(SyncCommand::RefreshSite { ref site_id })
             } if site_id == "corp-dc"
         ));
+    }
+
+    #[tokio::test]
+    async fn startup_lock_fails_instead_of_spinning_when_lock_cannot_be_removed() {
+        let dir = tempfile::tempdir().unwrap();
+        let lock_path = dir.path().join("daemon.lock");
+        // The lock has to exist for `create_new` (AlreadyExists) and resist `remove_file`.
+        // Windows: a file held open without FILE_SHARE_DELETE. A directory would not do there,
+        // because `create_new` on it fails with access denied instead of AlreadyExists.
+        #[cfg(windows)]
+        let _holder = {
+            use std::os::windows::fs::OpenOptionsExt;
+            const FILE_SHARE_READ_WRITE: u32 = 0x1 | 0x2;
+            OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .share_mode(FILE_SHARE_READ_WRITE)
+                .open(&lock_path)
+                .unwrap()
+        };
+        // Elsewhere: a directory, which `remove_file` cannot unlink.
+        #[cfg(not(windows))]
+        fs::create_dir(&lock_path).unwrap();
+
+        let result = tokio::time::timeout(
+            Duration::from_secs(5),
+            StartupLockGuard::acquire(&lock_path),
+        )
+        .await
+        .expect("acquire must give up instead of spinning");
+        let err = result
+            .err()
+            .expect("the lock cannot be acquired")
+            .to_string();
+        assert!(
+            err.contains("Could not acquire daemon startup lock"),
+            "{err}"
+        );
+        assert!(err.contains("Delete the file manually or retry."), "{err}");
+        assert!(lock_path.exists());
+    }
+
+    #[tokio::test]
+    async fn startup_lock_replaces_stale_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let lock_path = dir.path().join("daemon.lock");
+        let stale = fs::File::create(&lock_path).unwrap();
+        stale
+            .set_modified(SystemTime::now() - (LOCK_STALE_AGE + Duration::from_secs(5)))
+            .unwrap();
+        drop(stale);
+
+        let started = Instant::now();
+        let guard = StartupLockGuard::acquire(&lock_path).await.unwrap();
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "a stale lock is replaced without waiting for the deadline"
+        );
+        assert_eq!(
+            fs::read_to_string(&lock_path).unwrap().trim(),
+            std::process::id().to_string()
+        );
+        drop(guard);
+        assert!(!lock_path.exists());
     }
 
     #[tokio::test]

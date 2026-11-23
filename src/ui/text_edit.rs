@@ -1,6 +1,6 @@
 //! UTF-8 safe single-line & multiline text buffer + external `$EDITOR` helper.
 
-use std::process::Command;
+use std::{path::Path, process::Command};
 
 use anyhow::Result;
 
@@ -200,9 +200,7 @@ pub fn external_edit(current: &str) -> Result<String> {
         .filter(|v| !v.is_empty())
         .unwrap_or_else(default_editor);
 
-    let mut parts = editor.split_whitespace();
-    let program = parts.next().unwrap_or("vi");
-    let status = Command::new(program).args(parts).arg(&path).status();
+    let status = editor_command(split_editor_command(&editor), &path).status();
 
     let contents = std::fs::read_to_string(&path);
     let _ = std::fs::remove_file(&path);
@@ -213,6 +211,121 @@ pub fn external_edit(current: &str) -> Result<String> {
         .replace('\r', "\n")
         .trim_end()
         .to_string())
+}
+
+/// Splits an `$EDITOR` value into the program and its arguments.
+///
+/// Double and single quotes group text that contains spaces. A value that is the path of an
+/// existing file is the program as a whole, which covers an unquoted `C:\Program Files\...`.
+/// A backslash is ordinary text because it separates path components on Windows.
+fn split_editor_command(raw: &str) -> Vec<String> {
+    let raw = raw.trim();
+    if raw.is_empty() {
+        return Vec::new();
+    }
+    if Path::new(raw).is_file() {
+        return vec![raw.to_string()];
+    }
+
+    let mut parts = Vec::new();
+    let mut current: Option<String> = None;
+    let mut rest = raw;
+    while let Some(ch) = rest.chars().next() {
+        rest = &rest[ch.len_utf8()..];
+        if ch.is_whitespace() {
+            parts.extend(current.take());
+        } else if let Some(end) = matches!(ch, '"' | '\'').then(|| rest.find(ch)).flatten() {
+            current
+                .get_or_insert_with(String::new)
+                .push_str(&rest[..end]);
+            rest = &rest[end + 1..];
+        } else {
+            // Also a quote that is never closed, such as the apostrophe in `O'Brien`.
+            current.get_or_insert_with(String::new).push(ch);
+        }
+    }
+    parts.extend(current);
+    parts
+}
+
+/// Program and arguments that launch the editor for `parts` (the program comes first).
+///
+/// Windows cannot start a program without an extension (`code`) or a `.cmd`/`.bat` shim
+/// directly, so those run through `cmd /C`. The last argument is then a complete, already
+/// quoted command line that has to reach `cmd` unchanged.
+fn editor_invocation(parts: Vec<String>) -> (String, Vec<String>) {
+    #[cfg(windows)]
+    if parts.first().is_some_and(|program| needs_cmd_shim(program)) {
+        let line = parts
+            .iter()
+            .map(|part| quote_windows_arg(part))
+            .collect::<Vec<_>>()
+            .join(" ");
+        return (
+            "cmd".to_string(),
+            vec![
+                "/D".to_string(),
+                "/S".to_string(),
+                "/C".to_string(),
+                format!("\"{line}\""),
+            ],
+        );
+    }
+    let mut parts = parts.into_iter();
+    let program = parts.next().unwrap_or_else(|| "vi".to_string());
+    (program, parts.collect())
+}
+
+#[cfg(windows)]
+fn needs_cmd_shim(program: &str) -> bool {
+    match Path::new(program).extension() {
+        None => true,
+        Some(extension) => {
+            extension.eq_ignore_ascii_case("cmd") || extension.eq_ignore_ascii_case("bat")
+        }
+    }
+}
+
+/// Quotes one argument the way Windows programs parse their command line.
+#[cfg(windows)]
+fn quote_windows_arg(arg: &str) -> String {
+    let mut quoted = String::from('"');
+    let mut backslashes = 0;
+    for ch in arg.chars() {
+        match ch {
+            '\\' => backslashes += 1,
+            '"' => {
+                // Backslashes before a quote are doubled, and the quote itself is escaped.
+                quoted.extend(std::iter::repeat('\\').take(backslashes + 1));
+                backslashes = 0;
+            }
+            _ => backslashes = 0,
+        }
+        quoted.push(ch);
+    }
+    quoted.extend(std::iter::repeat('\\').take(backslashes));
+    quoted.push('"');
+    quoted
+}
+
+fn editor_command(parts: Vec<String>, file: &Path) -> Command {
+    #[cfg(windows)]
+    if parts.first().is_some_and(|program| needs_cmd_shim(program)) {
+        use std::os::windows::process::CommandExt;
+
+        let mut parts = parts;
+        parts.push(file.to_string_lossy().into_owned());
+        let (program, args) = editor_invocation(parts);
+        let mut command = Command::new(program);
+        for arg in args {
+            command.raw_arg(arg);
+        }
+        return command;
+    }
+    let (program, args) = editor_invocation(parts);
+    let mut command = Command::new(program);
+    command.args(args).arg(file);
+    command
 }
 
 fn default_editor() -> String {
@@ -242,5 +355,117 @@ mod tests {
         assert_eq!(buf.cursor, 0);
         buf.move_end();
         assert_eq!(buf.cursor, "가나".len());
+    }
+
+    #[test]
+    fn split_editor_command_handles_quoted_program_with_spaces() {
+        assert_eq!(
+            split_editor_command(r#""C:\Program Files\Notepad++\notepad++.exe" -multiInst"#),
+            [r"C:\Program Files\Notepad++\notepad++.exe", "-multiInst"]
+        );
+        assert_eq!(
+            split_editor_command("'/opt/my editor/bin/edit' --wait"),
+            ["/opt/my editor/bin/edit", "--wait"]
+        );
+        assert_eq!(
+            split_editor_command(r#"vim -c "set ft=markdown""#),
+            ["vim", "-c", "set ft=markdown"]
+        );
+        // A quote that is never closed is ordinary text.
+        assert_eq!(
+            split_editor_command(r"C:\Users\O'Brien\vim.exe -f"),
+            [r"C:\Users\O'Brien\vim.exe", "-f"]
+        );
+    }
+
+    #[test]
+    fn split_editor_command_keeps_unquoted_existing_path_whole() {
+        let dir = tempfile::tempdir().unwrap();
+        let folder = dir.path().join("Program Files");
+        std::fs::create_dir(&folder).unwrap();
+        let program = folder.join("my editor.exe");
+        std::fs::write(&program, b"").unwrap();
+        let raw = program.to_str().unwrap();
+
+        assert_eq!(split_editor_command(raw), [raw]);
+        assert_eq!(split_editor_command(&format!("  {raw}  ")), [raw]);
+    }
+
+    #[test]
+    fn split_editor_command_plain_unix_editor_with_args() {
+        assert_eq!(split_editor_command("code --wait"), ["code", "--wait"]);
+        assert_eq!(split_editor_command("open -W -t"), ["open", "-W", "-t"]);
+        assert_eq!(split_editor_command("  vi  "), ["vi"]);
+        assert!(split_editor_command("   ").is_empty());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_editor_cmd_shim_goes_through_cmd_c() {
+        let parts = |program: &str| {
+            vec![
+                program.to_string(),
+                "--wait".to_string(),
+                r"C:\Temp\my notes.md".to_string(),
+            ]
+        };
+        let through_cmd = |program: &str| {
+            (
+                "cmd".to_string(),
+                vec![
+                    "/D".to_string(),
+                    "/S".to_string(),
+                    "/C".to_string(),
+                    format!(r#"""{program}" "--wait" "C:\Temp\my notes.md"""#),
+                ],
+            )
+        };
+
+        // `code` resolves to `code.cmd`, which only `cmd` can run.
+        assert_eq!(editor_invocation(parts("code")), through_cmd("code"));
+        assert_eq!(
+            editor_invocation(parts(r"C:\Tools\My Editor\edit.CMD")),
+            through_cmd(r"C:\Tools\My Editor\edit.CMD")
+        );
+        assert_eq!(editor_invocation(parts("edit.bat")), through_cmd("edit.bat"));
+
+        // A real executable is started directly, as before.
+        assert_eq!(
+            editor_invocation(parts(r"C:\Program Files\Notepad++\notepad++.exe")),
+            (
+                r"C:\Program Files\Notepad++\notepad++.exe".to_string(),
+                vec!["--wait".to_string(), r"C:\Temp\my notes.md".to_string()]
+            )
+        );
+
+        assert_eq!(quote_windows_arg(r#"say "hi""#), r#""say \"hi\"""#);
+        assert_eq!(quote_windows_arg("C:\\dir\\"), "\"C:\\dir\\\\\"");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_editor_cmd_shim_runs_with_spaces_in_paths() {
+        let dir = tempfile::tempdir().unwrap();
+        let folder = dir.path().join("R&D tools");
+        std::fs::create_dir(&folder).unwrap();
+        // The shim writes its first argument into the file named by its second.
+        std::fs::write(folder.join("fake editor.cmd"), "@echo off\r\necho %~1>%2\r\n").unwrap();
+        let file = folder.join("my notes.md");
+
+        // With the extension, and without it the way `code` is usually written.
+        for program in ["fake editor.cmd", "fake editor"] {
+            let _ = std::fs::remove_file(&file);
+            let parts = vec![
+                folder.join(program).to_str().unwrap().to_string(),
+                "--wait".to_string(),
+            ];
+            let output = editor_command(parts, &file).output().unwrap();
+            assert!(output.status.success(), "{program}: {output:?}");
+            assert_eq!(
+                std::fs::read_to_string(&file).unwrap().trim(),
+                "--wait",
+                "{program}"
+            );
+        }
     }
 }

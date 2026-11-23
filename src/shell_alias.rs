@@ -199,11 +199,11 @@ pub fn render_init_script(shell: ShellKind, jira: &str, conf: &str, force: bool)
         ShellKind::Powershell => {
             if force {
                 format!(
-                    "function global:{jira} {{ atlassian @args }}\nfunction global:{conf} {{ conf @args }}\n"
+                    "Remove-Item -Path Alias:{jira} -ErrorAction SilentlyContinue\nfunction global:{jira} {{ atlassian @args }}\nRemove-Item -Path Alias:{conf} -ErrorAction SilentlyContinue\nfunction global:{conf} {{ conf @args }}\n"
                 )
             } else {
                 format!(
-                    "if (-not (Get-Command '{jira}' -CommandType Alias,Application,Cmdlet,ExternalScript -ErrorAction SilentlyContinue)) {{\n    function global:{jira} {{ atlassian @args }}\n}}\nif (-not (Get-Command '{conf}' -CommandType Alias,Application,Cmdlet,ExternalScript -ErrorAction SilentlyContinue)) {{\n    function global:{conf} {{ conf @args }}\n}}\n"
+                    "if (-not (Get-Command '{jira}' -CommandType Alias,Function,Application,Cmdlet,ExternalScript -ErrorAction SilentlyContinue)) {{\n    function global:{jira} {{ atlassian @args }}\n}}\nif (-not (Get-Command '{conf}' -CommandType Alias,Function,Application,Cmdlet,ExternalScript -ErrorAction SilentlyContinue)) {{\n    function global:{conf} {{ conf @args }}\n}}\n"
                 )
             }
         }
@@ -799,6 +799,42 @@ mod tests {
         assert!(fish.contains("function j --wraps atlassian"));
         assert!(fish.contains("function cf --wraps conf"));
         assert!(fish.contains("not type -q cf"));
+    }
+
+    #[test]
+    fn powershell_force_script_removes_existing_alias() {
+        // An alias wins over a function of the same name, so --force has to drop it first.
+        let script = render_init_script(ShellKind::Powershell, "j", "cf", true);
+        for name in ["j", "cf"] {
+            let removal = format!("Remove-Item -Path Alias:{name} -ErrorAction SilentlyContinue");
+            let removal_at = script
+                .find(&removal)
+                .unwrap_or_else(|| panic!("missing `{removal}` in:\n{script}"));
+            let function_at = script
+                .find(&format!("function global:{name} {{"))
+                .unwrap();
+            assert!(removal_at < function_at, "alias removal must precede the function:\n{script}");
+        }
+    }
+
+    #[test]
+    fn powershell_guard_does_not_clobber_existing_function() {
+        let script = render_init_script(ShellKind::Powershell, "j", "cf", false);
+        for name in ["j", "cf"] {
+            let guard = script
+                .lines()
+                .find(|line| line.contains(&format!("Get-Command '{name}'")))
+                .unwrap();
+            let kinds = guard
+                .split("-CommandType ")
+                .nth(1)
+                .and_then(|rest| rest.split_whitespace().next())
+                .unwrap();
+            assert!(
+                kinds.split(',').any(|kind| kind == "Function"),
+                "guard for '{name}' must see existing functions: {guard}"
+            );
+        }
     }
 
     #[test]

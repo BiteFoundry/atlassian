@@ -434,26 +434,29 @@ fn extract_binary_from_asset(asset_name: &str, asset_bytes: &[u8]) -> Result<Vec
     let extract_dir = tmp.path().join("extracted");
     std::fs::create_dir_all(&extract_dir)?;
 
-    let status = if lower.ends_with(".tar.gz") || lower.ends_with(".tgz") {
-        std::process::Command::new("tar")
-            .arg("-xzf")
-            .arg(&archive_path)
-            .arg("-C")
-            .arg(&extract_dir)
-            .status()
-            .context("Failed to run `tar -xzf`")?
+    let mut command = if lower.ends_with(".tar.gz") || lower.ends_with(".tgz") {
+        tar_extract_command("tar", "-xzf", &archive_path, &extract_dir)
     } else {
-        std::process::Command::new("tar")
-            .arg("-xf")
-            .arg(&archive_path)
-            .arg("-C")
-            .arg(&extract_dir)
-            .status()
-            .context("Failed to run `tar -xf`")?
+        zip_extract_command(&archive_path, &extract_dir)
     };
+    // `output()` captures the extractor's stdout and stderr, so nothing reaches our stdout.
+    let output = command.output().with_context(|| {
+        format!(
+            "Failed to run `{}`",
+            command.get_program().to_string_lossy()
+        )
+    })?;
 
-    if !status.success() {
-        bail!("Failed to extract archive ({asset_name}): exit status {status}");
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let detail = match stderr.trim() {
+            "" => String::new(),
+            stderr => format!(": {stderr}"),
+        };
+        bail!(
+            "Failed to extract archive ({asset_name}): exit status {}{detail}",
+            output.status
+        );
     }
 
     let primary_bin = if cfg!(windows) { "atlassian.exe" } else { "atlassian" };
@@ -467,6 +470,56 @@ fn extract_binary_from_asset(asset_name: &str, asset_bytes: &[u8]) -> Result<Vec
         })?;
     std::fs::read(&found)
         .with_context(|| format!("Failed to read extracted binary: {}", found.display()))
+}
+
+fn tar_extract_command(
+    program: impl AsRef<std::ffi::OsStr>,
+    flags: &str,
+    archive: &Path,
+    dir: &Path,
+) -> std::process::Command {
+    let mut command = std::process::Command::new(program);
+    command.arg(flags).arg(archive).arg("-C").arg(dir);
+    command
+}
+
+/// Builds the command that unpacks the `.zip` at `archive` into `dir`.
+///
+/// On Windows the first `tar` on `PATH` can be GNU tar from Git or MSYS2, which cannot read
+/// zip. The bsdtar that ships in `System32` is therefore called by its absolute path, and
+/// PowerShell does the work where that file does not exist.
+fn zip_extract_command(archive: &Path, dir: &Path) -> std::process::Command {
+    #[cfg(windows)]
+    {
+        match system32_tar().filter(|tar| tar.is_file()) {
+            Some(tar) => tar_extract_command(tar, "-xf", archive, dir),
+            None => powershell_expand_archive_command(archive, dir),
+        }
+    }
+    #[cfg(not(windows))]
+    {
+        tar_extract_command("tar", "-xf", archive, dir)
+    }
+}
+
+#[cfg(windows)]
+fn system32_tar() -> Option<PathBuf> {
+    let root = std::env::var_os("SystemRoot").or_else(|| std::env::var_os("windir"))?;
+    Some(PathBuf::from(root).join("System32").join("tar.exe"))
+}
+
+#[cfg(windows)]
+fn powershell_expand_archive_command(archive: &Path, dir: &Path) -> std::process::Command {
+    let quote = |path: &Path| format!("'{}'", path.to_string_lossy().replace('\'', "''"));
+    let mut command = std::process::Command::new("powershell");
+    command
+        .args(["-NoProfile", "-NonInteractive", "-Command"])
+        .arg(format!(
+            "$ProgressPreference = 'SilentlyContinue'; Expand-Archive -LiteralPath {} -DestinationPath {} -Force -ErrorAction Stop",
+            quote(archive),
+            quote(dir)
+        ));
+    command
 }
 
 fn find_file_recursive(dir: &Path, target_name: &str) -> Option<PathBuf> {
@@ -557,6 +610,67 @@ mod tests {
     };
     use std::sync::Arc;
     use tokio::net::TcpListener;
+
+    #[cfg(windows)]
+    #[test]
+    fn zip_extraction_uses_system32_tar_on_windows() {
+        let root = std::env::var_os("SystemRoot").expect("SystemRoot is set on Windows");
+        let system_tar = PathBuf::from(root).join("System32").join("tar.exe");
+
+        let command = zip_extract_command(Path::new("update.zip"), Path::new("out"));
+        if system_tar.is_file() {
+            // Never the bare `tar`, which Git or MSYS2 can shadow with GNU tar.
+            assert_eq!(Path::new(command.get_program()), system_tar);
+            assert_eq!(
+                command.get_args().collect::<Vec<_>>(),
+                ["-xf", "update.zip", "-C", "out"]
+            );
+        } else {
+            assert_eq!(command.get_program(), "powershell");
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn extract_zip_archive_roundtrip() {
+        const ASSET: &str = "atlassian-x86_64-pc-windows-msvc.zip";
+        const CONTENT: &[u8] = b"not a real atlassian.exe";
+
+        let tmp = tempfile::tempdir().unwrap();
+        let binary = tmp.path().join("atlassian.exe");
+        std::fs::write(&binary, CONTENT).unwrap();
+        let zip = tmp.path().join(ASSET);
+        let built = std::process::Command::new("powershell")
+            .args(["-NoProfile", "-NonInteractive", "-Command"])
+            .arg(format!(
+                "Compress-Archive -LiteralPath '{}' -DestinationPath '{}' -ErrorAction Stop",
+                binary.display(),
+                zip.display()
+            ))
+            .output();
+        if !matches!(&built, Ok(output) if output.status.success() && zip.is_file()) {
+            eprintln!(
+                "skipping extract_zip_archive_roundtrip: PowerShell Compress-Archive is unavailable: {built:?}"
+            );
+            return;
+        }
+
+        let bytes = std::fs::read(&zip).unwrap();
+        assert_eq!(extract_binary_from_asset(ASSET, &bytes).unwrap(), CONTENT);
+
+        // The PowerShell fallback unpacks the same archive.
+        let expanded = tmp.path().join("expanded");
+        let output = powershell_expand_archive_command(&zip, &expanded)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(output.stdout.is_empty(), "{:?}", output.stdout);
+        assert_eq!(std::fs::read(expanded.join("atlassian.exe")).unwrap(), CONTENT);
+    }
 
     #[test]
     fn test_semver_parsing_and_comparison() {
