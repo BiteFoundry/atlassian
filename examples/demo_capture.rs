@@ -24,7 +24,7 @@ use atlassian_cli::{
     sync,
     ui::{
         self,
-        app::{AppState, PaneFocus, UiState, WorkspaceTab},
+        app::{AppState, PaneFocus, SiteKey, UiState, WorkspaceTab},
         overlays::{
             command_palette::CommandPalette,
             file_picker::{FilePickerEntry, FilePickerMode, FilePickerOverlay},
@@ -858,13 +858,16 @@ fn build_demo_state() -> (AppState, UiState) {
         web_url: "https://acme.atlassian.net/wiki/spaces/ENG/pages/40230".into(),
     };
 
-    app.root_pages_by_space
-        .insert("ENG".into(), vec![root_arch.clone(), root_oncall]);
+    let tree_site = app.tree_site(&ui);
+    app.root_pages_by_space.insert(
+        SiteKey::new(&tree_site, "ENG"),
+        vec![root_arch.clone(), root_oncall],
+    );
     app.page_children_map.insert(
-        "40200".into(),
+        SiteKey::new(&tree_site, "40200"),
         vec![child_runbook.clone(), child_gateway],
     );
-    app.expanded_pages.insert("40200".into());
+    app.expanded_pages.insert(SiteKey::new(&tree_site, "40200"));
 
     app.active_page = Some(PageDetail {
         summary: child_runbook,
@@ -1109,6 +1112,7 @@ async fn main() {
     // Frame 6: File Picker overlay (Ctrl+F) with clean fictional workspace directory
     let picker = FilePickerOverlay {
         target: UploadTarget::Issue("ENG-101".into()),
+        site_id: None,
         current_dir: PathBuf::from("/workspace/acme-platform/docs"),
         entries: vec![
             FilePickerEntry {
