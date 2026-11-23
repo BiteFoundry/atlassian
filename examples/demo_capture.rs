@@ -453,6 +453,7 @@ fn build_demo_state() -> (AppState, UiState) {
         SprintSummary {
             id: 42,
             board_id: 11,
+            origin_board_id: None,
             name: "Sprint 42 — Core Scale".into(),
             state: "active".into(),
             start_date: Some("2025-11-10".into()),
@@ -462,6 +463,7 @@ fn build_demo_state() -> (AppState, UiState) {
         SprintSummary {
             id: 43,
             board_id: 11,
+            origin_board_id: None,
             name: "Sprint 43 — Hardening".into(),
             state: "future".into(),
             start_date: Some("2025-11-25".into()),

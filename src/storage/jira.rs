@@ -256,17 +256,27 @@ impl Storage {
                     goal = COALESCE(excluded.goal, sprints.goal)
                 ",
             )?;
+            let mut link = tx.prepare(
+                "INSERT OR IGNORE INTO board_sprints (site_id, board_id, sprint_id) VALUES (?1, ?2, ?3)",
+            )?;
             for s in sprints {
+                // `sprints.board_id` holds the owning board; `board_sprints` records every board
+                // the sprint is listed under, so a shared sprint shows up on each of them.
+                let home_board_id = s.origin_board_id.unwrap_or(s.board_id);
                 stmt.execute(params![
                     site_id,
                     s.id,
-                    s.board_id,
+                    home_board_id,
                     s.name,
                     s.state,
                     s.start_date,
                     s.end_date,
                     s.goal,
                 ])?;
+                link.execute(params![site_id, s.board_id, s.id])?;
+                if home_board_id != s.board_id {
+                    link.execute(params![site_id, home_board_id, s.id])?;
+                }
             }
         }
         tx.commit()?;
@@ -277,6 +287,9 @@ impl Storage {
         self.list_sprints_for_site(DEFAULT_SITE_ID, board_id)
     }
 
+    /// Lists the sprints linked to `board_id`, including sprints owned by another board. Each
+    /// result reports `board_id` as the queried board and `origin_board_id` as the board stored
+    /// on the sprint row.
     pub fn list_sprints_for_site(
         &self,
         site_id: &str,
@@ -285,18 +298,20 @@ impl Storage {
         let conn = self.lock_conn()?;
         let mut stmt = conn.prepare(
             "
-            SELECT id, board_id, name, state, start_date, end_date, goal
-            FROM sprints
-            WHERE site_id = ?1 AND board_id = ?2
+            SELECT s.id, s.board_id, s.name, s.state, s.start_date, s.end_date, s.goal
+            FROM sprints s
+            JOIN board_sprints bs ON bs.site_id = s.site_id AND bs.sprint_id = s.id
+            WHERE s.site_id = ?1 AND bs.board_id = ?2
             ORDER BY
-                CASE state WHEN 'active' THEN 0 WHEN 'future' THEN 1 ELSE 2 END,
-                id DESC
+                CASE s.state WHEN 'active' THEN 0 WHEN 'future' THEN 1 ELSE 2 END,
+                s.id DESC
             ",
         )?;
         let rows = stmt.query_map(params![site_id, board_id], |row| {
             Ok(SprintSummary {
                 id: row.get(0)?,
-                board_id: row.get(1)?,
+                board_id,
+                origin_board_id: Some(row.get(1)?),
                 name: row.get(2)?,
                 state: row.get(3)?,
                 start_date: row.get(4)?,
@@ -404,6 +419,21 @@ impl Storage {
                 )
                 .optional()?
                 .flatten();
+
+            // A detail without a timestamp cannot be ordered against the cached row. It takes the
+            // cached timestamp so the fetched detail is stored instead of dropped as older.
+            if detail.summary.updated_at.trim().is_empty() {
+                let existing_updated: Option<String> = tx
+                    .query_row(
+                        "SELECT updated_at FROM issues WHERE site_id = ?1 AND key = ?2",
+                        params![site_id, &detail.summary.key],
+                        |row| row.get(0),
+                    )
+                    .optional()?;
+                if let Some(existing_updated) = existing_updated.filter(|s| !s.trim().is_empty()) {
+                    detail.summary.updated_at = existing_updated;
+                }
+            }
 
             let applied =
                 upsert_issue_row(&tx, site_id, &detail.summary, None, detail.summary.sprint_id)?;
@@ -654,6 +684,20 @@ impl Storage {
         key: &str,
         comments: &[IssueComment],
     ) -> Result<()> {
+        self.update_issue_comments_for_site_with_total(site_id, key, comments, None)
+    }
+
+    /// Like `update_issue_comments_for_site`, with the comment total the server reported. The
+    /// stored `comment_count` is the larger of `total` and `comments.len()`, so a capped or
+    /// partial comment list does not lower the count.
+    pub fn update_issue_comments_for_site_with_total(
+        &self,
+        site_id: &str,
+        key: &str,
+        comments: &[IssueComment],
+        total: Option<usize>,
+    ) -> Result<()> {
+        let comment_count = total.unwrap_or(0).max(comments.len());
         let mut conn = self.lock_conn()?;
         let tx = conn.transaction()?;
         if let Some(raw) = tx
@@ -667,11 +711,11 @@ impl Storage {
         {
             if let Ok(mut detail) = serde_json::from_str::<IssueDetail>(&raw) {
                 detail.comments = comments.to_vec();
-                detail.summary.comment_count = comments.len();
+                detail.summary.comment_count = comment_count;
                 let updated_json = serde_json::to_string(&detail)?;
                 tx.execute(
                     "UPDATE issues SET detail_json = ?1, comment_count = ?2 WHERE site_id = ?3 AND key = ?4",
-                    params![updated_json, comments.len() as i64, site_id, key],
+                    params![updated_json, comment_count as i64, site_id, key],
                 )?;
             }
         }
@@ -711,8 +755,10 @@ impl Storage {
         Ok(())
     }
 
-    /// Removes cached issues belonging to `(site_id, board_id, sprint_id)` that are absent from
-    /// a complete board/sprint snapshot. Never touches other sites or other boards.
+    /// Detaches cached issues of `(site_id, board_id, sprint_id)` that are absent from a complete
+    /// board/sprint snapshot, and returns how many were detached. A sprint-scoped prune clears
+    /// the issue's sprint; a board-scoped prune (`sprint_id == None`) clears its board. The issue
+    /// row, its cached detail and its search entry stay. Never touches other sites or boards.
     pub fn prune_board_issues_for_site(
         &self,
         site_id: &str,
@@ -736,22 +782,24 @@ impl Storage {
             rows.collect::<rusqlite::Result<Vec<_>>>()?
         };
 
-        let mut removed = 0usize;
+        let mut detached = 0usize;
         for key in existing_keys {
             if !keep.contains(key.as_str()) {
-                tx.execute(
-                    "DELETE FROM issues_fts WHERE site_id = ?1 AND issue_key = ?2",
-                    params![site_id, &key],
-                )?;
-                tx.execute(
-                    "DELETE FROM issues WHERE site_id = ?1 AND key = ?2",
-                    params![site_id, &key],
-                )?;
-                removed += 1;
+                detached += if let Some(sid) = sprint_id {
+                    tx.execute(
+                        "UPDATE issues SET sprint_id = NULL, sprint_name = NULL WHERE site_id = ?1 AND key = ?2 AND sprint_id = ?3",
+                        params![site_id, &key, sid],
+                    )?
+                } else {
+                    tx.execute(
+                        "UPDATE issues SET board_id = NULL WHERE site_id = ?1 AND key = ?2 AND board_id = ?3",
+                        params![site_id, &key, board_id],
+                    )?
+                };
             }
         }
         tx.commit()?;
-        Ok(removed)
+        Ok(detached)
     }
 
     /// Stores one fetched page. Prunes only when it is a first page the source marked as the last.
@@ -1178,7 +1226,8 @@ pub(crate) fn compare_updated_at(incoming: &str, existing: &str) -> std::cmp::Or
         return std::cmp::Ordering::Greater;
     }
     if inc.is_empty() {
-        return std::cmp::Ordering::Equal;
+        // No incoming timestamp is no evidence of a newer revision.
+        return std::cmp::Ordering::Less;
     }
     let parse_ts = |s: &str| {
         chrono::DateTime::parse_from_rfc3339(s)
@@ -1274,7 +1323,10 @@ fn upsert_issue_row(
             comment_count = excluded.comment_count,
             attachment_count = excluded.attachment_count,
             created_at = excluded.created_at,
-            updated_at = excluded.updated_at,
+            updated_at = CASE
+                WHEN TRIM(excluded.updated_at) = '' THEN issues.updated_at
+                ELSE excluded.updated_at
+            END,
             web_url = excluded.web_url
         "
     );
@@ -1677,6 +1729,7 @@ mod tests {
             .upsert_sprints(&[SprintSummary {
                 id: 77,
                 board_id: 7,
+                origin_board_id: None,
                 name: "Sprint 77".into(),
                 state: "active".into(),
                 start_date: None,
@@ -1717,6 +1770,7 @@ mod tests {
                     &[SprintSummary {
                         id: 10,
                         board_id: 1,
+                        origin_board_id: None,
                         name: format!("{site} Sprint"),
                         state: "active".into(),
                         start_date: None,
@@ -1838,7 +1892,7 @@ mod tests {
             .is_issue_detail_stale_for_site("site-a", "PROJ-10")
             .unwrap());
 
-        // Pruning board 11 on site-a removes PROJ-10 while preserving site-b
+        // Pruning board 11 on site-a detaches PROJ-10 (row and detail stay) while preserving site-b
         storage
             .upsert_board_issues_for_site("site-b", 11, None, &[v2])
             .unwrap();
@@ -1849,7 +1903,18 @@ mod tests {
         assert!(storage
             .get_issue_detail_for_site("site-a", "PROJ-10")
             .unwrap()
-            .is_none());
+            .is_some());
+        assert!(storage
+            .list_board_issues_for_site("site-a", 11, None, 10)
+            .unwrap()
+            .is_empty());
+        assert_eq!(
+            storage
+                .list_board_issues_for_site("site-b", 11, None, 10)
+                .unwrap()
+                .len(),
+            1
+        );
         assert_eq!(
             storage.list_issues_for_site("site-b", None, 10).unwrap().len(),
             1
@@ -1899,7 +1964,7 @@ mod tests {
             120
         );
 
-        // Complete first page prunes missing issues
+        // Complete first page detaches missing issues from the board; their rows stay cached
         let complete_first = ListPage {
             items: issues[0..10].to_vec(),
             has_more: Some(false),
@@ -1914,6 +1979,10 @@ mod tests {
                 .unwrap()
                 .len(),
             10
+        );
+        assert_eq!(
+            storage.count_issues_for_site("default", Some("ENG")).unwrap(),
+            120
         );
     }
 
@@ -1951,5 +2020,385 @@ mod tests {
             let expected = storage.list_issues_for_site(site, proj, 1000).unwrap().len();
             assert_eq!(storage.count_issues_for_site(site, proj).unwrap(), expected);
         }
+    }
+
+    /// `(board_id, sprint_id, sprint_name)` of a cached issue row, or `None` when the row is gone.
+    fn issue_row_refs(
+        storage: &Storage,
+        site_id: &str,
+        key: &str,
+    ) -> Option<(Option<i64>, Option<i64>, Option<String>)> {
+        let conn = storage.lock_conn().unwrap();
+        conn.query_row(
+            "SELECT board_id, sprint_id, sprint_name FROM issues WHERE site_id = ?1 AND key = ?2",
+            params![site_id, key],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+        )
+        .optional()
+        .unwrap()
+    }
+
+    fn board_sprint_links(storage: &Storage, site_id: &str) -> Vec<(i64, i64)> {
+        let conn = storage.lock_conn().unwrap();
+        let mut stmt = conn
+            .prepare(
+                "SELECT board_id, sprint_id FROM board_sprints WHERE site_id = ?1 ORDER BY board_id, sprint_id",
+            )
+            .unwrap();
+        let rows = stmt
+            .query_map([site_id], |r| Ok((r.get(0)?, r.get(1)?)))
+            .unwrap();
+        rows.collect::<rusqlite::Result<Vec<_>>>().unwrap()
+    }
+
+    #[test]
+    fn prune_board_issues_detaches_instead_of_deleting() {
+        let storage = Storage::open_in_memory().unwrap();
+        let kept = sample_issue("ENG-1", "ENG", "Kept sprint work", Some(42));
+        let gone = sample_issue("ENG-2", "ENG", "Carried over migration task", Some(42));
+        storage
+            .upsert_board_issues_for_site("site-a", 7, Some(42), &[kept, gone.clone()])
+            .unwrap();
+        storage
+            .upsert_issue_detail_for_site(
+                "site-a",
+                &IssueDetail {
+                    summary: gone,
+                    description_markdown: "Rollback checklist".into(),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+
+        let detached = storage
+            .prune_board_issues_for_site("site-a", 7, Some(42), &["ENG-1".to_string()])
+            .unwrap();
+        assert_eq!(detached, 1);
+
+        // The row survives with its sprint cleared and its board kept.
+        assert_eq!(
+            issue_row_refs(&storage, "site-a", "ENG-2"),
+            Some((Some(7), None, None))
+        );
+        assert_eq!(
+            issue_row_refs(&storage, "site-a", "ENG-1"),
+            Some((Some(7), Some(42), Some("Sprint 42".to_string())))
+        );
+        // Cached detail and the search entry survive too.
+        let detail = storage
+            .get_issue_detail_for_site("site-a", "ENG-2")
+            .unwrap()
+            .unwrap();
+        assert_eq!(detail.description_markdown, "Rollback checklist");
+        let hits = storage
+            .search_issues_scoped("migration", Some("site-a"), 10)
+            .unwrap();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].1.id_or_key, "ENG-2");
+        assert_eq!(
+            storage
+                .list_issues_for_site("site-a", Some("ENG"), 10)
+                .unwrap()
+                .len(),
+            2
+        );
+        // It is no longer part of the sprint view.
+        let in_sprint = storage
+            .list_board_issues_for_site("site-a", 7, Some(42), 50)
+            .unwrap();
+        assert_eq!(in_sprint.len(), 1);
+        assert_eq!(in_sprint[0].key, "ENG-1");
+    }
+
+    #[test]
+    fn prune_board_scope_clears_board_id_only() {
+        let storage = Storage::open_in_memory().unwrap();
+        let on_board = [
+            sample_issue("ENG-1", "ENG", "Still on the board", Some(42)),
+            sample_issue("ENG-2", "ENG", "Left the board", Some(42)),
+        ];
+        storage
+            .upsert_board_issues_for_site("site-a", 7, None, &on_board)
+            .unwrap();
+        storage
+            .upsert_board_issues_for_site("site-b", 7, None, &on_board)
+            .unwrap();
+        storage
+            .upsert_board_issues_for_site(
+                "site-a",
+                8,
+                None,
+                &[sample_issue("ENG-3", "ENG", "Other board", None)],
+            )
+            .unwrap();
+
+        let detached = storage
+            .prune_board_issues_for_site("site-a", 7, None, &["ENG-1".to_string()])
+            .unwrap();
+        assert_eq!(detached, 1);
+
+        // Only the board link is cleared; the sprint stays.
+        let sprint = Some("Sprint 42".to_string());
+        assert_eq!(
+            issue_row_refs(&storage, "site-a", "ENG-2"),
+            Some((None, Some(42), sprint.clone()))
+        );
+        assert_eq!(
+            issue_row_refs(&storage, "site-a", "ENG-1"),
+            Some((Some(7), Some(42), sprint.clone()))
+        );
+        // Other boards and other sites are untouched.
+        assert_eq!(
+            issue_row_refs(&storage, "site-a", "ENG-3"),
+            Some((Some(8), None, None))
+        );
+        assert_eq!(
+            issue_row_refs(&storage, "site-b", "ENG-2"),
+            Some((Some(7), Some(42), sprint))
+        );
+        // No board or sprint row is cached here, so the board listing has no project or sprint
+        // fallback to bring ENG-2 back.
+        let listed = storage
+            .list_board_issues_for_site("site-a", 7, None, 50)
+            .unwrap();
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].key, "ENG-1");
+    }
+
+    #[test]
+    fn shared_sprint_is_listed_under_both_boards() {
+        let storage = Storage::open_in_memory().unwrap();
+        let sprint = |id: i64, board_id: i64| SprintSummary {
+            id,
+            board_id,
+            origin_board_id: Some(10),
+            name: format!("Sprint {id}"),
+            state: "active".into(),
+            ..Default::default()
+        };
+        storage
+            .upsert_sprints_for_site("site-a", &[sprint(7, 10)])
+            .unwrap();
+        storage
+            .upsert_sprints_for_site("site-a", &[sprint(7, 20)])
+            .unwrap();
+
+        for board in [10, 20] {
+            let listed = storage.list_sprints_for_site("site-a", board).unwrap();
+            assert_eq!(listed.len(), 1, "board {board}");
+            assert_eq!(listed[0].id, 7);
+            assert_eq!(listed[0].board_id, board);
+            assert_eq!(listed[0].origin_board_id, Some(10));
+        }
+        assert!(storage.list_sprints_for_site("site-a", 30).unwrap().is_empty());
+        assert!(storage.list_sprints_for_site("site-b", 10).unwrap().is_empty());
+        assert_eq!(board_sprint_links(&storage, "site-a"), vec![(10, 7), (20, 7)]);
+
+        // A sprint seen only through a borrowing board is linked to its owning board as well.
+        storage
+            .upsert_sprints_for_site("site-a", &[sprint(8, 20)])
+            .unwrap();
+        let owner_ids: Vec<i64> = storage
+            .list_sprints_for_site("site-a", 10)
+            .unwrap()
+            .iter()
+            .map(|s| s.id)
+            .collect();
+        assert_eq!(owner_ids, vec![8, 7]);
+    }
+
+    #[test]
+    fn board_sprints_backfilled_from_existing_sprints() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("cache_without_board_sprints.db");
+        {
+            // A schema v2 cache written before `board_sprints` existed.
+            let conn = Connection::open(&db_path).unwrap();
+            conn.execute_batch(
+                "
+                CREATE TABLE sprints (
+                    site_id TEXT NOT NULL DEFAULT 'default',
+                    id INTEGER NOT NULL,
+                    board_id INTEGER NOT NULL,
+                    name TEXT NOT NULL,
+                    state TEXT NOT NULL,
+                    start_date TEXT,
+                    end_date TEXT,
+                    goal TEXT,
+                    PRIMARY KEY (site_id, id)
+                );
+                INSERT INTO sprints (site_id, id, board_id, name, state)
+                VALUES ('default', 77, 7, 'Sprint 77', 'active'),
+                       ('site-a', 78, 9, 'Sprint 78', 'future');
+                PRAGMA user_version = 2;
+                ",
+            )
+            .unwrap();
+        }
+
+        let storage = Storage::open(&db_path).unwrap();
+        let default_sprints = storage.list_sprints_for_site(DEFAULT_SITE_ID, 7).unwrap();
+        assert_eq!(default_sprints.len(), 1);
+        assert_eq!(default_sprints[0].id, 77);
+        assert_eq!(default_sprints[0].board_id, 7);
+        let site_a_sprints = storage.list_sprints_for_site("site-a", 9).unwrap();
+        assert_eq!(site_a_sprints.len(), 1);
+        assert_eq!(site_a_sprints[0].id, 78);
+        {
+            let conn = storage.lock_conn().unwrap();
+            let version: i32 = conn
+                .query_row("PRAGMA user_version", [], |r| r.get(0))
+                .unwrap();
+            assert_eq!(version, 2);
+        }
+
+        // Re-opening repeats the backfill without duplicating links.
+        drop(storage);
+        let reopened = Storage::open(&db_path).unwrap();
+        assert_eq!(board_sprint_links(&reopened, DEFAULT_SITE_ID), vec![(7, 77)]);
+        assert_eq!(board_sprint_links(&reopened, "site-a"), vec![(9, 78)]);
+    }
+
+    #[test]
+    fn compare_updated_at_empty_incoming_is_older() {
+        use std::cmp::Ordering;
+
+        let ts = "2026-11-15T10:00:00Z";
+        assert_eq!(compare_updated_at("", ts), Ordering::Less);
+        assert_eq!(compare_updated_at("   ", ts), Ordering::Less);
+        // Unchanged orderings.
+        assert_eq!(compare_updated_at("", ""), Ordering::Greater);
+        assert_eq!(compare_updated_at(ts, ""), Ordering::Greater);
+        assert_eq!(compare_updated_at(ts, ts), Ordering::Equal);
+        assert_eq!(compare_updated_at("2026-11-14T10:00:00Z", ts), Ordering::Less);
+        assert_eq!(compare_updated_at("2026-11-16T10:00:00Z", ts), Ordering::Greater);
+    }
+
+    #[test]
+    fn upsert_summary_with_empty_updated_at_keeps_existing_timestamp() {
+        let storage = Storage::open_in_memory().unwrap();
+        let first = sample_issue("ENG-1", "ENG", "Original summary", None);
+        storage
+            .upsert_issues_for_site("site-a", &[first.clone()])
+            .unwrap();
+
+        let mut untimed = first.clone();
+        untimed.summary = "Untimed copy".into();
+        untimed.updated_at = String::new();
+        storage
+            .upsert_issues_for_site("site-a", &[untimed.clone()])
+            .unwrap();
+        assert_eq!(
+            storage
+                .get_issue_row_updated_at_for_site("site-a", "ENG-1")
+                .unwrap()
+                .as_deref(),
+            Some(first.updated_at.as_str())
+        );
+
+        // Listed on a board without a timestamp: only the board/sprint link is filled in.
+        storage
+            .upsert_board_issues_for_site("site-a", 7, Some(42), &[untimed])
+            .unwrap();
+        assert_eq!(
+            issue_row_refs(&storage, "site-a", "ENG-1"),
+            Some((Some(7), Some(42), None))
+        );
+        let rows = storage.list_issues_for_site("site-a", None, 10).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].summary, "Original summary");
+        assert_eq!(rows[0].updated_at, first.updated_at);
+    }
+
+    #[test]
+    fn upsert_detail_with_empty_updated_at_is_stored_and_keeps_timestamp() {
+        let storage = Storage::open_in_memory().unwrap();
+        let first = sample_issue("ENG-1", "ENG", "Original summary", None);
+        storage
+            .upsert_issues_for_site("site-a", &[first.clone()])
+            .unwrap();
+
+        let mut untimed = first.clone();
+        untimed.updated_at = String::new();
+        storage
+            .upsert_issue_detail_for_site(
+                "site-a",
+                &IssueDetail {
+                    summary: untimed,
+                    description_markdown: "Fetched without a timestamp".into(),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+
+        let detail = storage
+            .get_issue_detail_for_site("site-a", "ENG-1")
+            .unwrap()
+            .expect("detail without a timestamp must still be stored");
+        assert_eq!(detail.description_markdown, "Fetched without a timestamp");
+        assert_eq!(detail.summary.updated_at, first.updated_at);
+        assert_eq!(
+            storage
+                .get_issue_detail_updated_at_for_site("site-a", "ENG-1")
+                .unwrap()
+                .as_deref(),
+            Some(first.updated_at.as_str())
+        );
+        assert!(!storage
+            .is_issue_detail_stale_for_site("site-a", "ENG-1")
+            .unwrap());
+    }
+
+    #[test]
+    fn update_issue_comments_keeps_server_total() {
+        let storage = Storage::open_in_memory().unwrap();
+        let issue = sample_issue("ENG-1", "ENG", "Busy thread", None);
+        storage
+            .upsert_issue_detail_for_site(
+                "site-a",
+                &IssueDetail {
+                    summary: issue,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        let comments: Vec<IssueComment> = (1..=3)
+            .map(|i| IssueComment {
+                id: i.to_string(),
+                issue_key: "ENG-1".into(),
+                body_markdown: format!("Comment {i}"),
+                ..Default::default()
+            })
+            .collect();
+        let cached = |storage: &Storage| {
+            let detail = storage
+                .get_issue_detail_for_site("site-a", "ENG-1")
+                .unwrap()
+                .unwrap();
+            let row_count = storage.list_issues_for_site("site-a", None, 10).unwrap()[0].comment_count;
+            assert_eq!(detail.summary.comment_count, row_count);
+            (detail.comments.len(), row_count)
+        };
+
+        // The server reported 130 comments; only 3 were loaded.
+        storage
+            .update_issue_comments_for_site_with_total("site-a", "ENG-1", &comments, Some(130))
+            .unwrap();
+        assert_eq!(cached(&storage), (3, 130));
+
+        // A total below what was loaded never undercounts.
+        storage
+            .update_issue_comments_for_site_with_total("site-a", "ENG-1", &comments, Some(2))
+            .unwrap();
+        assert_eq!(cached(&storage), (3, 3));
+
+        // Without a total the count is the number of comments, as before.
+        storage
+            .update_issue_comments_for_site_with_total("site-a", "ENG-1", &comments, Some(130))
+            .unwrap();
+        storage
+            .update_issue_comments_for_site("site-a", "ENG-1", &comments[..2])
+            .unwrap();
+        assert_eq!(cached(&storage), (2, 2));
     }
 }

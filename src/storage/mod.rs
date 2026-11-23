@@ -163,6 +163,7 @@ impl Storage {
         tx.execute("DELETE FROM issues_fts WHERE site_id = ?1", [site_id])?;
         tx.execute("DELETE FROM pages_fts WHERE site_id = ?1", [site_id])?;
         tx.execute("DELETE FROM issues WHERE site_id = ?1", [site_id])?;
+        tx.execute("DELETE FROM board_sprints WHERE site_id = ?1", [site_id])?;
         tx.execute("DELETE FROM sprints WHERE site_id = ?1", [site_id])?;
         tx.execute("DELETE FROM boards WHERE site_id = ?1", [site_id])?;
         tx.execute("DELETE FROM projects WHERE site_id = ?1", [site_id])?;
@@ -331,6 +332,7 @@ mod tests {
         SprintSummary {
             id,
             board_id,
+            origin_board_id: None,
             name: name.to_string(),
             state: "active".into(),
             start_date: None,
@@ -874,5 +876,38 @@ mod tests {
         assert_eq!(corp_hits.len(), 1);
         assert_eq!(corp_hits[0].0, "corp-dc");
         assert_eq!(corp_hits[0].1.id_or_key, "ENG-1");
+    }
+
+    #[test]
+    fn delete_site_data_clears_board_sprints() {
+        let storage = Storage::open_in_memory().unwrap();
+        let shared = SprintSummary {
+            origin_board_id: Some(1),
+            ..make_sprint(10, 2, "Shared Sprint 10")
+        };
+        for site in ["acme-cloud", "corp-dc"] {
+            storage
+                .upsert_sprints_for_site(site, &[make_sprint(10, 1, "Sprint 10"), shared.clone()])
+                .unwrap();
+        }
+        let links = |site: &str| -> i64 {
+            let conn = storage.lock_conn().unwrap();
+            conn.query_row(
+                "SELECT COUNT(*) FROM board_sprints WHERE site_id = ?1",
+                [site],
+                |r| r.get(0),
+            )
+            .unwrap()
+        };
+        assert_eq!(links("acme-cloud"), 2);
+
+        storage.delete_site_data("acme-cloud").unwrap();
+
+        assert_eq!(links("acme-cloud"), 0);
+        assert!(storage.list_sprints_for_site("acme-cloud", 1).unwrap().is_empty());
+        assert!(storage.list_sprints_for_site("acme-cloud", 2).unwrap().is_empty());
+        // The other site keeps its sprint and both board links.
+        assert_eq!(links("corp-dc"), 2);
+        assert_eq!(storage.list_sprints_for_site("corp-dc", 2).unwrap().len(), 1);
     }
 }
