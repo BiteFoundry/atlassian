@@ -67,6 +67,28 @@ Read a Jira issue or Confluence page in compact JSON (passing a Jira key like `E
 
 ---
 
+## Data Center & Corporate Networks
+
+**Separate Jira and Confluence PATs.** Data Center PATs are per application, so a Jira PAT does not work on Confluence. Pass the Confluence PAT with `--confluence-pat`: it is checked against Confluence before anything is saved, stored under its own credential account (`--confluence-account`, default `<account>-confluence`), and linked from the site as `confluence_account_id` in `config.toml`. Requests under the Confluence URL then use it, while Jira keeps the site's own credential. Cloud sites reject `--confluence-pat`, because one Cloud credential covers both products.
+
+```bash
+atlassian login --url https://jira.acme.internal --confluence-url https://wiki.acme.internal --deployment datacenter --pat "$JIRA_PAT" --confluence-pat "$CONFLUENCE_PAT"
+# Add a Confluence PAT to a site that is already logged in (its Jira credential is reused):
+atlassian login --site <site-id> --confluence-pat "$CONFLUENCE_PAT"
+```
+
+`ATLASSIAN_CONFLUENCE_PAT` (alias `CONFLUENCE_PAT`) supplies the Confluence PAT of a Data Center site from the environment and takes precedence over a stored `confluence_account_id`. A Confluence-only server needs no Jira credential: `conf login --url https://wiki.acme.internal --deployment datacenter --pat "$CONFLUENCE_PAT"` verifies the login against Confluence. When a server answers HTTP 200 as an anonymous user (`X-AUSERNAME: anonymous`, a failed `X-Seraph-LoginReason`, or an HTML login page instead of JSON), the request fails as HTTP 401 instead of returning an empty result; on Confluence the message points to `--confluence-pat` and `ATLASSIAN_CONFLUENCE_PAT`.
+
+With two or more sites configured, environment credentials no longer override every site. `ATLASSIAN_PAT` / `JIRA_PAT` (or `ATLASSIAN_API_TOKEN` + `ATLASSIAN_EMAIL`) take precedence only on the site whose URL matches `ATLASSIAN_SITE_URL` / `JIRA_URL` (when neither is set, the top-level `site_url` in `config.toml`); every other site uses its stored credential and falls back to the environment only when it has none. `ATLASSIAN_CONFLUENCE_PAT` applies to that same site, or to the site whose Confluence URL matches `ATLASSIAN_CONFLUENCE_URL`.
+
+**Corporate root CAs.** TLS trusts the OS certificate store plus the bundled Mozilla roots. For a private root CA, set `ATLASSIAN_EXTRA_CA_PEM` to a PEM bundle path (or to the PEM text itself). `SSL_CERT_FILE` and `NODE_EXTRA_CA_CERTS` are read as PEM bundle paths too, and every variable that is set is loaded. A bundle that cannot be read or parsed is skipped with a warning on `stderr`. An untrusted server certificate fails with `TLS certificate for <host> is not trusted (...)`, which names these variables.
+
+**Config location.** `ATLASSIAN_CONFIG_DIR` replaces the default config directory: `config.toml` and the `credentials.json` fallback live there, and the SQLite cache moves to `<dir>/<profile>/cache.db`.
+
+**Diagnostics.** `atlassian doctor --probe` asks Jira and Confluence separately who the credential belongs to, and prints the TLS roots in use (with each extra CA bundle and its certificate count), the config directory and whether `ATLASSIAN_CONFIG_DIR` set it, and any separate Confluence credential account. With `--json` it reports `tls`, `config_dir_source`, `confluence_credential_account`, `env_credentials.applies_to_site` (the site the environment credentials are primary for), and `probe_confluence_me` / `probe_confluence_error` next to the Jira `probe_me` / `probe_error`. `atlassian whoami --json` adds `confluence_user` and `identity` (`ok`, `anonymous`, `unauthorized`, `not_found`, `error`, or `skipped` for each product).
+
+---
+
 ## Built for AI Agents (MCP & `--json` CLI)
 
 Most Jira and Confluence integrations break agents in predictable ways: dumping 25 KB of raw ADF JSON per issue, corrupting Confluence layouts on write, overwriting concurrent edits, or exposing destructive tools with no safety rail. `@bitefoundry/atlassian` is engineered around those exact failure modes:
@@ -97,6 +119,8 @@ Most Jira and Confluence integrations break agents in predictable ways: dumping 
 | `Ctrl+S` | Multi-Site Switcher (`All Sites` federated view, Cloud + DC) | Global |
 | `Ctrl+P` / `:` | Command Palette (fuzzy search every action) | Global |
 | `Ctrl+,` / `?` / `q` | Live Settings / Keyboard Shortcuts Help / Quit | Global |
+
+In the Confluence nav rail, press `/` while the SPACES section has focus to filter spaces by key or name as you type; `Enter` opens the selected space and `Esc` clears the filter, then closes it.
 
 ---
 

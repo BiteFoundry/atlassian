@@ -98,6 +98,7 @@ args = ["mcp"]
 - **Error codes**: `-32700` parse error, `-32600` invalid JSON-RPC envelope, `-32601` method not found.
 - **`tools/call`**: returns `{ "content": [{ "type": "text", "text": "<pretty JSON>" }], "isError": false }` on success, or `"isError": true` with structured JSON `{ "ok": false, "error": { "code", "message", "http_status"?, "details"? } }` on validation or API failures.
 - **Arguments**: each tool accepts exactly the properties of its `inputSchema` (`additionalProperties: false`). Every tool, `list_sites` included, also declares the optional `site` selector (site ID, name, or URL); `list_sites` checks it against the configured sites but always lists every site. Any other argument fails validation with `unknown argument '<name>' for <tool>; allowed: ...` before storage or the network is touched, so a misspelled argument (for example `assignee` for `assignee_id`) is never dropped silently.
+- **Site selection**: `site` takes a configured site ID, name, or URL, or `"all"`. Without it, a tool uses the site given at launch with `--site` (or `ATLASSIAN_SITE`), else the site saved by the TUI site switcher, else the default site. Cache searches (`search_all` and `search_confluence_pages` without `remote`, `search_jira_issues` with `offline: true` and `query`) and `sync_workspace` cover every site when `site` is `"all"`, or when it is omitted and no launch or TUI site is set; other read tools treat `"all"` as the server's site. An unknown `site` fails every tool with `unknown site '<name>'; configured sites: ...`, and write tools reject `site: "all"` with `site 'all' cannot be used for a write; name one site (...)`.
 
 ## Tools
 
@@ -138,24 +139,24 @@ args = ["mcp"]
 | `update_confluence_page` | `page_id`, `title?`, `body_markdown?`, `append_markdown?`, `replace_text?`, `replace_section?`, `prev_version?`, `version_message?`, `dry_run?` (bool), `compact?` (bool, default true) | Compact updated `page` (or full detail when `compact: false`) or a `preview` |
 | `add_confluence_comment` | `page_id`, `body_markdown` | `{ "ok": true, "comment": {...} }` |
 | `search_confluence_pages` | `query?`, `cql?`, `remote?` (bool), `limit?` (1..1000) | `{ "remote": ..., "hits"\|"pages": [...] }` |
-
-> **Search queries & pagination**: Plain-text `query` values (including phrases containing `and`, `or`, `=`, or `~` such as `read and write` or `timeout=30`) are escaped into `text ~ "..."` (with `project = "..." AND ...` when `project` is supplied). Standard leading field expressions (e.g. `project = FLS`, `space = ENG`, `status IN (...)`, `cf[10016] >= 5`, or `ORDER BY ...`) are recognized automatically; pass explicit `jql` (e.g. `{"jql": "customField = \"value\""}`) or `cql` (e.g. `{"cql": "customMeta = \"value\""}`) for custom raw expressions. For Jira pagination, use `page_token` on Cloud and `start_at` (from `next_start_at`) on Data Center; passing both cursors together is rejected.
-
-> **Offline Jira search**: with `offline: true`, `search_jira_issues` runs `query` as a full-text search of the cache and keeps only hits whose key starts with `<project>-` (case-insensitive) when `project` is given; the project filter is applied before `limit`. Only `query` is searched: `jql` cannot be evaluated offline, so `jql` with `offline: true` and no `query` fails with `jql cannot be evaluated offline; ...`. Without `query` and `jql`, it lists cached issues (of `project` when given), newest first.
-
-> **Collection paging**: `list_projects`, `list_boards`, `list_confluence_spaces`, `list_sprints`, `get_board_issues`, `list_space_pages`, and `list_child_pages` include `returned`, `has_more` (`true`, `false`, or `null` when upstream gives no completion signal), and `next_cursor` (`string` or `null`). Pass `next_cursor` back as `cursor` with the same arguments to continue. Catalog tools (`list_projects`, `list_boards`, `list_confluence_spaces`) follow all upstream pages on refresh and page locally from SQLite by integer offset; when reading from a cache populated by sync, pass `refresh: true` to load the full catalog. Single-page remote tools fetch one upstream page per call, capped by upstream per-call limits (`get_board_issues`: 100, `list_space_pages` / `list_child_pages`: 250, `list_sprints`: 50). `list_sprints` returns `active` and `future` sprints only. On Confluence page summaries, `has_children` is `true`, `false`, or `null` when unknown from cache without extra requests.
 | `delete_confluence_page` | `page_id`, `confirm` (must be literal `true`) | `{ "ok": true, "page_id": "..." }` |
 | `upload_confluence_attachment` | `page_id`, `path` (local file path) | `attachments` metadata |
 | `move_confluence_page` | `page_id`, `parent_id`, `prev_version?` (required on Data Center) | `page` summary with confirmed parent and version |
 | `add_confluence_labels` | `page_id`, `labels` (nonempty array) | `added` names |
 | `remove_confluence_label` | `page_id`, `label` | `removed` name |
 
+> **Search queries & pagination**: Plain-text `query` values (including phrases containing `and`, `or`, `=`, or `~` such as `read and write` or `timeout=30`) are escaped into `text ~ "..."` (with `project = "..." AND ...` when `project` is supplied). Standard leading field expressions (e.g. `project = FLS`, `space = ENG`, `status IN (...)`, `cf[10016] >= 5`, or `ORDER BY ...`) are recognized automatically; pass explicit `jql` (e.g. `{"jql": "customField = \"value\""}`) or `cql` (e.g. `{"cql": "customMeta = \"value\""}`) for custom raw expressions. For Jira pagination, use `page_token` on Cloud and `start_at` (from `next_start_at`) on Data Center; passing both cursors together is rejected.
+
+> **Offline Jira search**: with `offline: true`, `search_jira_issues` runs `query` as a full-text search of the cache and keeps only hits whose key starts with `<project>-` (case-insensitive) when `project` is given; the project filter is applied before `limit`. Only `query` is searched: `jql` cannot be evaluated offline, so `jql` with `offline: true` and no `query` fails with `jql cannot be evaluated offline; ...`. Without `query` and `jql`, it lists cached issues (of `project` when given), newest first.
+
+> **Collection paging**: `list_projects`, `list_boards`, `list_confluence_spaces`, `list_sprints`, `get_board_issues`, `list_space_pages`, and `list_child_pages` include `returned`, `has_more` (`true`, `false`, or `null` when upstream gives no completion signal), and `next_cursor` (`string` or `null`). Pass `next_cursor` back as `cursor` with the same arguments to continue. Catalog tools (`list_projects`, `list_boards`, `list_confluence_spaces`) follow all upstream pages on refresh and page locally from SQLite by integer offset; when reading from a cache populated by sync, pass `refresh: true` to load the full catalog. Single-page remote tools fetch one upstream page per call, capped by upstream per-call limits (`get_board_issues`: 100, `list_space_pages` / `list_child_pages`: 250, `list_sprints`: 50). `list_sprints` returns `active` and `future` sprints only. On Confluence page summaries, `has_children` is `true`, `false`, or `null` when unknown from cache without extra requests.
+
 ### Unified Tools
 
 | Tool | Arguments | Returns |
 | --- | --- | --- |
 | `search_all` | `query`, `scope?` (`all\|jira\|confluence`), `remote?` (bool), `limit?` (1..1000) | `{ "query": "...", "scope": "...", "remote": ..., "hits": [...] }` |
-| `sync_workspace` | _(none)_ | `{ "ok": true, "summary": "...", "counts": {...} }` |
+| `sync_workspace` | _(none)_ | One site: `{ "ok": true, "site_id": "...", "summary": "...", "counts": {...} }`. Every site (more than one enabled): `{ "ok": ..., "summary": "...", "sites": [...], "counts": {...} }`, an error when no site synced |
 | `list_sites` | _(none)_ | Configured sites and the default site |
 | `download_attachment` | One of `issue_key` or `page_id`, plus `attachment_id?` and `dest_dir?` | Local path and attachment metadata |
 
@@ -200,7 +201,6 @@ Tool descriptions state what a call costs so an agent can avoid needless traffic
 ## Safety guards
 
 - `assign_jira_issue` requires `assignee_id`. Pass an account ID (Cloud), a username (Data Center), `"me"`, or `null` to unassign. Omitting it is an error; through 0.8.0 an omitted `assignee_id` unassigned the issue.
-
 - Destructive tools (`delete_jira_issue` and `delete_confluence_page`) enforce `confirm: true` as a literal JSON boolean (`Value::Bool(true)`). Omitting `confirm` or passing `false`, `"true"`, `1`, or `null` returns `isError: true`.
 - `update_jira_issue` and `update_confluence_page` reject empty patches with no fields to update.
 - Confluence reports a version conflict if the page has changed since the supplied base version.
