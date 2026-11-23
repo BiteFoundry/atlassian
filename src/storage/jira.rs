@@ -10,13 +10,27 @@ use crate::{
     models::{
         AttachmentItem, BoardColumn, BoardSummary, IssueComment, IssueDetail, IssuePriority,
         IssueStatus, IssueSummary, IssueType, ListPage, ProjectSummary, SavedFilter, SearchHitKind,
-        SprintSummary, UnifiedSearchHit, UserSummary,
+        SprintSummary, StatusCategory, UnifiedSearchHit, UserSummary,
     },
     storage::{
         db::{build_contextual_snippet, build_fts_query, escape_like, DEFAULT_SITE_ID},
         Storage,
     },
 };
+
+/// Conditions for an offline issue list. Rows are matched before the limit is applied, so the
+/// limit counts matching issues, not scanned rows.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct IssueListFilter<'a> {
+    /// Exact project key.
+    pub project: Option<&'a str>,
+    /// Case-insensitive substring of the status name.
+    pub status_contains: Option<&'a str>,
+    /// Cloud account ID or Data Center username of the assignee.
+    pub assignee_id: Option<&'a str>,
+    /// Skip issues whose status category is Done.
+    pub open_only: bool,
+}
 
 impl Storage {
     pub fn upsert_projects(&self, projects: &[ProjectSummary]) -> Result<()> {
@@ -898,6 +912,70 @@ impl Storage {
             )?
         };
         Ok(count.max(0) as usize)
+    }
+
+    /// Cached issues of a site that match `filter`, newest first, at most `limit` of them.
+    /// Status and assignee live in JSON columns, so they are matched here rather than in SQL.
+    pub fn list_issues_filtered_for_site(
+        &self,
+        site_id: &str,
+        filter: &IssueListFilter<'_>,
+        limit: usize,
+    ) -> Result<Vec<IssueSummary>> {
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
+        let status_needle = filter
+            .status_contains
+            .map(|s| s.trim().to_lowercase())
+            .filter(|s| !s.is_empty());
+        let matches = |issue: &IssueSummary| {
+            status_needle
+                .as_deref()
+                .is_none_or(|needle| issue.status.name.to_lowercase().contains(needle))
+                && filter.assignee_id.is_none_or(|id| {
+                    issue.assignee.as_ref().is_some_and(|user| user.id == id)
+                })
+                && !(filter.open_only && matches!(issue.status.category, StatusCategory::Done))
+        };
+        let conn = self.lock_conn()?;
+        let mut stmt = conn.prepare(
+            "
+            SELECT
+                id, key, project_key, summary, status_json, priority_json,
+                issue_type_json, assignee_json, reporter_json, parent_key,
+                parent_summary, labels_json, story_points, sprint_id,
+                sprint_name, comment_count, attachment_count, created_at,
+                updated_at, web_url
+            FROM issues
+            WHERE site_id = ?1 AND (?2 IS NULL OR project_key = ?2)
+            ORDER BY updated_at DESC, key ASC
+            ",
+        )?;
+        let mut rows = stmt.query(params![site_id, filter.project])?;
+        let mut out = Vec::new();
+        while let Some(row) = rows.next()? {
+            let issue = map_issue_summary_row(row, 0)?;
+            if matches(&issue) {
+                out.push(issue);
+                if out.len() == limit {
+                    break;
+                }
+            }
+        }
+        Ok(out)
+    }
+
+    /// Number of cached issues of a site that match `filter`, ignoring any limit.
+    pub fn count_issues_filtered_for_site(
+        &self,
+        site_id: &str,
+        filter: &IssueListFilter<'_>,
+    ) -> Result<usize> {
+        if filter.status_contains.is_none() && filter.assignee_id.is_none() && !filter.open_only {
+            return self.count_issues_for_site(site_id, filter.project);
+        }
+        Ok(self.list_issues_filtered_for_site(site_id, filter, usize::MAX)?.len())
     }
 
     pub fn list_issues_all_sites(
@@ -2020,6 +2098,75 @@ mod tests {
             let expected = storage.list_issues_for_site(site, proj, 1000).unwrap().len();
             assert_eq!(storage.count_issues_for_site(site, proj).unwrap(), expected);
         }
+    }
+
+    #[test]
+    fn list_issues_filtered_applies_status_before_limit() {
+        let storage = Storage::open_in_memory().unwrap();
+        // ENG-11..=ENG-60 are the 50 newest rows and Done; ENG-1..=ENG-10 are older and open.
+        let issues: Vec<IssueSummary> = (1..=60)
+            .map(|i| {
+                let mut issue = sample_issue(&format!("ENG-{i}"), "ENG", &format!("Issue {i}"), None);
+                issue.updated_at = format!("2026-11-20T10:{:02}:{:02}Z", i / 60, i % 60);
+                if i > 10 {
+                    issue.status = IssueStatus {
+                        id: "3".into(),
+                        name: "Done".into(),
+                        category: StatusCategory::Done,
+                    };
+                }
+                if i <= 3 {
+                    issue.assignee = Some(UserSummary {
+                        id: "acct-me".into(),
+                        display_name: "Me".into(),
+                        ..Default::default()
+                    });
+                }
+                issue
+            })
+            .collect();
+        storage.upsert_issues_for_site("site-a", &issues).unwrap();
+
+        // Filtering after the limit is what used to return nothing.
+        let newest = storage.list_issues_for_site("site-a", None, 50).unwrap();
+        assert!(newest.iter().all(|i| i.status.name == "Done"));
+
+        let in_progress = IssueListFilter {
+            status_contains: Some(" progress "),
+            ..Default::default()
+        };
+        let open = storage
+            .list_issues_filtered_for_site("site-a", &in_progress, 50)
+            .unwrap();
+        assert_eq!(open.len(), 10);
+        assert_eq!(storage.count_issues_filtered_for_site("site-a", &in_progress).unwrap(), 10);
+        assert_eq!(
+            storage.count_issues_filtered_for_site("site-a", &IssueListFilter::default()).unwrap(),
+            60
+        );
+        assert!(open.iter().all(|i| i.status.name == "In Progress"));
+        let keys = |rows: &[IssueSummary]| rows.iter().map(|i| i.key.clone()).collect::<Vec<_>>();
+        assert_eq!(
+            keys(&storage.list_issues_filtered_for_site("site-a", &in_progress, 3).unwrap()),
+            ["ENG-10", "ENG-9", "ENG-8"],
+            "newest matches first, limit counts matches"
+        );
+
+        let open_only = IssueListFilter { open_only: true, ..Default::default() };
+        assert_eq!(storage.list_issues_filtered_for_site("site-a", &open_only, 50).unwrap().len(), 10);
+
+        let mine = IssueListFilter {
+            project: Some("ENG"),
+            assignee_id: Some("acct-me"),
+            ..Default::default()
+        };
+        assert_eq!(
+            keys(&storage.list_issues_filtered_for_site("site-a", &mine, 50).unwrap()),
+            ["ENG-3", "ENG-2", "ENG-1"]
+        );
+        let other_project = IssueListFilter { project: Some("OPS"), ..Default::default() };
+        assert!(storage.list_issues_filtered_for_site("site-a", &other_project, 50).unwrap().is_empty());
+        assert!(storage.list_issues_filtered_for_site("site-b", &open_only, 50).unwrap().is_empty());
     }
 
     /// `(board_id, sprint_id, sprint_name)` of a cached issue row, or `None` when the row is gone.

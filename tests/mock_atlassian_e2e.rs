@@ -4590,6 +4590,66 @@ async fn http_offline_issues_total_is_cache_count() {
     assert!(detail["issue"].get("omitted").is_none());
 }
 
+#[tokio::test]
+async fn http_offline_issues_filters_status_before_limit() {
+    ensure_isolated_env();
+    let storage = Storage::open_in_memory().expect("storage");
+    let issue = |key: &str, project: &str, done: bool, updated_at: String| {
+        atlassian_cli::models::IssueSummary {
+            id: key.into(),
+            key: key.into(),
+            project_key: project.into(),
+            summary: format!("Cached issue {key}"),
+            status: atlassian_cli::models::IssueStatus {
+                id: if done { "3" } else { "2" }.into(),
+                name: if done { "Done" } else { "In Progress" }.into(),
+                category: if done { StatusCategory::Done } else { StatusCategory::InProgress },
+            },
+            updated_at,
+            ..Default::default()
+        }
+    };
+    // The 50 newest ENG issues are Done; ten older ones are still in progress. OPS-1 is the
+    // newest row of all and belongs to another project.
+    let mut issues: Vec<_> = (1..=60)
+        .map(|i| issue(&format!("ENG-{i}"), "ENG", i > 10, format!("2026-11-20T10:00:{i:02}Z")))
+        .collect();
+    issues.push(issue("OPS-1", "OPS", false, "2026-11-21T00:00:00Z".into()));
+    storage.upsert_issues(&issues).unwrap();
+
+    let cfg = AppConfig {
+        default_project: Some("ENG".into()),
+        ..AppConfig::default()
+    };
+    let auth = AuthManager::new("http-offline-status");
+    let client = AtlassianClient::new(cfg.clone(), auth).unwrap();
+    let serve_url =
+        spawn_server(serve::build_router(cfg, client, storage, serve::ServeOptions::default())).await;
+    let http = reqwest::Client::new();
+    let get = |query: &str| http.get(format!("{serve_url}/issues?offline=true&{query}")).send();
+
+    let open: Value = get("status=progress&limit=50").await.unwrap().json().await.unwrap();
+    let open_issues = open["issues"].as_array().unwrap();
+    assert_eq!(open_issues.len(), 10, "{open}");
+    assert!(open_issues
+        .iter()
+        .all(|i| i["status"]["name"] == "In Progress" && i["project_key"] == "ENG"));
+    assert_eq!(open["total"], 10);
+
+    // The default project scopes offline lists the way it scopes live ones.
+    let all: Value = get("limit=1000").await.unwrap().json().await.unwrap();
+    assert_eq!(all["issues"].as_array().unwrap().len(), 60);
+    assert_eq!(all["total"], 60);
+    let ops: Value = get("project=OPS&status=progress").await.unwrap().json().await.unwrap();
+    assert_eq!(ops["issues"][0]["key"], "OPS-1");
+    assert_eq!(ops["total"], 1);
+
+    let jql = get("jql=project%20%3D%20ENG").await.unwrap();
+    assert_eq!(jql.status(), reqwest::StatusCode::BAD_REQUEST);
+    let body: Value = jql.json().await.unwrap();
+    assert!(body["error"].as_str().unwrap().contains("jql cannot be evaluated offline"), "{body}");
+}
+
 /// Mock Data Center pair for split-credential tests: Jira under "/jira" accepts only
 /// "PAT-J", Confluence under "/wiki" only "PAT-C". Every Authorization header is recorded
 /// per product so a test can assert that no credential crossed over.

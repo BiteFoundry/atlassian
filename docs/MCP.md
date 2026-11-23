@@ -97,6 +97,7 @@ args = ["mcp"]
 - **`ping`**: returns `{}`.
 - **Error codes**: `-32700` parse error, `-32600` invalid JSON-RPC envelope, `-32601` method not found.
 - **`tools/call`**: returns `{ "content": [{ "type": "text", "text": "<pretty JSON>" }], "isError": false }` on success, or `"isError": true` with structured JSON `{ "ok": false, "error": { "code", "message", "http_status"?, "details"? } }` on validation or API failures.
+- **Arguments**: each tool accepts exactly the properties of its `inputSchema` (`additionalProperties: false`). Every tool, `list_sites` included, also declares the optional `site` selector (site ID, name, or URL); `list_sites` checks it against the configured sites but always lists every site. Any other argument fails validation with `unknown argument '<name>' for <tool>; allowed: ...` before storage or the network is touched, so a misspelled argument (for example `assignee` for `assignee_id`) is never dropped silently.
 
 ## Tools
 
@@ -109,13 +110,13 @@ args = ["mcp"]
 | `list_boards` | `project?` (string), `refresh?` (bool), `limit?` (1..1000, default 50), `cursor?` (string) | `{ "boards": [...], "returned": ..., "has_more": ..., "next_cursor": ... }` |
 | `list_sprints` | `board_id` (int), `limit?` (1..1000, default 50), `cursor?` (string), `offline?` (bool) | `{ "board_id": ..., "sprints": [...], "returned": ..., "has_more": ..., "next_cursor": ... }` |
 | `get_board_issues` | `board_id` (int), `sprint_id?` (int), `limit?` (1..1000, default 50), `cursor?` (string), `offline?` (bool) | `{ "board_id": ..., "sprint_id": ..., "issues": [...], "returned": ..., "has_more": ..., "next_cursor": ... }` |
-| `search_jira_issues` | `jql?`, `query?`, `project?`, `limit?` (1..1000), `page_token?` (Cloud), `start_at?` (Data Center, >= 0), `offline?` (bool) | `{ "jql": "...", "issues": [...], "next_page_token": ..., "next_start_at": ..., "total": ... }` or offline `{ "offline": true, "hits"\|"issues": [...] }` |
+| `search_jira_issues` | `jql?`, `query?`, `project?`, `limit?` (1..1000), `page_token?` (Cloud), `start_at?` (Data Center, >= 0), `offline?` (bool; `jql` alone is rejected offline) | `{ "jql": "...", "issues": [...], "next_page_token": ..., "next_start_at": ..., "total": ... }` or offline `{ "offline": true, "hits"\|"issues": [...] }` |
 | `get_jira_issue` | `key` (string), `offline?` (bool), `compact?` (bool) | `{ "issue": {...} }` |
 | `create_jira_issue` | `project_key`, `summary`, `issue_type?`, `description_markdown?`, `priority?`, `assignee_id?` (`"me"`, account ID, or display name/email), `labels?`, `parent_key?`, `compact?` (bool, default true) | `{ "ok": true, "site_id": "...", "issue": { "key", "summary", "status", "web_url" } }` (or full detail when `compact: false`) |
 | `update_jira_issue` | `key`, `summary?`, `description_markdown?`, `append_markdown?`, `replace_text?`, `priority?`, `assignee_id?` (`string\|null`, `"me"` or name/email), `labels?` (replaces all labels; `[]` clears), `dry_run?` (bool), `compact?` (bool, default true) | Compact updated `issue` (or full detail when `compact: false`) or a `preview` |
 | `list_jira_transitions` | `key` (string) | `{ "key": "...", "transitions": [...] }` |
 | `transition_jira_issue` | `key`, `transition`, `comment_markdown?` | `{ "ok": true, "site_id": "...", "key": "...", "transition": "...", "transition_id": "...", "to_status"?: "..." }` |
-| `assign_jira_issue` | `key`, `assignee_id?` (`string\|null`, `"me"`, account ID, or display name/email) | `{ "ok": true, "site_id": "...", "key": "...", "assignee_id": ..., "resolved_assignee"?: {...} }` |
+| `assign_jira_issue` | `key`, `assignee_id` (required, `string\|null`: account ID on Cloud, username on Data Center, `"me"`, or display name/email; `null` unassigns) | `{ "ok": true, "site_id": "...", "key": "...", "assignee_id": ..., "resolved_assignee"?: {...} }` |
 | `add_jira_comment` | `key`, `body_markdown` | `{ "ok": true, "comment": {...} }` |
 | `upload_jira_attachment` | `key`, `path` (local file path) | `{ "ok": true, "key": "...", "attachments": [...] }` |
 | `delete_jira_issue` | `key`, `confirm` (must be literal `true`) | `{ "ok": true, "key": "..." }` |
@@ -139,6 +140,8 @@ args = ["mcp"]
 | `search_confluence_pages` | `query?`, `cql?`, `remote?` (bool), `limit?` (1..1000) | `{ "remote": ..., "hits"\|"pages": [...] }` |
 
 > **Search queries & pagination**: Plain-text `query` values (including phrases containing `and`, `or`, `=`, or `~` such as `read and write` or `timeout=30`) are escaped into `text ~ "..."` (with `project = "..." AND ...` when `project` is supplied). Standard leading field expressions (e.g. `project = FLS`, `space = ENG`, `status IN (...)`, `cf[10016] >= 5`, or `ORDER BY ...`) are recognized automatically; pass explicit `jql` (e.g. `{"jql": "customField = \"value\""}`) or `cql` (e.g. `{"cql": "customMeta = \"value\""}`) for custom raw expressions. For Jira pagination, use `page_token` on Cloud and `start_at` (from `next_start_at`) on Data Center; passing both cursors together is rejected.
+
+> **Offline Jira search**: with `offline: true`, `search_jira_issues` runs `query` as a full-text search of the cache and keeps only hits whose key starts with `<project>-` (case-insensitive) when `project` is given; the project filter is applied before `limit`. Only `query` is searched: `jql` cannot be evaluated offline, so `jql` with `offline: true` and no `query` fails with `jql cannot be evaluated offline; ...`. Without `query` and `jql`, it lists cached issues (of `project` when given), newest first.
 
 > **Collection paging**: `list_projects`, `list_boards`, `list_confluence_spaces`, `list_sprints`, `get_board_issues`, `list_space_pages`, and `list_child_pages` include `returned`, `has_more` (`true`, `false`, or `null` when upstream gives no completion signal), and `next_cursor` (`string` or `null`). Pass `next_cursor` back as `cursor` with the same arguments to continue. Catalog tools (`list_projects`, `list_boards`, `list_confluence_spaces`) follow all upstream pages on refresh and page locally from SQLite by integer offset; when reading from a cache populated by sync, pass `refresh: true` to load the full catalog. Single-page remote tools fetch one upstream page per call, capped by upstream per-call limits (`get_board_issues`: 100, `list_space_pages` / `list_child_pages`: 250, `list_sprints`: 50). `list_sprints` returns `active` and `future` sprints only. On Confluence page summaries, `has_children` is `true`, `false`, or `null` when unknown from cache without extra requests.
 | `delete_confluence_page` | `page_id`, `confirm` (must be literal `true`) | `{ "ok": true, "page_id": "..." }` |
@@ -187,7 +190,16 @@ Preview a section edit on page `40211` at version 7 with `update_confluence_page
 - `move_confluence_page` uses the Cloud move-to-child operation with an empty request body. An optional Cloud version is checked before the move. Data Center requires the current `prev_version` and a parent in the same space. Its metadata update sends the next version and `ancestors` without a body. [Cloud page move](https://developer.atlassian.com/cloud/confluence/rest/v1/api-group-content---children-and-descendants/) · [Data Center update content](https://developer.atlassian.com/server/confluence/rest/v1001/api-group-content-resource/)
 - Labels use the dedicated add and remove endpoints. Add accepts multiple global labels in one request. Remove accepts one label name. Attachment upload uses the existing create-only multipart path shared with `conf attach`. [Cloud labels](https://developer.atlassian.com/cloud/confluence/rest/v1/api-group-content-labels/) · [Data Center labels](https://developer.atlassian.com/server/confluence/rest/v9227/api-group-content-labels/) · [Cloud attachments](https://developer.atlassian.com/cloud/confluence/rest/v1/api-group-content---attachments/) · [Data Center attachments](https://developer.atlassian.com/server/confluence/rest/latest/)
 
+## Cost hints
+
+Tool descriptions state what a call costs so an agent can avoid needless traffic on large instances.
+
+- `sync_workspace`: walks every project, board, sprint, your open issues and every Confluence space (paginated) for each enabled site (or only the site named by `site`) — tens to hundreds of API requests and typically 10–120 s on large Data Center instances. Call it once per session or when the cache is known stale; prefer per-item tools or `refresh: true` on a single list.
+- `list_projects`, `list_boards`, `list_confluence_spaces`: `refresh: true` re-downloads the full catalog (one request per page of results; hundreds of projects, boards, or spaces means several requests and seconds of latency). The default reads the local cache with no network call; only an empty cache is fetched. Each `refresh` property carries a one-line version of this note.
+
 ## Safety guards
+
+- `assign_jira_issue` requires `assignee_id`. Pass an account ID (Cloud), a username (Data Center), `"me"`, or `null` to unassign. Omitting it is an error; through 0.8.0 an omitted `assignee_id` unassigned the issue.
 
 - Destructive tools (`delete_jira_issue` and `delete_confluence_page`) enforce `confirm: true` as a literal JSON boolean (`Value::Bool(true)`). Omitting `confirm` or passing `false`, `"true"`, `1`, or `null` returns `isError: true`.
 - `update_jira_issue` and `update_confluence_page` reject empty patches with no fields to update.

@@ -157,9 +157,9 @@ Lists issues on a Jira Agile board, optionally scoped to `sprint_id`, one page p
 
 ## Jira Issues
 
-### `GET /issues?jql=&project=&limit=50&page_token=&start_at=&offline=false`
+### `GET /issues?jql=&project=&status=&limit=50&page_token=&start_at=&offline=false`
 
-Searches Jira issues by explicit `jql`, `project` filter, or `my_open_issues_jql()`, or reads cached issues when `offline=true`. When `offline=true`, `total` is the total number of matching cached rows (not just the returned slice). On Cloud, pass `page_token` (from `next_page_token`); on Data Center, pass non-negative integer `start_at` (from `next_start_at`, default `0`). Supplying both `page_token` and `start_at` returns HTTP 400.
+Searches Jira issues by explicit `jql`, by `project` and `status` filters, or by `my_open_issues_jql()` when none is given, or reads cached issues when `offline=true`. `project` falls back to the configured default project in both modes. Live, `status` adds a `status = "..."` JQL clause. Offline, `status` matches a case-insensitive substring of the cached status name, and every filter is applied before `limit`, so `limit` counts matching issues. When `offline=true`, `total` is the total number of matching cached rows (not just the returned slice). `jql` cannot be evaluated offline: `jql` with `offline=true` returns HTTP 400 (use `GET /search?q=` for a cached full-text search). On Cloud, pass `page_token` (from `next_page_token`); on Data Center, pass non-negative integer `start_at` (from `next_start_at`, default `0`). Supplying both `page_token` and `start_at` returns HTTP 400.
 
 ```bash
 curl "http://127.0.0.1:8789/issues?project=ENG&limit=20"

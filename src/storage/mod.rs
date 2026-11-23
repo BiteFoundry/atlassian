@@ -13,9 +13,10 @@ use anyhow::{anyhow, Result};
 use rusqlite::{params, Connection, OptionalExtension, Row};
 use serde::{Deserialize, Serialize};
 
-use crate::models::UnifiedSearchHit;
+use crate::models::{UnifiedSearchHit, UserSummary};
 
 pub use db::{DEFAULT_SITE_ID, SCHEMA_VERSION};
+pub use jira::IssueListFilter;
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CacheCounts {
@@ -170,9 +171,40 @@ impl Storage {
         tx.execute("DELETE FROM saved_filters WHERE site_id = ?1", [site_id])?;
         tx.execute("DELETE FROM pages WHERE site_id = ?1", [site_id])?;
         tx.execute("DELETE FROM spaces WHERE site_id = ?1", [site_id])?;
+        tx.execute("DELETE FROM site_identities WHERE site_id = ?1", [site_id])?;
         tx.execute("DELETE FROM sites WHERE site_id = ?1", [site_id])?;
         tx.commit()?;
         Ok(())
+    }
+
+    /// Remembers who is signed in to a site, for offline "assigned to me" filters.
+    pub fn save_identity_for_site(&self, site_id: &str, user: &UserSummary) -> Result<()> {
+        let user_json = serde_json::to_string(user)?;
+        let conn = self.lock_conn()?;
+        conn.execute(
+            "
+            INSERT INTO site_identities (site_id, user_json, updated_at)
+            VALUES (?1, ?2, strftime('%Y-%m-%dT%H:%M:%SZ', 'now'))
+            ON CONFLICT(site_id) DO UPDATE SET
+                user_json = excluded.user_json,
+                updated_at = excluded.updated_at
+            ",
+            params![site_id, user_json],
+        )?;
+        Ok(())
+    }
+
+    /// The user [Self::save_identity_for_site] stored for a site, if any.
+    pub fn identity_for_site(&self, site_id: &str) -> Result<Option<UserSummary>> {
+        let conn = self.lock_conn()?;
+        let user_json: Option<String> = conn
+            .query_row(
+                "SELECT user_json FROM site_identities WHERE site_id = ?1",
+                [site_id],
+                |row| row.get(0),
+            )
+            .optional()?;
+        Ok(user_json.and_then(|raw| serde_json::from_str(&raw).ok()))
     }
 
     pub fn cache_counts(&self) -> Result<CacheCounts> {
@@ -909,5 +941,24 @@ mod tests {
         // The other site keeps its sprint and both board links.
         assert_eq!(links("corp-dc"), 2);
         assert_eq!(storage.list_sprints_for_site("corp-dc", 2).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn site_identity_round_trips_and_leaves_with_its_site() {
+        let storage = Storage::open_in_memory().unwrap();
+        let me = |id: &str| UserSummary {
+            id: id.into(),
+            display_name: format!("User {id}"),
+            ..Default::default()
+        };
+        assert_eq!(storage.identity_for_site("acme").unwrap(), None);
+        storage.save_identity_for_site("acme", &me("acct-1")).unwrap();
+        storage.save_identity_for_site("acme", &me("acct-2")).unwrap();
+        storage.save_identity_for_site("corp", &me("jdoe")).unwrap();
+        assert_eq!(storage.identity_for_site("acme").unwrap(), Some(me("acct-2")));
+
+        storage.delete_site_data("acme").unwrap();
+        assert_eq!(storage.identity_for_site("acme").unwrap(), None);
+        assert_eq!(storage.identity_for_site("corp").unwrap(), Some(me("jdoe")));
     }
 }

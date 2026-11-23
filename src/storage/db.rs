@@ -79,6 +79,16 @@ CREATE TABLE IF NOT EXISTS board_sprints (
 );
 ";
 
+/// The signed-in Jira user of each site, saved by `whoami` so `issues --offline --mine` can
+/// match assignees without a request. Additive to schema v2 like `board_sprints`.
+const SITE_IDENTITIES_TABLE_SQL: &str = "
+CREATE TABLE IF NOT EXISTS site_identities (
+    site_id    TEXT PRIMARY KEY,
+    user_json  TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+";
+
 const V2_ISSUES_TABLE_SQL: &str = "
 CREATE TABLE IF NOT EXISTS issues (
     site_id TEXT NOT NULL DEFAULT 'default',
@@ -280,6 +290,8 @@ fn init_connection(conn: &Connection, is_memory: bool) -> Result<()> {
     }
     ensure_detail_freshness_columns(conn)?;
     ensure_board_sprints(conn)?;
+    conn.execute_batch(SITE_IDENTITIES_TABLE_SQL)
+        .context("Failed to create site_identities table")?;
 
     Ok(())
 }

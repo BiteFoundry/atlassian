@@ -8,6 +8,7 @@
 //! response.
 
 use std::{
+    collections::{BTreeSet, HashMap},
     io::Write,
     path::{Path, PathBuf},
     sync::LazyLock,
@@ -311,6 +312,10 @@ fn resolve_mcp_site_id(
 ) -> Result<Option<String>, String> {
     config.resolve_site_scope(raw_site, fallback_client.site_id())
 }
+
+const OFFLINE_JQL_ERROR: &str = "jql cannot be evaluated offline; pass query (a full-text search of the cache) and/or project, or leave offline unset";
+const ASSIGNEE_REQUIRED: &str =
+    "assignee_id is required: pass an account id / username, \"me\", or null to unassign";
 
 /// Tools that change Atlassian data; they need one named site, never "all".
 const WRITE_TOOLS: &[&str] = &[
@@ -673,11 +678,23 @@ async fn call_tool(
             let offline = args.optional_bool("offline")?.unwrap_or(false);
 
             if offline {
-                if let Some(q) = query.as_deref().or(jql.as_deref()) {
+                if let Some(q) = query.as_deref() {
+                    // Only the text reaches the full-text index; project narrows its hits, so
+                    // ask for the most hits a call allows and cut to limit after filtering.
+                    let key_prefix = project
+                        .as_deref()
+                        .map(|p| format!("{}-", p.to_ascii_lowercase()));
+                    let fetch = if key_prefix.is_some() { clamp_limit(usize::MAX) } else { limit };
                     let hits: Vec<FederatedSearchHit> = storage
-                        .search_issues_scoped(q, scoped_site.as_deref(), limit)
+                        .search_issues_scoped(q, scoped_site.as_deref(), fetch)
                         .map_err(format_error)?
                         .into_iter()
+                        .filter(|(_, hit)| {
+                            key_prefix.as_deref().is_none_or(|prefix| {
+                                hit.id_or_key.to_ascii_lowercase().starts_with(prefix)
+                            })
+                        })
+                        .take(limit)
                         .map(|(sid, hit)| {
                             let sname = config
                                 .find_effective_site(&sid)
@@ -691,6 +708,9 @@ async fn call_tool(
                         "query": q,
                         "hits": hits,
                     }));
+                }
+                if jql.is_some() {
+                    return Err(OFFLINE_JQL_ERROR.to_string());
                 }
                 let target_site =
                     resolve_mcp_single_site_id(config, client, site_arg.as_deref())?;
@@ -1000,7 +1020,10 @@ async fn call_tool(
 
         "assign_jira_issue" => {
             let key = args.required_str("key")?;
-            let raw_assignee = args.optional_str("assignee_id")?;
+            // Absent is an error, not "unassign": only an explicit null unassigns.
+            let raw_assignee = args
+                .optional_nullable_str("assignee_id")?
+                .ok_or_else(|| ASSIGNEE_REQUIRED.to_string())?;
             let (target_site, target_client) =
                 resolve_mcp_client(config, client, site_arg.as_deref())?;
             let (mut resolved, raw_for_fallback) = match raw_assignee.as_deref() {
@@ -1717,10 +1740,37 @@ async fn call_tool(
     }
 }
 
+/// Argument names a tool accepts: the properties of its own input schema in [tool_catalog],
+/// the one place they are declared. None for a tool the catalog does not list.
+fn allowed_tool_keys(name: &str) -> Option<&'static BTreeSet<String>> {
+    static ALLOWED: LazyLock<HashMap<String, BTreeSet<String>>> = LazyLock::new(|| {
+        tool_catalog()
+            .iter()
+            .filter_map(|tool| {
+                let name = tool.get("name")?.as_str()?.to_string();
+                let properties = tool.pointer("/inputSchema/properties")?.as_object()?;
+                Some((name, properties.keys().cloned().collect()))
+            })
+            .collect()
+    });
+    ALLOWED.get(name)
+}
+
 /// Validates tool arguments before dispatching to Atlassian API or SQLite storage.
 pub(crate) fn validate_tool_args(name: &str, arguments: &Value) -> Result<(), String> {
     let args = Args::new(arguments);
     let _ = args.optional_str("site")?;
+    // Every schema says additionalProperties: false: reject an undeclared (often misspelled)
+    // argument instead of dropping it silently.
+    if let (Some(allowed), Some(given)) = (allowed_tool_keys(name), arguments.as_object()) {
+        if let Some(key) = given.keys().find(|key| !allowed.contains(key.as_str())) {
+            let allowed: Vec<&str> = allowed.iter().map(String::as_str).collect();
+            return Err(format!(
+                "unknown argument '{key}' for {name}; allowed: {}",
+                allowed.join(", ")
+            ));
+        }
+    }
 
     match name {
         "list_sites" | "get_myself" | "sync_workspace" => Ok(()),
@@ -1778,7 +1828,7 @@ pub(crate) fn validate_tool_args(name: &str, arguments: &Value) -> Result<(), St
         "get_jira_issue" | "list_jira_transitions" => {
             let _ = args.required_str("key")?;
             if name == "get_jira_issue" {
-                args.validate_detail("key")?;
+                args.validate_detail()?;
             }
             Ok(())
         }
@@ -1798,9 +1848,6 @@ pub(crate) fn validate_tool_args(name: &str, arguments: &Value) -> Result<(), St
             let _ = args.required_str("key")?;
             let _ = args.optional_bool("dry_run")?;
             let _ = args.optional_bool("compact")?;
-            if args.get("replace_section")?.is_some() {
-                return Err("section replacement requires a Confluence Cloud ADF page".to_string());
-            }
             let summary = args.optional_str("summary")?;
             let (full, append, replacement) = args.body_inputs("description_markdown")?;
             let edit = BodyEdit::from_inputs(
@@ -1831,7 +1878,9 @@ pub(crate) fn validate_tool_args(name: &str, arguments: &Value) -> Result<(), St
         }
         "assign_jira_issue" => {
             let _ = args.required_str("key")?;
-            let _ = args.optional_nullable_str("assignee_id")?;
+            if args.optional_nullable_str("assignee_id")?.is_none() {
+                return Err(ASSIGNEE_REQUIRED.to_string());
+            }
             Ok(())
         }
         "add_jira_comment" => {
@@ -1868,7 +1917,7 @@ pub(crate) fn validate_tool_args(name: &str, arguments: &Value) -> Result<(), St
         }
         "get_confluence_page" => {
             let _ = args.required_str("page_id")?;
-            args.validate_detail("page_id")
+            args.validate_detail()
         }
         "list_child_pages" => {
             let _ = args.required_str("page_id")?;
@@ -2148,6 +2197,13 @@ fn validate_range(field: &str, value: usize, min: usize, max: usize) -> Result<u
     }
 }
 
+#[cfg(test)]
+thread_local! {
+    /// Argument names read through [Args::get] while a test records them (Some).
+    static ARGS_READ: std::cell::RefCell<Option<BTreeSet<String>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
 struct Args<'a> {
     value: &'a Value,
 }
@@ -2158,6 +2214,12 @@ impl<'a> Args<'a> {
     }
 
     fn get(&self, key: &str) -> Result<Option<&'a Value>, String> {
+        #[cfg(test)]
+        ARGS_READ.with(|read| {
+            if let Some(keys) = read.borrow_mut().as_mut() {
+                keys.insert(key.to_string());
+            }
+        });
         let Some(obj) = self.value.as_object() else {
             return Err("arguments must be a JSON object".to_string());
         };
@@ -2230,19 +2292,9 @@ impl<'a> Args<'a> {
         }
     }
 
-    fn validate_detail(&self, id: &str) -> Result<(), String> {
+    fn validate_detail(&self) -> Result<(), String> {
         let _ = self.optional_bool("offline")?;
         let _ = self.optional_bool("compact")?;
-        let object = self
-            .value
-            .as_object()
-            .ok_or("arguments must be a JSON object")?;
-        if let Some(key) = object
-            .keys()
-            .find(|key| ![id, "site", "offline", "compact"].contains(&key.as_str()))
-        {
-            return Err(format!("unsupported detail argument '{key}'"));
-        }
         Ok(())
     }
 
@@ -2458,7 +2510,17 @@ fn workflow_tool(name: &str, description: &str, properties: Value, required: &[&
     })
 }
 
+/// Cost note for the catalog tools whose refresh re-downloads every page of the catalog.
+fn catalog_refresh_cost(noun: &str) -> String {
+    format!("refresh: true re-downloads the full catalog (one request per page of results; hundreds of {noun} means several requests and seconds of latency). Default reads the local cache with no network call; only an empty cache is fetched.")
+}
+
 fn tool_catalog() -> Vec<Value> {
+    let refresh_property = json!({
+        "type": "boolean",
+        "default": false,
+        "description": "Re-download the full catalog, one request per page of results. Default false reads the local cache."
+    });
     let text_replacement = json!({
         "type": "object",
         "description": "Replace one unique occurrence within a single source text node.",
@@ -2482,11 +2544,11 @@ fn tool_catalog() -> Vec<Value> {
         }),
         json!({
             "name": "list_projects",
-            "description": "List accessible Jira projects from SQLite cache or refresh from Jira API. Returns limit items from the cache; pass next_cursor as cursor to continue, and refresh: true to reload the full catalog.",
+            "description": format!("List accessible Jira projects from SQLite cache or refresh from Jira API. Returns limit items from the cache; pass next_cursor as cursor to continue, and refresh: true to reload the full catalog. {}", catalog_refresh_cost("projects")),
             "inputSchema": {
                 "type": "object",
                 "properties": {
-                    "refresh": { "type": "boolean", "default": false },
+                    "refresh": refresh_property.clone(),
                     "limit": { "type": "integer", "minimum": 1, "maximum": 1000, "default": 50 },
                     "cursor": { "type": "string", "description": "Offset from next_cursor." }
                 },
@@ -2495,12 +2557,12 @@ fn tool_catalog() -> Vec<Value> {
         }),
         json!({
             "name": "list_boards",
-            "description": "List Jira Agile boards, optionally filtered by project key. Returns limit items from the cache; pass next_cursor as cursor to continue, and refresh: true to reload the full catalog.",
+            "description": format!("List Jira Agile boards, optionally filtered by project key. Returns limit items from the cache; pass next_cursor as cursor to continue, and refresh: true to reload the full catalog. {}", catalog_refresh_cost("boards")),
             "inputSchema": {
                 "type": "object",
                 "properties": {
                     "project": { "type": "string", "description": "Optional Jira project key (e.g. ENG)." },
-                    "refresh": { "type": "boolean", "default": false },
+                    "refresh": refresh_property.clone(),
                     "limit": { "type": "integer", "minimum": 1, "maximum": 1000, "default": 50 },
                     "cursor": { "type": "string", "description": "Offset from next_cursor." }
                 },
@@ -2638,14 +2700,14 @@ fn tool_catalog() -> Vec<Value> {
         }),
         json!({
             "name": "assign_jira_issue",
-            "description": "Assign a Jira issue to a user (or 'me' for current user, or null to unassign).",
+            "description": "Assign a Jira issue. assignee_id is required: an account id (Cloud) or username (Data Center), \"me\", or null to unassign.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
                     "key": { "type": "string", "minLength": 1 },
-                    "assignee_id": { "type": ["string", "null"] }
+                    "assignee_id": { "type": ["string", "null"], "description": "Account ID (Cloud), username (Data Center), or 'me'; a display name or email is resolved when the ID is rejected. null unassigns." }
                 },
-                "required": ["key"],
+                "required": ["key", "assignee_id"],
                 "additionalProperties": false
             }
         }),
@@ -2715,11 +2777,11 @@ fn tool_catalog() -> Vec<Value> {
         // --- Confluence ---
         json!({
             "name": "list_confluence_spaces",
-            "description": "List accessible Confluence spaces from cache or refresh from Confluence API. Returns limit items from the cache; pass next_cursor as cursor to continue, and refresh: true to reload the full catalog.",
+            "description": format!("List accessible Confluence spaces from cache or refresh from Confluence API. Returns limit items from the cache; pass next_cursor as cursor to continue, and refresh: true to reload the full catalog. {}", catalog_refresh_cost("spaces")),
             "inputSchema": {
                 "type": "object",
                 "properties": {
-                    "refresh": { "type": "boolean", "default": false },
+                    "refresh": refresh_property.clone(),
                     "limit": { "type": "integer", "minimum": 1, "maximum": 1000, "default": 50 },
                     "cursor": { "type": "string", "description": "Offset from next_cursor." }
                 },
@@ -2901,7 +2963,7 @@ fn tool_catalog() -> Vec<Value> {
         }),
         json!({
             "name": "sync_workspace",
-            "description": "Synchronize Jira projects, boards, sprints, recent issues, and Confluence spaces & pages into the local SQLite cache.",
+            "description": "Synchronize Jira projects, boards, sprints, recent issues, and Confluence spaces & pages into the local SQLite cache. Cost: walks every project, board, sprint, your open issues and every Confluence space (paginated) for each enabled site (or only the site named by site) — tens to hundreds of API requests and typically 10–120 s on large Data Center instances. Call once per session or when the cache is known stale; prefer per-item tools or refresh: true on a single list.",
             "inputSchema": {
                 "type": "object",
                 "properties": {},
@@ -2924,22 +2986,23 @@ fn tool_catalog() -> Vec<Value> {
         }),
     ];
 
-    // Add optional `site` selector to every tool except `list_sites`.
+    // Every tool accepts the optional `site` selector; `list_sites` validates it but always
+    // lists every site.
     for tool in &mut tools {
         let is_list_sites = tool
             .get("name")
             .and_then(Value::as_str)
             .is_some_and(|n| n == "list_sites");
-        if !is_list_sites {
-            if let Some(props) = tool.pointer_mut("/inputSchema/properties").and_then(Value::as_object_mut) {
-                props.insert(
-                    "site".to_string(),
-                    json!({
-                        "type": "string",
-                        "description": "Optional target Atlassian site ID, name, or URL."
-                    }),
-                );
-            }
+        let description = if is_list_sites {
+            "Accepted for a uniform call shape and checked against the configured sites; every site is listed regardless."
+        } else {
+            "Optional target Atlassian site ID, name, or URL."
+        };
+        if let Some(props) = tool.pointer_mut("/inputSchema/properties").and_then(Value::as_object_mut) {
+            props.insert(
+                "site".to_string(),
+                json!({ "type": "string", "description": description }),
+            );
         }
     }
     tools
@@ -3009,6 +3072,298 @@ mod tests {
             )
             .unwrap();
         assert!(!needs_bootstrap(&client, &storage), "a cached site is not bootstrapped again");
+    }
+
+    #[tokio::test]
+    async fn assign_requires_explicit_assignee_id() {
+        let (cfg, client, storage) = test_ctx();
+        let missing = json!({ "key": "ENG-1" });
+        assert_eq!(validate_tool_args("assign_jira_issue", &missing).unwrap_err(), ASSIGNEE_REQUIRED);
+
+        // The call fails before storage or the network is touched.
+        let line = json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "tools/call",
+            "params": { "name": "assign_jira_issue", "arguments": missing }
+        })
+        .to_string();
+        let resp = handle_rpc_line_with_bootstrap(
+            &cfg,
+            &client,
+            McpOptions::FULL,
+            |_| panic!("storage must not be opened for an invalid assign"),
+            &line,
+            &mut true,
+        )
+        .await
+        .unwrap();
+        assert_eq!(resp["result"]["isError"], true, "{resp}");
+        let text = resp["result"]["content"][0]["text"].as_str().unwrap();
+        assert!(text.contains("assignee_id is required"), "{text}");
+
+        // The handler refuses it as well, for a caller that skips validation.
+        let err = Box::pin(call_tool(&cfg, &client, &storage, "assign_jira_issue", &missing))
+            .await
+            .unwrap_err();
+        assert_eq!(err, ASSIGNEE_REQUIRED);
+
+        let schema = tool_catalog()
+            .into_iter()
+            .find(|tool| tool["name"] == "assign_jira_issue")
+            .unwrap();
+        assert_eq!(schema["inputSchema"]["required"], json!(["key", "assignee_id"]));
+        assert!(schema["description"].as_str().unwrap().contains("null to unassign"));
+    }
+
+    #[tokio::test]
+    async fn assign_null_unassigns() {
+        use axum::{http::StatusCode, routing::put, Json, Router};
+        use std::sync::{Arc, Mutex};
+        use tokio::net::TcpListener;
+
+        let unassign = json!({ "key": "ENG-1", "assignee_id": null });
+        assert_eq!(validate_tool_args("assign_jira_issue", &unassign), Ok(()));
+
+        let bodies = Arc::new(Mutex::new(Vec::<Value>::new()));
+        let recorder = Arc::clone(&bodies);
+        let app = Router::new().route(
+            "/rest/api/3/issue/ENG-1/assignee",
+            put(move |Json(body): Json<Value>| {
+                let recorder = Arc::clone(&recorder);
+                async move {
+                    recorder.lock().unwrap().push(body);
+                    StatusCode::NO_CONTENT
+                }
+            }),
+        );
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base_url = format!("http://{}", listener.local_addr().unwrap());
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        let cfg = AppConfig {
+            site_url: base_url.clone(),
+            deployment: DeploymentKind::Cloud,
+            ..AppConfig::default()
+        };
+        let auth = AuthManager::with_credentials(
+            "test",
+            crate::auth::StoredCredentials::BearerPat {
+                site_url: base_url.clone(),
+                token: "tok".into(),
+                deployment: DeploymentKind::Cloud,
+            },
+        );
+        let client =
+            AtlassianClient::with_base_urls(&base_url, "", DeploymentKind::Cloud, auth).unwrap();
+        let storage = Storage::open_in_memory().unwrap();
+
+        let line = json!({
+            "jsonrpc": "2.0",
+            "id": 2,
+            "method": "tools/call",
+            "params": { "name": "assign_jira_issue", "arguments": unassign }
+        })
+        .to_string();
+        let resp = handle_rpc_line(&cfg, &client, &storage, &line).await.unwrap();
+        assert_eq!(resp["result"]["isError"], false, "{resp}");
+        let payload: Value =
+            serde_json::from_str(resp["result"]["content"][0]["text"].as_str().unwrap()).unwrap();
+        assert_eq!(payload["assignee_id"], Value::Null);
+        assert_eq!(*bodies.lock().unwrap(), vec![json!({ "accountId": null })]);
+    }
+
+    #[test]
+    fn assign_misspelled_key_is_rejected() {
+        let err = validate_tool_args(
+            "assign_jira_issue",
+            &json!({ "key": "ENG-1", "assignee": "alice" }),
+        )
+        .unwrap_err();
+        assert!(
+            err.starts_with("unknown argument 'assignee' for assign_jira_issue; allowed: "),
+            "{err}"
+        );
+        assert!(err.contains("assignee_id") && err.contains("site"), "{err}");
+    }
+
+    /// A value one schema property accepts, for driving validators and handlers.
+    fn sample_argument(key: &str, schema: &Value) -> Value {
+        if let Some(value) = schema.get("const") {
+            return value.clone();
+        }
+        if let Some(first) = schema.pointer("/enum/0") {
+            return first.clone();
+        }
+        match key {
+            "fields" => return json!({ "customfield_10000": 1 }),
+            "replace_text" => return json!({ "old_text": "a", "new_text": "b" }),
+            "replace_section" => return json!({ "heading": "h", "markdown": "m" }),
+            _ => {}
+        }
+        let kind = match &schema["type"] {
+            Value::Array(kinds) => kinds.first().and_then(Value::as_str),
+            other => other.as_str(),
+        };
+        match kind {
+            Some("integer") => json!(1),
+            Some("boolean") => json!(false),
+            Some("array") => json!(["ENG-1"]),
+            _ => json!("ENG-1"),
+        }
+    }
+
+    #[tokio::test]
+    async fn every_tool_schema_declares_every_argument_its_validator_reads() {
+        // No site URL: a handler that reaches for the network fails at once, after it has read
+        // its arguments.
+        let cfg = AppConfig::default();
+        let client = AtlassianClient::new(cfg.clone(), AuthManager::new("schema-audit")).unwrap();
+        let storage = Storage::open_in_memory().unwrap();
+        let catalog = tool_catalog();
+        assert_eq!(catalog.len(), 37);
+        for tool in &catalog {
+            let name = tool["name"].as_str().unwrap();
+            let properties = tool["inputSchema"]["properties"].as_object().unwrap();
+            let declared: BTreeSet<String> = properties.keys().cloned().collect();
+            assert!(declared.contains("site"), "{name} does not declare site");
+            assert_eq!(allowed_tool_keys(name), Some(&declared), "{name}");
+
+            // The smallest valid call: required arguments plus what a few validators insist on.
+            let mut base = match name {
+                "update_jira_issue" => json!({ "summary": "s" }),
+                "update_confluence_page" => json!({ "title": "t" }),
+                "search_confluence_pages" => json!({ "query": "q" }),
+                "download_attachment" => json!({ "issue_key": "ENG-1" }),
+                _ => json!({}),
+            };
+            for key in tool["inputSchema"]["required"].as_array().into_iter().flatten() {
+                let key = key.as_str().unwrap();
+                assert!(declared.contains(key), "{name} requires undeclared {key}");
+                base[key] = sample_argument(key, &properties[key]);
+            }
+
+            // Every argument the validator or the handler reads must be declared, or a valid
+            // call would be rejected as unknown.
+            ARGS_READ.with(|read| *read.borrow_mut() = Some(BTreeSet::new()));
+            let validated = validate_tool_args(name, &base);
+            let _ = Box::pin(call_tool(&cfg, &client, &storage, name, &base)).await;
+            let read = ARGS_READ.with(|read| read.borrow_mut().take()).unwrap();
+            assert_eq!(validated, Ok(()), "{name}: {base}");
+            let undeclared: Vec<&String> = read.difference(&declared).collect();
+            assert!(undeclared.is_empty(), "{name} reads undeclared arguments {undeclared:?}");
+
+            for key in &declared {
+                let mut args = base.clone();
+                args[key.as_str()] = sample_argument(key, &properties[key.as_str()]);
+                if let Err(err) = validate_tool_args(name, &args) {
+                    assert!(!err.contains("unknown argument"), "{name}.{key}: {err}");
+                }
+            }
+            let mut extra = base.clone();
+            extra["not_an_argument"] = json!(true);
+            let err = validate_tool_args(name, &extra).unwrap_err();
+            assert!(
+                err.starts_with(&format!("unknown argument 'not_an_argument' for {name}; allowed: ")),
+                "{err}"
+            );
+        }
+    }
+
+    #[test]
+    fn tool_descriptions_carry_cost_hints() {
+        let catalog = tool_catalog();
+        let sync = catalog.iter().find(|tool| tool["name"] == "sync_workspace").unwrap();
+        assert!(sync["description"].as_str().unwrap().contains("Cost:"));
+        let mut with_refresh = Vec::new();
+        for tool in &catalog {
+            let name = tool["name"].as_str().unwrap();
+            if let Some(refresh) = tool.pointer("/inputSchema/properties/refresh") {
+                with_refresh.push(name);
+                assert!(
+                    refresh["description"].as_str().is_some_and(|d| !d.trim().is_empty()),
+                    "{name}: refresh has no description"
+                );
+                assert!(
+                    tool["description"]
+                        .as_str()
+                        .unwrap()
+                        .contains("refresh: true re-downloads the full catalog"),
+                    "{name}"
+                );
+            }
+        }
+        assert_eq!(with_refresh, ["list_projects", "list_boards", "list_confluence_spaces"]);
+    }
+
+    #[tokio::test]
+    async fn mcp_offline_search_filters_hits_by_project() {
+        let (cfg, client, storage) = test_ctx();
+        // Forty ENG hits are newer than the single OPS hit, so a project filter applied after
+        // the limit would find nothing.
+        let mut issues: Vec<IssueSummary> = (1..=40)
+            .map(|i| IssueSummary {
+                id: format!("e{i}"),
+                key: format!("ENG-{i}"),
+                project_key: "ENG".into(),
+                summary: format!("Login timeout {i}"),
+                updated_at: format!("2026-11-20T10:00:{i:02}Z"),
+                ..Default::default()
+            })
+            .collect();
+        issues.push(IssueSummary {
+            id: "o1".into(),
+            key: "OPS-1".into(),
+            project_key: "OPS".into(),
+            summary: "Login timeout on the gateway".into(),
+            updated_at: "2026-11-01T00:00:00Z".into(),
+            ..Default::default()
+        });
+        storage.upsert_issues_for_site(client.site_id(), &issues).unwrap();
+
+        let search = |arguments: Value| {
+            let line = json!({
+                "jsonrpc": "2.0",
+                "id": 7,
+                "method": "tools/call",
+                "params": { "name": "search_jira_issues", "arguments": arguments }
+            })
+            .to_string();
+            let (cfg, client, storage) = (&cfg, &client, &storage);
+            async move {
+                let resp = handle_rpc_line(cfg, client, storage, &line).await.unwrap();
+                let text = resp["result"]["content"][0]["text"].as_str().unwrap().to_string();
+                (resp["result"]["isError"] == true, serde_json::from_str::<Value>(&text).unwrap())
+            }
+        };
+        let hit_keys = |payload: &Value| -> Vec<String> {
+            payload["hits"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|hit| hit["id_or_key"].as_str().unwrap().to_string())
+                .collect()
+        };
+
+        let (is_error, payload) =
+            search(json!({ "offline": true, "query": "timeout", "project": "ops", "limit": 5 })).await;
+        assert!(!is_error, "{payload}");
+        assert_eq!(hit_keys(&payload), ["OPS-1"]);
+
+        let (_, payload) = search(json!({ "offline": true, "query": "timeout", "limit": 5 })).await;
+        assert_eq!(hit_keys(&payload).len(), 5);
+
+        // Only the text reaches the index; jql next to a query is not searched as text.
+        let (is_error, payload) =
+            search(json!({ "offline": true, "query": "gateway", "jql": "project = ENG" })).await;
+        assert!(!is_error, "{payload}");
+        assert_eq!(payload["query"], "gateway");
+        assert_eq!(hit_keys(&payload), ["OPS-1"]);
+
+        let (is_error, payload) = search(json!({ "offline": true, "jql": "project = ENG" })).await;
+        assert!(is_error);
+        assert_eq!(payload["error"]["message"], OFFLINE_JQL_ERROR);
     }
 
     #[test]

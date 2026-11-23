@@ -235,6 +235,13 @@ paths:
         - name: project
           in: query
           required: false
+          description: Project key. Defaults to the configured default project, live and offline.
+          schema:
+            type: string
+        - name: status
+          in: query
+          required: false
+          description: Status name. Live, a `status = "..."` JQL clause; offline, a case-insensitive substring of the cached status name, applied before `limit`.
           schema:
             type: string
         - name: limit
@@ -283,6 +290,8 @@ paths:
                     type: [integer, "null"]
                   total:
                     type: [integer, "null"]
+        "400":
+          $ref: "#/components/responses/BadRequest"
         "401":
           $ref: "#/components/responses/Unauthorized"
     post:
