@@ -5328,3 +5328,152 @@ async fn regression_atl_15_http_lists_do_not_prune_on_server_capped_page() {
     assert_eq!(last["spaces"].as_array().unwrap().len(), 20);
     assert_eq!(last["has_more"], false);
 }
+
+
+/// ATL-25: "assign to me" on a row from site B must send site B's own account
+/// id, never the primary site's cached profile.
+#[tokio::test]
+async fn regression_atl_25_assign_to_me_uses_target_site_identity() {
+    use atlassian_cli::{
+        atlassian::SiteClientPool,
+        config::{Persona, SiteProfile},
+        models::UserSummary,
+        sync,
+        ui::app::{AppState, UiMsg, UiState},
+    };
+
+    ensure_isolated_env();
+
+    #[derive(Default)]
+    struct SiteMock {
+        me: String,
+        myself_calls: AtomicUsize,
+        assigned: RwLock<Vec<(String, Value)>>,
+    }
+    fn site_router(st: Arc<SiteMock>) -> Router {
+        Router::new()
+            .route(
+                "/rest/api/3/myself",
+                get(|State(st): State<Arc<SiteMock>>| async move {
+                    st.myself_calls.fetch_add(1, Ordering::SeqCst);
+                    Json(json!({
+                        "accountId": st.me,
+                        "displayName": format!("User {}", st.me),
+                        "active": true
+                    }))
+                }),
+            )
+            .route(
+                "/rest/api/3/issue/{key}/assignee",
+                put(
+                    |State(st): State<Arc<SiteMock>>,
+                     Path(key): Path<String>,
+                     Json(body): Json<Value>| async move {
+                        st.assigned.write().unwrap().push((key, body));
+                        StatusCode::NO_CONTENT
+                    },
+                ),
+            )
+            .with_state(st)
+    }
+
+    let site_a = Arc::new(SiteMock {
+        me: "acct-a".into(),
+        ..Default::default()
+    });
+    let site_b = Arc::new(SiteMock {
+        me: "acct-b".into(),
+        ..Default::default()
+    });
+    let base_a = spawn_server(site_router(site_a.clone())).await;
+    let base_b = spawn_server(site_router(site_b.clone())).await;
+
+    let sites: Vec<SiteProfile> = [("site-a", &base_a), ("site-b", &base_b)]
+        .into_iter()
+        .map(|(id, url)| SiteProfile {
+            id: id.into(),
+            name: id.to_uppercase(),
+            site_url: url.clone(),
+            deployment: DeploymentKind::Cloud,
+            account_id: "default".into(),
+            enabled: true,
+            ..Default::default()
+        })
+        .collect();
+    let cfg = AppConfig {
+        site_url: base_a.clone(),
+        deployment: DeploymentKind::Cloud,
+        sites: sites.clone(),
+        default_site: Some("site-a".into()),
+        active_site: Some("site-a".into()),
+        ..Default::default()
+    };
+    let auth = AuthManager::with_credentials(
+        "default",
+        StoredCredentials::ApiToken {
+            site_url: base_a.clone(),
+            email: "alice@acme.com".into(),
+            api_token: "tok".into(),
+            deployment: DeploymentKind::Cloud,
+        },
+    );
+    // Built like the TUI does: the primary client carries the default site's id.
+    let client = AtlassianClient::new(cfg.clone(), auth.clone()).expect("primary client");
+    assert_eq!(client.site_id(), "site-a");
+    let storage = Storage::open_in_memory().expect("storage");
+    let (core_tx, _) = tokio::sync::mpsc::unbounded_channel();
+    let sync_ctrl = sync::spawn_sync_engine(cfg.clone(), client.clone(), storage.clone(), core_tx);
+    let (ui_tx, mut ui_rx) = tokio::sync::mpsc::unbounded_channel();
+    let mut app = AppState::new_with_persona(
+        cfg.clone(),
+        Persona::Jira,
+        auth.clone(),
+        client,
+        storage,
+        sync_ctrl,
+        ui_tx,
+    );
+    let pool_auth = auth.clone();
+    app.site_pool = SiteClientPool::new(sites, move |_| pool_auth.clone(), None, None)
+        .expect("pool");
+    let mut ui = UiState::from_config_with_persona(&cfg, Persona::Jira);
+    // The primary site's profile is known; site B's is not.
+    app.me = Some(UserSummary {
+        id: "acct-a".into(),
+        display_name: "Alice (site A)".into(),
+        ..Default::default()
+    });
+
+    async fn wait_assign_result(rx: &mut tokio::sync::mpsc::UnboundedReceiver<UiMsg>) {
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                match rx.recv().await {
+                    Some(UiMsg::IssueMutated { .. } | UiMsg::IssueAssignFailed { .. }) => return,
+                    Some(_) => continue,
+                    None => panic!("ui_rx closed"),
+                }
+            }
+        })
+        .await
+        .expect("timed out waiting for the assign result");
+    }
+
+    app.request_assign_to_me_for_site(&mut ui, Some("site-b"), "B-1");
+    wait_assign_result(&mut ui_rx).await;
+    {
+        let assigned = site_b.assigned.read().unwrap();
+        assert_eq!(assigned.len(), 1, "site B received the assignment");
+        assert_eq!(assigned[0].0, "B-1");
+        assert_eq!(assigned[0].1["accountId"], "acct-b", "site B's own identity is sent");
+    }
+    assert_eq!(site_b.myself_calls.load(Ordering::SeqCst), 1);
+    assert!(site_a.assigned.read().unwrap().is_empty());
+
+    // The primary site keeps using the already-known profile without a lookup.
+    app.request_assign_to_me_for_site(&mut ui, Some("site-a"), "A-1");
+    wait_assign_result(&mut ui_rx).await;
+    let assigned_a = site_a.assigned.read().unwrap();
+    assert_eq!(assigned_a.len(), 1);
+    assert_eq!(assigned_a[0].1["accountId"], "acct-a");
+    assert_eq!(site_a.myself_calls.load(Ordering::SeqCst), 0);
+}

@@ -682,8 +682,9 @@ mod tests {
             has_children: Some(true),
             ..Default::default()
         };
+        let tree_site = app.tree_site(&ui);
         app.root_pages_by_space
-            .insert("ENG".into(), vec![root_page.clone()]);
+            .insert(app::SiteKey::new(&tree_site, "ENG"), vec![root_page.clone()]);
         app.active_page = Some(PageDetail {
             summary: root_page,
             body_markdown: "Linked with ATL-1 issue".into(),

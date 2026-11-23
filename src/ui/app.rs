@@ -257,16 +257,19 @@ pub enum UiMsg {
         clear_draft_key: Option<String>,
     },
     IssueTransitioned {
+        site_id: String,
         key: String,
         to_status: IssueStatus,
         toast: String,
     },
     IssueTransitionFailed {
+        site_id: String,
         key: String,
         previous_status: Option<IssueStatus>,
         error: String,
     },
     IssueAssignFailed {
+        site_id: String,
         key: String,
         previous_assignee: Option<Option<UserSummary>>,
         task_label: String,
@@ -530,9 +533,11 @@ pub struct AppState {
 
     pub spaces: Vec<SpaceSummary>,
     pub space_site_ids: Vec<String>,
-    pub root_pages_by_space: HashMap<String, Vec<PageSummary>>,
-    pub page_children_map: HashMap<String, Vec<PageSummary>>,
-    pub expanded_pages: HashSet<String>,
+    /// Keyed by `(site, space key)`: two sites can share a space key.
+    pub root_pages_by_space: HashMap<SiteKey, Vec<PageSummary>>,
+    /// Keyed by `(site, parent page id)`: page ids are only unique per site.
+    pub page_children_map: HashMap<SiteKey, Vec<PageSummary>>,
+    pub expanded_pages: HashSet<SiteKey>,
     pub active_page: Option<PageDetail>,
 
     pub my_issues: Vec<IssueSummary>,
@@ -1230,7 +1235,17 @@ impl AppState {
                 if let Ok(issues) = self.storage.list_issues_for_site(site_id, None, 200) {
                     self.issue_site_ids = vec![site_id.clone(); issues.len()];
                     self.issues = issues.clone();
-                    self.my_issues = issues.iter().take(20).cloned().collect();
+                    // Seed My Work with this site's open issues assigned to this site's
+                    // "me" (ATL-25); without a known identity show open issues only and
+                    // let the "Loading My Work" request replace the list.
+                    let (_, site_client) = self.site_id_and_client_for(Some(site_id));
+                    let me_id = self
+                        .known_me_for_site(site_id, &site_client)
+                        .map(|me| me.id);
+                    self.my_issues = self
+                        .storage
+                        .list_my_work_for_site(site_id, me_id.as_deref(), 40)
+                        .unwrap_or_default();
                     self.my_issue_site_ids = vec![site_id.clone(); self.my_issues.len()];
                     self.my_issue_site_labels = vec![None; self.my_issues.len()];
                     let preserved_key = self
@@ -1323,7 +1338,7 @@ impl AppState {
                             .list_space_root_pages_for_site(site_id, &first_space.key)
                         {
                             self.root_pages_by_space
-                                .insert(first_space.key.clone(), roots);
+                                .insert(SiteKey::new(site_id, &first_space.key), roots);
                         }
                     }
                 }
@@ -1483,7 +1498,7 @@ impl AppState {
                             .list_space_root_pages_for_site(first_sid, &first_space.key)
                         {
                             self.root_pages_by_space
-                                .insert(first_space.key.clone(), roots);
+                                .insert(SiteKey::new(first_sid, &first_space.key), roots);
                         }
                     }
                 }
@@ -1821,31 +1836,73 @@ impl AppState {
         let Some(space) = self.active_space(ui) else {
             return Vec::new();
         };
+        let site = self.tree_site(ui);
         let roots = self
             .root_pages_by_space
-            .get(&space.key)
+            .get(&SiteKey::new(&site, &space.key))
             .map(|v| v.as_slice())
             .unwrap_or(&[]);
-        flatten_page_tree(roots, &self.page_children_map, &self.expanded_pages)
+        flatten_page_tree(roots, &site, &self.page_children_map, &self.expanded_pages)
+    }
+
+    /// Site the SPACES tree currently shows: the selected space's site, else
+    /// the effective site of the current scope.
+    pub fn tree_site(&self, ui: &UiState) -> String {
+        self.active_space_site_id(ui)
+            .map(str::to_string)
+            .unwrap_or_else(|| self.effective_site_id_and_client().0)
     }
 
     pub fn selected_issue_key(&self, ui: &UiState) -> Option<String> {
+        self.selected_issue_ref(ui).map(|(_, key)| key)
+    }
+
+    /// `(site_id, key)` of the issue a write should target: the selected row
+    /// together with the site that row was loaded from — never the site of
+    /// whichever issue happens to be open in the detail pane (ATL-11).
+    pub fn selected_issue_ref(&self, ui: &UiState) -> Option<(String, String)> {
+        let fallback_site = || self.effective_site_id_and_client().0;
+        let opened = || {
+            self.active_issue.as_ref().map(|d| {
+                (
+                    self.active_issue_site_id
+                        .clone()
+                        .unwrap_or_else(fallback_site),
+                    d.summary.key.clone(),
+                )
+            })
+        };
         match ui.active_tab {
             WorkspaceTab::Board => self
                 .selected_board_issue(ui)
-                .map(|i| i.key)
-                .or_else(|| self.active_issue.as_ref().map(|d| d.summary.key.clone())),
-            WorkspaceTab::Issues => {
-                let list = self.filtered_issues(ui);
-                list.get(ui.issue_ui.selected_issue)
-                    .map(|i| i.key.clone())
-                    .or_else(|| self.active_issue.as_ref().map(|d| d.summary.key.clone()))
+                .map(|i| {
+                    (
+                        self.board_issue_site_id
+                            .clone()
+                            .unwrap_or_else(fallback_site),
+                        i.key,
+                    )
+                })
+                .or_else(opened),
+            WorkspaceTab::Issues => self
+                .filtered_issues_with_sites(ui)
+                .into_iter()
+                .nth(ui.issue_ui.selected_issue)
+                .map(|(sid, i)| (sid, i.key))
+                .or_else(opened),
+            WorkspaceTab::MyWork => {
+                let idx = ui.my_work_ui.selected_issue;
+                self.my_issues.get(idx).map(|i| {
+                    (
+                        self.my_issue_site_ids
+                            .get(idx)
+                            .cloned()
+                            .unwrap_or_else(fallback_site),
+                        i.key.clone(),
+                    )
+                })
             }
-            WorkspaceTab::MyWork => self
-                .my_issues
-                .get(ui.my_work_ui.selected_issue)
-                .map(|i| i.key.clone()),
-            _ => self.active_issue.as_ref().map(|d| d.summary.key.clone()),
+            _ => opened(),
         }
     }
 
@@ -2324,12 +2381,20 @@ impl AppState {
         true
     }
 
-    pub fn request_open_transitions(&self, ui: &mut UiState, issue_key: &str) {
-        ui.push_overlay(Overlay::Transition(TransitionOverlay::new(issue_key)));
+    pub fn request_open_transitions(
+        &self,
+        ui: &mut UiState,
+        site_id: Option<&str>,
+        issue_key: &str,
+    ) {
+        let site = self.issue_write_site(site_id);
+        let mut overlay = TransitionOverlay::new(issue_key);
+        overlay.site_id = site.clone();
+        ui.push_overlay(Overlay::Transition(overlay));
         if tokio::runtime::Handle::try_current().is_err() {
             return;
         }
-        let (_, client) = self.site_id_and_client_for(self.active_issue_site_id.as_deref());
+        let (_, client) = self.site_id_and_client_for(site.as_deref());
         let tx = self.ui_tx.clone();
         let key = issue_key.to_string();
         tokio::spawn(async move {
@@ -2347,16 +2412,27 @@ impl AppState {
         key: &str,
         tr: IssueTransition,
     ) {
+        self.request_transition_issue_for_site(ui, None, key, tr);
+    }
+
+    pub fn request_transition_issue_for_site(
+        &mut self,
+        ui: &mut UiState,
+        site_id: Option<&str>,
+        key: &str,
+        tr: IssueTransition,
+    ) {
+        let site = self.issue_write_site(site_id);
         // Capture previous status for clean rollback on API error.
-        let prev_status = self.current_issue_status(key);
+        let prev_status = self.current_issue_status(site.as_deref(), key);
         // 0ms optimistic local column update so Kanban card moves right away!
-        self.apply_local_status_update(key, &tr.to_status);
+        self.apply_local_status_update(site.as_deref(), key, &tr.to_status);
         if tokio::runtime::Handle::try_current().is_err() {
             ui.success(format!("{key} → {}", tr.to_status.name));
             return;
         }
         ui.tasks.begin(format!("Transition {key}"));
-        let (site_id, client) = self.site_id_and_client_for(self.active_issue_site_id.as_deref());
+        let (site_id, client) = self.site_id_and_client_for(site.as_deref());
         let storage = self.storage.clone();
         let tx = self.ui_tx.clone();
         let key_owned = key.to_string();
@@ -2364,6 +2440,7 @@ impl AppState {
             match client.transition_issue(&key_owned, &tr.id, None).await {
                 Ok(_) => {
                     let _ = tx.send(UiMsg::IssueTransitioned {
+                        site_id: site_id.clone(),
                         key: key_owned.clone(),
                         to_status: tr.to_status.clone(),
                         toast: format!("{key_owned} → {}", tr.to_status.name),
@@ -2385,6 +2462,7 @@ impl AppState {
                 }
                 Err(e) => {
                     let _ = tx.send(UiMsg::IssueTransitionFailed {
+                        site_id,
                         key: key_owned,
                         previous_status: prev_status,
                         error: format!("Transition failed: {e}"),
@@ -2394,130 +2472,170 @@ impl AppState {
         });
     }
 
-    fn current_issue_status(&self, key: &str) -> Option<IssueStatus> {
-        self.active_issue
-            .as_ref()
-            .filter(|d| d.summary.key == key)
-            .map(|d| d.summary.status.clone())
-            .or_else(|| self.board_issues.iter().find(|i| i.key == key).map(|i| i.status.clone()))
-            .or_else(|| self.issues.iter().find(|i| i.key == key).map(|i| i.status.clone()))
-            .or_else(|| self.my_issues.iter().find(|i| i.key == key).map(|i| i.status.clone()))
+    /// Site a write for an issue goes to: the explicit site carried by the
+    /// overlay/row, else the site of the opened issue.
+    fn issue_write_site(&self, explicit: Option<&str>) -> Option<String> {
+        explicit
+            .map(str::to_string)
+            .or_else(|| self.active_issue_site_id.clone())
     }
 
-    fn current_issue_assignee(&self, key: &str) -> Option<Option<UserSummary>> {
-        self.active_issue
-            .as_ref()
-            .filter(|d| d.summary.key == key)
-            .map(|d| d.summary.assignee.clone())
-            .or_else(|| {
-                self.board_issues
-                    .iter()
-                    .find(|i| i.key == key)
-                    .map(|i| i.assignee.clone())
+    /// Finds the locally listed issue `key` on `site_id` (`None` = any site).
+    fn find_local_issue(&self, site_id: Option<&str>, key: &str) -> Option<&IssueSummary> {
+        if let Some(d) = self.active_issue.as_ref() {
+            if d.summary.key == key && site_matches(self.active_issue_site_id.as_deref(), site_id) {
+                return Some(&d.summary);
+            }
+        }
+        if site_matches(self.board_issue_site_id.as_deref(), site_id) {
+            if let Some(it) = self.board_issues.iter().find(|i| i.key == key) {
+                return Some(it);
+            }
+        }
+        let in_list = |list: &'_ [IssueSummary], sites: &'_ [String]| {
+            list.iter().enumerate().find_map(|(idx, it)| {
+                (it.key == key && site_matches(sites.get(idx).map(String::as_str), site_id))
+                    .then_some(idx)
             })
-            .or_else(|| self.issues.iter().find(|i| i.key == key).map(|i| i.assignee.clone()))
-            .or_else(|| {
-                self.my_issues
-                    .iter()
-                    .find(|i| i.key == key)
-                    .map(|i| i.assignee.clone())
-            })
-    }
-
-    fn apply_local_status_update(&mut self, key: &str, to_status: &IssueStatus) {
-        for it in &mut self.board_issues {
-            if it.key == key {
-                it.status = to_status.clone();
-            }
-        }
-        for it in &mut self.issues {
-            if it.key == key {
-                it.status = to_status.clone();
-            }
-        }
-        for it in &mut self.my_issues {
-            if it.key == key {
-                it.status = to_status.clone();
-            }
-        }
-        if let Some(detail) = &mut self.active_issue {
-            if detail.summary.key == key {
-                detail.summary.status = to_status.clone();
-            }
-        }
-    }
-
-    fn apply_local_assignee_update(&mut self, key: &str, assignee: Option<UserSummary>) {
-        for it in &mut self.board_issues {
-            if it.key == key {
-                it.assignee = assignee.clone();
-            }
-        }
-        for it in &mut self.issues {
-            if it.key == key {
-                it.assignee = assignee.clone();
-            }
-        }
-        for it in &mut self.my_issues {
-            if it.key == key {
-                it.assignee = assignee.clone();
-            }
-        }
-        if let Some(detail) = &mut self.active_issue {
-            if detail.summary.key == key {
-                detail.summary.assignee = assignee;
-            }
-        }
-    }
-
-    fn bump_local_comment_count(&mut self, key: &str, delta: isize) {
-        let apply = |count: &mut usize| {
-            if delta >= 0 {
-                *count = count.saturating_add(delta as usize);
-            } else {
-                *count = count.saturating_sub((-delta) as usize);
-            }
         };
-        for it in &mut self.board_issues {
-            if it.key == key {
-                apply(&mut it.comment_count);
+        if let Some(idx) = in_list(&self.issues, &self.issue_site_ids) {
+            return self.issues.get(idx);
+        }
+        in_list(&self.my_issues, &self.my_issue_site_ids).and_then(|idx| self.my_issues.get(idx))
+    }
+
+    /// Applies `f` to every local copy of issue `key` that belongs to
+    /// `site_id` (`None` = any site): board, list, My Work and the opened issue.
+    fn for_each_local_issue_mut(
+        &mut self,
+        site_id: Option<&str>,
+        key: &str,
+        mut f: impl FnMut(&mut IssueSummary),
+    ) {
+        if site_matches(self.board_issue_site_id.as_deref(), site_id) {
+            for it in self.board_issues.iter_mut().filter(|i| i.key == key) {
+                f(it);
             }
         }
-        for it in &mut self.issues {
-            if it.key == key {
-                apply(&mut it.comment_count);
+        for (idx, it) in self.issues.iter_mut().enumerate() {
+            if it.key == key
+                && site_matches(self.issue_site_ids.get(idx).map(String::as_str), site_id)
+            {
+                f(it);
             }
         }
-        for it in &mut self.my_issues {
-            if it.key == key {
-                apply(&mut it.comment_count);
+        for (idx, it) in self.my_issues.iter_mut().enumerate() {
+            if it.key == key
+                && site_matches(self.my_issue_site_ids.get(idx).map(String::as_str), site_id)
+            {
+                f(it);
             }
         }
         if let Some(detail) = &mut self.active_issue {
-            if detail.summary.key == key {
-                apply(&mut detail.summary.comment_count);
+            if detail.summary.key == key
+                && site_matches(self.active_issue_site_id.as_deref(), site_id)
+            {
+                f(&mut detail.summary);
             }
         }
+    }
+
+    fn current_issue_status(&self, site_id: Option<&str>, key: &str) -> Option<IssueStatus> {
+        self.find_local_issue(site_id, key).map(|i| i.status.clone())
+    }
+
+    fn current_issue_assignee(
+        &self,
+        site_id: Option<&str>,
+        key: &str,
+    ) -> Option<Option<UserSummary>> {
+        self.find_local_issue(site_id, key).map(|i| i.assignee.clone())
+    }
+
+    fn apply_local_status_update(&mut self, site_id: Option<&str>, key: &str, to_status: &IssueStatus) {
+        self.for_each_local_issue_mut(site_id, key, |it| it.status = to_status.clone());
+    }
+
+    fn apply_local_assignee_update(
+        &mut self,
+        site_id: Option<&str>,
+        key: &str,
+        assignee: Option<UserSummary>,
+    ) {
+        self.for_each_local_issue_mut(site_id, key, |it| it.assignee = assignee.clone());
+    }
+
+    fn bump_local_comment_count(&mut self, site_id: Option<&str>, key: &str, delta: isize) {
+        self.for_each_local_issue_mut(site_id, key, |it| {
+            if delta >= 0 {
+                it.comment_count = it.comment_count.saturating_add(delta as usize);
+            } else {
+                it.comment_count = it.comment_count.saturating_sub((-delta) as usize);
+            }
+        });
     }
 
     pub fn request_assign_to_me(&mut self, ui: &mut UiState, key: &str) {
-        let Some(me) = self.me.clone().or_else(|| self.client.cached_me()) else {
+        self.request_assign_to_me_for_site(ui, None, key);
+    }
+
+    /// Identity of the signed-in user on `site_id`: the target client's own
+    /// cached profile, or the primary profile only when the target *is* the
+    /// primary site. Account ids differ per site (ATL-25), so another site's
+    /// "me" must never be sent.
+    fn known_me_for_site(&self, site_id: &str, client: &AtlassianClient) -> Option<UserSummary> {
+        client.cached_me().or_else(|| {
+            site_id
+                .eq_ignore_ascii_case(self.client.site_id())
+                .then(|| self.me.clone().or_else(|| self.client.cached_me()))
+                .flatten()
+        })
+    }
+
+    pub fn request_assign_to_me_for_site(
+        &mut self,
+        ui: &mut UiState,
+        site_id: Option<&str>,
+        key: &str,
+    ) {
+        let site = self.issue_write_site(site_id);
+        let (site_id, client) = self.site_id_and_client_for(site.as_deref());
+        let known_me = self.known_me_for_site(&site_id, &client);
+        let has_runtime = tokio::runtime::Handle::try_current().is_ok();
+        if known_me.is_none() && !has_runtime {
             ui.error("Current user profile has not been loaded yet");
             return;
-        };
-        let prev_assignee = self.current_issue_assignee(key);
-        self.apply_local_assignee_update(key, Some(me.clone()));
-        if tokio::runtime::Handle::try_current().is_err() {
+        }
+        let prev_assignee = self.current_issue_assignee(Some(&site_id), key);
+        if let Some(me) = &known_me {
+            self.apply_local_assignee_update(Some(&site_id), key, Some(me.clone()));
+        }
+        if !has_runtime {
             ui.success(format!("Assigned {key} to you"));
             return;
         }
         let task_label = format!("Assign {key} to me");
         ui.tasks.begin(&task_label);
-        let (site_id, client) = self.site_id_and_client_for(self.active_issue_site_id.as_deref());
         let storage = self.storage.clone();
         let tx = self.ui_tx.clone();
         let key_owned = key.to_string();
         tokio::spawn(async move {
+            let me = match known_me {
+                Some(me) => me,
+                None => match client.get_myself().await {
+                    Ok(me) => me,
+                    Err(e) => {
+                        let _ = tx.send(UiMsg::IssueAssignFailed {
+                            site_id,
+                            key: key_owned,
+                            previous_assignee: None,
+                            task_label,
+                            error: format!("Could not resolve your account on this site: {e}"),
+                        });
+                        return;
+                    }
+                },
+            };
             match client.assign_issue(&key_owned, Some(&me.id)).await {
                 Ok(()) => match client.get_issue_with_meta(&key_owned).await {
                     Ok((mut detail, meta)) => {
@@ -2535,6 +2653,7 @@ impl AppState {
                     }
                     Err(e) => {
                         let _ = tx.send(UiMsg::IssueAssignFailed {
+                            site_id,
                             key: key_owned,
                             previous_assignee: None,
                             task_label,
@@ -2544,6 +2663,7 @@ impl AppState {
                 },
                 Err(e) => {
                     let _ = tx.send(UiMsg::IssueAssignFailed {
+                        site_id,
                         key: key_owned,
                         previous_assignee: prev_assignee,
                         task_label,
@@ -2554,16 +2674,32 @@ impl AppState {
         });
     }
 
-    pub fn request_open_assignee_picker(&self, ui: &mut UiState, key: &str, project_key: &str) {
-        ui.push_overlay(Overlay::Assignee(AssigneeOverlay::new(key, project_key)));
-        self.request_assignable_users(key, "");
+    pub fn request_open_assignee_picker(
+        &self,
+        ui: &mut UiState,
+        site_id: Option<&str>,
+        key: &str,
+        project_key: &str,
+    ) {
+        let site = self.issue_write_site(site_id);
+        let mut overlay = AssigneeOverlay::new(key, project_key);
+        overlay.site_id = site.clone();
+        let lookup_key = overlay.project_or_issue_key.clone();
+        ui.push_overlay(Overlay::Assignee(overlay));
+        self.request_assignable_users(site.as_deref(), &lookup_key, "");
     }
 
-    pub fn request_assignable_users(&self, project_or_issue: &str, query: &str) {
+    pub fn request_assignable_users(
+        &self,
+        site_id: Option<&str>,
+        project_or_issue: &str,
+        query: &str,
+    ) {
         if tokio::runtime::Handle::try_current().is_err() {
             return;
         }
-        let (_, client) = self.site_id_and_client_for(self.active_issue_site_id.as_deref());
+        let site = self.issue_write_site(site_id);
+        let (_, client) = self.site_id_and_client_for(site.as_deref());
         let tx = self.ui_tx.clone();
         let key = project_or_issue.to_string();
         let q = query.to_string();
@@ -2576,20 +2712,27 @@ impl AppState {
         });
     }
 
-    pub fn request_assign_user(&mut self, ui: &mut UiState, key: &str, user: Option<UserSummary>) {
-        let prev_assignee = self.current_issue_assignee(key);
+    pub fn request_assign_user(
+        &mut self,
+        ui: &mut UiState,
+        site_id: Option<&str>,
+        key: &str,
+        user: Option<UserSummary>,
+    ) {
+        let site = self.issue_write_site(site_id);
+        let prev_assignee = self.current_issue_assignee(site.as_deref(), key);
         let label = user
             .as_ref()
             .map(|u| u.display_name.clone())
             .unwrap_or_else(|| "Unassigned".to_string());
-        self.apply_local_assignee_update(key, user.clone());
+        self.apply_local_assignee_update(site.as_deref(), key, user.clone());
         if tokio::runtime::Handle::try_current().is_err() {
             ui.success(format!("{key} assignee → {label}"));
             return;
         }
         let task_label = format!("Assign {key}");
         ui.tasks.begin(&task_label);
-        let (site_id, client) = self.site_id_and_client_for(self.active_issue_site_id.as_deref());
+        let (site_id, client) = self.site_id_and_client_for(site.as_deref());
         let storage = self.storage.clone();
         let tx = self.ui_tx.clone();
         let key_owned = key.to_string();
@@ -2612,6 +2755,7 @@ impl AppState {
                     }
                     Err(e) => {
                         let _ = tx.send(UiMsg::IssueAssignFailed {
+                            site_id,
                             key: key_owned,
                             previous_assignee: None,
                             task_label,
@@ -2621,6 +2765,7 @@ impl AppState {
                 },
                 Err(e) => {
                     let _ = tx.send(UiMsg::IssueAssignFailed {
+                        site_id,
                         key: key_owned,
                         previous_assignee: prev_assignee,
                         task_label,
@@ -2643,7 +2788,8 @@ impl AppState {
             }
             return;
         }
-        let (site_id, client) = self.site_id_and_client_for(self.active_issue_site_id.as_deref());
+        let site = self.issue_write_site(form.site_id.as_deref());
+        let (site_id, client) = self.site_id_and_client_for(site.as_deref());
         let storage = self.storage.clone();
         let tx = self.ui_tx.clone();
         if let Some(key) = form.edit_key.clone() {
@@ -2724,6 +2870,7 @@ impl AppState {
     ) {
         self.request_add_comment_with_draft(
             ui,
+            overlay.site_id.clone(),
             overlay.target.clone(),
             overlay.body.text.clone(),
             draft_key,
@@ -2736,16 +2883,21 @@ impl AppState {
         target: CommentTarget,
         body: String,
     ) {
-        self.request_add_comment_with_draft(ui, target, body, None);
+        self.request_add_comment_with_draft(ui, None, target, body, None);
     }
 
     fn request_add_comment_with_draft(
         &mut self,
         ui: &mut UiState,
+        site: Option<String>,
         target: CommentTarget,
         body: String,
         draft_key: Option<String>,
     ) {
+        let site = match &target {
+            CommentTarget::Issue(_) => self.issue_write_site(site.as_deref()),
+            CommentTarget::Page { .. } => site.or_else(|| self.active_page_site_id.clone()),
+        };
         let optimistic_id = format!("optimistic:{}", uuid::Uuid::new_v4());
         let now = chrono::Utc::now().to_rfc3339();
         let author = self
@@ -2761,7 +2913,9 @@ impl AppState {
 
         match &target {
             CommentTarget::Issue(key) => {
-                if let Some(detail) = &mut self.active_issue {
+                let opened_matches =
+                    site_matches(self.active_issue_site_id.as_deref(), site.as_deref());
+                if let Some(detail) = self.active_issue.as_mut().filter(|_| opened_matches) {
                     if detail.summary.key == *key {
                         detail.comments.push(IssueComment {
                             id: optimistic_id.clone(),
@@ -2775,7 +2929,7 @@ impl AppState {
                         });
                     }
                 }
-                self.bump_local_comment_count(key, 1);
+                self.bump_local_comment_count(site.as_deref(), key, 1);
             }
             CommentTarget::Page { page_id, .. } => {
                 if let Some(page) = &mut self.active_page {
@@ -2802,11 +2956,7 @@ impl AppState {
             return;
         }
 
-        let explicit_site = match &target {
-            CommentTarget::Issue(_) => self.active_issue_site_id.as_deref(),
-            CommentTarget::Page { .. } => self.active_page_site_id.as_deref(),
-        };
-        let (site_id, client) = self.site_id_and_client_for(explicit_site);
+        let (site_id, client) = self.site_id_and_client_for(site.as_deref());
         let tx = self.ui_tx.clone();
         match target {
             CommentTarget::Issue(key) => {
@@ -2885,7 +3035,7 @@ impl AppState {
         {
             if !roots.is_empty() {
                 self.root_pages_by_space
-                    .insert(space_key.to_string(), roots);
+                    .insert(SiteKey::new(&site_id, space_key), roots);
             }
         }
         if tokio::runtime::Handle::try_current().is_err() {
@@ -2916,23 +3066,21 @@ impl AppState {
     }
 
     pub fn toggle_expand_page(&mut self, ui: &mut UiState, page: &PageSummary) {
-        if self.expanded_pages.contains(&page.id) {
-            self.expanded_pages.remove(&page.id);
+        // Same site as `current_confluence_tree`, so the toggled row is the one drawn.
+        let tree_site = self.tree_site(ui);
+        let (site_id, client) = self.site_id_and_client_for(Some(&tree_site));
+        let node = SiteKey::new(&site_id, &page.id);
+        if self.expanded_pages.remove(&node) {
             return;
         }
-        self.expanded_pages.insert(page.id.clone());
+        self.expanded_pages.insert(node.clone());
 
-        if self.page_children_map.contains_key(&page.id) {
+        if self.page_children_map.contains_key(&node) {
             return;
         }
-        let target_site = self
-            .active_space_site_id(ui)
-            .map(str::to_string)
-            .or_else(|| self.active_page_site_id.clone());
-        let (site_id, client) = self.site_id_and_client_for(target_site.as_deref());
         if let Ok(cached) = self.storage.list_child_pages_for_site(&site_id, &page.id) {
             if !cached.is_empty() {
-                self.page_children_map.insert(page.id.clone(), cached);
+                self.page_children_map.insert(node, cached);
             }
         }
         if tokio::runtime::Handle::try_current().is_err() {
@@ -3237,7 +3385,11 @@ impl AppState {
             }
             return;
         }
-        let (site_id, client) = self.site_id_and_client_for(self.active_page_site_id.as_deref());
+        let site = form
+            .site_id
+            .clone()
+            .or_else(|| self.active_page_site_id.clone());
+        let (site_id, client) = self.site_id_and_client_for(site.as_deref());
         let storage = self.storage.clone();
         let tx = self.ui_tx.clone();
         if let Some(pid) = form.edit_page_id.clone() {
@@ -3525,28 +3677,44 @@ impl AppState {
     }
 
     pub fn active_upload_target(&self, ui: &UiState) -> Option<UploadTarget> {
+        self.active_upload_ref(ui).map(|(_, target)| target)
+    }
+
+    /// Upload target plus the site it lives on (the selected issue row's site,
+    /// or the opened page's site on the Confluence tab).
+    pub fn active_upload_ref(&self, ui: &UiState) -> Option<(Option<String>, UploadTarget)> {
         if ui.active_tab == WorkspaceTab::Confluence {
             if let Some(page) = &self.active_page {
-                return Some(UploadTarget::Page(page.summary.id.clone()));
+                return Some((
+                    self.active_page_site_id.clone(),
+                    UploadTarget::Page(page.summary.id.clone()),
+                ));
             }
         }
-        self.selected_issue_key(ui).map(UploadTarget::Issue)
+        self.selected_issue_ref(ui)
+            .map(|(site, key)| (Some(site), UploadTarget::Issue(key)))
     }
 
     pub fn request_upload_attachment(&self, ui: &mut UiState, overlay: &PathInputOverlay) {
         let path = PathBuf::from(overlay.path.text.trim());
-        self.request_upload_file(ui, overlay.target.clone(), path);
+        self.request_upload_file(ui, overlay.site_id.as_deref(), overlay.target.clone(), path);
     }
 
-    pub fn request_upload_file(&self, ui: &mut UiState, target: UploadTarget, path: PathBuf) {
+    pub fn request_upload_file(
+        &self,
+        ui: &mut UiState,
+        site_id: Option<&str>,
+        target: UploadTarget,
+        path: PathBuf,
+    ) {
         if tokio::runtime::Handle::try_current().is_err() {
             return;
         }
         ui.tasks.begin("Upload attachment");
-        let explicit_site = match &target {
+        let explicit_site = site_id.or(match &target {
             UploadTarget::Issue(_) => self.active_issue_site_id.as_deref(),
             UploadTarget::Page(_) => self.active_page_site_id.as_deref(),
-        };
+        });
         let (site_id, client) = self.site_id_and_client_for(explicit_site);
         let tx = self.ui_tx.clone();
         match target {
@@ -4063,7 +4231,8 @@ impl AppState {
                     .map(|s| s.eq_ignore_ascii_case(&effective_sid))
                     .unwrap_or_else(|| self.site_scope.matches(&effective_sid));
                 if matches_space_site {
-                    self.root_pages_by_space.insert(space_key, pages);
+                    self.root_pages_by_space
+                        .insert(SiteKey::new(&effective_sid, &space_key), pages);
                 }
                 if let Some((sid, pid, ver)) = active_refresh {
                     self.request_page_detail_for_site_if_needed(ui, Some(&sid), &pid, Some(ver));
@@ -4384,16 +4553,18 @@ impl AppState {
                 self.notify_desktop_issue(&key, &summary);
             }
             UiMsg::IssueTransitioned {
+                site_id,
                 key,
                 to_status,
                 toast,
             } => {
                 ui.tasks.finish(&format!("Transition {key}"), None);
-                self.apply_local_status_update(&key, &to_status);
+                self.apply_local_status_update(Some(&site_id), &key, &to_status);
                 ui.success(&toast);
                 self.notify_desktop_issue(&key, &format!("Transitioned to {}", to_status.name));
             }
             UiMsg::IssueTransitionFailed {
+                site_id,
                 key,
                 previous_status,
                 error,
@@ -4401,12 +4572,13 @@ impl AppState {
                 ui.tasks
                     .finish(&format!("Transition {key}"), Some(error.clone()));
                 if let Some(prev) = previous_status {
-                    self.apply_local_status_update(&key, &prev);
+                    self.apply_local_status_update(Some(&site_id), &key, &prev);
                 }
                 ui.error(&error);
                 self.notify_desktop("Atlassian Jira Error", &error);
             }
             UiMsg::IssueAssignFailed {
+                site_id,
                 key,
                 previous_assignee,
                 task_label,
@@ -4414,7 +4586,7 @@ impl AppState {
             } => {
                 ui.tasks.finish(&task_label, Some(error.clone()));
                 if let Some(prev) = previous_assignee {
-                    self.apply_local_assignee_update(&key, prev);
+                    self.apply_local_assignee_update(Some(&site_id), &key, prev);
                 }
                 ui.error(&error);
                 self.notify_desktop("Atlassian Jira Error", &error);
@@ -4501,7 +4673,7 @@ impl AppState {
                                     detail.comments.retain(|c| c.id != *opt_id);
                                 }
                             }
-                            self.bump_local_comment_count(k, -1);
+                            self.bump_local_comment_count(Some(&site_id), k, -1);
                         }
                         if let Some(ref pid) = page_id {
                             if let Some(page) = &mut self.active_page {
@@ -4536,7 +4708,8 @@ impl AppState {
                             .map(|s| s.eq_ignore_ascii_case(&site_id))
                             .unwrap_or(true);
                         if matches_space {
-                            self.root_pages_by_space.insert(space_key, list);
+                            self.root_pages_by_space
+                                .insert(SiteKey::new(&site_id, &space_key), list);
                         }
                     }
                     Err(e) => ui.error(format!("Failed to load root pages: {e}")),
@@ -4556,7 +4729,8 @@ impl AppState {
                 }
                 match children {
                     Ok(list) => {
-                        self.page_children_map.insert(parent_id, list);
+                        self.page_children_map
+                            .insert(SiteKey::new(&site_id, parent_id), list);
                     }
                     Err(e) => ui.error(format!("Failed to load child pages: {e}")),
                 }
@@ -4600,7 +4774,10 @@ impl AppState {
                     Ok(d) => {
                         let detail_ver = d.summary.version_number;
                         // Keep tree rows updated for title/version changes when matching space/parent.
-                        if let Some(roots) = self.root_pages_by_space.get_mut(&d.summary.space_key) {
+                        if let Some(roots) = self
+                            .root_pages_by_space
+                            .get_mut(&SiteKey::new(&site_id, &d.summary.space_key))
+                        {
                             if let Some(existing) = roots.iter_mut().find(|p| p.id == d.summary.id) {
                                 let had_children = existing.has_children == Some(true);
                                 *existing = d.summary.clone();
@@ -4610,7 +4787,9 @@ impl AppState {
                             }
                         }
                         if let Some(ref parent_id) = d.summary.parent_id {
-                            if let Some(kids) = self.page_children_map.get_mut(parent_id) {
+                            if let Some(kids) =
+                                self.page_children_map.get_mut(&SiteKey::new(&site_id, parent_id))
+                            {
                                 if let Some(existing) = kids.iter_mut().find(|p| p.id == d.summary.id) {
                                     let had_children = existing.has_children == Some(true);
                                     *existing = d.summary.clone();
@@ -4643,11 +4822,15 @@ impl AppState {
                     }
                     Err(e) => {
                         if not_found {
-                            for roots in self.root_pages_by_space.values_mut() {
-                                roots.retain(|p| p.id != page_id);
+                            for (k, roots) in self.root_pages_by_space.iter_mut() {
+                                if k.is_site(&site_id) {
+                                    roots.retain(|p| p.id != page_id);
+                                }
                             }
-                            for children in self.page_children_map.values_mut() {
-                                children.retain(|p| p.id != page_id);
+                            for (k, children) in self.page_children_map.iter_mut() {
+                                if k.is_site(&site_id) {
+                                    children.retain(|p| p.id != page_id);
+                                }
                             }
                             self.my_pages.retain(|p| p.id != page_id);
                             if self
@@ -4680,17 +4863,16 @@ impl AppState {
                 let pid_owned = detail.summary.id.clone();
                 if self.site_scope.matches(&site_id) {
                     if let Some(pid) = &detail.summary.parent_id {
-                        self.page_children_map
-                            .entry(pid.clone())
-                            .or_default()
-                            .retain(|p| p.id != detail.summary.id);
-                        self.page_children_map
-                            .entry(pid.clone())
-                            .or_default()
-                            .push(detail.summary.clone());
-                        self.expanded_pages.insert(pid.clone());
+                        let parent = SiteKey::new(&site_id, pid);
+                        let kids = self.page_children_map.entry(parent.clone()).or_default();
+                        kids.retain(|p| p.id != detail.summary.id);
+                        kids.push(detail.summary.clone());
+                        self.expanded_pages.insert(parent);
                     } else {
-                        let roots = self.root_pages_by_space.entry(sk.clone()).or_default();
+                        let roots = self
+                            .root_pages_by_space
+                            .entry(SiteKey::new(&site_id, &sk))
+                            .or_default();
                         if let Some(existing) = roots.iter_mut().find(|p| p.id == detail.summary.id) {
                             *existing = detail.summary.clone();
                         } else {
@@ -5090,16 +5272,40 @@ pub fn build_kanban_columns_for_board(
 }
 
 /// Flattens the hierarchical Confluence page tree respecting `expanded` page IDs.
+/// A cache key scoped to one site: Confluence space keys and page ids are
+/// only unique within a site (ATL-11). The site id is compared
+/// case-insensitively by normalising it at construction.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct SiteKey {
+    pub site_id: String,
+    pub id: String,
+}
+
+impl SiteKey {
+    pub fn new(site_id: &str, id: impl Into<String>) -> Self {
+        Self {
+            site_id: site_id.trim().to_ascii_lowercase(),
+            id: id.into(),
+        }
+    }
+
+    pub fn is_site(&self, site_id: &str) -> bool {
+        self.site_id.eq_ignore_ascii_case(site_id.trim())
+    }
+}
+
 pub fn flatten_page_tree(
     roots: &[PageSummary],
-    children_map: &HashMap<String, Vec<PageSummary>>,
-    expanded: &HashSet<String>,
+    site_id: &str,
+    children_map: &HashMap<SiteKey, Vec<PageSummary>>,
+    expanded: &HashSet<SiteKey>,
 ) -> Vec<TreeRow> {
     fn walk(
         nodes: &[PageSummary],
         depth: usize,
-        children_map: &HashMap<String, Vec<PageSummary>>,
-        expanded: &HashSet<String>,
+        site_id: &str,
+        children_map: &HashMap<SiteKey, Vec<PageSummary>>,
+        expanded: &HashSet<SiteKey>,
         visited: &mut HashSet<String>,
         out: &mut Vec<TreeRow>,
     ) {
@@ -5107,10 +5313,11 @@ pub fn flatten_page_tree(
             if !visited.insert(page.id.clone()) {
                 continue;
             }
-            let children = children_map.get(&page.id);
+            let node = SiteKey::new(site_id, &page.id);
+            let children = children_map.get(&node);
             let has_children =
                 page.has_children == Some(true) || children.is_some_and(|c| !c.is_empty());
-            let is_expanded = expanded.contains(&page.id);
+            let is_expanded = expanded.contains(&node);
             out.push(TreeRow {
                 page: page.clone(),
                 depth,
@@ -5119,7 +5326,7 @@ pub fn flatten_page_tree(
             });
             if is_expanded {
                 if let Some(kids) = children {
-                    walk(kids, depth + 1, children_map, expanded, visited, out);
+                    walk(kids, depth + 1, site_id, children_map, expanded, visited, out);
                 }
             }
         }
@@ -5127,7 +5334,7 @@ pub fn flatten_page_tree(
 
     let mut out = Vec::new();
     let mut visited = HashSet::new();
-    walk(roots, 0, children_map, expanded, &mut visited, &mut out);
+    walk(roots, 0, site_id, children_map, expanded, &mut visited, &mut out);
     out
 }
 
@@ -5145,6 +5352,15 @@ fn scan_issue_keys(text: &str) -> Vec<String> {
         }
     }
     out
+}
+
+/// `true` when a row loaded from `row_site` belongs to `target`; either side
+/// unknown matches (legacy single-site rows carry no site).
+fn site_matches(row_site: Option<&str>, target: Option<&str>) -> bool {
+    match (row_site, target) {
+        (Some(row), Some(target)) => row.eq_ignore_ascii_case(target),
+        _ => true,
+    }
 }
 
 #[cfg(test)]
@@ -5166,21 +5382,23 @@ mod tests {
     }
 
     fn two_site_app() -> (AppState, UiState) {
-        let mut cfg = AppConfig::default();
-        cfg.sites = ["site-a", "site-b"]
-            .iter()
-            .map(|id| SiteProfile {
-                id: (*id).into(),
-                name: id.to_uppercase(),
-                site_url: format!("https://{id}.example.com"),
-                deployment: DeploymentKind::Cloud,
-                account_id: "default".into(),
-                enabled: true,
-                ..Default::default()
-            })
-            .collect();
-        cfg.default_site = Some("site-a".into());
-        cfg.active_site = Some("site-a".into());
+        let cfg = AppConfig {
+            sites: ["site-a", "site-b"]
+                .iter()
+                .map(|id| SiteProfile {
+                    id: (*id).into(),
+                    name: id.to_uppercase(),
+                    site_url: format!("https://{id}.example.com"),
+                    deployment: DeploymentKind::Cloud,
+                    account_id: "default".into(),
+                    enabled: true,
+                    ..Default::default()
+                })
+                .collect(),
+            default_site: Some("site-a".into()),
+            active_site: Some("site-a".into()),
+            ..Default::default()
+        };
         let auth = AuthManager::new("w8-tasks");
         let client = AtlassianClient::new(cfg.clone(), auth.clone()).unwrap();
         let storage = Storage::open_in_memory().unwrap();
@@ -5199,6 +5417,212 @@ mod tests {
         );
         let ui = UiState::from_config_with_persona(&cfg, Persona::Jira);
         (app, ui)
+    }
+
+    fn page(id: &str, space: &str, title: &str) -> PageSummary {
+        PageSummary {
+            id: id.into(),
+            space_key: space.into(),
+            title: title.into(),
+            ..Default::default()
+        }
+    }
+
+    fn space(key: &str) -> SpaceSummary {
+        SpaceSummary {
+            id: format!("sp-{key}"),
+            key: key.into(),
+            name: key.into(),
+            space_type: "global".into(),
+            ..Default::default()
+        }
+    }
+
+    /// Two rows with the same key from two sites; the opened issue is site A's.
+    fn shared_key_rows(app: &mut AppState, ui: &mut UiState) {
+        app.site_scope = SiteScope::All;
+        let row = || sample_issue("SHARED-1", "To Do", StatusCategory::Todo);
+        app.issues = vec![row(), row()];
+        app.issue_site_ids = vec!["site-a".into(), "site-b".into()];
+        app.active_issue = Some(IssueDetail {
+            summary: row(),
+            ..Default::default()
+        });
+        app.active_issue_site_id = Some("site-a".into());
+        ui.active_tab = WorkspaceTab::Issues;
+        ui.issue_ui.selected_issue = 1;
+    }
+
+    #[tokio::test]
+    async fn write_targets_site_of_selected_row_not_opened_issue() {
+        let (mut app, mut ui) = two_site_app();
+        shared_key_rows(&mut app, &mut ui);
+        assert_eq!(
+            app.selected_issue_ref(&ui),
+            Some(("site-b".to_string(), "SHARED-1".to_string()))
+        );
+
+        crate::ui::action::dispatch(crate::ui::keymap::Action::OpenTransition, &mut app, &mut ui);
+        match ui.overlays.last() {
+            Some(Overlay::Transition(ov)) => assert_eq!(ov.site_id.as_deref(), Some("site-b")),
+            other => panic!("expected transition overlay, got {other:?}"),
+        }
+        ui.pop_overlay();
+
+        app.request_transition_issue_for_site(
+            &mut ui,
+            Some("site-b"),
+            "SHARED-1",
+            IssueTransition {
+                id: "31".into(),
+                name: "Done".into(),
+                to_status: IssueStatus {
+                    id: "3".into(),
+                    name: "Done".into(),
+                    category: StatusCategory::Done,
+                },
+            },
+        );
+        assert_eq!(app.issues[1].status.name, "Done", "site B row moved");
+        assert_eq!(app.issues[0].status.name, "To Do", "site A row untouched");
+        assert_eq!(
+            app.active_issue.as_ref().unwrap().summary.status.name,
+            "To Do",
+            "opened site A issue untouched"
+        );
+    }
+
+    #[tokio::test]
+    async fn optimistic_assignee_update_is_site_scoped() {
+        let (mut app, mut ui) = two_site_app();
+        shared_key_rows(&mut app, &mut ui);
+        let bob = UserSummary {
+            id: "bob-b".into(),
+            display_name: "Bob".into(),
+            ..Default::default()
+        };
+        app.request_assign_user(&mut ui, Some("site-b"), "SHARED-1", Some(bob));
+        assert_eq!(app.issues[1].assignee.as_ref().unwrap().id, "bob-b");
+        assert!(app.issues[0].assignee.is_none());
+        assert!(app.active_issue.as_ref().unwrap().summary.assignee.is_none());
+
+        app.handle_ui_msg(
+            &mut ui,
+            UiMsg::IssueAssignFailed {
+                site_id: "site-b".into(),
+                key: "SHARED-1".into(),
+                previous_assignee: Some(None),
+                task_label: "Assign SHARED-1".into(),
+                error: "HTTP 403".into(),
+            },
+        );
+        assert!(app.issues[1].assignee.is_none(), "rollback on site B");
+    }
+
+    #[tokio::test]
+    async fn tree_cache_does_not_collide_across_sites_with_same_space_key() {
+        let (mut app, mut ui) = two_site_app();
+        app.site_scope = SiteScope::All;
+        app.spaces = vec![space("ENG"), space("ENG")];
+        app.space_site_ids = vec!["site-a".into(), "site-b".into()];
+        app.root_pages_by_space
+            .insert(SiteKey::new("site-a", "ENG"), vec![page("1", "ENG", "A root")]);
+        app.root_pages_by_space
+            .insert(SiteKey::new("SITE-B", "ENG"), vec![page("1", "ENG", "B root")]);
+
+        ui.confluence_ui.selected_space = 0;
+        assert_eq!(app.current_confluence_tree(&ui)[0].page.title, "A root");
+        ui.confluence_ui.selected_space = 1;
+        assert_eq!(app.current_confluence_tree(&ui)[0].page.title, "B root");
+
+        // Site B's children of page "1" never show under site A's page "1".
+        app.handle_ui_msg(
+            &mut ui,
+            UiMsg::ChildPagesLoaded {
+                site_id: "site-b".into(),
+                parent_id: "1".into(),
+                task_label: "Child pages: B root".into(),
+                children: Ok(vec![page("2", "ENG", "B child")]),
+            },
+        );
+        app.expanded_pages.insert(SiteKey::new("site-a", "1"));
+        ui.confluence_ui.selected_space = 0;
+        assert_eq!(app.current_confluence_tree(&ui).len(), 1);
+        app.expanded_pages.insert(SiteKey::new("site-b", "1"));
+        ui.confluence_ui.selected_space = 1;
+        let tree_b = app.current_confluence_tree(&ui);
+        assert_eq!(tree_b.len(), 2);
+        assert_eq!(tree_b[1].page.title, "B child");
+    }
+
+    #[tokio::test]
+    async fn new_page_parent_only_when_active_page_in_selected_space_and_site() {
+        let (mut app, mut ui) = two_site_app();
+        app.site_scope = SiteScope::All;
+        ui.active_tab = WorkspaceTab::Confluence;
+        app.spaces = vec![space("ENG"), space("ENG"), space("OPS")];
+        app.space_site_ids = vec!["site-a".into(), "site-b".into(), "site-a".into()];
+        app.active_page = Some(PageDetail {
+            summary: page("500", "ENG", "Opened"),
+            ..Default::default()
+        });
+        app.active_page_site_id = Some("site-a".into());
+
+        let open_form = |app: &mut AppState, ui: &mut UiState, space_idx: usize| {
+            ui.confluence_ui.selected_space = space_idx;
+            crate::ui::action::dispatch(crate::ui::keymap::Action::NewItem, app, ui);
+            let form = match ui.overlays.last() {
+                Some(Overlay::PageForm(ov)) => (ov.parent_id.clone(), ov.site_id.clone()),
+                other => panic!("expected page form, got {other:?}"),
+            };
+            ui.pop_overlay();
+            form
+        };
+
+        assert_eq!(
+            open_form(&mut app, &mut ui, 0),
+            (Some("500".into()), Some("site-a".into())),
+            "same space and site: child of the opened page"
+        );
+        assert_eq!(
+            open_form(&mut app, &mut ui, 1),
+            (None, Some("site-b".into())),
+            "same space key on another site: space root"
+        );
+        assert_eq!(
+            open_form(&mut app, &mut ui, 2),
+            (None, Some("site-a".into())),
+            "other space on the same site: space root"
+        );
+    }
+
+    #[tokio::test]
+    async fn single_site_my_work_seed_is_site_scoped_and_mine() {
+        let (mut app, _ui) = two_site_app();
+        let mut mine = sample_issue("ATL-1", "To Do", StatusCategory::Todo);
+        mine.assignee = Some(UserSummary {
+            id: "me-a".into(),
+            ..Default::default()
+        });
+        let mut theirs = sample_issue("ATL-2", "To Do", StatusCategory::Todo);
+        theirs.assignee = Some(UserSummary {
+            id: "someone".into(),
+            ..Default::default()
+        });
+        let mut done = sample_issue("ATL-3", "Done", StatusCategory::Done);
+        done.assignee = mine.assignee.clone();
+        app.storage
+            .upsert_issues_for_site("site-a", &[mine, theirs, done])
+            .unwrap();
+        app.site_scope = SiteScope::Only("site-a".into());
+        app.me = Some(UserSummary {
+            id: "me-a".into(),
+            ..Default::default()
+        });
+        app.load_cached_initial();
+        let keys: Vec<&str> = app.my_issues.iter().map(|i| i.key.as_str()).collect();
+        assert_eq!(keys, vec!["ATL-1"]);
+        assert_eq!(app.my_issue_site_ids, vec!["site-a".to_string()]);
     }
 
     #[tokio::test]
@@ -5220,7 +5644,7 @@ mod tests {
             ui.tasks.first_running().is_none(),
             "out-of-scope child-pages result must still finish its task"
         );
-        assert!(!app.page_children_map.contains_key("42"));
+        assert!(!app.page_children_map.contains_key(&SiteKey::new("site-b", "42")));
     }
 
     #[tokio::test]
@@ -5355,21 +5779,26 @@ mod tests {
             ..Default::default()
         };
         let mut children_map = HashMap::new();
-        children_map.insert("100".to_string(), vec![child]);
+        children_map.insert(SiteKey::new("default", "100"), vec![child]);
 
         let mut expanded = HashSet::new();
-        let collapsed = flatten_page_tree(&[root.clone()], &children_map, &expanded);
+        let collapsed = flatten_page_tree(&[root.clone()], "default", &children_map, &expanded);
         assert_eq!(collapsed.len(), 1);
         assert!(!collapsed[0].expanded);
         assert!(collapsed[0].has_children);
 
-        expanded.insert("100".to_string());
-        let open = flatten_page_tree(&[root], &children_map, &expanded);
+        expanded.insert(SiteKey::new("DEFAULT", "100"));
+        let open = flatten_page_tree(&[root.clone()], "default", &children_map, &expanded);
         assert_eq!(open.len(), 2);
         assert_eq!(open[0].depth, 0);
         assert!(open[0].expanded);
         assert_eq!(open[1].depth, 1);
         assert_eq!(open[1].page.title, "TUI Design");
+
+        // The same page id on another site is a different node.
+        let other = flatten_page_tree(&[root], "site-b", &children_map, &expanded);
+        assert_eq!(other.len(), 1);
+        assert!(!other[0].expanded);
     }
 
     #[tokio::test]
@@ -5507,6 +5936,7 @@ mod tests {
         app.handle_ui_msg(
             &mut ui,
             UiMsg::IssueTransitionFailed {
+                site_id: "default".into(),
                 key: "ATL-99".into(),
                 previous_status: Some(initial_status),
                 error: "HTTP 500".into(),
@@ -5532,6 +5962,7 @@ mod tests {
         app.handle_ui_msg(
             &mut ui,
             UiMsg::IssueAssignFailed {
+                site_id: "default".into(),
                 key: "ATL-99".into(),
                 previous_assignee: Some(None),
                 task_label: "Assign ATL-99 to me".into(),

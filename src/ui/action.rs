@@ -4,7 +4,7 @@ use crate::{
     config::{self, ImageProtocolPreference as ConfigImageProtocol},
     models::{CrossRefTarget, SearchHitKind},
     ui::{
-        app::{AppState, PaneFocus, UiState, WorkspaceTab},
+        app::{AppState, PaneFocus, SiteKey, UiState, WorkspaceTab},
         hitmap::{ButtonId, HitTarget},
         keymap::Action,
         overlays::{
@@ -88,20 +88,25 @@ pub fn dispatch(action: Action, app: &mut AppState, ui: &mut UiState) -> bool {
             }
             Action::PasteClipboard => {
                 let image_target = match ui.overlays.last() {
-                    Some(Overlay::Comment(ov)) => Some(match &ov.target {
-                        CommentTarget::Issue(key) => UploadTarget::Issue(key.clone()),
-                        CommentTarget::Page { page_id, .. } => UploadTarget::Page(page_id.clone()),
-                    }),
+                    Some(Overlay::Comment(ov)) => Some((
+                        ov.site_id.clone(),
+                        match &ov.target {
+                            CommentTarget::Issue(key) => UploadTarget::Issue(key.clone()),
+                            CommentTarget::Page { page_id, .. } => {
+                                UploadTarget::Page(page_id.clone())
+                            }
+                        },
+                    )),
                     Some(Overlay::IssueForm(ov)) => ov
                         .edit_key
                         .clone()
-                        .map(UploadTarget::Issue)
-                        .or_else(|| app.active_upload_target(ui)),
+                        .map(|key| (ov.site_id.clone(), UploadTarget::Issue(key)))
+                        .or_else(|| app.active_upload_ref(ui)),
                     Some(Overlay::PageForm(ov)) => ov
                         .edit_page_id
                         .clone()
-                        .map(UploadTarget::Page)
-                        .or_else(|| app.active_upload_target(ui)),
+                        .map(|id| (ov.site_id.clone(), UploadTarget::Page(id)))
+                        .or_else(|| app.active_upload_ref(ui)),
                     _ => None,
                 };
                 if matches!(
@@ -114,9 +119,10 @@ pub fn dispatch(action: Action, app: &mut AppState, ui: &mut UiState) -> bool {
                 if let Some(top) = ui.overlays.last_mut() {
                     if top.paste_from_clipboard() {
                         if let Overlay::Assignee(ov) = top {
+                            let site = ov.site_id.clone();
                             let key = ov.project_or_issue_key.clone();
                             let query = ov.query.text.clone();
-                            app.request_assignable_users(&key, &query);
+                            app.request_assignable_users(site.as_deref(), &key, &query);
                         }
                     }
                 }
@@ -225,7 +231,7 @@ pub fn dispatch(action: Action, app: &mut AppState, ui: &mut UiState) -> bool {
         }
         Action::OpenFilePicker => open_file_picker(app, ui),
         Action::PasteClipboard => {
-            let target = app.active_upload_target(ui);
+            let target = app.active_upload_ref(ui);
             if !try_paste_clipboard_image(target, app, ui) {
                 ui.info("No image in clipboard to attach");
             }
@@ -236,20 +242,22 @@ pub fn dispatch(action: Action, app: &mut AppState, ui: &mut UiState) -> bool {
         // Jira & Confluence Domain Actions
         Action::OpenTransition => open_transition(app, ui),
         Action::AssignToMe => {
-            if let Some(key) = app.selected_issue_key(ui) {
-                app.request_assign_to_me(ui, &key);
+            if let Some((site, key)) = app.selected_issue_ref(ui) {
+                app.request_assign_to_me_for_site(ui, Some(&site), &key);
             } else {
                 ui.info("No Jira issue selected");
             }
         }
         Action::OpenAssignee => {
-            if let Some(key) = app.selected_issue_key(ui) {
+            if let Some((site, key)) = app.selected_issue_ref(ui) {
+                // Only borrow the opened issue's project when it *is* the selected row.
                 let proj = app
                     .active_issue
                     .as_ref()
+                    .filter(|d| d.summary.key == key)
                     .map(|d| d.summary.project_key.as_str())
                     .unwrap_or("");
-                app.request_open_assignee_picker(ui, &key, proj);
+                app.request_open_assignee_picker(ui, Some(&site), &key, proj);
             } else {
                 ui.info("No Jira issue selected");
             }
@@ -324,7 +332,8 @@ pub fn dispatch(action: Action, app: &mut AppState, ui: &mut UiState) -> bool {
                 let tree = app.current_confluence_tree(ui);
                 if let Some(row) = tree.get(ui.confluence_ui.selected_tree_row) {
                     if row.expanded {
-                        app.expanded_pages.remove(&row.page.id);
+                        let node = SiteKey::new(&app.tree_site(ui), &row.page.id);
+                        app.expanded_pages.remove(&node);
                     } else if let Some(pid) = &row.page.parent_id {
                         if let Some(parent_idx) = tree.iter().position(|r| &r.page.id == pid) {
                             ui.confluence_ui.selected_tree_row = parent_idx;
@@ -358,7 +367,10 @@ fn switch_tab(tab: WorkspaceTab, app: &mut AppState, ui: &mut UiState) {
         WorkspaceTab::Confluence => {
             ui.focus = PaneFocus::Nav;
             if let Some(sp) = app.active_space(ui).cloned() {
-                if !app.root_pages_by_space.contains_key(&sp.key) {
+                if !app
+                    .root_pages_by_space
+                    .contains_key(&SiteKey::new(&app.tree_site(ui), &sp.key))
+                {
                     app.request_space_root_pages(ui, &sp.key);
                 }
             }
@@ -765,7 +777,11 @@ fn handle_overlay_dispatch(action: Action, app: &mut AppState, ui: &mut UiState)
         }
         Action::RemoteSearch => {
             if let Some(Overlay::Assignee(ov)) = ui.overlays.last() {
-                app.request_assignable_users(&ov.project_or_issue_key, &ov.query.text);
+                app.request_assignable_users(
+                    ov.site_id.as_deref(),
+                    &ov.project_or_issue_key,
+                    &ov.query.text,
+                );
             }
         }
         Action::LoadPreviewImage => {
@@ -796,12 +812,22 @@ fn handle_overlay_dispatch(action: Action, app: &mut AppState, ui: &mut UiState)
             match top {
                 Overlay::Transition(ov) => {
                     if let Some(tr) = ov.selected_transition().cloned() {
-                        app.request_transition_issue(ui, &ov.issue_key, tr);
+                        app.request_transition_issue_for_site(
+                            ui,
+                            ov.site_id.as_deref(),
+                            &ov.issue_key,
+                            tr,
+                        );
                     }
                 }
                 Overlay::Assignee(ov) => {
                     if let Some(choice) = ov.selected_assignee() {
-                        app.request_assign_user(ui, &ov.issue_key, choice.cloned());
+                        app.request_assign_user(
+                            ui,
+                            ov.site_id.as_deref(),
+                            &ov.issue_key,
+                            choice.cloned(),
+                        );
                     }
                 }
                 Overlay::IssueForm(ov) => {
@@ -843,7 +869,7 @@ fn handle_overlay_dispatch(action: Action, app: &mut AppState, ui: &mut UiState)
                             .and_then(|s| s.to_str())
                             .unwrap_or("file")
                             .to_string();
-                        app.request_upload_file(ui, ov.target, path);
+                        app.request_upload_file(ui, ov.site_id.as_deref(), ov.target, path);
                         ui.info(format!("Uploading {fname}…"));
                     }
                 }
@@ -1441,8 +1467,8 @@ fn activate_selection(app: &mut AppState, ui: &mut UiState) {
 }
 
 fn open_transition(app: &AppState, ui: &mut UiState) {
-    if let Some(key) = app.selected_issue_key(ui) {
-        app.request_open_transitions(ui, &key);
+    if let Some((site, key)) = app.selected_issue_ref(ui) {
+        app.request_open_transitions(ui, Some(&site), &key);
     } else {
         ui.info("Select a Jira issue to transition first");
     }
@@ -1460,20 +1486,22 @@ fn open_comment(app: &mut AppState, ui: &mut UiState) {
                 CommentOverlay::with_draft(target, saved)
             } else {
                 CommentOverlay::new(target)
-            };
+            }
+            .with_site(app.active_page_site_id.clone());
             ui.push_overlay(Overlay::Comment(overlay));
             app.request_comments_refresh(ui);
             return;
         }
     }
-    if let Some(key) = app.selected_issue_key(ui) {
+    if let Some((site, key)) = app.selected_issue_ref(ui) {
         let target = CommentTarget::Issue(key);
         let overlay = if let Some(saved) = app.drafts.get(&target.draft_key()) {
             ui.info("Restored saved comment draft");
             CommentOverlay::with_draft(target, saved)
         } else {
             CommentOverlay::new(target)
-        };
+        }
+        .with_site(Some(site));
         ui.push_overlay(Overlay::Comment(overlay));
         app.request_comments_refresh(ui);
     } else {
@@ -1492,8 +1520,21 @@ fn open_new_item(app: &AppState, ui: &mut UiState) {
             ui.info("Select a Confluence space first");
             return;
         }
-        let parent_id = app.active_page.as_ref().map(|p| p.summary.id.clone());
+        // The opened page is only a valid parent when it lives in the selected
+        // space on the selected space's site; otherwise create at the space root.
+        let space_site = app.tree_site(ui);
+        let parent_id = app
+            .active_page
+            .as_ref()
+            .filter(|p| p.summary.space_key.eq_ignore_ascii_case(&space_key))
+            .filter(|_| {
+                app.active_page_site_id
+                    .as_deref()
+                    .is_none_or(|s| s.eq_ignore_ascii_case(&space_site))
+            })
+            .map(|p| p.summary.id.clone());
         let mut form = PageFormOverlay::new_page(space_key, parent_id);
+        form.site_id = Some(space_site);
         if let Some(saved) = app.drafts.get(&form.draft_key()) {
             if form.apply_draft_raw(saved) {
                 ui.info("Restored saved page draft");
@@ -1508,6 +1549,7 @@ fn open_new_item(app: &AppState, ui: &mut UiState) {
             .or_else(|| app.projects.first().map(|p| p.key.clone()))
             .unwrap_or_default();
         let mut form = IssueFormOverlay::new_issue(&default_proj);
+        form.site_id = app.selected_issue_ref(ui).map(|(site, _)| site);
         if let Some(saved) = app.drafts.get(&form.draft_key()) {
             if form.apply_draft_raw(saved) {
                 ui.info("Restored saved issue draft");
@@ -1521,6 +1563,7 @@ fn open_edit_item(app: &AppState, ui: &mut UiState) {
     if ui.active_tab == WorkspaceTab::Confluence {
         if let Some(page) = &app.active_page {
             let mut form = PageFormOverlay::edit_page(page);
+            form.site_id = app.active_page_site_id.clone();
             if let Some(saved) = app.drafts.get(&form.draft_key()) {
                 if form.apply_draft_raw(saved) {
                     ui.info("Restored saved page edit draft");
@@ -1532,6 +1575,7 @@ fn open_edit_item(app: &AppState, ui: &mut UiState) {
         }
     } else if let Some(issue) = &app.active_issue {
         let mut form = IssueFormOverlay::edit_issue(issue);
+        form.site_id = app.active_issue_site_id.clone();
         if let Some(saved) = app.drafts.get(&form.draft_key()) {
             if form.apply_draft_raw(saved) {
                 ui.info("Restored saved issue edit draft");
@@ -1544,23 +1588,27 @@ fn open_edit_item(app: &AppState, ui: &mut UiState) {
 }
 
 fn open_upload_attachment(app: &AppState, ui: &mut UiState) {
-    if let Some(target) = app.active_upload_target(ui) {
-        ui.push_overlay(Overlay::PathInput(PathInputOverlay::new(target)));
+    if let Some((site, target)) = app.active_upload_ref(ui) {
+        let mut overlay = PathInputOverlay::new(target);
+        overlay.site_id = site;
+        ui.push_overlay(Overlay::PathInput(overlay));
     } else {
         ui.info("Select an issue or page to attach a file first");
     }
 }
 
 fn open_file_picker(app: &AppState, ui: &mut UiState) {
-    if let Some(target) = app.active_upload_target(ui) {
-        ui.push_overlay(Overlay::FilePicker(FilePickerOverlay::new(target)));
+    if let Some((site, target)) = app.active_upload_ref(ui) {
+        let mut overlay = FilePickerOverlay::new(target);
+        overlay.site_id = site;
+        ui.push_overlay(Overlay::FilePicker(overlay));
     } else {
         ui.info("Select an issue or page to attach a file first");
     }
 }
 
 fn try_paste_clipboard_image(
-    target: Option<UploadTarget>,
+    target: Option<(Option<String>, UploadTarget)>,
     app: &AppState,
     ui: &mut UiState,
 ) -> bool {
@@ -1574,12 +1622,12 @@ fn try_paste_clipboard_image(
                 .and_then(|s| s.to_str())
                 .unwrap_or("pasted.png")
                 .to_string();
-            if let Some(upload_target) = target {
+            if let Some((site, upload_target)) = target {
                 let target_label = match &upload_target {
                     UploadTarget::Issue(k) => format!("Issue {k}"),
                     UploadTarget::Page(id) => format!("Page #{id}"),
                 };
-                app.request_upload_file(ui, upload_target, path);
+                app.request_upload_file(ui, site.as_deref(), upload_target, path);
                 ui.info(format!(
                     "Pasted clipboard image ({fname}) — uploading to {target_label}…"
                 ));

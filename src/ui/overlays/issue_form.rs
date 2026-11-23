@@ -77,6 +77,9 @@ pub struct IssueFormDraft {
 pub struct IssueFormOverlay {
     /// `None` when creating a new issue; `Some(key)` when editing an existing issue.
     pub edit_key: Option<String>,
+    /// Site the create/update request goes to (the site of the row or issue
+    /// the form was opened from).
+    pub site_id: Option<String>,
     pub project: TextBuffer,
     pub issue_type: TextBuffer,
     pub summary: TextBuffer,
@@ -95,6 +98,7 @@ impl IssueFormOverlay {
     pub fn new_issue(default_project: &str) -> Self {
         Self {
             edit_key: None,
+            site_id: None,
             project: TextBuffer::from_text(default_project),
             issue_type: TextBuffer::from_text("Task"),
             summary: TextBuffer::new(),
@@ -124,6 +128,7 @@ impl IssueFormOverlay {
         let initial_labels = detail.summary.labels.clone();
         Self {
             edit_key: Some(detail.summary.key.clone()),
+            site_id: None,
             project: TextBuffer::from_text(detail.summary.project_key.clone()),
             issue_type: TextBuffer::from_text(detail.summary.issue_type.name.clone()),
             summary: TextBuffer::from_text(detail.summary.summary.clone()),

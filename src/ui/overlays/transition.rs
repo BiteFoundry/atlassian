@@ -22,6 +22,8 @@ use crate::{
 #[derive(Debug, Clone)]
 pub struct TransitionOverlay {
     pub issue_key: String,
+    /// Site of the row the overlay was opened from; the transition is sent there.
+    pub site_id: Option<String>,
     pub transitions: Vec<IssueTransition>,
     pub selected: usize,
     pub loading: bool,
@@ -32,6 +34,7 @@ impl TransitionOverlay {
     pub fn new(issue_key: impl Into<String>) -> Self {
         Self {
             issue_key: issue_key.into(),
+            site_id: None,
             transitions: Vec::new(),
             selected: 0,
             loading: true,

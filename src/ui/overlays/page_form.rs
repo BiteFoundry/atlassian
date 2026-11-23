@@ -42,6 +42,8 @@ pub struct PageFormDraft {
 pub struct PageFormOverlay {
     /// `None` when creating a new page; `Some(page_id)` when editing an existing page.
     pub edit_page_id: Option<String>,
+    /// Site the create/update request goes to.
+    pub site_id: Option<String>,
     pub prev_version: i32,
     pub space_key: String,
     pub parent_id: Option<String>,
@@ -59,6 +61,7 @@ impl PageFormOverlay {
     pub fn new_page(space_key: impl Into<String>, parent_id: Option<String>) -> Self {
         Self {
             edit_page_id: None,
+            site_id: None,
             prev_version: 0,
             space_key: space_key.into(),
             parent_id,
@@ -76,6 +79,7 @@ impl PageFormOverlay {
     pub fn edit_page(detail: &PageDetail) -> Self {
         Self {
             edit_page_id: Some(detail.summary.id.clone()),
+            site_id: None,
             prev_version: detail.summary.version_number,
             space_key: detail.summary.space_key.clone(),
             parent_id: detail.summary.parent_id.clone(),

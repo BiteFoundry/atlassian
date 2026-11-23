@@ -36,6 +36,8 @@ impl CommentTarget {
 #[derive(Debug, Clone)]
 pub struct CommentOverlay {
     pub target: CommentTarget,
+    /// Site of the issue or page the overlay was opened for.
+    pub site_id: Option<String>,
     pub body: TextBuffer,
     pub error: Option<String>,
 }
@@ -44,6 +46,7 @@ impl CommentOverlay {
     pub fn new(target: CommentTarget) -> Self {
         Self {
             target,
+            site_id: None,
             body: TextBuffer::new(),
             error: None,
         }
@@ -52,6 +55,7 @@ impl CommentOverlay {
     pub fn with_draft(target: CommentTarget, draft: impl Into<String>) -> Self {
         Self {
             target,
+            site_id: None,
             body: TextBuffer::from_text(draft),
             error: None,
         }
@@ -59,6 +63,11 @@ impl CommentOverlay {
 
     pub fn draft_key(&self) -> String {
         self.target.draft_key()
+    }
+
+    pub fn with_site(mut self, site_id: Option<String>) -> Self {
+        self.site_id = site_id;
+        self
     }
 
     pub fn draft_text(&self) -> &str {

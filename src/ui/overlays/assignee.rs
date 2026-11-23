@@ -25,6 +25,8 @@ use crate::{
 #[derive(Debug, Clone)]
 pub struct AssigneeOverlay {
     pub issue_key: String,
+    /// Site of the row the overlay was opened from; users and the write go there.
+    pub site_id: Option<String>,
     pub project_or_issue_key: String,
     pub query: TextBuffer,
     pub users: Vec<UserSummary>,
@@ -41,6 +43,7 @@ impl AssigneeOverlay {
         Self {
             project_or_issue_key: if proj.is_empty() { key.clone() } else { proj },
             issue_key: key,
+            site_id: None,
             query: TextBuffer::new(),
             users: Vec::new(),
             selected: 0,

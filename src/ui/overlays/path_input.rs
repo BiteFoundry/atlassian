@@ -55,6 +55,8 @@ pub enum UploadTarget {
 #[derive(Debug, Clone)]
 pub struct PathInputOverlay {
     pub target: UploadTarget,
+    /// Site of the issue or page the upload goes to.
+    pub site_id: Option<String>,
     pub path: TextBuffer,
     pub error: Option<String>,
 }
@@ -63,6 +65,7 @@ impl PathInputOverlay {
     pub fn new(target: UploadTarget) -> Self {
         Self {
             target,
+            site_id: None,
             path: TextBuffer::new(),
             error: None,
         }

@@ -44,6 +44,8 @@ pub struct FilePickerEntry {
 #[derive(Debug, Clone)]
 pub struct FilePickerOverlay {
     pub target: UploadTarget,
+    /// Site of the issue or page the upload goes to.
+    pub site_id: Option<String>,
     pub current_dir: PathBuf,
     pub entries: Vec<FilePickerEntry>,
     pub filter: String,
@@ -66,6 +68,7 @@ impl FilePickerOverlay {
     pub fn new_in_dir(target: UploadTarget, dir: PathBuf) -> Self {
         let mut ov = Self {
             target,
+            site_id: None,
             current_dir: dir,
             entries: Vec::new(),
             filter: String::new(),

@@ -958,9 +958,35 @@ impl Storage {
     /// Federated "My Work" feed across all enabled sites: open issues (statusCategory != Done),
     /// ordered most-recently-updated first.
     pub fn list_my_work_all_sites(&self, limit: usize) -> Result<Vec<(String, IssueSummary)>> {
+        self.query_my_work(None, None, limit)
+    }
+
+    /// Open (non-Done) issues of one site for the My Work seed. With `me_id`
+    /// only issues assigned to that account are returned; the assignee filter
+    /// runs in SQL so it applies before `LIMIT`.
+    pub fn list_my_work_for_site(
+        &self,
+        site_id: &str,
+        me_id: Option<&str>,
+        limit: usize,
+    ) -> Result<Vec<IssueSummary>> {
+        Ok(self
+            .query_my_work(Some(site_id), me_id, limit)?
+            .into_iter()
+            .map(|(_, issue)| issue)
+            .collect())
+    }
+
+    fn query_my_work(
+        &self,
+        site_id: Option<&str>,
+        me_id: Option<&str>,
+        limit: usize,
+    ) -> Result<Vec<(String, IssueSummary)>> {
         if limit == 0 {
             return Ok(Vec::new());
         }
+        let me_id = me_id.map(str::trim).filter(|s| !s.is_empty());
         let conn = self.lock_conn()?;
         let mut stmt = conn.prepare(
             "
@@ -976,11 +1002,13 @@ impl Storage {
               AND NOT EXISTS (
                   SELECT 1 FROM sites s WHERE s.site_id = i.site_id AND s.enabled = 0
               )
+              AND (?2 IS NULL OR i.site_id = ?2)
+              AND (?3 IS NULL OR json_extract(i.assignee_json, '$.id') = ?3)
             ORDER BY i.updated_at DESC, i.site_id ASC, i.key ASC
             LIMIT ?1
             ",
         )?;
-        let rows = stmt.query_map(params![limit as i64], |row| {
+        let rows = stmt.query_map(params![limit as i64, site_id, me_id], |row| {
             let site_id: String = row.get(0)?;
             let issue = map_issue_summary_row(row, 1)?;
             Ok((site_id, issue))
@@ -1590,6 +1618,64 @@ fn map_issue_hit_row(
 mod tests {
     use super::*;
     use crate::models::StatusCategory;
+
+    #[test]
+    fn single_site_my_work_excludes_done_and_other_assignees() {
+        let storage = Storage::open_in_memory().unwrap();
+        let user = |id: &str| UserSummary {
+            id: id.into(),
+            display_name: id.to_uppercase(),
+            ..Default::default()
+        };
+        let with = |key: &str, assignee: Option<&str>, done: bool| {
+            let mut it = sample_issue(key, "ATL", key, None);
+            it.assignee = assignee.map(user);
+            it.updated_at = format!("2026-11-2{}T00:00:00Z", key.len() % 10);
+            if done {
+                it.status = IssueStatus {
+                    id: "3".into(),
+                    name: "Done".into(),
+                    category: StatusCategory::Done,
+                };
+            }
+            it
+        };
+        storage
+            .upsert_issues_for_site(
+                "site-a",
+                &[
+                    with("ATL-1", Some("me-a"), false),
+                    with("ATL-2", Some("someone"), false),
+                    with("ATL-3", Some("me-a"), true),
+                    with("ATL-4", None, false),
+                ],
+            )
+            .unwrap();
+        storage
+            .upsert_issues_for_site("site-b", &[with("ATL-9", Some("me-a"), false)])
+            .unwrap();
+
+        let mine: Vec<String> = storage
+            .list_my_work_for_site("site-a", Some("me-a"), 40)
+            .unwrap()
+            .into_iter()
+            .map(|i| i.key)
+            .collect();
+        assert_eq!(mine, vec!["ATL-1".to_string()]);
+
+        // Without a known identity: open issues of this site only.
+        let mut open: Vec<String> = storage
+            .list_my_work_for_site("site-a", None, 40)
+            .unwrap()
+            .into_iter()
+            .map(|i| i.key)
+            .collect();
+        open.sort();
+        assert_eq!(open, vec!["ATL-1", "ATL-2", "ATL-4"]);
+
+        // The all-sites listing keeps its previous shape.
+        assert_eq!(storage.list_my_work_all_sites(40).unwrap().len(), 4);
+    }
 
     fn sample_issue(
         key: &str,
