@@ -410,16 +410,16 @@ pub async fn run(
 
     let addr: SocketAddr = format!("{}:{}", opts.bind, opts.port)
         .parse()
-        .with_context(|| format!("잘못된 바인드 주소: {}:{}", opts.bind, opts.port))?;
+        .with_context(|| format!("Invalid bind address: {}:{}", opts.bind, opts.port))?;
     let listener = TcpListener::bind(addr)
         .await
-        .with_context(|| format!("리스너 바인드 실패: {addr}"))?;
+        .with_context(|| format!("Failed to bind listener: {addr}"))?;
 
     println!("atlassian HTTP API listening on http://{addr}");
 
     axum::serve(listener, app)
         .await
-        .context("HTTP 서버 오류")?;
+        .context("HTTP server error")?;
 
     Ok(())
 }

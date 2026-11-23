@@ -1585,7 +1585,7 @@ mod tests {
         assert_eq!(filters.len(), 4);
         assert!(filters
             .iter()
-            .any(|f| f.id == "my_open" && f.name == "내게 할당된 미해결"));
+            .any(|f| f.id == "my_open" && f.name == "Assigned to me (open)"));
 
         let p = ProjectSummary {
             id: "100".into(),

@@ -136,7 +136,7 @@ impl AtlassianClient {
         let lim = limit.clamp(1, 250);
         let input = space_id_or_key.trim();
         if input.is_empty() {
-            bail!("Confluence 스페이스 키 또는 ID를 입력하세요.");
+            bail!("Please provide a Confluence space key or ID.");
         }
 
         match self.deployment() {
@@ -817,7 +817,7 @@ impl AtlassianClient {
             DeploymentKind::Cloud => {
                 let (space_id, _) = self.resolve_cloud_space_id(&req.space_id_or_key).await?;
                 let adf_str = serde_json::to_string(&markdown_to_adf(&req.body_markdown))
-                    .context("ADF 직렬화 실패")?;
+                    .context("Failed to serialize ADF")?;
                 let mut payload = Map::new();
                 payload.insert("spaceId".into(), Value::String(space_id));
                 payload.insert("status".into(), Value::String("current".into()));
@@ -878,7 +878,7 @@ impl AtlassianClient {
         };
 
         if created_id.is_empty() {
-            bail!("페이지 생성 응답에 id가 없습니다.");
+            bail!("Page creation response is missing an id.");
         }
         self.get_page(&created_id).await
     }
@@ -1073,7 +1073,7 @@ impl AtlassianClient {
                     None => (
                         "atlas_doc_format",
                         serde_json::to_string(&markdown_to_adf(&patch.body_markdown))
-                            .context("ADF 직렬화 실패")?,
+                            .context("Failed to serialize ADF")?,
                     ),
                 };
                 Ok(json!({
@@ -1284,7 +1284,7 @@ impl AtlassianClient {
         let resp: Value = match self.deployment() {
             DeploymentKind::Cloud => {
                 let adf_str = serde_json::to_string(&markdown_to_adf(body_markdown))
-                    .context("ADF 직렬화 실패")?;
+                    .context("Failed to serialize ADF")?;
                 let url = format!("{conf_root}/api/v2/footer-comments");
                 let payload = json!({
                     "pageId": page_id,
@@ -1425,7 +1425,7 @@ impl AtlassianClient {
                 None => break,
             }
         }
-        bail!("Confluence 스페이스 '{}'을(를) 찾을 수 없습니다.", trimmed)
+        bail!("Confluence space '{}' not found.", trimmed)
     }
 }
 
@@ -2345,7 +2345,7 @@ mod tests {
         assert!(
             missing_err
                 .to_string()
-                .contains("Confluence 스페이스 'NOPE'을(를) 찾을 수 없습니다."),
+                .contains("Confluence space 'NOPE' not found."),
             "{missing_err}"
         );
     }

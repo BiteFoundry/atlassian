@@ -59,7 +59,7 @@ impl AtlassianClient {
         let raw_url = attachment.content_url.trim();
         if raw_url.is_empty() {
             bail!(
-                "첨부파일 '{}'의 다운로드 URL이 비어 있습니다.",
+                "Download URL for attachment '{}' is empty.",
                 attachment.filename
             );
         }
@@ -80,7 +80,7 @@ impl AtlassianClient {
         let bytes = self.fetch_attachment_bytes(attachment).await?;
         tokio::fs::create_dir_all(dest_dir)
             .await
-            .with_context(|| format!("다운로드 디렉터리 생성 실패: {}", dest_dir.display()))?;
+            .with_context(|| format!("Failed to create download directory: {}", dest_dir.display()))?;
 
         let safe_name = sanitize_windows_filename(&attachment.filename);
         let target_path = deduplicate_path(dest_dir, &safe_name);
@@ -104,7 +104,7 @@ impl AtlassianClient {
 async fn read_upload_file(file_path: &Path) -> Result<(String, String, Vec<u8>)> {
     let bytes = tokio::fs::read(file_path)
         .await
-        .with_context(|| format!("첨부파일 읽기 실패: {}", file_path.display()))?;
+        .with_context(|| format!("Failed to read attachment file: {}", file_path.display()))?;
     let file_name = file_path
         .file_name()
         .and_then(|s| s.to_str())
@@ -251,10 +251,10 @@ async fn write_bytes_atomic(path: &Path, bytes: &[u8]) -> Result<()> {
     let tmp = path.with_file_name(format!(".{}.tmp", uuid::Uuid::new_v4()));
     tokio::fs::write(&tmp, bytes)
         .await
-        .with_context(|| format!("임시 첨부파일 쓰기 실패: {}", tmp.display()))?;
+        .with_context(|| format!("Failed to write temporary attachment file: {}", tmp.display()))?;
     if let Err(err) = tokio::fs::rename(&tmp, path).await {
         let _ = tokio::fs::remove_file(&tmp).await;
-        return Err(err).with_context(|| format!("첨부파일 저장 실패: {}", path.display()));
+        return Err(err).with_context(|| format!("Failed to save attachment file: {}", path.display()));
     }
     Ok(())
 }

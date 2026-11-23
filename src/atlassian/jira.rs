@@ -471,7 +471,7 @@ impl AtlassianClient {
             .await?;
         let created_key = first_nonempty_str(&created, &["key", "id"]);
         if created_key.is_empty() {
-            bail!("이슈 생성 응답에 key가 없습니다.");
+            bail!("Issue creation response is missing a key.");
         }
         self.get_issue(&created_key).await
     }
@@ -898,7 +898,7 @@ impl AtlassianClient {
         let encoded_key = urlencoding::encode(key);
         let target = transition_id_or_name.trim();
         if target.is_empty() {
-            bail!("전환(transition) ID 또는 이름을 입력하세요.");
+            bail!("Please provide a transition ID or name.");
         }
 
         let (resolved_id, selected) = if target.chars().all(|c| c.is_ascii_digit()) {
@@ -924,7 +924,7 @@ impl AtlassianClient {
                     [only] => (*only).clone(),
                     [] => {
                         return Err(anyhow!(
-                            "이슈 {key}에서 전환 '{target}'을(를) 찾을 수 없습니다."
+                            "Transition '{target}' not found on issue {key}."
                         ));
                     }
                     many => {
@@ -946,7 +946,7 @@ impl AtlassianClient {
                         return Err(CodedError {
                             code: "ambiguous_transition",
                             message: format!(
-                                "이슈 {key}에서 '{target}'에 해당하는 전환이 {}개입니다. 전환 ID로 지정하세요: {list}",
+                                "Multiple transitions ({}) match '{target}' on issue {key}. Specify a transition ID: {list}",
                                 many.len()
                             ),
                             details: Some(json!({ "candidates": candidates })),
@@ -1987,7 +1987,7 @@ mod tests {
         assert_eq!(payload["code"], "ambiguous_transition");
         assert_eq!(
             payload["message"],
-            "이슈 KAN-10에서 'Review'에 해당하는 전환이 2개입니다. 전환 ID로 지정하세요: [41] Submit for Review -> Review, [42] Fast-Track Review -> Review"
+            "Multiple transitions (2) match 'Review' on issue KAN-10. Specify a transition ID: [41] Submit for Review -> Review, [42] Fast-Track Review -> Review"
         );
         assert_eq!(payload["details"]["candidates"].as_array().unwrap().len(), 2);
         assert_eq!(payload["details"]["candidates"][0]["id"], "41");

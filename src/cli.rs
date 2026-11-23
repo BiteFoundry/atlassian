@@ -31,6 +31,9 @@ use crate::{
     },
     resolver::resolve_rejected_assignee,
     serve::{self, ServeOptions},
+    shell_alias::{
+        self, AliasCommand, ShellKind, DEFAULT_CONF_ALIAS, DEFAULT_JIRA_ALIAS,
+    },
     storage::{SiteRecord, Storage},
     sync::{self, SiteSyncTarget},
     tui, updater,
@@ -42,12 +45,37 @@ const DELETE_JSON_REQUIRES_YES: &str = "Deleting in --json mode requires passing
 #[error("{0}")]
 struct JsonReported(String);
 
+pub(crate) fn argv_requests_json(args: &[OsString]) -> bool {
+    for arg in args.iter().skip(1) {
+        let Some(text) = arg.to_str() else {
+            continue;
+        };
+        if text == "--" {
+            break;
+        }
+        if text == "--json" || text == "-j" {
+            return true;
+        }
+        if let Some(short_cluster) = text.strip_prefix('-') {
+            if !short_cluster.starts_with('-')
+                && short_cluster.len() >= 2
+                && short_cluster.bytes().all(|b| b.is_ascii_alphabetic())
+                && short_cluster.contains('j')
+            {
+                return true;
+            }
+        }
+    }
+    false
+}
+
 pub fn report_error(err: &anyhow::Error) {
-    eprintln!("오류: {err:#}");
+    eprintln!("Error: {err:#}");
     if err.downcast_ref::<JsonReported>().is_some() {
         return;
     }
-    if std::env::args_os().skip(1).any(|a| a == "--json") {
+    let argv: Vec<OsString> = std::env::args_os().collect();
+    if argv_requests_json(&argv) {
         let payload = json!({
             "ok": false,
             "error": error_payload(err),
@@ -107,7 +135,7 @@ pub struct ConfluenceCli {
 #[derive(clap::Args, Debug)]
 pub struct EditBodyArgs {
     /// Replace the entire body with Markdown
-    #[arg(long, allow_hyphen_values = true, conflicts_with = "body_file")]
+    #[arg(short = 'b', long, allow_hyphen_values = true, conflicts_with = "body_file")]
     body: Option<String>,
     /// Replace the entire body from a Markdown file
     #[arg(long = "body-file")]
@@ -194,7 +222,7 @@ pub struct SiteAddArgs {
     /// Cloud vs Data Center API dialect
     #[arg(long, value_enum)]
     pub deployment: Option<DeploymentArg>,
-    #[arg(long)]
+    #[arg(short = 'j', long)]
     pub json: bool,
 }
 
@@ -203,7 +231,7 @@ pub enum SitesCommand {
     /// List all registered Atlassian sites and sync/cache status
     #[command(visible_alias = "ls")]
     List {
-        #[arg(long)]
+        #[arg(short = 'j', long)]
         json: bool,
     },
     /// Register a Cloud or Data Center Atlassian site
@@ -216,34 +244,34 @@ pub enum SitesCommand {
         client_id: Option<String>,
         #[arg(long = "client-secret")]
         client_secret: Option<String>,
-        #[arg(long)]
+        #[arg(short = 'j', long)]
         json: bool,
     },
     /// Set the default target site for single-site CLI / HTTP / MCP commands
     Default {
         id: String,
-        #[arg(long)]
+        #[arg(short = 'j', long)]
         json: bool,
     },
     /// Enable a site for federated sync, search, and TUI views
     Enable {
         id: String,
-        #[arg(long)]
+        #[arg(short = 'j', long)]
         json: bool,
     },
     /// Disable a site without deleting its config or cached data
     Disable {
         id: String,
-        #[arg(long)]
+        #[arg(short = 'j', long)]
         json: bool,
     },
     /// Remove a registered site and purge its local cached data
     #[command(visible_alias = "rm")]
     Remove {
         id: String,
-        #[arg(long)]
+        #[arg(short = 'y', long)]
         yes: bool,
-        #[arg(long)]
+        #[arg(short = 'j', long)]
         json: bool,
     },
 }
@@ -252,22 +280,22 @@ pub enum SitesCommand {
 pub enum DaemonCommand {
     /// Start the background sync daemon
     Start {
-        #[arg(long)]
+        #[arg(short = 'j', long)]
         json: bool,
     },
     /// Stop the running background sync daemon
     Stop {
-        #[arg(long)]
+        #[arg(short = 'j', long)]
         json: bool,
     },
     /// Show background sync daemon status
     Status {
-        #[arg(long)]
+        #[arg(short = 'j', long)]
         json: bool,
     },
     /// Restart the background sync daemon
     Restart {
-        #[arg(long)]
+        #[arg(short = 'j', long)]
         json: bool,
     },
     /// Run the background sync daemon in the foreground
@@ -309,7 +337,7 @@ pub enum Command {
         /// Human-readable site name when registering a site during login
         #[arg(long)]
         name: Option<String>,
-        #[arg(long)]
+        #[arg(short = 'j', long)]
         json: bool,
     },
     /// Manage connected Atlassian Cloud and Data Center sites
@@ -320,59 +348,59 @@ pub enum Command {
     /// Remove stored credentials
     #[command(visible_alias = "out")]
     Logout {
-        #[arg(long)]
+        #[arg(short = 'j', long)]
         json: bool,
     },
     /// Show the currently authenticated Atlassian user profile
     Whoami {
-        #[arg(long)]
+        #[arg(short = 'j', long)]
         json: bool,
     },
     /// Diagnose config, SQLite cache, keyring paths, deployment mode, and optional API probe
     Doctor {
         #[arg(long)]
         probe: bool,
-        #[arg(long)]
+        #[arg(short = 'j', long)]
         json: bool,
     },
     /// List Jira projects
     Projects {
-        #[arg(long)]
+        #[arg(short = 'r', long)]
         refresh: bool,
         /// Maximum number of projects to return (default: 50 for --json, all for text)
-        #[arg(long)]
+        #[arg(short = 'n', long)]
         limit: Option<usize>,
         /// Pagination offset cursor from next_cursor
         #[arg(long)]
         cursor: Option<String>,
-        #[arg(long)]
+        #[arg(short = 'j', long)]
         json: bool,
     },
     /// List Jira Agile boards
     Boards {
-        #[arg(long)]
+        #[arg(short = 'p', long)]
         project: Option<String>,
-        #[arg(long)]
+        #[arg(short = 'r', long)]
         refresh: bool,
         /// Maximum number of boards to return (default: 50 for --json, all for text)
-        #[arg(long)]
+        #[arg(short = 'n', long)]
         limit: Option<usize>,
         /// Pagination offset cursor from next_cursor
         #[arg(long)]
         cursor: Option<String>,
-        #[arg(long)]
+        #[arg(short = 'j', long)]
         json: bool,
     },
     /// List active and future sprints for a Jira Agile board
     Sprints {
         board_id: i64,
         /// Maximum number of sprints to return (up to 50 per live call)
-        #[arg(long, default_value_t = 50)]
+        #[arg(short = 'n', long, default_value_t = 50)]
         limit: usize,
         /// Pagination offset cursor from next_cursor
         #[arg(long)]
         cursor: Option<String>,
-        #[arg(long)]
+        #[arg(short = 'j', long)]
         json: bool,
     },
     /// Render a Kanban board by columns in the terminal
@@ -380,21 +408,21 @@ pub enum Command {
         board_id: Option<i64>,
         #[arg(long)]
         sprint: Option<i64>,
-        #[arg(long)]
+        #[arg(short = 'j', long)]
         json: bool,
     },
     /// List Jira issues
     #[command(visible_alias = "ls")]
     Issues {
-        #[arg(long)]
+        #[arg(short = 'p', long)]
         project: Option<String>,
         #[arg(long)]
         jql: Option<String>,
-        #[arg(long)]
+        #[arg(short = 'm', long)]
         mine: bool,
-        #[arg(long)]
+        #[arg(short = 's', long)]
         status: Option<String>,
-        #[arg(long, default_value_t = 50)]
+        #[arg(short = 'n', long, default_value_t = 50)]
         limit: usize,
         /// Cloud pagination token from next_page_token
         #[arg(long = "page-token", conflicts_with_all = ["start_at", "offline"])]
@@ -402,9 +430,9 @@ pub enum Command {
         /// Data Center 0-based pagination offset from next_start_at
         #[arg(long = "start-at", conflicts_with = "offline")]
         start_at: Option<usize>,
-        #[arg(long)]
+        #[arg(short = 'o', long)]
         offline: bool,
-        #[arg(long)]
+        #[arg(short = 'j', long)]
         json: bool,
     },
     /// View Jira issue details (description, linked Confluence pages, subtasks, comments)
@@ -413,105 +441,119 @@ pub enum Command {
         key: String,
         #[arg(long = "preview-images")]
         preview_images: bool,
-        #[arg(long)]
+        #[arg(short = 'o', long)]
         offline: bool,
-        #[arg(long)]
+        #[arg(short = 'j', long)]
         json: bool,
         /// Accepted for compatibility: compact is the default for --json
         #[arg(long, requires = "json")]
         compact: bool,
         /// Return the full structure: native body, blocks, comments, attachments
-        #[arg(long, requires = "json", conflicts_with = "compact")]
+        #[arg(short = 'f', long, requires = "json", conflicts_with = "compact")]
         full: bool,
     },
     /// Create a new Jira issue
     #[command(visible_alias = "new")]
     Create {
+        /// Issue summary (shorthand for --summary)
+        #[arg(
+            value_name = "SUMMARY",
+            allow_hyphen_values = true,
+            conflicts_with = "summary",
+            required_unless_present = "summary"
+        )]
+        summary_pos: Option<String>,
         /// Project key (default: config default_project)
-        #[arg(long)]
+        #[arg(short = 'p', long)]
         project: Option<String>,
-        #[arg(long = "type", default_value = "Task")]
+        #[arg(short = 't', long = "type", default_value = "Task")]
         issue_type: String,
-        #[arg(long, allow_hyphen_values = true)]
-        summary: String,
-        #[arg(long, allow_hyphen_values = true)]
+        #[arg(short = 's', long, allow_hyphen_values = true)]
+        summary: Option<String>,
+        #[arg(short = 'b', long, allow_hyphen_values = true)]
         body: Option<String>,
         #[arg(long = "body-file")]
         body_file: Option<PathBuf>,
-        #[arg(long)]
+        #[arg(short = 'P', long)]
         priority: Option<String>,
         /// Account ID, "me", or a display name / email (resolved when the ID is rejected)
-        #[arg(long)]
+        #[arg(short = 'a', long)]
         assignee: Option<String>,
         /// Label to set (repeat for several)
-        #[arg(long = "label")]
+        #[arg(short = 'l', long = "label")]
         label: Vec<String>,
         /// Parent issue key
         #[arg(long)]
         parent: Option<String>,
-        #[arg(long)]
+        #[arg(short = 'j', long)]
         json: bool,
         /// Return the full structure: native body, blocks, comments, attachments
-        #[arg(long, requires = "json")]
+        #[arg(short = 'f', long, requires = "json")]
         full: bool,
     },
     /// Edit fields of an existing Jira issue
+    #[command(visible_alias = "e")]
     Edit {
         key: String,
-        #[arg(long, allow_hyphen_values = true)]
+        #[arg(short = 's', long, allow_hyphen_values = true)]
         summary: Option<String>,
         #[command(flatten)]
         body: EditBodyArgs,
-        #[arg(long)]
+        #[arg(short = 'P', long)]
         priority: Option<String>,
         /// Account ID, "me", "none" (unassign), or a display name / email (resolved when the ID is rejected)
-        #[arg(long)]
+        #[arg(short = 'a', long)]
         assignee: Option<String>,
         /// Replace all labels with the given set (repeat for several)
-        #[arg(long = "label")]
+        #[arg(short = 'l', long = "label")]
         label: Option<Vec<String>>,
-        #[arg(long)]
+        #[arg(short = 'j', long)]
         json: bool,
         /// Return the full structure: native body, blocks, comments, attachments
-        #[arg(long, requires = "json")]
+        #[arg(short = 'f', long, requires = "json")]
         full: bool,
     },
     /// Transition a Jira issue workflow status or list available transitions
-    #[command(visible_alias = "move")]
+    #[command(visible_aliases = ["move", "mv"])]
     Transition {
         key: String,
         status: Option<String>,
-        #[arg(long, allow_hyphen_values = true)]
+        #[arg(short = 'c', long, allow_hyphen_values = true)]
         comment: Option<String>,
-        #[arg(long)]
+        #[arg(short = 'l', long)]
         list: bool,
-        #[arg(long)]
+        #[arg(short = 'j', long)]
         json: bool,
     },
-    /// Assign or unassign a Jira issue (supports `--to me`)
+    /// Assign or unassign a Jira issue (supports `me`, account ID, name, or email)
+    #[command(visible_alias = "as")]
     Assign {
         key: String,
+        /// Account ID, "me", or a display name / email (shorthand for --to)
+        #[arg(value_name = "ASSIGNEE", conflicts_with_all = ["to", "unassign"])]
+        assignee_pos: Option<String>,
         /// Account ID, "me", or a display name / email (resolved when the ID is rejected)
-        #[arg(long)]
+        #[arg(short = 't', long)]
         to: Option<String>,
-        #[arg(long)]
+        #[arg(short = 'u', long)]
         unassign: bool,
-        #[arg(long)]
+        #[arg(short = 'j', long)]
         json: bool,
     },
     /// Add a Markdown comment to a Jira issue
+    #[command(visible_alias = "c")]
     Comment {
         key: String,
         #[arg(allow_hyphen_values = true)]
         body: String,
-        #[arg(long)]
+        #[arg(short = 'j', long)]
         json: bool,
     },
     /// Upload a local file attachment to a Jira issue
     Attach {
         key: String,
         file: PathBuf,
-        #[arg(long)]
+        #[arg(short = 'j', long)]
         json: bool,
     },
     /// Download attachments from a Jira issue
@@ -522,27 +564,28 @@ pub enum Command {
         attachment_id: Option<String>,
         #[arg(long)]
         dir: Option<PathBuf>,
-        #[arg(long)]
+        #[arg(short = 'j', long)]
         json: bool,
     },
     /// Delete a Jira issue
     Delete {
         key: String,
-        #[arg(long)]
+        #[arg(short = 'y', long)]
         yes: bool,
-        #[arg(long)]
+        #[arg(short = 'j', long)]
         json: bool,
     },
     /// Search Jira issues in local SQLite cache or via remote JQL (for custom raw JQL, pass `--jql`, e.g. `atlassian search 'customField = "foo"' --jql`)
+    #[command(visible_alias = "q")]
     Search {
         #[arg(allow_hyphen_values = true)]
         query: String,
         /// Treat `query` as a raw JQL expression verbatim (e.g. `--jql 'customField = "read and write"'`)
         #[arg(long)]
         jql: bool,
-        #[arg(long)]
+        #[arg(short = 'r', long)]
         remote: bool,
-        #[arg(long, default_value_t = 30)]
+        #[arg(short = 'n', long, default_value_t = 30)]
         limit: usize,
         /// Cloud pagination token from next_page_token (requires --remote or --jql)
         #[arg(long = "page-token", conflicts_with = "start_at")]
@@ -550,7 +593,7 @@ pub enum Command {
         /// Data Center 0-based pagination offset from next_start_at (requires --remote or --jql)
         #[arg(long = "start-at")]
         start_at: Option<usize>,
-        #[arg(long)]
+        #[arg(short = 'j', long)]
         json: bool,
     },
     /// Open a Jira issue web URL in the default browser
@@ -582,13 +625,32 @@ pub enum Command {
     },
     /// Sync Jira and Confluence workspace metadata into the local SQLite cache
     Sync {
-        #[arg(long)]
+        #[arg(short = 'j', long)]
         json: bool,
     },
     /// Manage the background sync daemon
     Daemon {
         #[command(subcommand)]
         action: DaemonCommand,
+    },
+    /// Manage opt-in short shell aliases (`j` -> atlassian, `cf` -> conf)
+    Alias {
+        #[command(subcommand)]
+        action: AliasCommand,
+    },
+    /// Print shell initialization snippet defining short aliases (`j` -> atlassian, `cf` -> conf)
+    Init {
+        #[arg(value_enum)]
+        shell: ShellKind,
+        /// Alias name for `atlassian` (Jira TUI & CLI)
+        #[arg(long, default_value = DEFAULT_JIRA_ALIAS)]
+        jira: String,
+        /// Alias name for `conf` (Confluence TUI & CLI)
+        #[arg(long, default_value = DEFAULT_CONF_ALIAS)]
+        conf: String,
+        /// Define aliases even if another command with the same name exists on PATH
+        #[arg(long)]
+        force: bool,
     },
     /// Check GitHub Releases for updates or self-update the binary
     Update {
@@ -598,7 +660,7 @@ pub enum Command {
         force: bool,
         #[arg(long)]
         repo: Option<String>,
-        #[arg(long)]
+        #[arg(short = 'j', long)]
         json: bool,
     },
     /// Launch the interactive terminal UI (TUI)
@@ -659,7 +721,7 @@ pub enum ConfluenceCommand {
         /// Human-readable site name when registering a site during login
         #[arg(long)]
         name: Option<String>,
-        #[arg(long)]
+        #[arg(short = 'j', long)]
         json: bool,
     },
     /// Manage connected Atlassian Cloud and Data Center sites
@@ -670,47 +732,47 @@ pub enum ConfluenceCommand {
     /// Remove stored credentials
     #[command(visible_alias = "out")]
     Logout {
-        #[arg(long)]
+        #[arg(short = 'j', long)]
         json: bool,
     },
     /// Show the currently authenticated Atlassian user profile
     Whoami {
-        #[arg(long)]
+        #[arg(short = 'j', long)]
         json: bool,
     },
     /// Diagnose config, SQLite cache, keyring paths, deployment mode, and optional API probe
     Doctor {
         #[arg(long)]
         probe: bool,
-        #[arg(long)]
+        #[arg(short = 'j', long)]
         json: bool,
     },
     /// List Confluence spaces
     Spaces {
-        #[arg(long)]
+        #[arg(short = 'r', long)]
         refresh: bool,
-        #[arg(long, default_value_t = 50)]
+        #[arg(short = 'n', long, default_value_t = 50)]
         limit: usize,
         /// Pagination offset cursor from next_cursor
         #[arg(long)]
         cursor: Option<String>,
-        #[arg(long)]
+        #[arg(short = 'j', long)]
         json: bool,
     },
     /// List root pages in a space or child pages under a parent page
     #[command(visible_alias = "tree")]
     Pages {
         space: Option<String>,
-        #[arg(long)]
+        #[arg(short = 'p', long)]
         parent: Option<String>,
-        #[arg(long, default_value_t = 50)]
+        #[arg(short = 'n', long, default_value_t = 50)]
         limit: usize,
         /// Pagination cursor from next_cursor
         #[arg(long)]
         cursor: Option<String>,
-        #[arg(long)]
+        #[arg(short = 'o', long)]
         offline: bool,
-        #[arg(long)]
+        #[arg(short = 'j', long)]
         json: bool,
     },
     /// Read Confluence page body and metadata
@@ -719,67 +781,77 @@ pub enum ConfluenceCommand {
         page_id: String,
         #[arg(long = "preview-images")]
         preview_images: bool,
-        #[arg(long)]
+        #[arg(short = 'o', long)]
         offline: bool,
-        #[arg(long)]
+        #[arg(short = 'j', long)]
         json: bool,
         /// Accepted for compatibility: compact is the default for --json
         #[arg(long, requires = "json")]
         compact: bool,
         /// Return the full structure: native body, blocks, comments, attachments
-        #[arg(long, requires = "json", conflicts_with = "compact")]
+        #[arg(short = 'f', long, requires = "json", conflicts_with = "compact")]
         full: bool,
     },
     /// Create a new Confluence page
     #[command(visible_alias = "new")]
     Create {
-        #[arg(long)]
+        /// Page title (shorthand for --title)
+        #[arg(
+            value_name = "TITLE",
+            allow_hyphen_values = true,
+            conflicts_with = "title",
+            required_unless_present = "title"
+        )]
+        title_pos: Option<String>,
+        #[arg(short = 's', long)]
         space: Option<String>,
-        #[arg(long)]
+        #[arg(short = 'p', long)]
         parent: Option<String>,
-        #[arg(long, allow_hyphen_values = true)]
-        title: String,
-        #[arg(long, allow_hyphen_values = true)]
+        #[arg(short = 't', long, allow_hyphen_values = true)]
+        title: Option<String>,
+        #[arg(short = 'b', long, allow_hyphen_values = true)]
         body: Option<String>,
         #[arg(long = "body-file")]
         body_file: Option<PathBuf>,
-        #[arg(long)]
+        #[arg(short = 'j', long)]
         json: bool,
         /// Return the full structure: native body, blocks, comments, attachments
-        #[arg(long, requires = "json")]
+        #[arg(short = 'f', long, requires = "json")]
         full: bool,
     },
     /// Edit a Confluence page
+    #[command(visible_alias = "e")]
     Edit {
         page_id: String,
-        #[arg(long, allow_hyphen_values = true)]
+        #[arg(short = 't', long, allow_hyphen_values = true)]
         title: Option<String>,
         #[command(flatten)]
         body: PageBodyArgs,
         /// Current page version from view (required for body edits; optional for title/message-only edits)
         #[arg(long = "prev-version")]
         prev_version: Option<i32>,
-        #[arg(long, allow_hyphen_values = true)]
+        #[arg(short = 'm', long, allow_hyphen_values = true)]
         message: Option<String>,
-        #[arg(long)]
+        #[arg(short = 'j', long)]
         json: bool,
         /// Return the full structure: native body, blocks, comments, attachments
-        #[arg(long, requires = "json")]
+        #[arg(short = 'f', long, requires = "json")]
         full: bool,
     },
     /// Add a Markdown comment to a Confluence page
+    #[command(visible_alias = "c")]
     Comment {
         page_id: String,
         #[arg(allow_hyphen_values = true)]
         body: String,
-        #[arg(long)]
+        #[arg(short = 'j', long)]
         json: bool,
     },
     /// Upload a local file attachment to a Confluence page
     Attach {
         page_id: String,
         file: PathBuf,
-        #[arg(long)]
+        #[arg(short = 'j', long)]
         json: bool,
     },
     /// Download attachments from a Confluence page
@@ -790,29 +862,30 @@ pub enum ConfluenceCommand {
         attachment_id: Option<String>,
         #[arg(long)]
         dir: Option<PathBuf>,
-        #[arg(long)]
+        #[arg(short = 'j', long)]
         json: bool,
     },
     /// Delete a Confluence page
     Delete {
         page_id: String,
-        #[arg(long)]
+        #[arg(short = 'y', long)]
         yes: bool,
-        #[arg(long)]
+        #[arg(short = 'j', long)]
         json: bool,
     },
     /// Search Confluence pages in local SQLite cache or via remote CQL (for custom raw CQL, pass `--cql`, e.g. `confluence search 'customMeta = "foo"' --cql`)
+    #[command(visible_alias = "q")]
     Search {
         #[arg(allow_hyphen_values = true)]
         query: String,
         /// Treat `query` as a raw CQL expression verbatim (e.g. `--cql 'customMeta = "alpha or beta"'`)
         #[arg(long)]
         cql: bool,
-        #[arg(long)]
+        #[arg(short = 'r', long)]
         remote: bool,
-        #[arg(long, default_value_t = 30)]
+        #[arg(short = 'n', long, default_value_t = 30)]
         limit: usize,
-        #[arg(long)]
+        #[arg(short = 'j', long)]
         json: bool,
     },
     /// Open a Confluence page web URL in the default browser
@@ -843,13 +916,32 @@ pub enum ConfluenceCommand {
     },
     /// Sync Jira and Confluence workspace metadata into the local SQLite cache
     Sync {
-        #[arg(long)]
+        #[arg(short = 'j', long)]
         json: bool,
     },
     /// Manage the background sync daemon
     Daemon {
         #[command(subcommand)]
         action: DaemonCommand,
+    },
+    /// Manage opt-in short shell aliases (`j` -> atlassian, `cf` -> conf)
+    Alias {
+        #[command(subcommand)]
+        action: AliasCommand,
+    },
+    /// Print shell initialization snippet defining short aliases (`j` -> atlassian, `cf` -> conf)
+    Init {
+        #[arg(value_enum)]
+        shell: ShellKind,
+        /// Alias name for `atlassian` (Jira TUI & CLI)
+        #[arg(long, default_value = DEFAULT_JIRA_ALIAS)]
+        jira: String,
+        /// Alias name for `conf` (Confluence TUI & CLI)
+        #[arg(long, default_value = DEFAULT_CONF_ALIAS)]
+        conf: String,
+        /// Define aliases even if another command with the same name exists on PATH
+        #[arg(long)]
+        force: bool,
     },
     /// Check GitHub Releases for updates or self-update the binary
     Update {
@@ -859,7 +951,7 @@ pub enum ConfluenceCommand {
         force: bool,
         #[arg(long)]
         repo: Option<String>,
-        #[arg(long)]
+        #[arg(short = 'j', long)]
         json: bool,
     },
     /// Launch the interactive terminal UI (TUI)
@@ -889,30 +981,30 @@ pub enum ConfluenceCommand {
 pub enum WikiCommand {
     /// List Confluence spaces
     Spaces {
-        #[arg(long)]
+        #[arg(short = 'r', long)]
         refresh: bool,
-        #[arg(long, default_value_t = 50)]
+        #[arg(short = 'n', long, default_value_t = 50)]
         limit: usize,
         /// Pagination offset cursor from next_cursor
         #[arg(long)]
         cursor: Option<String>,
-        #[arg(long)]
+        #[arg(short = 'j', long)]
         json: bool,
     },
     /// List root pages in a space or child pages under a parent page
     #[command(visible_alias = "tree")]
     Pages {
         space: Option<String>,
-        #[arg(long)]
+        #[arg(short = 'p', long)]
         parent: Option<String>,
-        #[arg(long, default_value_t = 50)]
+        #[arg(short = 'n', long, default_value_t = 50)]
         limit: usize,
         /// Pagination cursor from next_cursor
         #[arg(long)]
         cursor: Option<String>,
-        #[arg(long)]
+        #[arg(short = 'o', long)]
         offline: bool,
-        #[arg(long)]
+        #[arg(short = 'j', long)]
         json: bool,
     },
     /// Read a Confluence page
@@ -921,67 +1013,77 @@ pub enum WikiCommand {
         page_id: String,
         #[arg(long = "preview-images")]
         preview_images: bool,
-        #[arg(long)]
+        #[arg(short = 'o', long)]
         offline: bool,
-        #[arg(long)]
+        #[arg(short = 'j', long)]
         json: bool,
         /// Accepted for compatibility: compact is the default for --json
         #[arg(long, requires = "json")]
         compact: bool,
         /// Return the full structure: native body, blocks, comments, attachments
-        #[arg(long, requires = "json", conflicts_with = "compact")]
+        #[arg(short = 'f', long, requires = "json", conflicts_with = "compact")]
         full: bool,
     },
     /// Create a new Confluence page
     #[command(visible_alias = "new")]
     Create {
-        #[arg(long)]
+        /// Page title (shorthand for --title)
+        #[arg(
+            value_name = "TITLE",
+            allow_hyphen_values = true,
+            conflicts_with = "title",
+            required_unless_present = "title"
+        )]
+        title_pos: Option<String>,
+        #[arg(short = 's', long)]
         space: Option<String>,
-        #[arg(long)]
+        #[arg(short = 'p', long)]
         parent: Option<String>,
-        #[arg(long, allow_hyphen_values = true)]
-        title: String,
-        #[arg(long, allow_hyphen_values = true)]
+        #[arg(short = 't', long, allow_hyphen_values = true)]
+        title: Option<String>,
+        #[arg(short = 'b', long, allow_hyphen_values = true)]
         body: Option<String>,
         #[arg(long = "body-file")]
         body_file: Option<PathBuf>,
-        #[arg(long)]
+        #[arg(short = 'j', long)]
         json: bool,
         /// Return the full structure: native body, blocks, comments, attachments
-        #[arg(long, requires = "json")]
+        #[arg(short = 'f', long, requires = "json")]
         full: bool,
     },
     /// Edit a Confluence page
+    #[command(visible_alias = "e")]
     Edit {
         page_id: String,
-        #[arg(long, allow_hyphen_values = true)]
+        #[arg(short = 't', long, allow_hyphen_values = true)]
         title: Option<String>,
         #[command(flatten)]
         body: PageBodyArgs,
         /// Current page version from view (required for body edits; optional for title/message-only edits)
         #[arg(long = "prev-version")]
         prev_version: Option<i32>,
-        #[arg(long, allow_hyphen_values = true)]
+        #[arg(short = 'm', long, allow_hyphen_values = true)]
         message: Option<String>,
-        #[arg(long)]
+        #[arg(short = 'j', long)]
         json: bool,
         /// Return the full structure: native body, blocks, comments, attachments
-        #[arg(long, requires = "json")]
+        #[arg(short = 'f', long, requires = "json")]
         full: bool,
     },
     /// Add a comment to a Confluence page
+    #[command(visible_alias = "c")]
     Comment {
         page_id: String,
         #[arg(allow_hyphen_values = true)]
         body: String,
-        #[arg(long)]
+        #[arg(short = 'j', long)]
         json: bool,
     },
     /// Attach a file to a Confluence page
     Attach {
         page_id: String,
         file: PathBuf,
-        #[arg(long)]
+        #[arg(short = 'j', long)]
         json: bool,
     },
     /// Download attachments from a Confluence page
@@ -992,29 +1094,30 @@ pub enum WikiCommand {
         attachment_id: Option<String>,
         #[arg(long)]
         dir: Option<PathBuf>,
-        #[arg(long)]
+        #[arg(short = 'j', long)]
         json: bool,
     },
     /// Delete a Confluence page
     Delete {
         page_id: String,
-        #[arg(long)]
+        #[arg(short = 'y', long)]
         yes: bool,
-        #[arg(long)]
+        #[arg(short = 'j', long)]
         json: bool,
     },
     /// Search Confluence pages (for custom raw CQL, pass `--cql`, e.g. `atlassian wiki search 'customMeta = "foo"' --cql`)
+    #[command(visible_alias = "q")]
     Search {
         #[arg(allow_hyphen_values = true)]
         query: String,
         /// Treat `query` as a raw CQL expression verbatim
         #[arg(long)]
         cql: bool,
-        #[arg(long)]
+        #[arg(short = 'r', long)]
         remote: bool,
-        #[arg(long, default_value_t = 30)]
+        #[arg(short = 'n', long, default_value_t = 30)]
         limit: usize,
-        #[arg(long)]
+        #[arg(short = 'j', long)]
         json: bool,
     },
     /// Open a Confluence page web URL
@@ -1027,42 +1130,42 @@ pub enum WikiCommand {
 pub enum JiraSubcommand {
     /// List Jira projects
     Projects {
-        #[arg(long)]
+        #[arg(short = 'r', long)]
         refresh: bool,
         /// Maximum number of projects to return (default: 50 for --json, all for text)
-        #[arg(long)]
+        #[arg(short = 'n', long)]
         limit: Option<usize>,
         /// Pagination offset cursor from next_cursor
         #[arg(long)]
         cursor: Option<String>,
-        #[arg(long)]
+        #[arg(short = 'j', long)]
         json: bool,
     },
     /// List Jira Agile boards
     Boards {
-        #[arg(long)]
+        #[arg(short = 'p', long)]
         project: Option<String>,
-        #[arg(long)]
+        #[arg(short = 'r', long)]
         refresh: bool,
         /// Maximum number of boards to return (default: 50 for --json, all for text)
-        #[arg(long)]
+        #[arg(short = 'n', long)]
         limit: Option<usize>,
         /// Pagination offset cursor from next_cursor
         #[arg(long)]
         cursor: Option<String>,
-        #[arg(long)]
+        #[arg(short = 'j', long)]
         json: bool,
     },
     /// List active and future sprints for a board
     Sprints {
         board_id: i64,
         /// Maximum number of sprints to return (up to 50 per live call)
-        #[arg(long, default_value_t = 50)]
+        #[arg(short = 'n', long, default_value_t = 50)]
         limit: usize,
         /// Pagination offset cursor from next_cursor
         #[arg(long)]
         cursor: Option<String>,
-        #[arg(long)]
+        #[arg(short = 'j', long)]
         json: bool,
     },
     /// Render a Kanban board by columns
@@ -1070,21 +1173,21 @@ pub enum JiraSubcommand {
         board_id: Option<i64>,
         #[arg(long)]
         sprint: Option<i64>,
-        #[arg(long)]
+        #[arg(short = 'j', long)]
         json: bool,
     },
     /// List Jira issues
     #[command(visible_alias = "ls")]
     Issues {
-        #[arg(long)]
+        #[arg(short = 'p', long)]
         project: Option<String>,
         #[arg(long)]
         jql: Option<String>,
-        #[arg(long)]
+        #[arg(short = 'm', long)]
         mine: bool,
-        #[arg(long)]
+        #[arg(short = 's', long)]
         status: Option<String>,
-        #[arg(long, default_value_t = 50)]
+        #[arg(short = 'n', long, default_value_t = 50)]
         limit: usize,
         /// Cloud pagination token from next_page_token
         #[arg(long = "page-token", conflicts_with_all = ["start_at", "offline"])]
@@ -1092,9 +1195,9 @@ pub enum JiraSubcommand {
         /// Data Center 0-based pagination offset from next_start_at
         #[arg(long = "start-at", conflicts_with = "offline")]
         start_at: Option<usize>,
-        #[arg(long)]
+        #[arg(short = 'o', long)]
         offline: bool,
-        #[arg(long)]
+        #[arg(short = 'j', long)]
         json: bool,
     },
     /// View Jira issue details
@@ -1103,105 +1206,119 @@ pub enum JiraSubcommand {
         key: String,
         #[arg(long = "preview-images")]
         preview_images: bool,
-        #[arg(long)]
+        #[arg(short = 'o', long)]
         offline: bool,
-        #[arg(long)]
+        #[arg(short = 'j', long)]
         json: bool,
         /// Accepted for compatibility: compact is the default for --json
         #[arg(long, requires = "json")]
         compact: bool,
         /// Return the full structure: native body, blocks, comments, attachments
-        #[arg(long, requires = "json", conflicts_with = "compact")]
+        #[arg(short = 'f', long, requires = "json", conflicts_with = "compact")]
         full: bool,
     },
     /// Create a new Jira issue
     #[command(visible_alias = "new")]
     Create {
+        /// Issue summary (shorthand for --summary)
+        #[arg(
+            value_name = "SUMMARY",
+            allow_hyphen_values = true,
+            conflicts_with = "summary",
+            required_unless_present = "summary"
+        )]
+        summary_pos: Option<String>,
         /// Project key (default: config default_project)
-        #[arg(long)]
+        #[arg(short = 'p', long)]
         project: Option<String>,
-        #[arg(long = "type", default_value = "Task")]
+        #[arg(short = 't', long = "type", default_value = "Task")]
         issue_type: String,
-        #[arg(long, allow_hyphen_values = true)]
-        summary: String,
-        #[arg(long, allow_hyphen_values = true)]
+        #[arg(short = 's', long, allow_hyphen_values = true)]
+        summary: Option<String>,
+        #[arg(short = 'b', long, allow_hyphen_values = true)]
         body: Option<String>,
         #[arg(long = "body-file")]
         body_file: Option<PathBuf>,
-        #[arg(long)]
+        #[arg(short = 'P', long)]
         priority: Option<String>,
         /// Account ID, "me", or a display name / email (resolved when the ID is rejected)
-        #[arg(long)]
+        #[arg(short = 'a', long)]
         assignee: Option<String>,
         /// Label to set (repeat for several)
-        #[arg(long = "label")]
+        #[arg(short = 'l', long = "label")]
         label: Vec<String>,
         /// Parent issue key
         #[arg(long)]
         parent: Option<String>,
-        #[arg(long)]
+        #[arg(short = 'j', long)]
         json: bool,
         /// Return the full structure: native body, blocks, comments, attachments
-        #[arg(long, requires = "json")]
+        #[arg(short = 'f', long, requires = "json")]
         full: bool,
     },
     /// Edit a Jira issue
+    #[command(visible_alias = "e")]
     Edit {
         key: String,
-        #[arg(long, allow_hyphen_values = true)]
+        #[arg(short = 's', long, allow_hyphen_values = true)]
         summary: Option<String>,
         #[command(flatten)]
         body: EditBodyArgs,
-        #[arg(long)]
+        #[arg(short = 'P', long)]
         priority: Option<String>,
         /// Account ID, "me", "none" (unassign), or a display name / email (resolved when the ID is rejected)
-        #[arg(long)]
+        #[arg(short = 'a', long)]
         assignee: Option<String>,
         /// Replace all labels with the given set (repeat for several)
-        #[arg(long = "label")]
+        #[arg(short = 'l', long = "label")]
         label: Option<Vec<String>>,
-        #[arg(long)]
+        #[arg(short = 'j', long)]
         json: bool,
         /// Return the full structure: native body, blocks, comments, attachments
-        #[arg(long, requires = "json")]
+        #[arg(short = 'f', long, requires = "json")]
         full: bool,
     },
     /// Transition a Jira issue status
-    #[command(visible_alias = "move")]
+    #[command(visible_aliases = ["move", "mv"])]
     Transition {
         key: String,
         status: Option<String>,
-        #[arg(long, allow_hyphen_values = true)]
+        #[arg(short = 'c', long, allow_hyphen_values = true)]
         comment: Option<String>,
-        #[arg(long)]
+        #[arg(short = 'l', long)]
         list: bool,
-        #[arg(long)]
+        #[arg(short = 'j', long)]
         json: bool,
     },
     /// Assign or unassign a Jira issue
+    #[command(visible_alias = "as")]
     Assign {
         key: String,
+        /// Account ID, "me", or a display name / email (shorthand for --to)
+        #[arg(value_name = "ASSIGNEE", conflicts_with_all = ["to", "unassign"])]
+        assignee_pos: Option<String>,
         /// Account ID, "me", or a display name / email (resolved when the ID is rejected)
-        #[arg(long)]
+        #[arg(short = 't', long)]
         to: Option<String>,
-        #[arg(long)]
+        #[arg(short = 'u', long)]
         unassign: bool,
-        #[arg(long)]
+        #[arg(short = 'j', long)]
         json: bool,
     },
     /// Add a comment to a Jira issue
+    #[command(visible_alias = "c")]
     Comment {
         key: String,
         #[arg(allow_hyphen_values = true)]
         body: String,
-        #[arg(long)]
+        #[arg(short = 'j', long)]
         json: bool,
     },
     /// Attach a file to a Jira issue
     Attach {
         key: String,
         file: PathBuf,
-        #[arg(long)]
+        #[arg(short = 'j', long)]
         json: bool,
     },
     /// Download attachments from a Jira issue
@@ -1212,27 +1329,28 @@ pub enum JiraSubcommand {
         attachment_id: Option<String>,
         #[arg(long)]
         dir: Option<PathBuf>,
-        #[arg(long)]
+        #[arg(short = 'j', long)]
         json: bool,
     },
     /// Delete a Jira issue
     Delete {
         key: String,
-        #[arg(long)]
+        #[arg(short = 'y', long)]
         yes: bool,
-        #[arg(long)]
+        #[arg(short = 'j', long)]
         json: bool,
     },
     /// Search Jira issues (for custom raw JQL, pass `--jql`, e.g. `confluence jira search 'customField = "foo"' --jql`)
+    #[command(visible_alias = "q")]
     Search {
         #[arg(allow_hyphen_values = true)]
         query: String,
         /// Treat `query` as a raw JQL expression verbatim
         #[arg(long)]
         jql: bool,
-        #[arg(long)]
+        #[arg(short = 'r', long)]
         remote: bool,
-        #[arg(long, default_value_t = 30)]
+        #[arg(short = 'n', long, default_value_t = 30)]
         limit: usize,
         /// Cloud pagination token from next_page_token (requires --remote or --jql)
         #[arg(long = "page-token", conflicts_with = "start_at")]
@@ -1240,7 +1358,7 @@ pub enum JiraSubcommand {
         /// Data Center 0-based pagination offset from next_start_at (requires --remote or --jql)
         #[arg(long = "start-at")]
         start_at: Option<usize>,
-        #[arg(long)]
+        #[arg(short = 'j', long)]
         json: bool,
     },
     /// Open a Jira issue web URL
@@ -1255,7 +1373,7 @@ pub enum JiraWorkflow {
     Parent {
         key: String,
         parent_key: String,
-        #[arg(long)]
+        #[arg(short = 'j', long)]
         json: bool,
     },
     /// Update explicit custom field IDs with native JSON values
@@ -1271,16 +1389,16 @@ pub enum JiraWorkflow {
         /// Read the JSON object from a UTF-8 file
         #[arg(long)]
         fields_file: Option<PathBuf>,
-        #[arg(long)]
+        #[arg(short = 'j', long)]
         json: bool,
     },
     /// Create a Jira link using its named type and explicit link ends
     Link {
         inward_key: String,
         outward_key: String,
-        #[arg(long = "type")]
+        #[arg(short = 't', long = "type")]
         link_type: String,
-        #[arg(long)]
+        #[arg(short = 'j', long)]
         json: bool,
     },
     /// Move 1 to 50 existing issues to an open or active sprint
@@ -1288,7 +1406,7 @@ pub enum JiraWorkflow {
         sprint_id: i64,
         #[arg(required = true, num_args = 1..=50)]
         keys: Vec<String>,
-        #[arg(long)]
+        #[arg(short = 'j', long)]
         json: bool,
     },
     /// Record positive seconds while keeping the remaining estimate
@@ -1300,9 +1418,9 @@ pub enum JiraWorkflow {
         #[arg(long)]
         started: Option<String>,
         /// Markdown worklog comment
-        #[arg(long, allow_hyphen_values = true)]
+        #[arg(short = 'c', long, allow_hyphen_values = true)]
         comment: Option<String>,
-        #[arg(long)]
+        #[arg(short = 'j', long)]
         json: bool,
     },
 }
@@ -1316,7 +1434,7 @@ pub enum ConfluenceWorkflow {
         /// Current page version required on Data Center
         #[arg(long)]
         prev_version: Option<i32>,
-        #[arg(long)]
+        #[arg(short = 'j', long)]
         json: bool,
     },
     /// Add global labels or remove one label by name
@@ -1326,7 +1444,7 @@ pub enum ConfluenceWorkflow {
         add: Vec<String>,
         #[arg(long)]
         remove: Option<String>,
-        #[arg(long)]
+        #[arg(short = 'j', long)]
         json: bool,
     },
 }
@@ -1408,7 +1526,118 @@ fn classify_known_flag_or_terminator(
     if text.starts_with('-') && text.len() == 2 {
         return find_matching_option(active, root, text).map(|_| KnownFlagToken::Other);
     }
+    if let Some(cluster) = text.strip_prefix('-') {
+        if cluster.len() >= 2
+            && !cluster.starts_with('-')
+            && cluster.bytes().all(|b| b.is_ascii_alphabetic())
+        {
+            let mut single = [b'-', 0];
+            let all_known = cluster.bytes().all(|b| {
+                single[1] = b;
+                let flag = std::str::from_utf8(&single).unwrap_or("");
+                find_matching_option(active, root, flag).is_some()
+            });
+            if all_known {
+                return Some(KnownFlagToken::Other);
+            }
+        }
+    }
     None
+}
+
+fn is_jira_issue_key(token: &str) -> bool {
+    let Some((project, number)) = token.split_once('-') else {
+        return false;
+    };
+    if project.is_empty() || number.is_empty() || number.contains('-') {
+        return false;
+    }
+    let mut chars = project.chars();
+    let Some(first) = chars.next() else {
+        return false;
+    };
+    first.is_ascii_alphabetic()
+        && chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
+        && number.bytes().all(|b| b.is_ascii_digit())
+}
+
+fn is_confluence_page_id(token: &str) -> bool {
+    !token.is_empty() && token.bytes().all(|b| b.is_ascii_digit())
+}
+
+fn has_subcommand_named(cmd: &clap::Command, token: &str) -> bool {
+    cmd.get_subcommands()
+        .any(|sub| sub.get_name() == token || sub.get_all_aliases().any(|a| a == token))
+}
+
+/// Expands shorthand target lookups into explicit `view` invocations:
+/// - `atlassian ENG-42 [-j]` -> `atlassian view ENG-42 [-j]`
+/// - `conf 40211 [-j]` -> `conf view 40211 [-j]`
+/// - `atlassian wiki 40211 [-j]` -> `atlassian wiki view 40211 [-j]`
+/// - `conf jira ENG-42 [-j]` -> `conf jira view ENG-42 [-j]`
+fn expand_smart_view_shortcut(cmd: &clap::Command, name: &str, argv: &mut Vec<OsString>) {
+    let is_confluence_root = matches!(name, "confluence" | "conf");
+    let mut i = 1usize;
+    while i < argv.len() {
+        let Some(text) = argv[i].to_str() else {
+            return;
+        };
+        if text == "--" || text == "-h" || text == "--help" || text == "-V" || text == "--version" {
+            return;
+        }
+        if text == "--site" {
+            i += 2;
+            continue;
+        }
+        if text.starts_with("--site=") {
+            i += 1;
+            continue;
+        }
+        if text.starts_with('-') {
+            return;
+        }
+
+        // Handle cross-mounted namespace shortcuts: `atlassian wiki 40211` / `conf jira ENG-42`
+        if !is_confluence_root && matches!(text, "wiki" | "conf") {
+            if let Some(next_tok) = argv.get(i + 1).and_then(|s| s.to_str()) {
+                if let Some(wiki_sub) = cmd.find_subcommand("wiki") {
+                    if !next_tok.starts_with('-')
+                        && !has_subcommand_named(wiki_sub, next_tok)
+                        && is_confluence_page_id(next_tok)
+                    {
+                        argv.insert(i + 1, OsString::from("view"));
+                    }
+                }
+            }
+            return;
+        }
+        if is_confluence_root && text == "jira" {
+            if let Some(next_tok) = argv.get(i + 1).and_then(|s| s.to_str()) {
+                if let Some(jira_sub) = cmd.find_subcommand("jira") {
+                    if !next_tok.starts_with('-')
+                        && !has_subcommand_named(jira_sub, next_tok)
+                        && is_jira_issue_key(next_tok)
+                    {
+                        argv.insert(i + 1, OsString::from("view"));
+                    }
+                }
+            }
+            return;
+        }
+
+        if has_subcommand_named(cmd, text) {
+            return;
+        }
+        let matches_target = if is_confluence_root {
+            is_confluence_page_id(text)
+        } else {
+            is_jira_issue_key(text)
+        };
+        if matches_target {
+            argv.insert(i, OsString::from("view"));
+        }
+        return;
+    }
 }
 
 fn disable_hyphen_values_on_arg(
@@ -1549,8 +1778,9 @@ pub(crate) fn try_parse_cli_from<T: Parser>(
     name: &'static str,
     args: impl IntoIterator<Item = impl Into<OsString>>,
 ) -> Result<T, clap::Error> {
-    let argv: Vec<OsString> = args.into_iter().map(Into::into).collect();
+    let mut argv: Vec<OsString> = args.into_iter().map(Into::into).collect();
     let cmd = T::command().name(name).bin_name(name);
+    expand_smart_view_shortcut(&cmd, name, &mut argv);
 
     if has_potential_flag_in_option_value(&argv) {
         if let Some(violation) = find_option_flag_violation(&cmd, &argv) {
@@ -1813,6 +2043,7 @@ async fn dispatch_jira_cli(
             .await
         }
         Some(Command::Create {
+            summary_pos,
             project,
             issue_type,
             summary,
@@ -1826,11 +2057,12 @@ async fn dispatch_jira_cli(
             full,
         }) => {
             let scoped = apply_site_override(cfg, site_override.as_deref())?;
+            let resolved_summary = summary.or(summary_pos).unwrap_or_default();
             Box::pin(cmd_issue_create(
                 &scoped,
                 project.as_deref(),
                 &issue_type,
-                &summary,
+                &resolved_summary,
                 body.as_deref(),
                 body_file.as_deref(),
                 priority.as_deref(),
@@ -1878,12 +2110,21 @@ async fn dispatch_jira_cli(
         }
         Some(Command::Assign {
             key,
+            assignee_pos,
             to,
             unassign,
             json,
         }) => {
             let scoped = apply_site_override(cfg, site_override.as_deref())?;
-            Box::pin(cmd_issue_assign(&scoped, &key, to.as_deref(), unassign, json)).await
+            let resolved_to = to.or(assignee_pos);
+            Box::pin(cmd_issue_assign(
+                &scoped,
+                &key,
+                resolved_to.as_deref(),
+                unassign,
+                json,
+            ))
+            .await
         }
         Some(Command::Comment { key, body, json }) => {
             let scoped = apply_site_override(cfg, site_override.as_deref())?;
@@ -1964,6 +2205,13 @@ async fn dispatch_jira_cli(
             Box::pin(cmd_sync(cfg, site_override.as_deref(), json)).await
         }
         Some(Command::Daemon { action }) => Box::pin(cmd_daemon(cfg, action)).await,
+        Some(Command::Alias { action }) => shell_alias::cmd_alias(action),
+        Some(Command::Init {
+            shell,
+            jira,
+            conf,
+            force,
+        }) => shell_alias::cmd_init(shell, &jira, &conf, force),
         Some(Command::Update {
             check,
             force,
@@ -2111,6 +2359,7 @@ async fn dispatch_confluence_cli(
             .await
         }
         Some(ConfluenceCommand::Create {
+            title_pos,
             space,
             parent,
             title,
@@ -2120,11 +2369,12 @@ async fn dispatch_confluence_cli(
             full,
         }) => {
             let scoped = apply_site_override(cfg, site_override.as_deref())?;
+            let resolved_title = title.or(title_pos).unwrap_or_default();
             Box::pin(cmd_page_create(
                 &scoped,
                 space.as_deref(),
                 parent.as_deref(),
-                &title,
+                &resolved_title,
                 body.as_deref(),
                 body_file.as_deref(),
                 json,
@@ -2231,6 +2481,13 @@ async fn dispatch_confluence_cli(
             Box::pin(cmd_sync(cfg, site_override.as_deref(), json)).await
         }
         Some(ConfluenceCommand::Daemon { action }) => Box::pin(cmd_daemon(cfg, action)).await,
+        Some(ConfluenceCommand::Alias { action }) => shell_alias::cmd_alias(action),
+        Some(ConfluenceCommand::Init {
+            shell,
+            jira,
+            conf,
+            force,
+        }) => shell_alias::cmd_init(shell, &jira, &conf, force),
         Some(ConfluenceCommand::Update {
             check,
             force,
@@ -2314,6 +2571,7 @@ async fn dispatch_wiki_subcommand(cfg: &AppConfig, command: WikiCommand) -> Resu
             .await
         }
         WikiCommand::Create {
+            title_pos,
             space,
             parent,
             title,
@@ -2322,11 +2580,12 @@ async fn dispatch_wiki_subcommand(cfg: &AppConfig, command: WikiCommand) -> Resu
             json,
             full,
         } => {
+            let resolved_title = title.or(title_pos).unwrap_or_default();
             Box::pin(cmd_page_create(
                 cfg,
                 space.as_deref(),
                 parent.as_deref(),
-                &title,
+                &resolved_title,
                 body.as_deref(),
                 body_file.as_deref(),
                 json,
@@ -2475,6 +2734,7 @@ async fn dispatch_jira_subcommand(cfg: &AppConfig, command: JiraSubcommand) -> R
             .await
         }
         JiraSubcommand::Create {
+            summary_pos,
             project,
             issue_type,
             summary,
@@ -2487,11 +2747,12 @@ async fn dispatch_jira_subcommand(cfg: &AppConfig, command: JiraSubcommand) -> R
             json,
             full,
         } => {
+            let resolved_summary = summary.or(summary_pos).unwrap_or_default();
             Box::pin(cmd_issue_create(
                 cfg,
                 project.as_deref(),
                 &issue_type,
-                &summary,
+                &resolved_summary,
                 body.as_deref(),
                 body_file.as_deref(),
                 priority.as_deref(),
@@ -2537,10 +2798,21 @@ async fn dispatch_jira_subcommand(cfg: &AppConfig, command: JiraSubcommand) -> R
         }
         JiraSubcommand::Assign {
             key,
+            assignee_pos,
             to,
             unassign,
             json,
-        } => Box::pin(cmd_issue_assign(cfg, &key, to.as_deref(), unassign, json)).await,
+        } => {
+            let resolved_to = to.or(assignee_pos);
+            Box::pin(cmd_issue_assign(
+                cfg,
+                &key,
+                resolved_to.as_deref(),
+                unassign,
+                json,
+            ))
+            .await
+        }
         JiraSubcommand::Comment { key, body, json } => {
             Box::pin(cmd_issue_comment(cfg, &key, &body, json)).await
         }
@@ -2641,7 +2913,7 @@ fn open_client(cfg: &AppConfig, require_login: bool) -> Result<(AuthManager, Atl
     let auth = AuthManager::new(&cfg.profile);
     if require_login && !auth.is_logged_in() {
         bail!(
-            "로그인이 필요합니다. 먼저 `{} login --url https://<site>.atlassian.net --email <email>` 을 실행하세요.",
+            "Login required. Run `{} login --url https://<site>.atlassian.net --email <email>` first.",
             Persona::detect().command_name()
         );
     }
@@ -2667,10 +2939,10 @@ async fn cmd_tui(cfg: &mut AppConfig, persona: Persona) -> Result<()> {
 
     if !has_any_auth || !has_any_site {
         let bin = persona.command_name();
-        println!("저장된 Atlassian 로그인 정보가 없습니다.");
-        println!("빠른 로그인 예시: {bin} login --oauth  또는  {bin} login --url https://<site>.atlassian.net --email <email>");
+        println!("No saved Atlassian credentials found.");
+        println!("Quick login: {bin} login --oauth  or  {bin} login --url https://<site>.atlassian.net --email <email>");
         if !io::stdin().is_terminal() {
-            bail!("비대화형 터미널입니다. 먼저 `{bin} login --url ... --email ... --token ...` 으로 로그인하세요.");
+            bail!("Non-interactive terminal. Log in first with `{bin} login --url ... --email ... --token ...`.");
         }
         println!();
         cmd_login(
@@ -2758,7 +3030,7 @@ async fn cmd_login(
                     format!(" [{default_url_hint}]")
                 };
                 let entered = prompt_line(&format!(
-                    "Atlassian 사이트 URL{default_hint} (예: https://acme.atlassian.net): "
+                    "Atlassian site URL{default_hint} (e.g. https://acme.atlassian.net): "
                 ))?;
                 if entered.is_empty() && !default_url_hint.trim().is_empty() {
                     default_url_hint.clone()
@@ -2770,7 +3042,7 @@ async fn cmd_login(
     };
     let site_url = config::normalize_base_url(&raw_url);
     if site_url.is_empty() {
-        bail!("사이트 URL이 비어 있습니다. `--url https://<site>.atlassian.net` 를 지정하세요.");
+        bail!("Site URL is empty. Specify `--url https://<site>.atlassian.net`.");
     }
 
     let matched_site: Option<SiteProfile> = if let Some(ref target) = target_site {
@@ -2803,7 +3075,7 @@ async fn cmd_login(
         && params.pat.is_none()
         && params.token.is_none()
     {
-        let entered = prompt_line("Confluence 별도 URL (동일 호스트면 Enter): ")?;
+        let entered = prompt_line("Separate Confluence URL (press Enter for same host): ")?;
         config::normalize_base_url(&entered)
     } else if let Some(ref matched) = matched_site {
         matched.confluence_url.clone()
@@ -2826,10 +3098,10 @@ async fn cmd_login(
     } else if let Some(token) = params.token.filter(|s| !s.trim().is_empty()) {
         let email = match params.email.filter(|s| !s.trim().is_empty()) {
             Some(e) => e.trim().to_string(),
-            None => prompt_line("이메일 (또는 Data Center 사용자명): ")?,
+            None => prompt_line("Email (or Data Center username): ")?,
         };
         if email.trim().is_empty() {
-            bail!("이메일이 비어 있습니다. `--email <email>` 또는 `--pat <PAT>` 를 사용하세요.");
+            bail!("Email is empty. Use `--email <email>` or `--pat <PAT>`.");
         }
         StoredCredentials::ApiToken {
             site_url: site_url.clone(),
@@ -2841,13 +3113,13 @@ async fn cmd_login(
         let email = if let Some(e) = params.email.filter(|s| !s.trim().is_empty()) {
             e.trim().to_string()
         } else {
-            prompt_line("Data Center 사용자명/이메일 (PAT 인증 시 비워두고 Enter): ")?
+            prompt_line("Data Center username/email (leave empty and press Enter for PAT auth): ")?
         };
         if email.trim().is_empty() {
             let pat = rpassword::prompt_password("Personal Access Token (PAT): ")
-                .context("PAT 입력 실패")?;
+                .context("Failed to read PAT")?;
             if pat.trim().is_empty() {
-                bail!("PAT가 비어 있습니다.");
+                bail!("PAT is empty.");
             }
             StoredCredentials::BearerPat {
                 site_url: site_url.clone(),
@@ -2855,10 +3127,10 @@ async fn cmd_login(
                 deployment,
             }
         } else {
-            let token = rpassword::prompt_password("비밀번호 또는 API 토큰: ")
-                .context("토큰 입력 실패")?;
+            let token = rpassword::prompt_password("Password or API token: ")
+                .context("Failed to read token")?;
             if token.trim().is_empty() {
-                bail!("비밀번호/토큰이 비어 있습니다.");
+                bail!("Password/token is empty.");
             }
             StoredCredentials::ApiToken {
                 site_url: site_url.clone(),
@@ -2870,15 +3142,15 @@ async fn cmd_login(
     } else {
         let email = match params.email.filter(|s| !s.trim().is_empty()) {
             Some(e) => e.trim().to_string(),
-            None => prompt_line("Atlassian 계정 이메일: ")?,
+            None => prompt_line("Atlassian account email: ")?,
         };
         if email.trim().is_empty() {
-            bail!("이메일이 비어 있습니다.");
+            bail!("Email is empty.");
         }
-        let token = rpassword::prompt_password("Atlassian API 토큰: ")
-            .context("API 토큰 입력 실패")?;
+        let token = rpassword::prompt_password("Atlassian API token: ")
+            .context("Failed to read API token")?;
         if token.trim().is_empty() {
-            bail!("API 토큰이 비어 있습니다.");
+            bail!("API token is empty.");
         }
         StoredCredentials::ApiToken {
             site_url: site_url.clone(),
@@ -2960,7 +3232,7 @@ async fn cmd_login(
     let me = probe_client
         .get_myself()
         .await
-        .context("자격 증명 검증(`/myself`)에 실패했습니다")?;
+        .context("Failed to verify credentials (`/myself`)")?;
 
     let auth = AuthManager::for_account(&account_id);
     auth.save_credentials(&creds)?;
@@ -3010,13 +3282,13 @@ async fn cmd_login(
         );
     } else {
         println!(
-            "로그인 성공: {} ({}) [id={}]",
+            "Logged in: {} ({}) [id={}]",
             me.display_name,
             me.email.as_deref().unwrap_or("-"),
             me.id
         );
         println!(
-            "환경: {} · Jira={} · Confluence={} · 계정={}",
+            "Deployment: {} · Jira={} · Confluence={} · Account={}",
             effective_deployment, effective_site_url, effective_conf_url, account_id
         );
     }
@@ -3707,7 +3979,7 @@ fn cmd_logout(cfg: &AppConfig, json_out: bool) -> Result<()> {
     if json_out {
         println!("{}", serde_json::to_string_pretty(&json!({ "ok": true }))?);
     } else {
-        println!("로그아웃했습니다. 저장된 자격 증명을 삭제했습니다.");
+        println!("Logged out. Removed stored credentials.");
     }
     Ok(())
 }
@@ -3756,15 +4028,15 @@ async fn cmd_whoami(cfg: &AppConfig, persona: Persona, json_out: bool) -> Result
     } else {
         println!("persona: {}", persona.as_str());
         println!(
-            "사용자: {} ({})",
+            "User: {} ({})",
             me.display_name,
             me.email.as_deref().unwrap_or("-")
         );
         println!("id: {}", me.id);
-        println!("배포: {effective_deployment}");
+        println!("Deployment: {effective_deployment}");
         println!("Jira URL: {effective_site_url}");
         println!("Confluence URL: {effective_conf_url}");
-        println!("인증: {}", auth.status_summary());
+        println!("Auth: {}", auth.status_summary());
     }
     Ok(())
 }
@@ -3831,11 +4103,11 @@ async fn cmd_doctor(
         );
     } else {
         println!("atlassian-cli v{} ({})", env!("CARGO_PKG_VERSION"), persona.as_str());
-        println!("프로필: {} · 배포: {effective_deployment}", cfg.profile);
+        println!("Profile: {} · Deployment: {effective_deployment}", cfg.profile);
         println!(
             "Jira URL: {}",
             if effective_site_url.is_empty() {
-                "(미설정)"
+                "(not set)"
             } else {
                 &effective_site_url
             }
@@ -3843,44 +4115,44 @@ async fn cmd_doctor(
         println!(
             "Confluence URL: {}",
             if effective_conf_url.is_empty() {
-                "(미설정)"
+                "(not set)"
             } else {
                 &effective_conf_url
             }
         );
-        println!("인증 상태: {auth_status}");
+        println!("Auth status: {auth_status}");
         println!(
-            "설정 파일: {} ({})",
+            "Config file: {} ({})",
             cfg_path.display(),
-            if cfg_path.exists() { "존재" } else { "없음" }
+            if cfg_path.exists() { "exists" } else { "missing" }
         );
         println!(
-            "자격 증명 폴백: {} ({})",
+            "Credentials fallback: {} ({})",
             cred_path.display(),
-            if cred_path.exists() { "존재" } else { "없음" }
+            if cred_path.exists() { "exists" } else { "missing" }
         );
         println!(
             "SQLite DB: {} ({})",
             db_path.display(),
-            if db_path.exists() { "존재" } else { "없음" }
+            if db_path.exists() { "exists" } else { "missing" }
         );
-        println!("다운로드 경로: {}", dl_dir.display());
+        println!("Download dir: {}", dl_dir.display());
         if let Some(counts) = cache_counts {
             println!(
-                "캐시: projects={}, boards={}, issues={}, spaces={}, pages={}",
+                "Cache: projects={}, boards={}, issues={}, spaces={}, pages={}",
                 counts.projects, counts.boards, counts.issues, counts.spaces, counts.pages
             );
         }
         if probe {
             if let Some(me) = probe_me {
                 println!(
-                    "라이브 프로브 성공: {} ({}) [id={}]",
+                    "Live probe OK: {} ({}) [id={}]",
                     me.display_name,
                     me.email.as_deref().unwrap_or("-"),
                     me.id
                 );
             } else if let Some(err) = probe_error {
-                println!("라이브 프로브 실패: {err}");
+                println!("Live probe failed: {err}");
             }
         }
     }
@@ -3934,7 +4206,7 @@ async fn cmd_projects(
             }))?
         );
     } else if page.items.is_empty() {
-        println!("프로젝트가 없습니다.");
+        println!("No projects found.");
     } else {
         for p in &page.items {
             println!(
@@ -3946,7 +4218,7 @@ async fn cmd_projects(
             );
         }
         if let Some(next) = page.next_cursor.as_deref() {
-            eprintln!("다음 페이지: --cursor {next}");
+            eprintln!("Next page: --cursor {next}");
         }
     }
     Ok(())
@@ -3996,7 +4268,7 @@ async fn cmd_boards(
             }))?
         );
     } else if page.items.is_empty() {
-        println!("보드가 없습니다.");
+        println!("No boards found.");
     } else {
         for b in &page.items {
             println!(
@@ -4008,7 +4280,7 @@ async fn cmd_boards(
             );
         }
         if let Some(next) = page.next_cursor.as_deref() {
-            eprintln!("다음 페이지: --cursor {next}");
+            eprintln!("Next page: --cursor {next}");
         }
     }
     Ok(())
@@ -4041,7 +4313,7 @@ async fn cmd_sprints(
             }))?
         );
     } else if page.items.is_empty() {
-        println!("보드 #{board_id}에 스프린트가 없습니다.");
+        println!("No sprints found for board #{board_id}.");
     } else {
         for s in &page.items {
             println!(
@@ -4054,7 +4326,7 @@ async fn cmd_sprints(
             );
         }
         if let Some(next) = page.next_cursor.as_deref() {
-            eprintln!("다음 페이지: --cursor {next}");
+            eprintln!("Next page: --cursor {next}");
         }
     }
     Ok(())
@@ -4088,7 +4360,7 @@ async fn cmd_board(
         None => boards
             .into_iter()
             .next()
-            .context("사용 가능한 Jira 보드를 찾지 못했습니다. `board <ID>`를 지정하세요.")?,
+            .context("No available Jira boards found. Specify `board <ID>`.")?,
     };
 
     if board.columns.is_empty() {
@@ -4208,14 +4480,14 @@ async fn cmd_issues(
             println!("{}", serde_json::to_string_pretty(&json!({ "issues": issues }))?);
         }
     } else if issues.is_empty() {
-        println!("이슈가 없습니다.");
+        println!("No issues found.");
     } else {
         for issue in &issues {
             let assignee = issue
                 .assignee
                 .as_ref()
                 .map(|u| u.display_name.as_str())
-                .unwrap_or("미배정");
+                .unwrap_or("Unassigned");
             let prio = issue
                 .priority
                 .as_ref()
@@ -4228,9 +4500,9 @@ async fn cmd_issues(
         }
         if let Some(page) = remote_page {
             if let Some(tok) = page.next_page_token.as_deref() {
-                eprintln!("다음 페이지: --page-token {tok}");
+                eprintln!("Next page: --page-token {tok}");
             } else if let Some(next_start) = page.next_start_at {
-                eprintln!("다음 페이지: --start-at {next_start}");
+                eprintln!("Next page: --start-at {next_start}");
             }
         }
     }
@@ -4250,7 +4522,7 @@ async fn cmd_issue_view(
     let (detail, detail_stale) = if offline {
         let d = storage
             .get_issue_detail_for_site(site_id, key)?
-            .with_context(|| format!("오프라인 캐시에서 이슈 '{key}'를 찾을 수 없습니다."))?;
+            .with_context(|| format!("Issue '{key}' not found in offline cache."))?;
         let stale = storage
             .is_issue_detail_stale_for_site(site_id, key)
             .unwrap_or(false);
@@ -4296,7 +4568,7 @@ async fn cmd_issue_view(
 
     print_issue_detail(&detail);
     if detail_stale {
-        println!("\n[안내] 캐시된 상세 본문은 이전 수정 시각 기준입니다. 온라인에서 다시 조회하세요.");
+        println!("\n[Note] Cached issue details are from an earlier revision. Fetch online to refresh.");
     }
 
     if preview_images && !offline {
@@ -4324,7 +4596,7 @@ async fn cmd_issue_create(
         .or(cfg.default_project.as_deref())
         .map(str::trim)
         .filter(|s| !s.is_empty())
-        .context("프로젝트 키가 필요합니다 (`--project <KEY>` 또는 config `default_project`).")?;
+        .context("Project key is required (`--project <KEY>` or config `default_project`).")?;
     let description_markdown = read_body_arg(body, body_file)?.unwrap_or_default();
 
     let (_auth, client, storage) = open_runtime(cfg, true)?;
@@ -4381,7 +4653,7 @@ async fn cmd_issue_create(
         println!("{}", serde_json::to_string_pretty(&payload)?);
     } else {
         println!(
-            "이슈 생성 완료: {} — {} ({})",
+            "Issue created: {} — {} ({})",
             created.summary.key, created.summary.summary, created.summary.web_url
         );
     }
@@ -4403,7 +4675,7 @@ async fn dispatch_jira_workflow(cfg: &AppConfig, command: JiraWorkflow) -> Resul
             (
                 json!({"ok": true, "site_id": site_id, "key": key, "parent_key": parent}),
                 json,
-                format!("{key}: 상위 이슈 {parent} 지정 완료"),
+                format!("{key}: set parent to {parent}"),
             )
         }
         JiraWorkflow::CustomFields {
@@ -4421,7 +4693,7 @@ async fn dispatch_jira_workflow(cfg: &AppConfig, command: JiraWorkflow) -> Resul
             (
                 json!({"ok": true, "site_id": site_id, "key": key, "custom_fields": updated}),
                 json,
-                format!("{key}: 사용자 정의 필드 {}개 수정 완료", updated.len()),
+                format!("{key}: updated {} custom field(s)", updated.len()),
             )
         }
         JiraWorkflow::Link {
@@ -4439,7 +4711,7 @@ async fn dispatch_jira_workflow(cfg: &AppConfig, command: JiraWorkflow) -> Resul
                 json!({"ok": true, "site_id": site_id, "link": link}),
                 json,
                 format!(
-                    "{inward_key} ↔ {outward_key}: 링크 생성 완료 ({})",
+                    "{inward_key} ↔ {outward_key}: link created ({})",
                     link["id"]
                 ),
             )
@@ -4456,7 +4728,7 @@ async fn dispatch_jira_workflow(cfg: &AppConfig, command: JiraWorkflow) -> Resul
             (
                 json!({"ok": true, "site_id": site_id, "sprint_id": sprint_id, "issue_keys": confirmed}),
                 json,
-                format!("스프린트 {sprint_id}: 이슈 {}개 이동 완료", confirmed.len()),
+                format!("Sprint {sprint_id}: moved {} issue(s)", confirmed.len()),
             )
         }
         JiraWorkflow::LogWork {
@@ -4472,7 +4744,7 @@ async fn dispatch_jira_workflow(cfg: &AppConfig, command: JiraWorkflow) -> Resul
             (
                 json!({"ok": true, "site_id": site_id, "key": key, "worklog": log}),
                 json,
-                format!("{key}: 작업 시간 {seconds}초 기록 완료 ({})", log["id"]),
+                format!("{key}: logged {seconds}s of work ({})", log["id"]),
             )
         }
     };
@@ -4510,7 +4782,7 @@ async fn cmd_issue_edit(
         && assignee.is_none()
         && labels.is_none()
     {
-        bail!("수정할 필드를 하나 이상 지정하세요 (`--summary`, `--body`, `--append`, `--replace` 등).");
+        bail!("Specify at least one field to update (`--summary`, `--body`, `--append`, `--replace`, etc.).");
     }
 
     let (_auth, client) = open_client(cfg, true)?;
@@ -4572,7 +4844,7 @@ async fn cmd_issue_edit(
         println!("{}", serde_json::to_string_pretty(&payload)?);
     } else {
         println!(
-            "이슈 수정 완료: {} — {}",
+            "Issue updated: {} — {}",
             updated.summary.key, updated.summary.summary
         );
     }
@@ -4598,9 +4870,9 @@ async fn cmd_issue_transition(
                 serde_json::to_string_pretty(&json!({ "key": key, "transitions": transitions }))?
             );
         } else if transitions.is_empty() {
-            println!("{key}: 사용 가능한 상태 전환이 없습니다.");
+            println!("{key}: no available transitions.");
         } else {
-            println!("{key} 상태 전환 목록:");
+            println!("{key} available transitions:");
             for t in transitions {
                 println!("  [{}] {} -> {}", t.id, t.name, t.to_status.name);
             }
@@ -4629,7 +4901,7 @@ async fn cmd_issue_transition(
         }
         println!("{}", serde_json::to_string_pretty(&payload)?);
     } else {
-        println!("{key}: '{target}'(으)로 상태 전환했습니다.");
+        println!("{key}: transitioned to '{target}'.");
     }
     Ok(())
 }
@@ -4642,7 +4914,7 @@ async fn cmd_issue_assign(
     json_out: bool,
 ) -> Result<()> {
     if !unassign && to.is_none() {
-        bail!("`--to <USER_OR_ME>` 또는 `--unassign` 을 지정하세요.");
+        bail!("Specify `--to <USER_OR_ME>` or `--unassign`.");
     }
     let (_auth, client, storage) = open_runtime(cfg, true)?;
     let site_id = client.site_id();
@@ -4694,13 +4966,13 @@ async fn cmd_issue_assign(
         println!("{}", serde_json::to_string_pretty(&payload)?);
     } else if let Some(user) = resolved_assignee {
         println!(
-            "{key}: 담당자를 '{}'({})(으)로 지정했습니다.",
+            "{key}: assigned to '{}' ({}).",
             user.display_name, user.id
         );
     } else if let Some(uid) = target_id {
-        println!("{key}: 담당자를 '{uid}'(으)로 지정했습니다.");
+        println!("{key}: assigned to '{uid}'.");
     } else {
-        println!("{key}: 담당자를 해제했습니다.");
+        println!("{key}: unassigned.");
     }
     Ok(())
 }
@@ -4715,7 +4987,7 @@ async fn cmd_issue_comment(cfg: &AppConfig, key: &str, body: &str, json_out: boo
             serde_json::to_string_pretty(&json!({ "ok": true, "comment": comment }))?
         );
     } else {
-        println!("{key}: 댓글을 등록했습니다 (id={}).", comment.id);
+        println!("{key}: comment added (id={}).", comment.id);
     }
     Ok(())
 }
@@ -4730,7 +5002,7 @@ async fn cmd_issue_attach(cfg: &AppConfig, key: &str, file: &Path, json_out: boo
             serde_json::to_string_pretty(&json!({ "ok": true, "key": key, "attachments": uploaded }))?
         );
     } else {
-        println!("{key}: 파일 '{}' 첨부 완료 ({}개).", file.display(), uploaded.len());
+        println!("{key}: attached '{}' ({} file(s)).", file.display(), uploaded.len());
     }
     Ok(())
 }
@@ -4745,7 +5017,7 @@ async fn cmd_issue_download(
     let (_auth, client, _storage) = open_runtime(cfg, true)?;
     let detail = client.get_issue(key).await?;
     let attachment = select_attachment(&detail.attachments, attachment_id)
-        .with_context(|| format!("이슈 {key}에서 다운로드할 첨부파일을 찾지 못했습니다."))?;
+        .with_context(|| format!("No attachment found to download on issue {key}."))?;
     let dest_dir = dir
         .map(Path::to_path_buf)
         .unwrap_or_else(|| cfg.resolved_download_dir());
@@ -4768,7 +5040,7 @@ async fn cmd_issue_download(
         );
     } else {
         println!(
-            "다운로드 완료: {} ({} bytes)",
+            "Downloaded: {} ({} bytes)",
             downloaded.path.display(),
             downloaded.size
         );
@@ -4779,7 +5051,7 @@ async fn cmd_issue_download(
 async fn cmd_issue_delete(cfg: &AppConfig, key: &str, yes: bool, json_out: bool) -> Result<()> {
     let answer = if !yes && !json_out {
         Some(prompt_line(&format!(
-            "정말 Jira 이슈 '{key}'를 삭제하시겠습니까? [y/N]: "
+            "Delete Jira issue '{key}'? [y/N]: "
         ))?)
     } else {
         None
@@ -4797,7 +5069,7 @@ async fn cmd_issue_delete(cfg: &AppConfig, key: &str, yes: bool, json_out: bool)
             serde_json::to_string_pretty(&json!({ "ok": true, "site_id": site_id, "key": key }))?
         );
     } else {
-        println!("Jira 이슈 '{key}'를 삭제했습니다.");
+        println!("Deleted Jira issue '{key}'.");
     }
     Ok(())
 }
@@ -4850,15 +5122,15 @@ async fn cmd_issue_search(
                 }))?
             );
         } else if page.issues.is_empty() {
-            println!("검색 결과가 없습니다.");
+            println!("No results found.");
         } else {
             for i in &page.issues {
                 println!("{:<12} [{:<12}] {}", i.key, i.status.name, i.summary);
             }
             if let Some(tok) = page.next_page_token.as_deref() {
-                eprintln!("다음 페이지: --page-token {tok}");
+                eprintln!("Next page: --page-token {tok}");
             } else if let Some(next_start) = page.next_start_at {
-                eprintln!("다음 페이지: --start-at {next_start}");
+                eprintln!("Next page: --start-at {next_start}");
             }
         }
     } else {
@@ -4882,7 +5154,7 @@ async fn cmd_issue_search(
                 }))?
             );
         } else if hits.is_empty() {
-            println!("로컬 캐시 검색 결과가 없습니다. (`--remote`로 Jira 서버 검색 가능)");
+            println!("No results in local cache. (Use `--remote` to search Jira server)");
         } else {
             for h in &hits {
                 println!(
@@ -4905,10 +5177,10 @@ async fn cmd_issue_open(cfg: &AppConfig, key: &str) -> Result<()> {
     } else if !cfg.site_url.trim().is_empty() {
         format!("{}/browse/{key}", cfg.jira_base_url())
     } else {
-        bail!("웹 URL을 구성할 수 없습니다. 먼저 `atlassian login` 을 실행하세요.");
+        bail!("Cannot build web URL. Run `atlassian login` first.");
     };
-    open::that(&url).with_context(|| format!("브라우저 열기 실패: {url}"))?;
-    println!("브라우저에서 열었습니다: {url}");
+    open::that(&url).with_context(|| format!("Failed to open browser: {url}"))?;
+    println!("Opened in browser: {url}");
     Ok(())
 }
 
@@ -4957,13 +5229,13 @@ async fn cmd_spaces(
             }))?
         );
     } else if page.items.is_empty() {
-        println!("스페이스가 없습니다.");
+        println!("No spaces found.");
     } else {
         for s in &page.items {
             println!("{:<12} {:<32} [{}]", s.key, s.name, s.space_type);
         }
         if let Some(next) = page.next_cursor.as_deref() {
-            eprintln!("다음 페이지: --cursor {next}");
+            eprintln!("Next page: --cursor {next}");
         }
     }
     Ok(())
@@ -5025,7 +5297,7 @@ async fn cmd_pages(
         )?;
         slice_page(rows, offline_offset, limit)
     } else {
-        bail!("스페이스 키 또는 `--parent <PAGE_ID>` 를 지정하세요.");
+        bail!("Specify a space key or `--parent <PAGE_ID>`.");
     };
 
     if json_out {
@@ -5039,7 +5311,7 @@ async fn cmd_pages(
             }))?
         );
     } else if page.items.is_empty() {
-        println!("페이지가 없습니다.");
+        println!("No pages found.");
     } else {
         for p in &page.items {
             let children_mark = if p.has_children == Some(true) {
@@ -5053,7 +5325,7 @@ async fn cmd_pages(
             );
         }
         if let Some(next) = page.next_cursor.as_deref() {
-            eprintln!("다음 페이지: --cursor {next}");
+            eprintln!("Next page: --cursor {next}");
         }
     }
     Ok(())
@@ -5072,7 +5344,7 @@ async fn cmd_page_view(
     let (detail, detail_stale) = if offline {
         let d = storage
             .get_page_detail_for_site(site_id, page_id)?
-            .with_context(|| format!("오프라인 캐시에서 페이지 '{page_id}'를 찾을 수 없습니다."))?;
+            .with_context(|| format!("Page '{page_id}' not found in offline cache."))?;
         let stale = storage
             .is_page_detail_stale_for_site(site_id, page_id)
             .unwrap_or(false);
@@ -5117,7 +5389,7 @@ async fn cmd_page_view(
 
     print_page_detail(&detail);
     if detail_stale {
-        println!("\n[안내] 캐시된 페이지 본문은 이전 버전 기준입니다. 온라인에서 다시 조회하세요.");
+        println!("\n[Note] Cached page body is from an earlier version. Fetch online to refresh.");
     }
 
     if preview_images && !offline {
@@ -5141,7 +5413,7 @@ async fn cmd_page_create(
         .or(cfg.default_space_key.as_deref())
         .map(str::trim)
         .filter(|s| !s.is_empty())
-        .context("스페이스 키 또는 ID가 필요합니다 (`--space <KEY_OR_ID>`).")?;
+        .context("Space key or ID is required (`--space <KEY_OR_ID>`).")?;
     let body_markdown = read_body_arg(body, body_file)?.unwrap_or_default();
 
     let (_auth, client, storage) = open_runtime(cfg, true)?;
@@ -5166,7 +5438,7 @@ async fn cmd_page_create(
         );
     } else {
         println!(
-            "페이지 생성 완료: [{}] {} ({})",
+            "Page created: [{}] {} ({})",
             created.summary.id, created.summary.title, created.summary.web_url
         );
     }
@@ -5189,7 +5461,7 @@ async fn dispatch_confluence_workflow(cfg: &AppConfig, command: ConfluenceWorkfl
             (
                 json!({"ok": true, "site_id": site_id, "page": page}),
                 json,
-                format!("페이지 {page_id}: 상위 페이지 {parent_id}로 이동 완료"),
+                format!("Page {page_id}: moved under parent {parent_id}"),
             )
         }
         ConfluenceWorkflow::Labels {
@@ -5206,7 +5478,7 @@ async fn dispatch_confluence_workflow(cfg: &AppConfig, command: ConfluenceWorkfl
                 json!({"ok": true, "site_id": site_id, "page_id": page_id, "added": added})
             };
             refresh_cli_page_cache(&client, &storage, &page_id).await;
-            (result, json, format!("페이지 {page_id}: 라벨 수정 완료"))
+            (result, json, format!("Page {page_id}: labels updated"))
         }
     };
     if json_out {
@@ -5268,7 +5540,7 @@ async fn cmd_page_edit(
         );
     } else {
         println!(
-            "페이지 수정 완료: [{}] {} (v{})",
+            "Page updated: [{}] {} (v{})",
             updated.summary.id, updated.summary.title, updated.summary.version_number
         );
     }
@@ -5300,7 +5572,7 @@ async fn cmd_page_comment(
             serde_json::to_string_pretty(&json!({ "ok": true, "comment": comment }))?
         );
     } else {
-        println!("페이지 {page_id}: 댓글을 등록했습니다 (id={}).", comment.id);
+        println!("Page {page_id}: comment added (id={}).", comment.id);
     }
     Ok(())
 }
@@ -5321,7 +5593,7 @@ async fn cmd_page_attach(
         );
     } else {
         println!(
-            "페이지 {page_id}: 파일 '{}' 첨부 완료 ({}개).",
+            "Page {page_id}: attached '{}' ({} file(s)).",
             file.display(),
             uploaded.len()
         );
@@ -5339,7 +5611,7 @@ async fn cmd_page_download(
     let (_auth, client, _storage) = open_runtime(cfg, true)?;
     let detail = client.get_page(page_id).await?;
     let attachment = select_attachment(&detail.attachments, attachment_id)
-        .with_context(|| format!("페이지 {page_id}에서 다운로드할 첨부파일을 찾지 못했습니다."))?;
+        .with_context(|| format!("No attachment found to download on page {page_id}."))?;
     let dest_dir = dir
         .map(Path::to_path_buf)
         .unwrap_or_else(|| cfg.resolved_download_dir());
@@ -5362,7 +5634,7 @@ async fn cmd_page_download(
         );
     } else {
         println!(
-            "다운로드 완료: {} ({} bytes)",
+            "Downloaded: {} ({} bytes)",
             downloaded.path.display(),
             downloaded.size
         );
@@ -5373,7 +5645,7 @@ async fn cmd_page_download(
 async fn cmd_page_delete(cfg: &AppConfig, page_id: &str, yes: bool, json_out: bool) -> Result<()> {
     let answer = if !yes && !json_out {
         Some(prompt_line(&format!(
-            "정말 Confluence 페이지 '{page_id}'를 삭제하시겠습니까? [y/N]: "
+            "Delete Confluence page '{page_id}'? [y/N]: "
         ))?)
     } else {
         None
@@ -5391,7 +5663,7 @@ async fn cmd_page_delete(cfg: &AppConfig, page_id: &str, yes: bool, json_out: bo
             serde_json::to_string_pretty(&json!({ "ok": true, "site_id": site_id, "page_id": page_id }))?
         );
     } else {
-        println!("Confluence 페이지 '{page_id}'를 삭제했습니다.");
+        println!("Deleted Confluence page '{page_id}'.");
     }
     Ok(())
 }
@@ -5429,7 +5701,7 @@ async fn cmd_page_search(
                 }))?
             );
         } else if pages.is_empty() {
-            println!("검색 결과가 없습니다.");
+            println!("No results found.");
         } else {
             for p in &pages {
                 println!("{:<12} [{}] {}", p.id, p.space_key, p.title);
@@ -5456,7 +5728,7 @@ async fn cmd_page_search(
                 }))?
             );
         } else if hits.is_empty() {
-            println!("로컬 캐시 검색 결과가 없습니다. (`--remote`로 Confluence 서버 검색 가능)");
+            println!("No results in local cache. (Use `--remote` to search Confluence server)");
         } else {
             for h in &hits {
                 println!(
@@ -5479,12 +5751,12 @@ async fn cmd_page_open(cfg: &AppConfig, page_id: &str) -> Result<()> {
     } else {
         let root = cfg.effective_confluence_root();
         if root.is_empty() {
-            bail!("웹 URL을 구성할 수 없습니다. 먼저 `confluence login` 을 실행하세요.");
+            bail!("Cannot build web URL. Run `confluence login` first.");
         }
         format!("{root}/pages/{page_id}")
     };
-    open::that(&url).with_context(|| format!("브라우저 열기 실패: {url}"))?;
-    println!("브라우저에서 열었습니다: {url}");
+    open::that(&url).with_context(|| format!("Failed to open browser: {url}"))?;
+    println!("Opened in browser: {url}");
     Ok(())
 }
 
@@ -5513,7 +5785,7 @@ async fn cmd_preview(
             .iter()
             .find(|a| img_preview::is_image_attachment(&a.mime_type, &a.filename))
     }
-    .with_context(|| format!("'{target_id_or_key}'에서 이미지 첨부파일을 찾지 못했습니다."))?;
+    .with_context(|| format!("No image attachment found in '{target_id_or_key}'."))?;
 
     let bytes = client.fetch_attachment_bytes(selected).await?;
     let rendered = img_preview::render_for_stdout(
@@ -5528,7 +5800,7 @@ async fn cmd_preview(
 
 fn cmd_preview_file(path: &Path, cols: Option<u16>, rows: Option<u16>) -> Result<()> {
     let bytes = std::fs::read(path)
-        .with_context(|| format!("이미지 파일 읽기 실패: {}", path.display()))?;
+        .with_context(|| format!("Failed to read image file: {}", path.display()))?;
     let rendered = img_preview::render_for_stdout(
         &bytes,
         cols.unwrap_or(80),
@@ -5799,7 +6071,7 @@ fn prompt_line(prompt: &str) -> Result<String> {
     let mut line = String::new();
     let n = io::stdin().read_line(&mut line)?;
     if n == 0 {
-        bail!("표준 입력이 닫혀 있습니다.");
+        bail!("Standard input is closed.");
     }
     Ok(line.trim().to_string())
 }
@@ -5832,18 +6104,18 @@ fn print_issue_detail(detail: &IssueDetail) {
     let s = &detail.summary;
     println!("{} — {}", s.key, s.summary);
     println!(
-        "상태: [{}] ({}) · 유형: {} · 우선순위: {}",
+        "Status: [{}] ({}) · Type: {} · Priority: {}",
         s.status.name,
         s.status.category.badge_label(),
         s.issue_type.name,
         s.priority.as_ref().map(|p| p.name.as_str()).unwrap_or("-")
     );
     println!(
-        "담당자: {} · 보고자: {} · 스프린트: {}",
+        "Assignee: {} · Reporter: {} · Sprint: {}",
         s.assignee
             .as_ref()
             .map(|u| u.display_name.as_str())
-            .unwrap_or("미배정"),
+            .unwrap_or("Unassigned"),
         s.reporter
             .as_ref()
             .map(|u| u.display_name.as_str())
@@ -5851,35 +6123,35 @@ fn print_issue_detail(detail: &IssueDetail) {
         s.sprint_name.as_deref().unwrap_or("-")
     );
     if !s.labels.is_empty() {
-        println!("라벨: {}", s.labels.join(", "));
+        println!("Labels: {}", s.labels.join(", "));
     }
     if !s.web_url.is_empty() {
         println!("URL: {}", s.web_url);
     }
 
     if !detail.description_markdown.trim().is_empty() {
-        println!("\n--- 설명 ---\n{}", detail.description_markdown.trim());
+        println!("\n--- Description ---\n{}", detail.description_markdown.trim());
     }
     if !detail.subtasks.is_empty() {
-        println!("\n--- 서브태스크 ({}) ---", detail.subtasks.len());
+        println!("\n--- Subtasks ({}) ---", detail.subtasks.len());
         for sub in &detail.subtasks {
             println!("  {} [{}] {}", sub.key, sub.status.name, sub.summary);
         }
     }
     if !detail.linked_pages.is_empty() {
-        println!("\n--- 연결된 Confluence 페이지 ({}) ---", detail.linked_pages.len());
+        println!("\n--- Linked Confluence Pages ({}) ---", detail.linked_pages.len());
         for page in &detail.linked_pages {
             println!("  [{}] {} ({})", page.page_id, page.title, page.web_url);
         }
     }
     if !detail.attachments.is_empty() {
-        println!("\n--- 첨부파일 ({}) ---", detail.attachments.len());
+        println!("\n--- Attachments ({}) ---", detail.attachments.len());
         for att in &detail.attachments {
             println!("  [{}] {} ({}, {}B)", att.id, att.filename, att.mime_type, att.size);
         }
     }
     if !detail.comments.is_empty() {
-        println!("\n--- 댓글 ({}) ---", detail.comments.len());
+        println!("\n--- Comments ({}) ---", detail.comments.len());
         for c in &detail.comments {
             println!("  [{}] {}:", c.created_at, c.author.display_name);
             for line in c.body_markdown.lines() {
@@ -5893,35 +6165,35 @@ fn print_page_detail(detail: &PageDetail) {
     let s = &detail.summary;
     println!("[{}] {} (v{})", s.id, s.title, s.version_number);
     println!(
-        "스페이스: {} · 작성자: {} · 수정일: {}",
+        "Space: {} · Author: {} · Updated: {}",
         s.space_key,
         s.author_name.as_deref().unwrap_or("-"),
         s.updated_at
     );
     if !detail.ancestors.is_empty() {
         let trail: Vec<&str> = detail.ancestors.iter().map(|a| a.title.as_str()).collect();
-        println!("경로: {}", trail.join(" > "));
+        println!("Path: {}", trail.join(" > "));
     }
     if !detail.labels.is_empty() {
-        println!("라벨: {}", detail.labels.join(", "));
+        println!("Labels: {}", detail.labels.join(", "));
     }
     if !s.web_url.is_empty() {
         println!("URL: {}", s.web_url);
     }
     if !detail.body_markdown.trim().is_empty() {
-        println!("\n--- 본문 ---\n{}", detail.body_markdown.trim());
+        println!("\n--- Body ---\n{}", detail.body_markdown.trim());
     }
     if !detail.linked_issue_keys.is_empty() {
-        println!("\n--- 연결된 Jira 이슈 ---\n  {}", detail.linked_issue_keys.join(", "));
+        println!("\n--- Linked Jira Issues ---\n  {}", detail.linked_issue_keys.join(", "));
     }
     if !detail.attachments.is_empty() {
-        println!("\n--- 첨부파일 ({}) ---", detail.attachments.len());
+        println!("\n--- Attachments ({}) ---", detail.attachments.len());
         for att in &detail.attachments {
             println!("  [{}] {} ({}, {}B)", att.id, att.filename, att.mime_type, att.size);
         }
     }
     if !detail.comments.is_empty() {
-        println!("\n--- 댓글 ({}) ---", detail.comments.len());
+        println!("\n--- Comments ({}) ---", detail.comments.len());
         for c in &detail.comments {
             println!("  [{}] {}:", c.created_at, c.author_name);
             for line in c.body_markdown.lines() {
@@ -5949,16 +6221,16 @@ async fn render_attachments_preview(
                     rows.unwrap_or(18),
                 ) {
                     Ok(rendered) => {
-                        println!("\n[이미지 미리보기: {}]", att.filename);
+                        println!("\n[Image preview: {}]", att.filename);
                         println!("{rendered}");
                     }
                     Err(err) => {
-                        eprintln!("이미지 렌더링 건너뜀 ({}): {err:#}", att.filename);
+                        eprintln!("Skipped image rendering ({}): {err:#}", att.filename);
                     }
                 }
             }
             Err(err) => {
-                eprintln!("이미지 다운로드 건너뜀 ({}): {err:#}", att.filename);
+                eprintln!("Skipped image download ({}): {err:#}", att.filename);
             }
         }
     }
@@ -6054,7 +6326,7 @@ pub(crate) fn format_kanban_board(
             .iter()
             .enumerate()
             .map(|(i, _)| {
-                let txt = if i == 0 { "(이슈 없음)" } else { "" };
+                let txt = if i == 0 { "(no issues)" } else { "" };
                 format!(" {} ", pad_width(txt, col_width))
             })
             .collect();
@@ -6616,7 +6888,7 @@ mod tests {
         .unwrap();
         match cli.command.unwrap() {
             Command::Create { summary, body, json, .. } => {
-                assert_eq!(summary, bullet);
+                assert_eq!(summary.as_deref(), Some(bullet));
                 assert_eq!(body.as_deref(), Some(multiline));
                 assert!(json);
             }
@@ -6644,7 +6916,7 @@ mod tests {
             Command::Wiki {
                 command: WikiCommand::Create { title, body, json, .. },
             } => {
-                assert_eq!(title, bullet);
+                assert_eq!(title.as_deref(), Some(bullet));
                 assert_eq!(body.as_deref(), Some(multiline));
                 assert!(json);
             }
@@ -6977,5 +7249,215 @@ mod tests {
             conf.command.unwrap(),
             ConfluenceCommand::Mcp { read_only: true }
         ));
+    }
+
+    #[test]
+    fn parses_smart_view_shortcuts_short_flags_and_aliases() {
+        // 1. Smart Jira issue key shortcut (`atlassian ENG-42 -jf`, with global `--site`)
+        let cli: Cli = try_parse_cli_from("atlassian", ["atlassian", "ENG-42", "-jf"]).unwrap();
+        assert!(matches!(
+            cli.command.unwrap(),
+            Command::View {
+                ref key,
+                json: true,
+                full: true,
+                offline: false,
+                ..
+            } if key == "ENG-42"
+        ));
+
+        let cli: Cli = try_parse_cli_from(
+            "atlassian",
+            ["atlassian", "--site", "acme", "PLAT_2-109", "-oj"],
+        )
+        .unwrap();
+        assert_eq!(cli.site.as_deref(), Some("acme"));
+        assert!(matches!(
+            cli.command.unwrap(),
+            Command::View {
+                ref key,
+                offline: true,
+                json: true,
+                ..
+            } if key == "PLAT_2-109"
+        ));
+
+        // 2. Smart Confluence page ID shortcut (`conf 40211 -j`, `atlassian wiki 40211 -j`, `conf jira ENG-42 -j`)
+        let conf: ConfluenceCli = try_parse_cli_from("conf", ["conf", "40211", "-jf"]).unwrap();
+        assert!(matches!(
+            conf.command.unwrap(),
+            ConfluenceCommand::View {
+                ref page_id,
+                json: true,
+                full: true,
+                ..
+            } if page_id == "40211"
+        ));
+
+        let cli: Cli =
+            try_parse_cli_from("atlassian", ["atlassian", "wiki", "40211", "-j"]).unwrap();
+        assert!(matches!(
+            cli.command.unwrap(),
+            Command::Wiki {
+                command: WikiCommand::View {
+                    ref page_id,
+                    json: true,
+                    ..
+                }
+            } if page_id == "40211"
+        ));
+
+        let conf: ConfluenceCli =
+            try_parse_cli_from("conf", ["conf", "jira", "ENG-42", "-j"]).unwrap();
+        assert!(matches!(
+            conf.command.unwrap(),
+            ConfluenceCommand::Jira {
+                command: JiraSubcommand::View {
+                    ref key,
+                    json: true,
+                    ..
+                }
+            } if key == "ENG-42"
+        ));
+
+        // Non-key unknown subcommand still fails cleanly
+        assert!(try_parse_cli_from::<Cli>("atlassian", ["atlassian", "bogus"]).is_err());
+
+        // 3. Combined short flags & subcommand short aliases
+        let cli: Cli =
+            try_parse_cli_from("atlassian", ["atlassian", "ls", "-mj", "-p", "ENG", "-n", "15"])
+                .unwrap();
+        assert!(matches!(
+            cli.command.unwrap(),
+            Command::Issues {
+                mine: true,
+                json: true,
+                limit: 15,
+                ref project,
+                ..
+            } if project.as_deref() == Some("ENG")
+        ));
+
+        let cli: Cli =
+            try_parse_cli_from("atlassian", ["atlassian", "q", "canary", "-rj", "-n", "10"])
+                .unwrap();
+        assert!(matches!(
+            cli.command.unwrap(),
+            Command::Search {
+                ref query,
+                remote: true,
+                json: true,
+                limit: 10,
+                ..
+            } if query == "canary"
+        ));
+
+        let cli: Cli = try_parse_cli_from(
+            "atlassian",
+            ["atlassian", "mv", "ENG-42", "In Review", "-c", "LGTM", "-j"],
+        )
+        .unwrap();
+        assert!(matches!(
+            cli.command.unwrap(),
+            Command::Transition {
+                ref key,
+                ref status,
+                ref comment,
+                json: true,
+                ..
+            } if key == "ENG-42"
+                && status.as_deref() == Some("In Review")
+                && comment.as_deref() == Some("LGTM")
+        ));
+
+        // 4. Positional shortcuts for Create & Assign
+        let cli: Cli = try_parse_cli_from(
+            "atlassian",
+            ["atlassian", "new", "Fix login", "-p", "ENG", "-a", "me", "-j"],
+        )
+        .unwrap();
+        assert!(matches!(
+            cli.command.unwrap(),
+            Command::Create {
+                ref summary_pos,
+                summary: None,
+                ref project,
+                ref assignee,
+                json: true,
+                ..
+            } if summary_pos.as_deref() == Some("Fix login")
+                && project.as_deref() == Some("ENG")
+                && assignee.as_deref() == Some("me")
+        ));
+
+        let conf: ConfluenceCli = try_parse_cli_from(
+            "conf",
+            ["conf", "new", "Release Notes", "-s", "ENG", "-j"],
+        )
+        .unwrap();
+        assert!(matches!(
+            conf.command.unwrap(),
+            ConfluenceCommand::Create {
+                ref title_pos,
+                title: None,
+                ref space,
+                json: true,
+                ..
+            } if title_pos.as_deref() == Some("Release Notes") && space.as_deref() == Some("ENG")
+        ));
+
+        let cli: Cli =
+            try_parse_cli_from("atlassian", ["atlassian", "as", "ENG-42", "me", "-j"]).unwrap();
+        assert!(matches!(
+            cli.command.unwrap(),
+            Command::Assign {
+                ref key,
+                ref assignee_pos,
+                to: None,
+                json: true,
+                ..
+            } if key == "ENG-42" && assignee_pos.as_deref() == Some("me")
+        ));
+
+        // 5. Alias & Init subcommands
+        let cli: Cli = try_parse_cli_from(
+            "atlassian",
+            ["atlassian", "alias", "install", "--shell", "powershell", "--dry-run", "-j"],
+        )
+        .unwrap();
+        assert!(matches!(
+            cli.command.unwrap(),
+            Command::Alias {
+                action: AliasCommand::Install {
+                    shell: Some(ShellKind::Powershell),
+                    dry_run: true,
+                    json: true,
+                    ref jira,
+                    ref conf,
+                    ..
+                }
+            } if jira == "j" && conf == "cf"
+        ));
+
+        let cli: Cli =
+            try_parse_cli_from("atlassian", ["atlassian", "init", "zsh"]).unwrap();
+        assert!(matches!(
+            cli.command.unwrap(),
+            Command::Init {
+                shell: ShellKind::Zsh,
+                ref jira,
+                ref conf,
+                force: false,
+            } if jira == "j" && conf == "cf"
+        ));
+
+        // 6. JSON detection helper covers `--json`, `-j`, and combined short flags
+        let to_os = |v: &[&str]| v.iter().map(OsString::from).collect::<Vec<_>>();
+        assert!(argv_requests_json(&to_os(&["atlassian", "ENG-42", "--json"])));
+        assert!(argv_requests_json(&to_os(&["atlassian", "ENG-42", "-j"])));
+        assert!(argv_requests_json(&to_os(&["atlassian", "q", "bug", "-rj"])));
+        assert!(argv_requests_json(&to_os(&["atlassian", "ls", "-mj"])));
+        assert!(!argv_requests_json(&to_os(&["atlassian", "ENG-42"])));
+        assert!(!argv_requests_json(&to_os(&["atlassian", "comment", "ENG-42", "--", "-j"])));
     }
 }

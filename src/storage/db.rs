@@ -652,22 +652,22 @@ fn seed_builtin_filters(conn: &Connection) -> Result<()> {
     let builtins = [
         (
             "my_open",
-            "내게 할당된 미해결",
+            "Assigned to me (open)",
             "assignee = currentUser() AND statusCategory != Done ORDER BY updated DESC",
         ),
         (
             "reported",
-            "내가 보고한 이슈",
+            "Reported by me",
             "reporter = currentUser() ORDER BY updated DESC",
         ),
         (
             "recent",
-            "최근 업데이트 (7일)",
+            "Recently updated (7d)",
             "updated >= -7d ORDER BY updated DESC",
         ),
         (
             "all_open",
-            "미해결 전체",
+            "All open",
             "statusCategory != Done ORDER BY updated DESC",
         ),
     ];

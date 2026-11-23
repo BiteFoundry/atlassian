@@ -1,4 +1,4 @@
-//! `atlassian_cli` — Unified Atlassian Jira & Confluence native terminal client (`jira` / `confluence` / `conf`).
+//! `atlassian_cli` — Unified Atlassian Jira & Confluence native terminal client (`atlassian` / `confluence` / `conf`).
 
 pub mod adf;
 pub mod atlassian;
@@ -11,6 +11,7 @@ pub mod mcp;
 pub mod models;
 pub mod resolver;
 pub mod serve;
+pub mod shell_alias;
 pub mod storage;
 pub mod sync;
 pub mod tui;

@@ -9,7 +9,7 @@
 [![Rust & Ratatui](https://img.shields.io/badge/built%20with-Rust%20%2B%20Ratatui-DEA584?style=flat-square&logo=rust)](https://github.com/BiteFoundry/atlassian/blob/master/Cargo.toml)
 [![License: MIT](https://img.shields.io/badge/license-MIT-00875A?style=flat-square)](LICENSE)
 
-[BiteFoundry](https://bitefoundry.dev/#app-atlassian) · [Latest release notes](https://github.com/BiteFoundry/atlassian/releases/latest)
+[BiteFoundry](https://bitefoundry.dev/#app-atlassian) · [Watch 35s Launch Film](https://bitefoundry.dev/#app-atlassian) · [Latest release notes](https://github.com/BiteFoundry/atlassian/releases/latest)
 
 <br />
 
@@ -36,23 +36,48 @@
 # 1. Install globally (links `atlassian`, `confluence`, `conf` native binaries)
 npm i -g @bitefoundry/atlassian
 
-# 2. Authenticate — Atlassian Cloud (OAuth 2.0 or API Token) or Data Center (PAT)
+# 2. Authenticate interactively — or pass flags for Cloud API Token, Data Center PAT, or OAuth 2.0
+atlassian login
+
+# Non-interactive examples:
+# Atlassian Cloud API Token:
 atlassian login --url https://acme.atlassian.net --email you@acme.com --token "$ATLASSIAN_API_TOKEN"
-# Or Data Center / Server:
+# Data Center / Server PAT:
 atlassian login --url https://jira.acme.internal --confluence-url https://wiki.acme.internal --deployment datacenter --pat "$ATLASSIAN_PAT"
-# Or Atlassian Cloud OAuth 2.0 (3LO) with multi-site discovery:
+# Atlassian Cloud OAuth 2.0 (3LO) with multi-site discovery:
 atlassian login --oauth --client-id "$ATLASSIAN_OAUTH_CLIENT_ID"
 
 # 3. Launch the TUI (Jira Kanban or Confluence Wiki persona)
-atlassian          # Jira Kanban Board & Issue Explorer
-confluence    # Confluence Space Tree & Wiki Reader (alias: conf)
+atlassian     # Jira Kanban Board & Issue Explorer
+conf          # Confluence Space Tree & Wiki Reader (full alias: confluence)
+
+# Optional: install short shell aliases (`j` -> atlassian, `cf` -> conf)
+atlassian alias install
+# After reloading your shell: `j` opens Jira TUI, `cf` opens Confluence TUI
 ```
 
 ```sh
-atlassian view ENG-42 --json
+atlassian ENG-42 -j          # shorthand for: atlassian view ENG-42 --json
+conf 40211 -j                # shorthand for: conf view 40211 --json
 ```
 
-Read a Jira issue in compact JSON. Use `atlassian wiki view 40211 --json` for a Confluence page. Both report omitted fields and include a hint for retrieving full detail. For full detail, add `--full` in the CLI or pass `compact: false` to `get_jira_issue` in MCP.
+Read a Jira issue or Confluence page in compact JSON (passing a Jira key like `ENG-42` to `atlassian` or a numeric page ID like `40211` to `conf` opens `view` automatically). Both report omitted fields and include a hint for retrieving full detail. For full detail, add `-f` / `--full` in the CLI or pass `compact: false` to `get_jira_issue` in MCP.
+
+> **Short Shell Aliases (`j` & `cf`):** Run `atlassian alias install` to add guarded `j` (Jira) and `cf` (Confluence) functions to your PowerShell, Zsh, Bash, or Fish profile without global PATH collisions—typing `j` launches Jira TUI, `cf` launches Confluence TUI, and `j ENG-42 -j` / `cf 40211 -j` work directly. Customize names with `--jira` / `--conf`, preview with `--dry-run`, or print raw shell code via `atlassian init <powershell|zsh|bash|fish>`.
+
+---
+
+## Built for AI Agents (MCP & `--json` CLI)
+
+Most Jira and Confluence integrations break agents in predictable ways: dumping 25 KB of raw ADF JSON per issue, corrupting Confluence layouts on write, overwriting concurrent edits, or exposing destructive tools with no safety rail. `@bitefoundry/atlassian` is engineered around those exact failure modes:
+
+| Agent Capability | What It Does |
+| :--- | :--- |
+| **Compact by Default (24× smaller reads)** | `get_jira_issue`, `get_confluence_page`, CLI `view --json`, and create/edit writes return compact JSON by default (**1,076 B vs 25,834 B** on a 20-comment issue), with an explicit `omitted` summary and a `hint` to fetch full detail (`--full` / `compact: false`). |
+| **Structure-Preserving Edits + `dry_run`** | Update a single Confluence heading with `replace_section` (including inside Cloud layout columns) or surgical `replace_text`, guard against concurrent edits with `prev_version`, and preview native `before`/`after` diffs via `dry_run: true` / `--dry-run` with zero remote writes. |
+| **Read-Only MCP & Delete Guards** | Start `atlassian mcp --read-only` to expose only the **15 query tools** and reject write, sync, and download calls before execution. Destructive delete tools require literal boolean `confirm: true`. |
+| **Cloud + Data Center Ergonomics** | Works on both Atlassian Cloud and Data Center (PAT), resolves `"me"`, display names, or emails for Jira assignees, lists candidate IDs for ambiguous transitions, auto-escapes plain-text JQL/CQL queries, and emits structured `{ok:false, error:{code, message, http_status?, details?}}` JSON on `--json` runtime failures. |
+| **Shared Human + Agent Local Cache** | TUI, CLI, HTTP, and MCP share one SQLite WAL + FTS5 cache—let an agent triage issues or draft Confluence updates, then review them immediately in the terminal UI (`atlassian` / `conf`). |
 
 ---
 
@@ -144,6 +169,14 @@ Full endpoint catalog and OpenAPI schema: **[docs/API.md](docs/API.md)** · **[d
 
 ### MCP Server (`atlassian mcp`)
 
+Exposes **37 Jira, Agile, Confluence & unified search tools** over newline-delimited stdio JSON-RPC 2.0 — or **15 read-only query tools** with `--read-only`:
+
+```bash
+# Claude Code (full access / read-only mode)
+claude mcp add atlassian -- atlassian mcp
+claude mcp add atlassian-ro -- atlassian mcp --read-only
+```
+
 ```json
 {
   "mcpServers": {
@@ -154,6 +187,8 @@ Full endpoint catalog and OpenAPI schema: **[docs/API.md](docs/API.md)** · **[d
   }
 }
 ```
+
+Pass `["mcp", "--read-only"]` in `args` to restrict the session to the 15 read-only tools and reject write, sync, and download calls before execution.
 
 Both CLI `--json` detail views (`atlassian view`, `atlassian wiki view`, `conf view`) and the two MCP detail tools (`get_jira_issue`, `get_confluence_page`) return compact responses with identifying fields, full Markdown, an `omitted` summary, and a `hint` by default. Pass `--json --full` in the CLI or `compact: false` in MCP for native body data and the full structure. In `omitted`, a `null` count means the collection could not be confirmed in full (failed or truncated subresource).
 
@@ -171,6 +206,7 @@ Full tool catalog and argument schemas: **[docs/MCP.md](docs/MCP.md)** · npm pa
 | [`@bitefoundry/sharepoint`](https://www.npmjs.com/package/@bitefoundry/sharepoint) | `sharepoint`, `bitefoundry-onedrive` | Microsoft SharePoint & OneDrive (Sites, Libraries & Lists) | TUI · CLI · HTTP · MCP |
 | **`@bitefoundry/atlassian`** | `atlassian`, `confluence`, `conf` | Atlassian Jira (Kanban, Sprints, JQL) & Confluence Wiki | TUI · CLI · HTTP · MCP |
 | [`@bitefoundry/notion`](https://www.npmjs.com/package/@bitefoundry/notion) | `notion` | Notion (Editorial Pages, Interactive Blocks & Databases) | TUI · CLI · HTTP · MCP |
+| [`@bitefoundry/obsidian`](https://www.npmjs.com/package/@bitefoundry/obsidian) | `bitefoundry-obsidian` | Obsidian (Local Vaults, Backlinks & Interactive Knowledge Graph) | TUI · CLI · HTTP · MCP |
 
 ---
 

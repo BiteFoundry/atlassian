@@ -349,7 +349,7 @@ Runs `sync::bootstrap_workspace` synchronously and returns the summary plus `Sto
 ```json
 {
   "ok": true,
-  "summary": "동기화 완료",
+  "summary": "Sync complete",
   "counts": {
     "projects": 3,
     "boards": 2,

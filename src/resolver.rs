@@ -956,8 +956,8 @@ pub async fn resolve_user(
     resolve_user_from_slice(&merged, q)
 }
 
-/// 서버가 담당자 값을 거부한 뒤 이름·이메일로 한 번 찾아본다.
-/// `None`이면 호출자는 원래 오류를 그대로 반환한다.
+/// After the server rejects an assignee value, try resolving once by name or email.
+/// If `None`, the caller returns the original error as-is.
 pub(crate) async fn resolve_rejected_assignee(
     client: &AtlassianClient,
     scope_key: &str,
@@ -1006,7 +1006,7 @@ pub(crate) async fn resolve_rejected_assignee(
                 Some(Err(CodedError {
                     code: "ambiguous_user",
                     message: format!(
-                        "'{q}'에 해당하는 사용자가 {}명입니다. accountId로 지정하세요:\n{}",
+                        "Multiple users ({}) match '{q}'. Specify an accountId:\n{}",
                         users.len(),
                         format_user_candidates(&refs),
                     ),
