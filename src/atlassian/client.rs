@@ -10,7 +10,7 @@ use std::{
 
 use anyhow::{anyhow, bail, Context, Result};
 use reqwest::{
-    header::{ACCEPT, AUTHORIZATION, LOCATION, RETRY_AFTER},
+    header::{HeaderMap, ACCEPT, AUTHORIZATION, CONTENT_LENGTH, CONTENT_TYPE, LOCATION, RETRY_AFTER},
     multipart::{Form, Part},
     Method, StatusCode,
 };
@@ -105,6 +105,202 @@ pub(crate) fn http_status_code(err: &anyhow::Error) -> Option<StatusCode> {
 
 pub(crate) fn is_not_found_error(err: &anyhow::Error) -> bool {
     http_status_code(err) == Some(StatusCode::NOT_FOUND)
+}
+
+/// Evidence that a 2xx response was served to an anonymous session although the request
+/// carried a credential (Data Center answers 200 instead of 401 when anonymous access is
+/// enabled or an SSO filter intercepts the request).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum AnonymousSignal {
+    /// "X-AUSERNAME: anonymous".
+    HeaderAnonymous,
+    /// "X-Seraph-LoginReason" reporting a failed or denied login (value kept).
+    SeraphLoginFailed(String),
+    /// An HTML page (SSO / login form) answered a JSON REST request.
+    HtmlLoginPage,
+    /// The identity endpoint returned an anonymous or empty user.
+    AnonymousPayload,
+}
+
+impl AnonymousSignal {
+    fn evidence(&self) -> String {
+        match self {
+            Self::HeaderAnonymous => "X-AUSERNAME: anonymous".to_string(),
+            Self::SeraphLoginFailed(value) => format!("X-Seraph-LoginReason: {value}"),
+            Self::HtmlLoginPage => "an HTML login page instead of JSON".to_string(),
+            Self::AnonymousPayload => "anonymous user in the identity response".to_string(),
+        }
+    }
+}
+
+/// Marker stored in [HttpStatusError::body] for a 200-but-anonymous response.
+const ANONYMOUS_BODY_MARKER: &str = "\"anonymous_signal\"";
+
+/// Detects a 200-but-anonymous response from its headers (names are case-insensitive).
+/// Pass "content_type" only for JSON REST requests: an HTML answer to those is a login page.
+pub(crate) fn detect_anonymous_response(
+    headers: &HeaderMap,
+    content_type: Option<&str>,
+) -> Option<AnonymousSignal> {
+    let values = |name: &str| -> Vec<String> {
+        headers
+            .get_all(name)
+            .iter()
+            .filter_map(|v| v.to_str().ok())
+            .map(|v| v.trim().to_string())
+            .collect()
+    };
+    if values("x-ausername")
+        .iter()
+        .any(|v| v.eq_ignore_ascii_case("anonymous"))
+    {
+        return Some(AnonymousSignal::HeaderAnonymous);
+    }
+    for value in values("x-seraph-loginreason") {
+        let upper = value.to_ascii_uppercase();
+        // "OK" is success and "OUT" (logged out before this request) is not a verdict.
+        if ["AUTHENTICATED_FAILED", "AUTHENTICATION_DENIED", "AUTHORISATION_FAILED"]
+            .iter()
+            .any(|reason| upper.contains(reason))
+        {
+            return Some(AnonymousSignal::SeraphLoginFailed(value));
+        }
+    }
+    if content_type
+        .map(|ct| ct.trim().to_ascii_lowercase())
+        .is_some_and(|ct| ct.starts_with("text/html"))
+    {
+        return Some(AnonymousSignal::HtmlLoginPage);
+    }
+    None
+}
+
+/// True when the error reports a 200-but-anonymous response (see [AnonymousSignal]).
+pub(crate) fn is_anonymous_error(err: &anyhow::Error) -> bool {
+    err.downcast_ref::<HttpStatusError>()
+        .is_some_and(|e| e.status == StatusCode::UNAUTHORIZED && e.body.contains(ANONYMOUS_BODY_MARKER))
+}
+
+fn is_json_rest_path(url: &str) -> bool {
+    let path = Url::parse(url)
+        .map(|u| u.path().to_string())
+        .unwrap_or_else(|_| url.to_string());
+    path.contains("/rest/") || path.contains("/api/")
+}
+
+/// Why one product's identity probe failed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProbeFailure {
+    /// HTTP status when the server answered (a 200-but-anonymous answer is reported as 401).
+    pub status: Option<u16>,
+    /// The server answered, but as an anonymous user.
+    pub anonymous: bool,
+    pub message: String,
+}
+
+impl ProbeFailure {
+    pub fn from_error(err: &anyhow::Error) -> Self {
+        Self {
+            status: http_status_code(err).map(|s| s.as_u16()),
+            anonymous: is_anonymous_error(err),
+            message: format!("{err:#}"),
+        }
+    }
+
+    pub fn is_not_found(&self) -> bool {
+        self.status == Some(404)
+    }
+
+    /// Rebuilds an error that keeps the HTTP status, so the JSON error code survives.
+    pub fn to_error(&self) -> anyhow::Error {
+        match self.status.and_then(|s| StatusCode::from_u16(s).ok()) {
+            Some(status) => HttpStatusError {
+                status,
+                message: self.message.clone(),
+                body: if self.anonymous {
+                    json!({ "anonymous_signal": "probe" }).to_string()
+                } else {
+                    String::new()
+                },
+            }
+            .into(),
+            None => anyhow!("{}", self.message),
+        }
+    }
+
+    pub fn is_unauthorized(&self) -> bool {
+        self.anonymous || matches!(self.status, Some(401) | Some(403))
+    }
+
+    /// "anonymous", "unauthorized", "not_found" or "error".
+    pub fn label(&self) -> &'static str {
+        if self.anonymous {
+            "anonymous"
+        } else if matches!(self.status, Some(401) | Some(403)) {
+            "unauthorized"
+        } else if self.is_not_found() {
+            "not_found"
+        } else {
+            "error"
+        }
+    }
+}
+
+/// Result of asking each product who the credential belongs to. "None" = not probed
+/// (no URL configured for that product).
+#[derive(Debug, Clone, Default)]
+pub struct IdentityProbe {
+    pub jira: Option<Result<UserSummary, ProbeFailure>>,
+    pub confluence: Option<Result<UserSummary, ProbeFailure>>,
+}
+
+impl IdentityProbe {
+    pub fn jira_user(&self) -> Option<&UserSummary> {
+        self.jira.as_ref().and_then(|r| r.as_ref().ok())
+    }
+
+    pub fn confluence_user(&self) -> Option<&UserSummary> {
+        self.confluence.as_ref().and_then(|r| r.as_ref().ok())
+    }
+
+    /// The user a login belongs to. The "confluence" persona, a Jira 404 (a Confluence-only
+    /// host) or a missing Jira URL require the Confluence probe to succeed; otherwise the
+    /// Jira probe must succeed and a Confluence failure is not fatal.
+    pub fn login_user(&self, persona: crate::config::Persona) -> Result<UserSummary> {
+        let jira_not_found = matches!(&self.jira, Some(Err(failure)) if failure.is_not_found());
+        let confluence_decides = persona == crate::config::Persona::Confluence
+            || jira_not_found
+            || self.jira.is_none();
+        if confluence_decides {
+            match (&self.confluence, &self.jira) {
+                (Some(Ok(user)), _) => return Ok(user.clone()),
+                // Neither product lives at this URL: report the Jira 404 as before.
+                (Some(Err(failure)), Some(Err(jira))) if failure.is_not_found() && jira.is_not_found() => {
+                    return Err(jira.to_error())
+                }
+                (Some(Err(failure)), _) => return Err(failure.to_error()),
+                (None, None) => bail!("No site URL is configured, so the credential could not be verified."),
+                (None, Some(_)) => {}
+            }
+        }
+        match &self.jira {
+            Some(Ok(user)) => Ok(user.clone()),
+            Some(Err(failure)) => Err(failure.to_error()),
+            None => bail!("No site URL is configured, so the credential could not be verified."),
+        }
+    }
+
+    /// "ok", "skipped", or the failure label, per product.
+    pub fn status_labels(&self) -> (&'static str, &'static str) {
+        fn label(side: &Option<Result<UserSummary, ProbeFailure>>) -> &'static str {
+            match side {
+                None => "skipped",
+                Some(Ok(_)) => "ok",
+                Some(Err(failure)) => failure.label(),
+            }
+        }
+        (label(&self.jira), label(&self.confluence))
+    }
 }
 
 /// Environment variables that may name extra trusted root CA bundles.
@@ -631,8 +827,109 @@ impl AtlassianClient {
         };
         let val: Value = self.get_json(&url).await?;
         let me = parse_user_summary(&val, self.deployment());
+        // An empty identity ("{}") is an anonymous answer, not a user: never cache it.
+        if me.id.trim().is_empty() {
+            return Err(self.anonymous_error(&self.resolve_api_url(&url), &AnonymousSignal::AnonymousPayload));
+        }
         self.set_cached_me(me.clone());
         Ok(me)
+    }
+
+    /// Asks Jira and Confluence separately who the credential belongs to. Jira is probed
+    /// when a site URL is configured, Confluence when a Confluence root resolves. A failure
+    /// on one product is recorded, never fatal by itself.
+    pub async fn probe_identity(&self) -> IdentityProbe {
+        let jira = if normalize_base_url(self.site_url()).is_empty() {
+            None
+        } else {
+            Some(
+                self.get_myself()
+                    .await
+                    .map_err(|err| ProbeFailure::from_error(&err)),
+            )
+        };
+        let confluence = if self.confluence_root_url().trim().is_empty() {
+            None
+        } else {
+            Some(
+                self.get_confluence_current_user()
+                    .await
+                    .map_err(|err| ProbeFailure::from_error(&err)),
+            )
+        };
+        IdentityProbe { jira, confluence }
+    }
+
+    /// "Confluence" or "Jira", for messages about "target_url".
+    fn product_for_url(&self, target_url: &str) -> &'static str {
+        let path = Url::parse(target_url)
+            .map(|u| u.path().to_string())
+            .unwrap_or_default();
+        let jira_path = ["/rest/api/2/", "/rest/api/3/", "/rest/agile/", "/rest/greenhopper/"]
+            .iter()
+            .any(|p| path.contains(p));
+        let under_confluence = [self.confluence_root_url(), self.confluence_api_base_url()]
+            .iter()
+            .map(|root| normalize_base_url(root))
+            .filter(|root| !root.is_empty())
+            .any(|root| strip_url_prefix(target_url, &root).is_some());
+        if self.is_confluence_url(target_url) || (under_confluence && !jira_path) {
+            "Confluence"
+        } else {
+            "Jira"
+        }
+    }
+
+    /// Builds the 401-style error for a 200-but-anonymous response, so the existing 401
+    /// handling (auth pause, error formatting) applies. Never includes the credential.
+    pub(crate) fn anonymous_error(&self, target_url: &str, signal: &AnonymousSignal) -> anyhow::Error {
+        let host = Url::parse(target_url)
+            .ok()
+            .and_then(|u| u.host_str().map(str::to_string))
+            .unwrap_or_else(|| "the server".to_string());
+        let product = self.product_for_url(target_url);
+        let hint = if product == "Confluence" && self.deployment() == DeploymentKind::DataCenter {
+            format!(
+                "Data Center PATs are per application — a Jira PAT does not work on Confluence. Set ATLASSIAN_CONFLUENCE_PAT or run \"atlassian login --site {} --confluence-pat <PAT>\" (stored under confluence_account_id), then \"atlassian doctor --probe\".",
+                self.site_id()
+            )
+        } else if self.deployment() == DeploymentKind::DataCenter {
+            "Check the PAT and run \"atlassian login --url <URL> --pat <PAT>\" again, then \"atlassian doctor --probe\".".to_string()
+        } else {
+            "Run \"atlassian login\" again, then \"atlassian doctor --probe\".".to_string()
+        };
+        let message = format!(
+            "{product} at {host} answered HTTP 200 as an anonymous user ({}): the credential was not accepted. {hint}",
+            signal.evidence()
+        );
+        let kind = match signal {
+            AnonymousSignal::HeaderAnonymous => "x-ausername",
+            AnonymousSignal::SeraphLoginFailed(_) => "x-seraph-loginreason",
+            AnonymousSignal::HtmlLoginPage => "html-login-page",
+            AnonymousSignal::AnonymousPayload => "anonymous-payload",
+        };
+        HttpStatusError {
+            status: StatusCode::UNAUTHORIZED,
+            message,
+            body: json!({ "anonymous_signal": kind }).to_string(),
+        }
+        .into()
+    }
+
+    /// Checks a successful JSON-API response for signs that it was served anonymously.
+    fn anonymous_signal_for(&self, target_url: &str, resp: &reqwest::Response) -> Option<AnonymousSignal> {
+        let headers = resp.headers();
+        let has_body = headers
+            .get(CONTENT_LENGTH)
+            .and_then(|v| v.to_str().ok())
+            .and_then(|v| v.trim().parse::<u64>().ok())
+            .map_or(true, |len| len > 0);
+        let content_type = if resp.status() == StatusCode::OK && has_body && is_json_rest_path(target_url) {
+            headers.get(CONTENT_TYPE).and_then(|v| v.to_str().ok())
+        } else {
+            None
+        };
+        detect_anonymous_response(headers, content_type)
     }
 
     pub(crate) async fn get_json<T: DeserializeOwned>(&self, url: &str) -> Result<T> {
@@ -946,7 +1243,15 @@ impl AtlassianClient {
                 let resp = req.send().await.map_err(send_error)?;
                 let status = resp.status();
 
-                if status.is_success() || status.is_redirection() {
+                if status.is_success() {
+                    // Every request on this path carries a credential and expects JSON, so
+                    // an anonymous 2xx means the credential was not accepted.
+                    if let Some(signal) = self.anonymous_signal_for(target_url, &resp) {
+                        break Err(Some(self.anonymous_error(target_url, &signal)));
+                    }
+                    return Ok(resp);
+                }
+                if status.is_redirection() {
                     return Ok(resp);
                 }
 
@@ -1663,6 +1968,180 @@ mod tests {
             let _ = axum::serve(listener, app).await;
         });
         format!("http://{addr}")
+    }
+
+    fn response_headers(pairs: &[(&'static str, &'static str)]) -> reqwest::header::HeaderMap {
+        let mut headers = reqwest::header::HeaderMap::new();
+        for (name, value) in pairs {
+            headers.append(*name, reqwest::header::HeaderValue::from_static(value));
+        }
+        headers
+    }
+
+    #[test]
+    fn detect_anonymous_header_x_ausername() {
+        assert_eq!(
+            detect_anonymous_response(&response_headers(&[("x-ausername", "anonymous")]), None),
+            Some(AnonymousSignal::HeaderAnonymous)
+        );
+        // Header names and the value are case-insensitive.
+        assert_eq!(
+            detect_anonymous_response(&response_headers(&[("X-AUSERNAME", " Anonymous ")]), None),
+            Some(AnonymousSignal::HeaderAnonymous)
+        );
+        assert_eq!(
+            detect_anonymous_response(&response_headers(&[("x-ausername", "jdoe")]), None),
+            None
+        );
+        assert_eq!(detect_anonymous_response(&response_headers(&[]), None), None);
+    }
+
+    #[test]
+    fn detect_anonymous_seraph_login_reason_failed() {
+        for reason in ["AUTHENTICATED_FAILED", "AUTHENTICATION_DENIED", "AUTHORISATION_FAILED"] {
+            assert_eq!(
+                detect_anonymous_response(
+                    &response_headers(&[("x-seraph-loginreason", reason)]),
+                    None
+                ),
+                Some(AnonymousSignal::SeraphLoginFailed(reason.to_string())),
+                "{reason}"
+            );
+        }
+        // Jira sends "OUT, AUTHENTICATED_FAILED" when a stale session was dropped first.
+        assert!(matches!(
+            detect_anonymous_response(
+                &response_headers(&[("x-seraph-loginreason", "OUT, AUTHENTICATED_FAILED")]),
+                None
+            ),
+            Some(AnonymousSignal::SeraphLoginFailed(_))
+        ));
+    }
+
+    #[test]
+    fn detect_anonymous_ignores_seraph_ok() {
+        for reason in ["OK", "OUT", "OUT, OK"] {
+            assert_eq!(
+                detect_anonymous_response(
+                    &response_headers(&[("x-seraph-loginreason", reason), ("x-ausername", "jdoe")]),
+                    Some("application/json;charset=UTF-8")
+                ),
+                None,
+                "{reason}"
+            );
+        }
+    }
+
+    #[test]
+    fn detect_html_login_page_on_json_request() {
+        assert_eq!(
+            detect_anonymous_response(&response_headers(&[]), Some("text/html;charset=UTF-8")),
+            Some(AnonymousSignal::HtmlLoginPage)
+        );
+        assert_eq!(
+            detect_anonymous_response(&response_headers(&[]), Some("application/json")),
+            None
+        );
+        // Only JSON REST paths expect JSON; page and download URLs may legitimately be HTML.
+        assert!(is_json_rest_path("https://wiki.corp/rest/api/space?limit=1"));
+        assert!(is_json_rest_path("https://acme.atlassian.net/wiki/api/v2/pages/1"));
+        assert!(!is_json_rest_path("https://wiki.corp/download/attachments/1/a.html"));
+    }
+
+    #[tokio::test]
+    async fn get_myself_rejects_empty_identity() {
+        let app = Router::new().route(
+            "/rest/api/2/myself",
+            get(|| async { Json(serde_json::json!({})) }),
+        );
+        let base_url = spawn_router(app).await;
+        let auth = AuthManager::with_credentials(
+            "dc",
+            StoredCredentials::BearerPat {
+                site_url: base_url.clone(),
+                token: "pat-rejected".into(),
+                deployment: DeploymentKind::DataCenter,
+            },
+        );
+        let client =
+            AtlassianClient::with_base_urls(&base_url, "", DeploymentKind::DataCenter, auth).unwrap();
+        let err = client.get_myself().await.expect_err("an empty identity is not a user");
+        assert_eq!(http_status_code(&err), Some(StatusCode::UNAUTHORIZED));
+        assert!(is_anonymous_error(&err));
+        let text = format!("{err:#}");
+        assert!(text.contains("anonymous"), "{text}");
+        assert!(!text.contains("pat-rejected"), "the credential must never be printed: {text}");
+        assert!(client.cached_me().is_none(), "an empty identity must not be cached");
+    }
+
+    #[tokio::test]
+    async fn html_login_page_answer_to_json_request_is_unauthorized() {
+        let app = Router::new().route(
+            "/rest/api/2/project",
+            get(|| async {
+                (
+                    [("content-type", "text/html;charset=UTF-8")],
+                    "<html><body>Single sign-on</body></html>",
+                )
+            }),
+        );
+        let base_url = spawn_router(app).await;
+        let auth = AuthManager::with_credentials(
+            "dc",
+            StoredCredentials::BearerPat {
+                site_url: base_url.clone(),
+                token: "pat".into(),
+                deployment: DeploymentKind::DataCenter,
+            },
+        );
+        let client =
+            AtlassianClient::with_base_urls(&base_url, "", DeploymentKind::DataCenter, auth).unwrap();
+        let err = client
+            .get_json::<Value>(&format!("{base_url}/rest/api/2/project"))
+            .await
+            .expect_err("an HTML page is not a JSON answer");
+        assert_eq!(http_status_code(&err), Some(StatusCode::UNAUTHORIZED));
+        assert!(format!("{err:#}").contains("HTML login page"), "{err:#}");
+    }
+
+    #[test]
+    fn identity_probe_login_user_by_persona() {
+        use crate::config::Persona;
+        let user = |id: &str| UserSummary {
+            id: id.into(),
+            display_name: id.into(),
+            email: None,
+            avatar_url: None,
+            active: true,
+        };
+        let fail = |status: u16, anonymous: bool| ProbeFailure {
+            status: Some(status),
+            anonymous,
+            message: format!("HTTP {status}"),
+        };
+        let both = IdentityProbe {
+            jira: Some(Ok(user("jira-user"))),
+            confluence: Some(Ok(user("wiki-user"))),
+        };
+        assert_eq!(both.login_user(Persona::Jira).unwrap().id, "jira-user");
+        assert_eq!(both.login_user(Persona::Confluence).unwrap().id, "wiki-user");
+        assert_eq!(both.status_labels(), ("ok", "ok"));
+
+        let confluence_only = IdentityProbe {
+            jira: Some(Err(fail(404, false))),
+            confluence: Some(Ok(user("wiki-user"))),
+        };
+        assert_eq!(confluence_only.login_user(Persona::Jira).unwrap().id, "wiki-user");
+        assert_eq!(confluence_only.status_labels(), ("not_found", "ok"));
+
+        let rejected = IdentityProbe {
+            jira: Some(Err(fail(401, false))),
+            confluence: Some(Err(fail(401, true))),
+        };
+        let err = rejected.login_user(Persona::Jira).unwrap_err();
+        assert_eq!(http_status_code(&err), Some(StatusCode::UNAUTHORIZED));
+        assert_eq!(rejected.status_labels(), ("unauthorized", "anonymous"));
+        assert!(is_anonymous_error(&rejected.login_user(Persona::Confluence).unwrap_err()));
     }
 
     #[tokio::test]

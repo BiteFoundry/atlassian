@@ -15,14 +15,14 @@ use crate::{
         body::{body_change, same_markdown, BodyEdit, BodyEditError},
         client::{
             first_nonempty_str, join_url, json_id_to_string, next_link_page_state,
-            parse_attachment_item, HttpStatusError,
+            parse_attachment_item, AnonymousSignal, HttpStatusError,
         },
         AtlassianClient,
     },
     config::DeploymentKind,
     models::{
         parse_offset_cursor, ConfluenceComment, CrossRefTarget, ListPage, OutgoingPage,
-        PageAncestor, PageDetail, PageSummary, PageUpdate, SpaceSummary,
+        PageAncestor, PageDetail, PageSummary, PageUpdate, SpaceSummary, UserSummary,
     },
 };
 
@@ -331,6 +331,43 @@ impl AtlassianClient {
 
     pub async fn list_child_pages(&self, page_id: &str) -> Result<Vec<PageSummary>> {
         Ok(self.list_child_pages_page(page_id, 100, None).await?.items)
+    }
+
+    /// The user the Confluence credential belongs to ("{conf_root}/rest/api/user/current";
+    /// for Cloud the root already ends in "/wiki"). An anonymous or empty answer is
+    /// reported as the 401-style anonymous error, never as a user.
+    pub async fn get_confluence_current_user(&self) -> Result<UserSummary> {
+        let conf_root = self.require_confluence_root()?;
+        let url = format!("{conf_root}/rest/api/user/current");
+        let val: Value = self.get_json(&url).await?;
+        // Cloud has only accountId; on Data Center the username is the id (as for Jira).
+        let id = first_nonempty_str(&val, &["accountId", "username", "userKey"]);
+        let username = first_nonempty_str(&val, &["username"]);
+        let display_name = first_nonempty_str(&val, &["displayName", "publicName", "username"]);
+        let is_anonymous_type = val
+            .get("type")
+            .and_then(|v| v.as_str())
+            .is_some_and(|t| t.trim().eq_ignore_ascii_case("anonymous"));
+        if is_anonymous_type || (id.is_empty() && username.is_empty() && display_name.is_empty()) {
+            return Err(self.anonymous_error(
+                &self.resolve_api_url(&url),
+                &AnonymousSignal::AnonymousPayload,
+            ));
+        }
+        let email = val
+            .get("email")
+            .or_else(|| val.get("emailAddress"))
+            .and_then(|v| v.as_str())
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string);
+        Ok(UserSummary {
+            id,
+            display_name,
+            email,
+            avatar_url: None,
+            active: true,
+        })
     }
 
     /// Lightweight single-request Confluence page revision probe (version, title, updated_at;

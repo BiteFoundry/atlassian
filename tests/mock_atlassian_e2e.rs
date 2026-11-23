@@ -4785,3 +4785,155 @@ async fn regression_known_2_sync_uses_default_space_key() {
         "the first listed space must not be used when a default is configured: {requests:?}"
     );
 }
+
+#[tokio::test]
+async fn regression_atl_09_confluence_only_dc_login_and_whoami() {
+    use atlassian_cli::config::Persona;
+
+    ensure_isolated_env();
+    // A Confluence-only Data Center host: no Jira routes at all (404), and the Confluence
+    // identity endpoint accepts only the Confluence PAT.
+    let app = Router::new().route(
+        "/rest/api/user/current",
+        get(|headers: HeaderMap| async move {
+            let authorized = headers
+                .get(header::AUTHORIZATION)
+                .and_then(|v| v.to_str().ok())
+                == Some("Bearer PAT-C");
+            if !authorized {
+                return StatusCode::UNAUTHORIZED.into_response();
+            }
+            Json(json!({
+                "type": "known",
+                "username": "jdoe",
+                "userKey": "8a7f808a5f1e2d3c015f1e2d3c4b0000",
+                "displayName": "John Doe"
+            }))
+            .into_response()
+        }),
+    );
+    let base_url = spawn_server(app).await;
+
+    let auth = AuthManager::with_credentials(
+        "wiki",
+        StoredCredentials::BearerPat {
+            site_url: base_url.clone(),
+            token: "PAT-C".into(),
+            deployment: DeploymentKind::DataCenter,
+        },
+    );
+    let client =
+        AtlassianClient::with_base_urls(&base_url, "", DeploymentKind::DataCenter, auth).unwrap();
+
+    let probe = client.probe_identity().await;
+    let jira_failure = probe
+        .jira
+        .as_ref()
+        .expect("jira is probed when a site URL is set")
+        .as_ref()
+        .expect_err("there is no Jira on this host");
+    assert!(jira_failure.is_not_found(), "{jira_failure:?}");
+    let confluence_user = probe.confluence_user().expect("confluence identity");
+    assert_eq!(confluence_user.id, "jdoe");
+    assert_eq!(confluence_user.display_name, "John Doe");
+    assert_eq!(probe.status_labels(), ("not_found", "ok"));
+
+    // Login and whoami accept the Confluence user for either persona.
+    assert_eq!(probe.login_user(Persona::Jira).expect("jira persona").id, "jdoe");
+    assert_eq!(
+        probe.login_user(Persona::Confluence).expect("confluence persona").id,
+        "jdoe"
+    );
+
+    // A rejected credential on the same host is still a hard failure.
+    let bad_auth = AuthManager::with_credentials(
+        "wiki-bad",
+        StoredCredentials::BearerPat {
+            site_url: base_url.clone(),
+            token: "PAT-J".into(),
+            deployment: DeploymentKind::DataCenter,
+        },
+    );
+    let bad_client =
+        AtlassianClient::with_base_urls(&base_url, "", DeploymentKind::DataCenter, bad_auth)
+            .unwrap();
+    let bad_probe = bad_client.probe_identity().await;
+    assert_eq!(bad_probe.status_labels(), ("not_found", "unauthorized"));
+    assert!(bad_probe.login_user(Persona::Jira).is_err());
+}
+
+#[tokio::test]
+async fn regression_ent_anon_dc_200_anonymous_is_reported_as_unauthorized() {
+    use atlassian_cli::{atlassian::client::ProbeFailure, models::SpaceSummary, sync};
+
+    ensure_isolated_env();
+    // Data Center with anonymous access enabled: a rejected PAT gets HTTP 200 and an
+    // empty listing instead of 401.
+    let anonymous = || {
+        [
+            ("X-AUSERNAME", "anonymous"),
+            ("X-Seraph-LoginReason", "AUTHENTICATED_FAILED"),
+        ]
+    };
+    let app = Router::new()
+        .route(
+            "/rest/api/space",
+            get(move || async move {
+                (anonymous(), Json(json!({ "results": [], "start": 0, "limit": 50, "size": 0 })))
+            }),
+        )
+        .route(
+            "/rest/api/user/current",
+            get(move || async move { (anonymous(), Json(json!({ "type": "anonymous" }))) }),
+        );
+    let base_url = spawn_server(app).await;
+
+    let auth = AuthManager::with_credentials(
+        "corp",
+        StoredCredentials::BearerPat {
+            site_url: base_url.clone(),
+            token: "PAT-J-secret".into(),
+            deployment: DeploymentKind::DataCenter,
+        },
+    );
+    let client =
+        AtlassianClient::with_base_urls(&base_url, "", DeploymentKind::DataCenter, auth).unwrap();
+
+    let err = client
+        .list_all_spaces()
+        .await
+        .expect_err("an anonymous 200 must not look like an empty space list");
+    let failure = ProbeFailure::from_error(&err);
+    assert_eq!(failure.status, Some(401), "{failure:?}");
+    assert!(failure.anonymous && failure.is_unauthorized(), "{failure:?}");
+    let text = format!("{err:#}");
+    assert!(text.contains("ATLASSIAN_CONFLUENCE_PAT"), "{text}");
+    assert!(text.contains("--confluence-pat"), "{text}");
+    assert!(text.contains("X-AUSERNAME: anonymous"), "{text}");
+    assert!(!text.contains("PAT-J-secret"), "the credential must never be printed: {text}");
+
+    let probe = client.probe_identity().await;
+    assert_eq!(probe.status_labels().1, "anonymous");
+
+    // The cached spaces survive a sync that only sees the anonymous answer.
+    let storage = Storage::open_in_memory().unwrap();
+    let cached = SpaceSummary {
+        id: "sp-DOCS".into(),
+        key: "DOCS".into(),
+        name: "Docs".into(),
+        space_type: "global".into(),
+        homepage_id: Some("100".into()),
+        description: None,
+        web_url: format!("{base_url}/display/DOCS"),
+        pinned: false,
+    };
+    storage.upsert_spaces_for_site("corp", &[cached.clone()]).unwrap();
+    let _ = sync::bootstrap_workspace_for_site("corp", &client, &storage).await;
+    let after = storage.list_spaces_for_site("corp").unwrap();
+    assert_eq!(
+        after.iter().map(|s| s.key.as_str()).collect::<Vec<_>>(),
+        vec!["DOCS"],
+        "the spaces cache must not be pruned or overwritten"
+    );
+    assert_eq!(after[0].name, "Docs");
+}

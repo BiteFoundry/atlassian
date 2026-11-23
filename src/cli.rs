@@ -14,12 +14,12 @@ use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 use crate::{
     atlassian::{
         body::{BodyEdit, SectionReplacement, TextReplacement},
-        client::{error_payload, is_not_found_error},
+        client::{error_payload, is_not_found_error, HttpStatusError, IdentityProbe},
         AtlassianClient, SiteClientPool,
     },
     auth::{
-        fetch_accessible_resources, run_oauth_loopback_login, AuthManager, OAuthLoopbackOptions,
-        StoredCredentials, DEFAULT_OAUTH_API_BASE, DEFAULT_OAUTH_AUTH_BASE,
+        fetch_accessible_resources, run_oauth_loopback_login, AuthManager, EnvCredentialPolicy,
+        OAuthLoopbackOptions, StoredCredentials, DEFAULT_OAUTH_API_BASE, DEFAULT_OAUTH_AUTH_BASE,
     },
     config::{
         self, AppConfig, DeploymentKind, Persona, SiteProfile, DEFAULT_SERVE_PORT,
@@ -317,6 +317,12 @@ pub enum Command {
         token: Option<String>,
         #[arg(long)]
         pat: Option<String>,
+        /// Data Center only: separate Confluence PAT, stored under the site's confluence_account_id
+        #[arg(long = "confluence-pat")]
+        confluence_pat: Option<String>,
+        /// Credential account ID for --confluence-pat (default: "<account>-confluence")
+        #[arg(long = "confluence-account")]
+        confluence_account: Option<String>,
         #[arg(long, value_enum)]
         deployment: Option<DeploymentArg>,
         /// Sign in via Atlassian Cloud OAuth 2.0 (3LO) loopback flow and auto-discover all consented sites
@@ -701,6 +707,12 @@ pub enum ConfluenceCommand {
         token: Option<String>,
         #[arg(long)]
         pat: Option<String>,
+        /// Data Center only: separate Confluence PAT, stored under the site's confluence_account_id
+        #[arg(long = "confluence-pat")]
+        confluence_pat: Option<String>,
+        /// Credential account ID for --confluence-pat (default: "<account>-confluence")
+        #[arg(long = "confluence-account")]
+        confluence_account: Option<String>,
         #[arg(long, value_enum)]
         deployment: Option<DeploymentArg>,
         /// Sign in via Atlassian Cloud OAuth 2.0 (3LO) loopback flow and auto-discover all consented sites
@@ -1906,6 +1918,8 @@ async fn dispatch_jira_cli(
             email,
             token,
             pat,
+            confluence_pat,
+            confluence_account,
             deployment,
             oauth,
             cloud_account,
@@ -1924,6 +1938,8 @@ async fn dispatch_jira_cli(
                     email,
                     token,
                     pat,
+                    confluence_pat,
+                    confluence_account,
                     deployment: deployment.map(Into::into),
                     oauth,
                     cloud_account,
@@ -2263,6 +2279,8 @@ async fn dispatch_confluence_cli(
             email,
             token,
             pat,
+            confluence_pat,
+            confluence_account,
             deployment,
             oauth,
             cloud_account,
@@ -2281,6 +2299,8 @@ async fn dispatch_confluence_cli(
                     email,
                     token,
                     pat,
+                    confluence_pat,
+                    confluence_account,
                     deployment: deployment.map(Into::into),
                     oauth,
                     cloud_account,
@@ -2872,6 +2892,8 @@ struct LoginParams {
     email: Option<String>,
     token: Option<String>,
     pat: Option<String>,
+    confluence_pat: Option<String>,
+    confluence_account: Option<String>,
     deployment: Option<DeploymentKind>,
     oauth: bool,
     cloud_account: bool,
@@ -2954,6 +2976,8 @@ async fn cmd_tui(cfg: &mut AppConfig, persona: Persona) -> Result<()> {
                 email: None,
                 token: None,
                 pat: None,
+                confluence_pat: None,
+                confluence_account: None,
                 deployment: None,
                 oauth: false,
                 cloud_account: false,
@@ -2984,6 +3008,21 @@ async fn cmd_login(
     if params.cloud_account {
         return cmd_login_cloud_account(cfg, params, json_out).await;
     }
+
+    let persona = Persona::detect();
+    let confluence_pat = params
+        .confluence_pat
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string);
+    // "login --site <id> --confluence-pat <PAT>" only adds the Confluence credential: the
+    // site's stored primary credential is reused instead of being asked for again.
+    let reuse_primary_credential = confluence_pat.is_some()
+        && params.pat.is_none()
+        && params.token.is_none()
+        && params.email.is_none()
+        && params.account.is_none();
 
     let explicit_site_ref = site_override
         .map(str::trim)
@@ -3020,7 +3059,9 @@ async fn cmd_login(
         Some(u) => u.to_string(),
         None => {
             if !default_url_hint.trim().is_empty()
-                && (params.pat.is_some() || (params.email.is_some() && params.token.is_some()))
+                && (params.pat.is_some()
+                    || (params.email.is_some() && params.token.is_some())
+                    || reuse_primary_credential)
             {
                 default_url_hint.clone()
             } else {
@@ -3047,17 +3088,19 @@ async fn cmd_login(
 
     let matched_site: Option<SiteProfile> = if let Some(ref target) = target_site {
         Some(target.clone())
-    } else if !cfg.sites.is_empty() {
-        let norm_target = config::normalize_url_for_match(&site_url);
-        cfg.sites
-            .iter()
-            .find(|s| {
-                let norm = config::normalize_url_for_match(&s.site_url);
-                !norm.is_empty() && norm == norm_target
-            })
-            .cloned()
     } else {
-        None
+        // A split Confluence credential lives on a site entry, so a legacy single-site
+        // config is matched (and then stored) as its "default" site.
+        let known_sites = if cfg.sites.is_empty() && confluence_pat.is_some() {
+            cfg.effective_sites()
+        } else {
+            cfg.sites.clone()
+        };
+        let norm_target = config::normalize_url_for_match(&site_url);
+        known_sites.into_iter().find(|s| {
+            let norm = config::normalize_url_for_match(&s.site_url);
+            !norm.is_empty() && norm == norm_target
+        })
     };
 
     let deployment = params.deployment.unwrap_or_else(|| {
@@ -3074,6 +3117,7 @@ async fn cmd_login(
     } else if deployment == DeploymentKind::DataCenter
         && params.pat.is_none()
         && params.token.is_none()
+        && confluence_pat.is_none()
     {
         let entered = prompt_line("Separate Confluence URL (press Enter for same host): ")?;
         config::normalize_base_url(&entered)
@@ -3089,7 +3133,25 @@ async fn cmd_login(
         String::new()
     };
 
-    let creds = if let Some(pat) = params.pat.filter(|s| !s.trim().is_empty()) {
+    if confluence_pat.is_some() && deployment != DeploymentKind::DataCenter {
+        bail!("`--confluence-pat` applies to Data Center sites only; Atlassian Cloud uses one credential for Jira and Confluence.");
+    }
+    let help = login_failure_help(persona, &site_url, deployment);
+    let stored_primary = if reuse_primary_credential {
+        matched_site.as_ref().and_then(|site| {
+            AuthManager::for_account(&site.account_id)
+                .load_credentials()
+                .ok()
+                .flatten()
+        })
+    } else {
+        None
+    };
+    let primary_is_reused = stored_primary.is_some();
+
+    let creds = if let Some(stored) = stored_primary {
+        stored
+    } else if let Some(pat) = params.pat.filter(|s| !s.trim().is_empty()) {
         StoredCredentials::BearerPat {
             site_url: site_url.clone(),
             token: pat.trim().to_string(),
@@ -3117,9 +3179,9 @@ async fn cmd_login(
         };
         if email.trim().is_empty() {
             let pat = rpassword::prompt_password("Personal Access Token (PAT): ")
-                .context("Failed to read PAT")?;
+                .map_err(|err| anyhow::anyhow!("Failed to read PAT: {err}\n{help}"))?;
             if pat.trim().is_empty() {
-                bail!("PAT is empty.");
+                bail!("PAT is empty.\n{help}");
             }
             StoredCredentials::BearerPat {
                 site_url: site_url.clone(),
@@ -3128,9 +3190,9 @@ async fn cmd_login(
             }
         } else {
             let token = rpassword::prompt_password("Password or API token: ")
-                .context("Failed to read token")?;
+                .map_err(|err| anyhow::anyhow!("Failed to read token: {err}\n{help}"))?;
             if token.trim().is_empty() {
-                bail!("Password/token is empty.");
+                bail!("Password/token is empty.\n{help}");
             }
             StoredCredentials::ApiToken {
                 site_url: site_url.clone(),
@@ -3148,9 +3210,9 @@ async fn cmd_login(
             bail!("Email is empty.");
         }
         let token = rpassword::prompt_password("Atlassian API token: ")
-            .context("Failed to read API token")?;
+            .map_err(|err| anyhow::anyhow!("Failed to read API token: {err}\n{help}"))?;
         if token.trim().is_empty() {
-            bail!("API token is empty.");
+            bail!("API token is empty.\n{help}");
         }
         StoredCredentials::ApiToken {
             site_url: site_url.clone(),
@@ -3181,7 +3243,8 @@ async fn cmd_login(
         || !cfg.sites.is_empty()
         || explicit_name.is_some()
         || explicit_account.is_some()
-        || has_legacy_other_url;
+        || has_legacy_other_url
+        || confluence_pat.is_some();
 
     let (resolved_site_id, account_id, display_name) = if use_multi_site {
         if let Some(ref existing) = matched_site {
@@ -3211,6 +3274,36 @@ async fn cmd_login(
         ("default".to_string(), acct, "default".to_string())
     };
 
+    let confluence_account_id: Option<String> = if confluence_pat.is_some() {
+        let chosen = params
+            .confluence_account
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string)
+            .or_else(|| {
+                matched_site
+                    .as_ref()
+                    .and_then(|s| s.confluence_account_id.clone())
+                    .filter(|id| !id.trim().is_empty())
+            })
+            .unwrap_or_else(|| format!("{account_id}-confluence"));
+        if chosen.eq_ignore_ascii_case(&account_id) {
+            bail!(
+                "`--confluence-account` must differ from the site's credential account '{account_id}', or the Confluence PAT would overwrite the Jira credential."
+            );
+        }
+        Some(chosen)
+    } else if deployment == DeploymentKind::DataCenter {
+        // Logging in again keeps an existing split Confluence credential.
+        matched_site
+            .as_ref()
+            .and_then(|s| s.confluence_account_id.clone())
+            .filter(|id| !id.trim().is_empty())
+    } else {
+        None
+    };
+
     let candidate_profile = SiteProfile {
         id: resolved_site_id.clone(),
         name: display_name,
@@ -3224,19 +3317,59 @@ async fn cmd_login(
             .as_ref()
             .map(|s| s.scopes.clone())
             .unwrap_or_default(),
-        confluence_account_id: None,
+        confluence_account_id,
     };
 
     // Validate credentials against the target site BEFORE persisting config or credentials.
     let probe_auth = AuthManager::with_credentials(&account_id, creds.clone());
-    let probe_client = AtlassianClient::for_site(&candidate_profile, probe_auth, None)?;
-    let me = probe_client
-        .get_myself()
-        .await
-        .context("Failed to verify credentials (`/myself`)")?;
+    let mut probe_client = AtlassianClient::for_site(&candidate_profile, probe_auth, None)?;
+    let new_confluence_credential = match (&confluence_pat, &candidate_profile.confluence_account_id)
+    {
+        (Some(token), Some(conf_account)) => {
+            let conf_creds = StoredCredentials::BearerPat {
+                site_url: candidate_profile.effective_confluence_root(),
+                token: token.clone(),
+                deployment,
+            };
+            probe_client = probe_client.with_confluence_auth(AuthManager::with_credentials(
+                conf_account,
+                conf_creds.clone(),
+            ));
+            Some((conf_account.clone(), conf_creds))
+        }
+        (None, Some(conf_account)) => {
+            // The site already has a separate Confluence credential: probe with that one.
+            probe_client = probe_client.with_confluence_auth(
+                AuthManager::for_account(conf_account).with_env_policy(EnvCredentialPolicy::Never),
+            );
+            None
+        }
+        _ => None,
+    };
+    let probe = probe_client.probe_identity().await;
+    let me = decide_login_identity(persona, &probe).map_err(|err| with_login_help(err, &help))?;
+    if new_confluence_credential.is_some() {
+        if let Some(Err(failure)) = &probe.confluence {
+            // No generic login help here: it describes the Jira credential, and the
+            // failure already says what Confluence expects.
+            return Err(failure
+                .to_error()
+                .context("Confluence did not accept the `--confluence-pat` credential"));
+        }
+    }
+    let confluence_warning = if new_confluence_credential.is_some() {
+        None
+    } else {
+        confluence_login_warning(&probe, deployment, &resolved_site_id, persona)
+    };
 
-    let auth = AuthManager::for_account(&account_id);
-    auth.save_credentials(&creds)?;
+    if !primary_is_reused {
+        let auth = AuthManager::for_account(&account_id);
+        auth.save_credentials(&creds)?;
+    }
+    if let Some((conf_account, conf_creds)) = &new_confluence_credential {
+        AuthManager::for_account(conf_account).save_credentials(conf_creds)?;
+    }
 
     if use_multi_site {
         if cfg.sites.is_empty() && !cfg.site_url.trim().is_empty() {
@@ -3278,7 +3411,10 @@ async fn cmd_login(
                 "site_url": effective_site_url,
                 "confluence_url": effective_conf_url,
                 "credential_account": account_id,
+                "confluence_credential_account": candidate_profile.confluence_account_id,
                 "user": me,
+                "confluence_user": probe.confluence_user(),
+                "identity": identity_json(&probe),
             }))?
         );
     } else {
@@ -3292,8 +3428,83 @@ async fn cmd_login(
             "Deployment: {} · Jira={} · Confluence={} · Account={}",
             effective_deployment, effective_site_url, effective_conf_url, account_id
         );
+        if let Some(conf_account) = &candidate_profile.confluence_account_id {
+            println!("Confluence credential: separate account '{conf_account}'");
+        }
+    }
+    // stderr only, so --json output stays a single JSON document.
+    if let Some(warning) = confluence_warning {
+        eprintln!("{warning}");
     }
     Ok(())
+}
+
+/// Picks the user a login belongs to from the per-product probe (see
+/// [IdentityProbe::login_user]).
+fn decide_login_identity(persona: Persona, probe: &IdentityProbe) -> Result<crate::models::UserSummary> {
+    probe.login_user(persona)
+}
+
+/// Warning for a Data Center login whose Jira credential Confluence did not accept.
+fn confluence_login_warning(
+    probe: &IdentityProbe,
+    deployment: DeploymentKind,
+    site_id: &str,
+    persona: Persona,
+) -> Option<String> {
+    if deployment != DeploymentKind::DataCenter || probe.jira_user().is_none() {
+        return None;
+    }
+    match &probe.confluence {
+        Some(Err(failure)) if failure.is_unauthorized() => Some(format!(
+            "Warning: Confluence did not accept this credential ({}). Data Center PATs are per application — a Jira PAT does not work on Confluence. Run \"{} login --site {site_id} --confluence-pat <PAT>\" or set ATLASSIAN_CONFLUENCE_PAT.",
+            failure.label(),
+            persona.command_name()
+        )),
+        _ => None,
+    }
+}
+
+/// {"jira": "ok|anonymous|unauthorized|not_found|error|skipped", "confluence": "..."}.
+fn identity_json(probe: &IdentityProbe) -> Value {
+    let (jira, confluence) = probe.status_labels();
+    json!({ "jira": jira, "confluence": confluence })
+}
+
+/// Next steps appended to a login failure (credential rejected, or the hidden prompt
+/// returned nothing — common when pasting into Windows consoles).
+fn login_failure_help(persona: Persona, site_url: &str, deployment: DeploymentKind) -> String {
+    let cmd = persona.command_name();
+    let url = if site_url.trim().is_empty() {
+        "<URL>"
+    } else {
+        site_url.trim()
+    };
+    let direct = match deployment {
+        DeploymentKind::DataCenter => {
+            format!("{cmd} login --url {url} --pat <PAT>        or set ATLASSIAN_PAT=<PAT>")
+        }
+        DeploymentKind::Cloud => {
+            format!("{cmd} login --url {url} --email <EMAIL> --token <API_TOKEN>")
+        }
+    };
+    format!(
+        "Could not verify the credential.\n  - If pasting into the hidden prompt fails in your terminal (common in Windows consoles), pass it directly:\n      {direct}\n  - Check paths, TLS roots and credentials with:  {cmd} doctor --probe"
+    )
+}
+
+/// Appends "help" to an error while keeping its HTTP status (and so its JSON error code).
+fn with_login_help(err: anyhow::Error, help: &str) -> anyhow::Error {
+    let text = format!("{err:#}\n{help}");
+    match err.downcast_ref::<HttpStatusError>() {
+        Some(http) => HttpStatusError {
+            status: http.status,
+            message: text,
+            body: http.body.clone(),
+        }
+        .into(),
+        None => anyhow::anyhow!(text),
+    }
 }
 
 async fn cmd_login_oauth(
@@ -3445,10 +3656,11 @@ async fn cmd_login_cloud_account(
             if !io::stdin().is_terminal() {
                 bail!("API token is required for `--cloud-account`. Pass `--token <TOKEN>`.");
             }
+            let help = login_failure_help(Persona::detect(), "", DeploymentKind::Cloud);
             let entered = rpassword::prompt_password("Atlassian Cloud API Token: ")
-                .context("Failed to read API token")?;
+                .map_err(|err| anyhow::anyhow!("Failed to read API token: {err}\n{help}"))?;
             if entered.trim().is_empty() {
-                bail!("API token cannot be empty.");
+                bail!("API token cannot be empty.\n{help}");
             }
             entered.trim().to_string()
         }
@@ -4010,7 +4222,16 @@ async fn refresh_cli_page_cache(client: &AtlassianClient, storage: &Storage, pag
 
 async fn cmd_whoami(cfg: &AppConfig, persona: Persona, json_out: bool) -> Result<()> {
     let (auth, client, _storage) = open_runtime(cfg, true)?;
-    let me = client.get_myself().await?;
+    let probe = client.probe_identity().await;
+    // Non-zero exit only when no product accepts the credential.
+    let me = match probe.jira_user().or(probe.confluence_user()) {
+        Some(user) => user.clone(),
+        None => {
+            return Err(decide_login_identity(persona, &probe).err().unwrap_or_else(|| {
+                anyhow::anyhow!("Neither Jira nor Confluence accepted the credential.")
+            }))
+        }
+    };
     let effective_site_url = client.site_url();
     let effective_conf_url = client.confluence_root_url();
     let effective_deployment = client.deployment().as_str();
@@ -4027,6 +4248,8 @@ async fn cmd_whoami(cfg: &AppConfig, persona: Persona, json_out: bool) -> Result
                 "confluence_url": effective_conf_url,
                 "auth_status": auth.status_summary(),
                 "user": me,
+                "confluence_user": probe.confluence_user(),
+                "identity": identity_json(&probe),
             }))?
         );
     } else {
@@ -4037,6 +4260,19 @@ async fn cmd_whoami(cfg: &AppConfig, persona: Persona, json_out: bool) -> Result
             me.email.as_deref().unwrap_or("-")
         );
         println!("id: {}", me.id);
+        match &probe.confluence {
+            Some(Ok(user)) => println!(
+                "Confluence user: {} ({}) [id={}]",
+                user.display_name,
+                user.email.as_deref().unwrap_or("-"),
+                user.id
+            ),
+            Some(Err(failure)) => println!("Confluence user: ({})", failure.label()),
+            None => {}
+        }
+        if let Some(Err(failure)) = &probe.jira {
+            println!("Jira user: ({})", failure.label());
+        }
         println!("Deployment: {effective_deployment}");
         println!("Jira URL: {effective_site_url}");
         println!("Confluence URL: {effective_conf_url}");
@@ -4094,6 +4330,92 @@ fn env_credentials_report(cfg: &AppConfig) -> Value {
     })
 }
 
+/// "env:ATLASSIAN_CONFIG_DIR" when the override is set, else "default".
+fn config_dir_source(env_override: Option<&str>) -> &'static str {
+    if env_override.is_some_and(|v| !v.trim().is_empty()) {
+        "env:ATLASSIAN_CONFIG_DIR"
+    } else {
+        "default"
+    }
+}
+
+/// Everything "doctor --json" reports, gathered before printing.
+struct DoctorFacts<'a> {
+    persona: Persona,
+    profile: &'a str,
+    site_id: &'a str,
+    credential_account: &'a str,
+    confluence_credential_account: Option<&'a str>,
+    env_credentials: Value,
+    tls: Value,
+    deployment: &'a str,
+    site_url: &'a str,
+    confluence_url: &'a str,
+    logged_in: bool,
+    auth_status: &'a str,
+    config_dir: &'a Path,
+    config_dir_source: &'a str,
+    data_dir: &'a Path,
+    config_path: &'a Path,
+    credentials_fallback_path: &'a Path,
+    db_path: &'a Path,
+    download_dir: &'a Path,
+    cache_counts: Value,
+    /// "None" when "--probe" was not requested.
+    probe: Option<&'a IdentityProbe>,
+}
+
+/// JSON body of "doctor --json". "probe_me" / "probe_error" describe Jira (as before);
+/// "probe_confluence_me" / "probe_confluence_error" describe Confluence.
+fn doctor_report(facts: &DoctorFacts<'_>) -> Value {
+    let mut probe_me = Value::Null;
+    let mut probe_error = Value::Null;
+    let mut probe_confluence_me = Value::Null;
+    let mut probe_confluence_error = Value::Null;
+    if let Some(probe) = facts.probe {
+        match &probe.jira {
+            Some(Ok(user)) => probe_me = json!(user),
+            Some(Err(failure)) => probe_error = json!(failure.message),
+            None => probe_error = json!("Jira was not probed: no site URL is configured."),
+        }
+        match &probe.confluence {
+            Some(Ok(user)) => probe_confluence_me = json!(user),
+            Some(Err(failure)) => probe_confluence_error = json!(failure.message),
+            None => {}
+        }
+    }
+    json!({
+        "version": env!("CARGO_PKG_VERSION"),
+        "persona": facts.persona.as_str(),
+        "profile": facts.profile,
+        "site_id": facts.site_id,
+        "credential_account": facts.credential_account,
+        "confluence_credential_account": facts.confluence_credential_account,
+        "env_credentials": facts.env_credentials,
+        "tls": facts.tls,
+        "deployment": facts.deployment,
+        "site_url": facts.site_url,
+        "confluence_url": facts.confluence_url,
+        "logged_in": facts.logged_in,
+        "auth_status": facts.auth_status,
+        "config_dir": facts.config_dir,
+        "config_dir_source": facts.config_dir_source,
+        "data_dir": facts.data_dir,
+        "config_path": facts.config_path,
+        "config_exists": facts.config_path.exists(),
+        "credentials_fallback_path": facts.credentials_fallback_path,
+        "credentials_fallback_exists": facts.credentials_fallback_path.exists(),
+        "db_path": facts.db_path,
+        "db_exists": facts.db_path.exists(),
+        "download_dir": facts.download_dir,
+        "cache_counts": facts.cache_counts,
+        "probe_me": probe_me,
+        "probe_error": probe_error,
+        "probe_confluence_me": probe_confluence_me,
+        "probe_confluence_error": probe_confluence_error,
+    })
+}
+
 async fn cmd_doctor(
     cfg: &AppConfig,
     persona: Persona,
@@ -4121,44 +4443,41 @@ async fn cmd_doctor(
 
     let ca_sources = crate::atlassian::client::extra_ca_sources();
 
-    let mut probe_me = None;
-    let mut probe_error = None;
-    if probe {
-        match client.get_myself().await {
-            Ok(me) => probe_me = Some(me),
-            Err(err) => probe_error = Some(format!("{err:#}")),
-        }
-    }
+    let identity = if probe {
+        Some(client.probe_identity().await)
+    } else {
+        None
+    };
+    let config_dir = config::config_dir();
+    let data_dir = config::data_dir(&cfg.profile);
+    let config_dir_override = std::env::var("ATLASSIAN_CONFIG_DIR").ok();
+    let config_dir_source = config_dir_source(config_dir_override.as_deref());
 
     if json_out {
-        println!(
-            "{}",
-            serde_json::to_string_pretty(&json!({
-                "version": env!("CARGO_PKG_VERSION"),
-                "persona": persona.as_str(),
-                "profile": cfg.profile,
-                "site_id": client.site_id(),
-                "credential_account": auth.profile(),
-                "confluence_credential_account": client.confluence_credential_account(),
-                "env_credentials": env_credentials_report(cfg),
-                "tls": tls_report(&ca_sources),
-                "deployment": effective_deployment,
-                "site_url": effective_site_url,
-                "confluence_url": effective_conf_url,
-                "logged_in": logged_in,
-                "auth_status": auth_status,
-                "config_path": cfg_path,
-                "config_exists": cfg_path.exists(),
-                "credentials_fallback_path": cred_path,
-                "credentials_fallback_exists": cred_path.exists(),
-                "db_path": db_path,
-                "db_exists": db_path.exists(),
-                "download_dir": dl_dir,
-                "cache_counts": cache_counts,
-                "probe_me": probe_me,
-                "probe_error": probe_error,
-            }))?
-        );
+        let report = doctor_report(&DoctorFacts {
+            persona,
+            profile: &cfg.profile,
+            site_id: client.site_id(),
+            credential_account: auth.profile(),
+            confluence_credential_account: client.confluence_credential_account(),
+            env_credentials: env_credentials_report(cfg),
+            tls: tls_report(&ca_sources),
+            deployment: effective_deployment,
+            site_url: &effective_site_url,
+            confluence_url: &effective_conf_url,
+            logged_in,
+            auth_status: &auth_status,
+            config_dir: &config_dir,
+            config_dir_source,
+            data_dir: &data_dir,
+            config_path: &cfg_path,
+            credentials_fallback_path: &cred_path,
+            db_path: &db_path,
+            download_dir: &dl_dir,
+            cache_counts: json!(&cache_counts),
+            probe: identity.as_ref(),
+        });
+        println!("{}", serde_json::to_string_pretty(&report)?);
     } else {
         println!("atlassian-cli v{} ({})", env!("CARGO_PKG_VERSION"), persona.as_str());
         println!("Profile: {} · Deployment: {effective_deployment}", cfg.profile);
@@ -4184,6 +4503,16 @@ async fn cmd_doctor(
         }
         println!("TLS roots: {}", tls_roots_line(&ca_sources));
         println!(
+            "Config dir: {} ({})",
+            config_dir.display(),
+            if config_dir_source == "default" {
+                "default; override with ATLASSIAN_CONFIG_DIR"
+            } else {
+                "ATLASSIAN_CONFIG_DIR override"
+            }
+        );
+        println!("Data dir: {}", data_dir.display());
+        println!(
             "Config file: {} ({})",
             cfg_path.display(),
             if cfg_path.exists() { "exists" } else { "missing" }
@@ -4205,16 +4534,26 @@ async fn cmd_doctor(
                 counts.projects, counts.boards, counts.issues, counts.spaces, counts.pages
             );
         }
-        if probe {
-            if let Some(me) = probe_me {
-                println!(
+        if let Some(identity) = &identity {
+            match &identity.jira {
+                Some(Ok(me)) => println!(
                     "Live probe OK: {} ({}) [id={}]",
                     me.display_name,
                     me.email.as_deref().unwrap_or("-"),
                     me.id
-                );
-            } else if let Some(err) = probe_error {
-                println!("Live probe failed: {err}");
+                ),
+                Some(Err(failure)) => println!("Live probe failed: {}", failure.message),
+                None => println!("Live probe skipped: no Jira URL is configured."),
+            }
+            match &identity.confluence {
+                Some(Ok(me)) => println!(
+                    "Confluence probe OK: {} ({}) [id={}]",
+                    me.display_name,
+                    me.email.as_deref().unwrap_or("-"),
+                    me.id
+                ),
+                Some(Err(failure)) => println!("Confluence probe failed: {}", failure.message),
+                None => {}
             }
         }
     }
@@ -6460,7 +6799,211 @@ fn pad_width(raw: &str, max_width: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::atlassian::client::ProbeFailure;
     use crate::models::{BoardColumn, IssueStatus, UserSummary};
+
+    fn probe_user(id: &str) -> UserSummary {
+        UserSummary {
+            id: id.into(),
+            display_name: format!("User {id}"),
+            email: None,
+            avatar_url: None,
+            active: true,
+        }
+    }
+
+    fn probe_failure(status: u16, anonymous: bool) -> ProbeFailure {
+        ProbeFailure {
+            status: Some(status),
+            anonymous,
+            message: format!("request failed (HTTP {status})"),
+        }
+    }
+
+    #[test]
+    fn decide_login_identity_accepts_jira_user() {
+        let probe = IdentityProbe {
+            jira: Some(Ok(probe_user("jdoe"))),
+            confluence: Some(Ok(probe_user("jdoe-wiki"))),
+        };
+        assert_eq!(decide_login_identity(Persona::Jira, &probe).unwrap().id, "jdoe");
+        assert_eq!(
+            confluence_login_warning(&probe, DeploymentKind::DataCenter, "corp", Persona::Jira),
+            None
+        );
+    }
+
+    #[test]
+    fn decide_login_identity_accepts_confluence_only_site_on_jira_404() {
+        let probe = IdentityProbe {
+            jira: Some(Err(probe_failure(404, false))),
+            confluence: Some(Ok(probe_user("wiki-user"))),
+        };
+        assert_eq!(decide_login_identity(Persona::Jira, &probe).unwrap().id, "wiki-user");
+        assert_eq!(
+            decide_login_identity(Persona::Confluence, &probe).unwrap().id,
+            "wiki-user"
+        );
+        assert_eq!(identity_json(&probe), json!({ "jira": "not_found", "confluence": "ok" }));
+    }
+
+    #[test]
+    fn decide_login_identity_jira_ok_confluence_anonymous_is_ok_with_warning() {
+        let probe = IdentityProbe {
+            jira: Some(Ok(probe_user("jdoe"))),
+            confluence: Some(Err(probe_failure(401, true))),
+        };
+        assert_eq!(decide_login_identity(Persona::Jira, &probe).unwrap().id, "jdoe");
+        let warning =
+            confluence_login_warning(&probe, DeploymentKind::DataCenter, "corp", Persona::Jira)
+                .expect("a Data Center login must warn");
+        assert!(warning.contains("atlassian login --site corp --confluence-pat <PAT>"), "{warning}");
+        assert!(warning.contains("ATLASSIAN_CONFLUENCE_PAT"), "{warning}");
+        // Cloud uses one credential for both products: no split-PAT warning there.
+        assert_eq!(
+            confluence_login_warning(&probe, DeploymentKind::Cloud, "acme", Persona::Jira),
+            None
+        );
+        // A Confluence 404 (no Confluence on this host) is not a credential problem.
+        let no_wiki = IdentityProbe {
+            jira: Some(Ok(probe_user("jdoe"))),
+            confluence: Some(Err(probe_failure(404, false))),
+        };
+        assert_eq!(
+            confluence_login_warning(&no_wiki, DeploymentKind::DataCenter, "corp", Persona::Jira),
+            None
+        );
+        // The confluence persona logs into Confluence, so its rejection is a failure.
+        assert!(decide_login_identity(Persona::Confluence, &probe).is_err());
+    }
+
+    #[test]
+    fn decide_login_identity_fails_when_both_products_reject() {
+        let probe = IdentityProbe {
+            jira: Some(Err(probe_failure(401, false))),
+            confluence: Some(Err(probe_failure(401, true))),
+        };
+        let err = decide_login_identity(Persona::Jira, &probe).unwrap_err();
+        let helped = with_login_help(
+            err,
+            &login_failure_help(Persona::Jira, "https://jira.corp", DeploymentKind::DataCenter),
+        );
+        // The HTTP status (JSON error code "unauthorized") survives the appended help.
+        assert_eq!(error_payload(&helped)["code"], "unauthorized");
+        let text = format!("{helped:#}");
+        assert!(text.contains("request failed (HTTP 401)"), "{text}");
+        assert!(text.contains("atlassian login --url https://jira.corp --pat <PAT>"), "{text}");
+        assert!(text.contains("ATLASSIAN_PAT=<PAT>"), "{text}");
+        assert!(text.contains("atlassian doctor --probe"), "{text}");
+
+        let neither = IdentityProbe {
+            jira: Some(Err(probe_failure(404, false))),
+            confluence: Some(Err(probe_failure(404, false))),
+        };
+        assert_eq!(
+            error_payload(&decide_login_identity(Persona::Jira, &neither).unwrap_err())["code"],
+            "not_found"
+        );
+    }
+
+    #[test]
+    fn login_failure_help_matches_deployment_and_persona() {
+        let cloud = login_failure_help(Persona::Confluence, "", DeploymentKind::Cloud);
+        assert!(cloud.starts_with("Could not verify the credential."), "{cloud}");
+        assert!(
+            cloud.contains("confluence login --url <URL> --email <EMAIL> --token <API_TOKEN>"),
+            "{cloud}"
+        );
+        assert!(cloud.contains("confluence doctor --probe"), "{cloud}");
+        assert!(cloud.contains("Windows consoles"), "{cloud}");
+    }
+
+    #[test]
+    fn login_accepts_confluence_pat_flags() {
+        let cli = Cli::try_parse_from([
+            "atlassian",
+            "login",
+            "--site",
+            "corp",
+            "--confluence-pat",
+            "PAT-C",
+            "--confluence-account",
+            "corp-wiki",
+        ])
+        .unwrap();
+        assert_eq!(cli.site.as_deref(), Some("corp"));
+        match cli.command {
+            Some(Command::Login {
+                confluence_pat,
+                confluence_account,
+                pat,
+                ..
+            }) => {
+                assert_eq!(confluence_pat.as_deref(), Some("PAT-C"));
+                assert_eq!(confluence_account.as_deref(), Some("corp-wiki"));
+                assert_eq!(pat, None);
+            }
+            other => panic!("expected login, got {other:?}"),
+        }
+        let conf = ConfluenceCli::try_parse_from(["confluence", "login", "--confluence-pat", "PAT-C"])
+            .unwrap();
+        assert!(matches!(
+            conf.command,
+            Some(ConfluenceCommand::Login { confluence_pat: Some(_), .. })
+        ));
+    }
+
+    #[test]
+    fn doctor_reports_config_dir_override() {
+        assert_eq!(config_dir_source(Some("D:\\atl")), "env:ATLASSIAN_CONFIG_DIR");
+        assert_eq!(config_dir_source(Some("  ")), "default");
+        assert_eq!(config_dir_source(None), "default");
+
+        let probe = IdentityProbe {
+            jira: Some(Err(probe_failure(404, false))),
+            confluence: Some(Ok(probe_user("wiki-user"))),
+        };
+        let missing = Path::new("definitely-missing-doctor-path");
+        let facts = DoctorFacts {
+            persona: Persona::Jira,
+            profile: "default",
+            site_id: "corp",
+            credential_account: "corp",
+            confluence_credential_account: Some("corp-confluence"),
+            env_credentials: json!({ "present": false, "applies_to_site": null }),
+            tls: json!({ "native_roots": true, "extra_ca_sources": [] }),
+            deployment: "datacenter",
+            site_url: "https://jira.corp",
+            confluence_url: "https://wiki.corp",
+            logged_in: true,
+            auth_status: "PAT",
+            config_dir: Path::new("D:\\atl"),
+            config_dir_source: config_dir_source(Some("D:\\atl")),
+            data_dir: Path::new("D:\\atl\\default"),
+            config_path: missing,
+            credentials_fallback_path: missing,
+            db_path: missing,
+            download_dir: missing,
+            cache_counts: Value::Null,
+            probe: Some(&probe),
+        };
+        let report = doctor_report(&facts);
+        assert_eq!(report["config_dir"], "D:\\atl");
+        assert_eq!(report["config_dir_source"], "env:ATLASSIAN_CONFIG_DIR");
+        assert_eq!(report["data_dir"], "D:\\atl\\default");
+        assert_eq!(report["config_exists"], false);
+        assert_eq!(report["confluence_credential_account"], "corp-confluence");
+        // Jira keeps probe_me / probe_error; Confluence gets its own pair.
+        assert_eq!(report["probe_me"], Value::Null);
+        assert_eq!(report["probe_error"], "request failed (HTTP 404)");
+        assert_eq!(report["probe_confluence_me"]["id"], "wiki-user");
+        assert_eq!(report["probe_confluence_error"], Value::Null);
+
+        let not_probed = doctor_report(&DoctorFacts { probe: None, ..facts });
+        for key in ["probe_me", "probe_error", "probe_confluence_me", "probe_confluence_error"] {
+            assert_eq!(not_probed[key], Value::Null, "{key}");
+        }
+    }
 
     #[test]
     fn parses_jira_and_confluence_persona_clis() {
