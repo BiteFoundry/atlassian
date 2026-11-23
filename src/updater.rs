@@ -78,10 +78,10 @@ pub async fn check_or_apply_update_at(
     token: Option<String>,
 ) -> Result<UpdateCheckResult> {
     let current_version = env!("CARGO_PKG_VERSION").to_string();
-    let client = reqwest::Client::builder()
-        .timeout(Duration::from_secs(60))
-        .build()
-        .context("Failed to create HTTP client")?;
+    let client = crate::atlassian::client::build_http_client(|builder| {
+        builder.timeout(Duration::from_secs(60))
+    })
+    .context("Failed to create HTTP client")?;
 
     let ua = format!("atlassian-cli/{current_version}");
     let api_base = api_base_url.trim_end_matches('/');

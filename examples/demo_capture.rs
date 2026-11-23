@@ -316,6 +316,7 @@ fn build_demo_state() -> (AppState, UiState) {
         account_id: "acme-oauth".into(),
         enabled: true,
         scopes: vec!["read:jira-work".into(), "read:confluence-content.all".into()],
+        confluence_account_id: None,
     };
     let dc_site = SiteProfile {
         id: "acme-dc".into(),
@@ -327,6 +328,7 @@ fn build_demo_state() -> (AppState, UiState) {
         account_id: "acme-dc-pat".into(),
         enabled: true,
         scopes: vec![],
+        confluence_account_id: None,
     };
 
     let cfg = AppConfig {

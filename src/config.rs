@@ -264,6 +264,9 @@ pub struct SiteProfile {
     /// OAuth scopes granted for this Cloud site (empty for API token / PAT sites).
     #[serde(default)]
     pub scopes: Vec<String>,
+    /// Separate credential account for Confluence (Data Center PATs are per application).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub confluence_account_id: Option<String>,
 }
 
 impl Default for SiteProfile {
@@ -278,6 +281,7 @@ impl Default for SiteProfile {
             account_id: "default".to_string(),
             enabled: true,
             scopes: Vec::new(),
+            confluence_account_id: None,
         }
     }
 }
@@ -587,6 +591,7 @@ impl AppConfig {
             account_id,
             enabled: true,
             scopes: Vec::new(),
+            confluence_account_id: None,
         }]
     }
 
@@ -1352,6 +1357,7 @@ mod tests {
             account_id: "oauth-main".into(),
             enabled: true,
             scopes: vec!["read:jira-work".into()],
+            confluence_account_id: None,
         });
         cfg.upsert_site(SiteProfile {
             id: "corp-dc".into(),
@@ -1363,6 +1369,7 @@ mod tests {
             account_id: "dc-pat".into(),
             enabled: false,
             scopes: Vec::new(),
+            confluence_account_id: None,
         });
         cfg.active_site = Some("acme".into());
         cfg.default_site = Some("acme".into());
@@ -1402,6 +1409,7 @@ mod tests {
             account_id: "oauth-main".into(),
             enabled: true,
             scopes: vec!["read:jira-work".into(), "write:jira-work".into()],
+            confluence_account_id: None,
         });
         assert_eq!(cfg.sites.len(), 2);
         assert_eq!(cfg.find_site("acme-renamed").unwrap().name, "Acme Updated");
@@ -1462,5 +1470,50 @@ mod tests {
             Some(v) => std::env::set_var("ATLASSIAN_OAUTH_CLIENT_SECRET", v),
             None => std::env::remove_var("ATLASSIAN_OAUTH_CLIENT_SECRET"),
         }
+    }
+
+    #[test]
+    fn site_profile_without_confluence_account_roundtrips_unchanged() {
+        // A 0.8.0-style config: no confluence_account_id anywhere.
+        let legacy = r#"
+site_url = "https://jira.corp.example"
+confluence_url = "https://wiki.corp.example"
+deployment = "datacenter"
+sync_interval_secs = 45
+github_repo = "BiteFoundry/atlassian"
+profile = "default"
+
+[[sites]]
+id = "corp"
+name = "Corp DC"
+site_url = "https://jira.corp.example"
+confluence_url = "https://wiki.corp.example"
+deployment = "datacenter"
+account_id = "corp"
+enabled = true
+scopes = []
+"#;
+        let cfg: AppConfig = toml::from_str(legacy).expect("0.8.0 config loads unchanged");
+        assert_eq!(cfg.sites.len(), 1);
+        assert_eq!(cfg.sites[0].confluence_account_id, None);
+
+        let serialized = toml::to_string_pretty(&cfg).unwrap();
+        assert!(
+            !serialized.contains("confluence_account_id"),
+            "an unset Confluence account must not be written: {serialized}"
+        );
+        let reparsed: AppConfig = toml::from_str(&serialized).unwrap();
+        assert_eq!(reparsed.sites, cfg.sites);
+
+        // When set, it is written and read back.
+        let mut split = cfg.clone();
+        split.sites[0].confluence_account_id = Some("corp-confluence".into());
+        let serialized = toml::to_string_pretty(&split).unwrap();
+        assert!(serialized.contains("confluence_account_id = \"corp-confluence\""));
+        let reparsed: AppConfig = toml::from_str(&serialized).unwrap();
+        assert_eq!(
+            reparsed.sites[0].confluence_account_id.as_deref(),
+            Some("corp-confluence")
+        );
     }
 }

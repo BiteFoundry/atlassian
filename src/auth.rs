@@ -91,6 +91,7 @@ impl AccessibleResource {
             account_id: account_id.into(),
             enabled: true,
             scopes: self.scopes.clone(),
+            confluence_account_id: None,
         }
     }
 }
@@ -867,12 +868,45 @@ fn global_refresh_mutex(key: &str) -> Arc<tokio::sync::Mutex<()>> {
         .clone()
 }
 
+/// How credentials supplied through environment variables (ATLASSIAN_PAT,
+/// ATLASSIAN_API_TOKEN + ATLASSIAN_EMAIL, ...) rank against stored credentials.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum EnvCredentialPolicy {
+    /// Environment credentials win over stored ones (single-site behaviour).
+    #[default]
+    Primary,
+    /// Stored credentials win; the environment is used only when nothing is stored.
+    FallbackOnly,
+    /// Environment credentials are never used for this account.
+    Never,
+}
+
+impl EnvCredentialPolicy {
+    fn strength(self) -> u8 {
+        match self {
+            Self::Primary => 2,
+            Self::FallbackOnly => 1,
+            Self::Never => 0,
+        }
+    }
+
+    /// The policy that lets the environment apply more often.
+    pub fn strongest(self, other: Self) -> Self {
+        if other.strength() > self.strength() {
+            other
+        } else {
+            self
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct AuthManager {
     profile: String,
     direct_credentials: Arc<RwLock<Option<StoredCredentials>>>,
     fallback_path_override: Option<PathBuf>,
     refresh_lock: Arc<tokio::sync::Mutex<()>>,
+    env_policy: EnvCredentialPolicy,
 }
 
 impl AuthManager {
@@ -889,6 +923,7 @@ impl AuthManager {
             direct_credentials: Arc::new(RwLock::new(None)),
             fallback_path_override: None,
             refresh_lock: global_refresh_mutex(&lock_key),
+            env_policy: EnvCredentialPolicy::Primary,
         }
     }
 
@@ -919,6 +954,7 @@ impl AuthManager {
             direct_credentials: Arc::new(RwLock::new(Some(creds))),
             fallback_path_override: None,
             refresh_lock: Arc::new(tokio::sync::Mutex::new(())),
+            env_policy: EnvCredentialPolicy::Primary,
         }
     }
 
@@ -934,6 +970,16 @@ impl AuthManager {
         self.refresh_lock = global_refresh_mutex(&lock_key);
         self.fallback_path_override = Some(path);
         self
+    }
+
+    /// Sets how environment credentials rank against this account's stored credentials.
+    pub fn with_env_policy(mut self, policy: EnvCredentialPolicy) -> Self {
+        self.env_policy = policy;
+        self
+    }
+
+    pub fn env_policy(&self) -> EnvCredentialPolicy {
+        self.env_policy
     }
 
     pub fn profile(&self) -> &str {
@@ -963,13 +1009,22 @@ impl AuthManager {
     }
 
     pub fn load_credentials(&self) -> Result<Option<StoredCredentials>> {
+        // An isolated fallback file (tests, DI) never consults the process environment.
+        self.load_credentials_with_env(self.fallback_path_override.is_none())
+    }
+
+    /// Resolution order by [EnvCredentialPolicy]:
+    /// Primary = direct, env, keyring, file; FallbackOnly = direct, keyring, file, env;
+    /// Never = direct, keyring, file.
+    fn load_credentials_with_env(&self, env_enabled: bool) -> Result<Option<StoredCredentials>> {
         if let Ok(guard) = self.direct_credentials.read() {
             if let Some(ref creds) = *guard {
                 return Ok(Some(creds.clone()));
             }
         }
 
-        if self.fallback_path_override.is_none() {
+        let env_enabled = env_enabled && self.env_policy != EnvCredentialPolicy::Never;
+        if env_enabled && self.env_policy == EnvCredentialPolicy::Primary {
             if let Some(env_creds) = load_credentials_from_env() {
                 return Ok(Some(env_creds));
             }
@@ -989,7 +1044,14 @@ impl AuthManager {
         }
 
         let fallback = self.effective_fallback_path();
-        load_profile_from_file(&fallback, &self.profile)
+        let stored = load_profile_from_file(&fallback, &self.profile)?;
+        if stored.is_some() {
+            return Ok(stored);
+        }
+        if env_enabled && self.env_policy == EnvCredentialPolicy::FallbackOnly {
+            return Ok(load_credentials_from_env());
+        }
+        Ok(None)
     }
 
     pub fn save_credentials(&self, creds: &StoredCredentials) -> Result<()> {
@@ -1220,6 +1282,24 @@ fn load_credentials_from_env() -> Option<StoredCredentials> {
     }
 
     None
+}
+
+/// Site URL the environment credentials belong to, or "None" when the environment
+/// carries no credentials. Used to scope them to one site in multi-site configurations.
+pub(crate) fn env_credentials_site_url() -> Option<String> {
+    load_credentials_from_env().map(|creds| normalize_base_url(creds.site_url()))
+}
+
+/// Confluence-only Data Center PAT from ATLASSIAN_CONFLUENCE_PAT (alias CONFLUENCE_PAT).
+pub(crate) fn env_confluence_pat() -> Option<String> {
+    first_nonempty_env(&["ATLASSIAN_CONFLUENCE_PAT", "CONFLUENCE_PAT"])
+}
+
+/// Confluence root named by ATLASSIAN_CONFLUENCE_URL (alias CONFLUENCE_URL), normalized.
+pub(crate) fn env_confluence_url() -> Option<String> {
+    first_nonempty_env(&["ATLASSIAN_CONFLUENCE_URL", "CONFLUENCE_URL"])
+        .map(|u| normalize_base_url(&u))
+        .filter(|u| !u.is_empty())
 }
 
 fn resolve_env_site_and_deployment(default_deployment: DeploymentKind) -> (String, DeploymentKind) {
@@ -1862,5 +1942,94 @@ mod tests {
         }
         // Only ONE HTTP refresh call despite 8 concurrent callers!
         assert_eq!(refresh_hits.load(Ordering::SeqCst), 1);
+    }
+
+    fn stored_api_token() -> StoredCredentials {
+        StoredCredentials::ApiToken {
+            site_url: "https://acme.atlassian.net".into(),
+            email: "alice@acme.com".into(),
+            api_token: "stored-token".into(),
+            deployment: DeploymentKind::Cloud,
+        }
+    }
+
+    /// Sets an environment PAT and returns a manager whose stored credentials live in "dir".
+    fn manager_with_env_pat(dir: &Path, policy: EnvCredentialPolicy) -> AuthManager {
+        std::env::set_var("ATLASSIAN_CONFIG_DIR", dir);
+        std::env::set_var("ATLASSIAN_DISABLE_KEYRING", "1");
+        std::env::set_var("ATLASSIAN_PAT", "env-pat");
+        std::env::set_var("ATLASSIAN_SITE_URL", "https://jira.corp.example");
+        AuthManager::for_account("acct")
+            .with_fallback_path(dir.join("credentials.json"))
+            .with_env_policy(policy)
+    }
+
+    fn env_pat() -> StoredCredentials {
+        StoredCredentials::BearerPat {
+            site_url: "https://jira.corp.example".into(),
+            token: "env-pat".into(),
+            deployment: DeploymentKind::DataCenter,
+        }
+    }
+
+    #[test]
+    fn env_pat_primary_for_single_site() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let _guard = EnvGuard::clear(ALL_AUTH_ENVS);
+        let dir = tempdir().unwrap();
+        let mgr = manager_with_env_pat(dir.path(), EnvCredentialPolicy::Primary);
+        assert_eq!(mgr.env_policy(), EnvCredentialPolicy::Primary);
+        assert_eq!(AuthManager::new("x").env_policy(), EnvCredentialPolicy::Primary);
+        mgr.save_credentials(&stored_api_token()).unwrap();
+        // Primary: the environment wins over the stored credential (unchanged behaviour).
+        assert_eq!(mgr.load_credentials_with_env(true).unwrap(), Some(env_pat()));
+    }
+
+    #[test]
+    fn env_pat_fallback_only_does_not_override_stored_credentials() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let _guard = EnvGuard::clear(ALL_AUTH_ENVS);
+        let dir = tempdir().unwrap();
+        let mgr = manager_with_env_pat(dir.path(), EnvCredentialPolicy::FallbackOnly);
+        mgr.save_credentials(&stored_api_token()).unwrap();
+        assert_eq!(
+            mgr.load_credentials_with_env(true).unwrap(),
+            Some(stored_api_token())
+        );
+    }
+
+    #[test]
+    fn env_pat_used_when_no_stored_credentials_under_fallback_only() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let _guard = EnvGuard::clear(ALL_AUTH_ENVS);
+        let dir = tempdir().unwrap();
+        let mgr = manager_with_env_pat(dir.path(), EnvCredentialPolicy::FallbackOnly);
+        assert_eq!(mgr.load_credentials_with_env(true).unwrap(), Some(env_pat()));
+    }
+
+    #[test]
+    fn env_policy_never_ignores_env() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let _guard = EnvGuard::clear(ALL_AUTH_ENVS);
+        let dir = tempdir().unwrap();
+        let mgr = manager_with_env_pat(dir.path(), EnvCredentialPolicy::Never);
+        assert_eq!(mgr.load_credentials_with_env(true).unwrap(), None);
+        mgr.save_credentials(&stored_api_token()).unwrap();
+        assert_eq!(
+            mgr.load_credentials_with_env(true).unwrap(),
+            Some(stored_api_token())
+        );
+        // An isolated fallback file never consults the environment, whatever the policy.
+        let isolated = manager_with_env_pat(dir.path(), EnvCredentialPolicy::Primary);
+        assert_eq!(isolated.load_credentials().unwrap(), Some(stored_api_token()));
+    }
+
+    #[test]
+    fn env_credential_policy_strongest_orders_primary_first() {
+        use EnvCredentialPolicy::*;
+        assert_eq!(FallbackOnly.strongest(Primary), Primary);
+        assert_eq!(Primary.strongest(Never), Primary);
+        assert_eq!(Never.strongest(FallbackOnly), FallbackOnly);
+        assert_eq!(Never.strongest(Never), Never);
     }
 }

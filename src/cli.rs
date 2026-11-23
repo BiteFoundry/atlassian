@@ -3224,6 +3224,7 @@ async fn cmd_login(
             .as_ref()
             .map(|s| s.scopes.clone())
             .unwrap_or_default(),
+        confluence_account_id: None,
     };
 
     // Validate credentials against the target site BEFORE persisting config or credentials.
@@ -3493,6 +3494,7 @@ async fn cmd_login_cloud_account(
             account_id: account_id.clone(),
             enabled: true,
             scopes: Vec::new(),
+            confluence_account_id: None,
         };
         let storage = Storage::open(&config::cache_db_path(&cfg.profile))?;
         let _ = storage.upsert_site(&SiteRecord {
@@ -3693,6 +3695,7 @@ async fn cmd_sites(cfg: &mut AppConfig, action: SitesCommand) -> Result<()> {
                 account_id: account_id.clone(),
                 enabled: true,
                 scopes: Vec::new(),
+                confluence_account_id: None,
             };
             storage.upsert_site(&SiteRecord {
                 site_id: profile.id.clone(),
@@ -4018,6 +4021,7 @@ async fn cmd_whoami(cfg: &AppConfig, persona: Persona, json_out: bool) -> Result
                 "persona": persona.as_str(),
                 "site_id": client.site_id(),
                 "credential_account": auth.profile(),
+                "confluence_credential_account": client.confluence_credential_account(),
                 "deployment": effective_deployment,
                 "site_url": effective_site_url,
                 "confluence_url": effective_conf_url,
@@ -4039,6 +4043,55 @@ async fn cmd_whoami(cfg: &AppConfig, persona: Persona, json_out: bool) -> Result
         println!("Auth: {}", auth.status_summary());
     }
     Ok(())
+}
+
+/// "tls" object of the doctor report. Lists CA bundle paths and certificate counts only,
+/// never certificate contents.
+fn tls_report(sources: &[crate::atlassian::client::ExtraCaSource]) -> Value {
+    json!({
+        "native_roots": true,
+        "extra_ca_sources": sources
+            .iter()
+            .map(|s| json!({
+                "env": s.env,
+                "path": s.path,
+                "certificates": s.certificates,
+                "error": s.error,
+            }))
+            .collect::<Vec<_>>(),
+    })
+}
+
+fn tls_roots_line(sources: &[crate::atlassian::client::ExtraCaSource]) -> String {
+    let mut line = "OS trust store + bundled roots".to_string();
+    if sources.is_empty() {
+        line.push_str(" (no extra CA; set ATLASSIAN_EXTRA_CA_PEM for a corporate root)");
+        return line;
+    }
+    for source in sources {
+        match &source.error {
+            None => line.push_str(&format!(
+                " + {}={} ({} certificate(s))",
+                source.env, source.path, source.certificates
+            )),
+            Some(err) => line.push_str(&format!(
+                " + {}={} (ignored: {err})",
+                source.env, source.path
+            )),
+        }
+    }
+    line
+}
+
+/// "env_credentials" object of the doctor report: whether the environment carries
+/// credentials and which site they are primary for (so a 401 caused by a stray
+/// ATLASSIAN_PAT is diagnosable). Never includes the credential itself.
+fn env_credentials_report(cfg: &AppConfig) -> Value {
+    let env = crate::atlassian::client::PoolEnv::from_process_env();
+    json!({
+        "present": env.credentials_site_url.is_some(),
+        "applies_to_site": env.credentials_site_id(&cfg.effective_sites()),
+    })
 }
 
 async fn cmd_doctor(
@@ -4066,6 +4119,8 @@ async fn cmd_doctor(
         None
     };
 
+    let ca_sources = crate::atlassian::client::extra_ca_sources();
+
     let mut probe_me = None;
     let mut probe_error = None;
     if probe {
@@ -4084,6 +4139,9 @@ async fn cmd_doctor(
                 "profile": cfg.profile,
                 "site_id": client.site_id(),
                 "credential_account": auth.profile(),
+                "confluence_credential_account": client.confluence_credential_account(),
+                "env_credentials": env_credentials_report(cfg),
+                "tls": tls_report(&ca_sources),
                 "deployment": effective_deployment,
                 "site_url": effective_site_url,
                 "confluence_url": effective_conf_url,
@@ -4121,6 +4179,10 @@ async fn cmd_doctor(
             }
         );
         println!("Auth status: {auth_status}");
+        if let Some(account) = client.confluence_credential_account() {
+            println!("Confluence credential: separate account '{account}'");
+        }
+        println!("TLS roots: {}", tls_roots_line(&ca_sources));
         println!(
             "Config file: {} ({})",
             cfg_path.display(),

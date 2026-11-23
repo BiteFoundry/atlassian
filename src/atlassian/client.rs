@@ -4,7 +4,7 @@
 use std::{
     collections::HashMap,
     path::PathBuf,
-    sync::{Arc, RwLock},
+    sync::{Arc, OnceLock, RwLock},
     time::Duration,
 };
 
@@ -21,8 +21,11 @@ use url::Url;
 
 use crate::{
     atlassian::body::BodyEditError,
-    auth::{AuthManager, StoredCredentials, DEFAULT_OAUTH_API_BASE, DEFAULT_OAUTH_AUTH_BASE},
-    config::{normalize_base_url, AppConfig, DeploymentKind, SiteProfile},
+    auth::{
+        AuthManager, EnvCredentialPolicy, StoredCredentials, DEFAULT_OAUTH_API_BASE,
+        DEFAULT_OAUTH_AUTH_BASE,
+    },
+    config::{normalize_base_url, normalize_url_for_match, AppConfig, DeploymentKind, SiteProfile},
     models::{AttachmentItem, UserSummary},
 };
 
@@ -104,19 +107,222 @@ pub(crate) fn is_not_found_error(err: &anyhow::Error) -> bool {
     http_status_code(err) == Some(StatusCode::NOT_FOUND)
 }
 
-fn build_shared_http_client() -> Result<reqwest::Client> {
+/// Environment variables that may name extra trusted root CA bundles.
+/// Every variable that is set is loaded (not only the first one).
+pub(crate) const EXTRA_CA_ENV_VARS: [&str; 3] =
+    ["ATLASSIAN_EXTRA_CA_PEM", "SSL_CERT_FILE", "NODE_EXTRA_CA_CERTS"];
+
+/// One extra-CA source and what loading it produced. Never carries certificate contents.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ExtraCaSource {
+    pub env: &'static str,
+    /// File path, or "<inline PEM>" when the variable holds the PEM text itself.
+    pub path: String,
+    pub certificates: usize,
+    pub error: Option<String>,
+}
+
+impl ExtraCaSource {
+    fn warning(&self) -> Option<String> {
+        self.error.as_ref().map(|err| {
+            format!(
+                "ignoring extra CA bundle from {} ({}): {err}",
+                self.env, self.path
+            )
+        })
+    }
+}
+
+/// Loads extra root certificates named by [EXTRA_CA_ENV_VARS] through "lookup".
+/// A missing or unparseable source is reported in the returned sources, never as a failure.
+pub(crate) fn load_extra_ca_sources(
+    lookup: impl Fn(&str) -> Option<String>,
+) -> (Vec<reqwest::Certificate>, Vec<ExtraCaSource>) {
+    let mut certs = Vec::new();
+    let mut sources = Vec::new();
+    for env in EXTRA_CA_ENV_VARS {
+        let Some(raw) = lookup(env)
+            .map(|v| v.trim().to_string())
+            .filter(|v| !v.is_empty())
+        else {
+            continue;
+        };
+        // Only ATLASSIAN_EXTRA_CA_PEM may hold the PEM text itself; the other two are paths.
+        let inline = env == "ATLASSIAN_EXTRA_CA_PEM" && raw.starts_with("-----BEGIN");
+        let (path, bytes) = if inline {
+            (
+                "<inline PEM>".to_string(),
+                Ok(raw.replace("\\n", "\n").into_bytes()),
+            )
+        } else {
+            let read = std::fs::read(&raw).map_err(|e| format!("cannot read file: {e}"));
+            (raw, read)
+        };
+        let parsed = bytes.and_then(|b| {
+            reqwest::Certificate::from_pem_bundle(&b).map_err(|e| format!("cannot parse PEM: {e}"))
+        });
+        match parsed {
+            Ok(list) if list.is_empty() => sources.push(ExtraCaSource {
+                env,
+                path,
+                certificates: 0,
+                error: Some("no PEM certificates found".to_string()),
+            }),
+            Ok(list) => {
+                sources.push(ExtraCaSource {
+                    env,
+                    path,
+                    certificates: list.len(),
+                    error: None,
+                });
+                certs.extend(list);
+            }
+            Err(error) => sources.push(ExtraCaSource {
+                env,
+                path,
+                certificates: 0,
+                error: Some(error),
+            }),
+        }
+    }
+    (certs, sources)
+}
+
+/// Extra-CA sources from the process environment (for "atlassian doctor").
+pub(crate) fn extra_ca_sources() -> Vec<ExtraCaSource> {
+    load_extra_ca_sources(|name| std::env::var(name).ok()).1
+}
+
+fn extra_ca_certificates_with(
+    lookup: impl Fn(&str) -> Option<String>,
+) -> (Vec<reqwest::Certificate>, Vec<String>) {
+    let (certs, sources) = load_extra_ca_sources(lookup);
+    let warnings = sources.iter().filter_map(ExtraCaSource::warning).collect();
+    (certs, warnings)
+}
+
+/// Extra root certificates from ATLASSIAN_EXTRA_CA_PEM, SSL_CERT_FILE and NODE_EXTRA_CA_CERTS,
+/// plus one warning per source that could not be used.
+fn extra_ca_certificates() -> (Vec<reqwest::Certificate>, Vec<String>) {
+    extra_ca_certificates_with(|name| std::env::var(name).ok())
+}
+
+/// Prints TLS trust-store warnings once per process, to stderr only (stdout carries
+/// JSON and the MCP stdio protocol).
+fn warn_tls_once(warnings: &[String]) {
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    if warnings.is_empty() {
+        return;
+    }
+    ONCE.call_once(|| {
+        for warning in warnings {
+            eprintln!("warning: {warning}");
+        }
+    });
+}
+
+fn base_http_client_builder() -> reqwest::ClientBuilder {
     reqwest::Client::builder()
         .user_agent(format!("atlassian-cli/{}", env!("CARGO_PKG_VERSION")))
         .timeout(Duration::from_secs(30))
-        .build()
-        .context("Failed to initialize HTTP client")
+}
+
+/// The one place HTTP clients are configured: user agent, 30 s timeout, the OS trust store
+/// plus bundled Mozilla roots (reqwest features), and any extra corporate root CAs.
+pub(crate) fn http_client_builder() -> reqwest::ClientBuilder {
+    let (certs, warnings) = extra_ca_certificates();
+    warn_tls_once(&warnings);
+    let mut builder = base_http_client_builder();
+    for cert in certs {
+        builder = builder.add_root_certificate(cert);
+    }
+    builder
+}
+
+/// Builds a client from [http_client_builder] after "customize". If the extra CA
+/// certificates are rejected at build time, falls back to the OS and bundled roots
+/// instead of leaving the user without any client.
+pub(crate) fn build_http_client(
+    customize: impl Fn(reqwest::ClientBuilder) -> reqwest::ClientBuilder,
+) -> reqwest::Result<reqwest::Client> {
+    match customize(http_client_builder()).build() {
+        Ok(client) => Ok(client),
+        Err(err) => {
+            if extra_ca_certificates().0.is_empty() {
+                return Err(err);
+            }
+            static ONCE: std::sync::Once = std::sync::Once::new();
+            ONCE.call_once(|| {
+                eprintln!(
+                    "warning: extra CA certificates were rejected ({err}); continuing with the OS and bundled trust roots only"
+                );
+            });
+            customize(base_http_client_builder()).build()
+        }
+    }
+}
+
+fn build_shared_http_client() -> Result<reqwest::Client> {
+    build_http_client(|builder| builder).context("Failed to initialize HTTP client")
+}
+
+fn error_chain_text(err: &(dyn std::error::Error + 'static)) -> String {
+    let mut text = err.to_string();
+    let mut source = err.source();
+    while let Some(inner) = source {
+        text.push_str(": ");
+        text.push_str(&inner.to_string());
+        source = inner.source();
+    }
+    text
+}
+
+/// Turns a TLS trust failure into an actionable message. "chain" is the rendered error
+/// chain: reqwest does not expose the rustls error type through a stable API, so this
+/// matches on text deliberately.
+pub(crate) fn tls_recovery_hint(chain: &str, host: &str) -> Option<String> {
+    let lower = chain.to_ascii_lowercase();
+    let reason = if lower.contains("unknownissuer") || lower.contains("unknown issuer") {
+        "UnknownIssuer"
+    } else if lower.contains("self-signed")
+        || lower.contains("self signed")
+        || lower.contains("unable to get local issuer")
+    {
+        "self-signed or private root"
+    } else if lower.contains("invalid peer certificate") {
+        "invalid peer certificate"
+    } else {
+        return None;
+    };
+    Some(format!(
+        "TLS certificate for {host} is not trusted ({reason}). If your company uses its own root CA, set ATLASSIAN_EXTRA_CA_PEM=<path to PEM bundle> (SSL_CERT_FILE and NODE_EXTRA_CA_CERTS are also honoured), then run \"atlassian doctor --probe\"."
+    ))
+}
+
+/// Wraps a transport error, adding the TLS recovery hint when the chain shows a trust failure.
+fn send_error(err: reqwest::Error) -> anyhow::Error {
+    let host = err
+        .url()
+        .and_then(|u| u.host_str().map(str::to_string))
+        .unwrap_or_else(|| "the server".to_string());
+    let hint = tls_recovery_hint(&error_chain_text(&err), &host);
+    let err = anyhow::Error::new(err);
+    match hint {
+        Some(hint) => err.context(format!("Failed to send Atlassian API request: {hint}")),
+        None => err.context("Failed to send Atlassian API request"),
+    }
 }
 
 #[derive(Clone)]
 pub struct AtlassianClient {
     pub(crate) http: reqwest::Client,
+    /// Lazily built no-redirect client for attachment downloads (shared by clones).
+    pub(crate) download_http: Arc<OnceLock<reqwest::Client>>,
     pub(crate) config: AppConfig,
     pub(crate) auth: AuthManager,
+    /// Separate credential for requests under the Confluence root (Data Center PATs are
+    /// per application). "None" means every request uses "auth".
+    pub(crate) confluence_auth: Option<AuthManager>,
     pub(crate) me_cache: Arc<RwLock<Option<UserSummary>>>,
     pub(crate) space_id_cache: Arc<RwLock<HashMap<String, (String, String)>>>,
     pub(crate) site_id: String,
@@ -135,8 +341,10 @@ impl AtlassianClient {
             .unwrap_or_else(|| "default".to_string());
         Ok(Self {
             http,
+            download_http: Arc::new(OnceLock::new()),
             config,
             auth,
+            confluence_auth: None,
             me_cache: Arc::new(RwLock::new(None)),
             space_id_cache: Arc::new(RwLock::new(HashMap::new())),
             site_id,
@@ -191,8 +399,10 @@ impl AtlassianClient {
 
         Self {
             http,
+            download_http: Arc::new(OnceLock::new()),
             config,
             auth,
+            confluence_auth: None,
             me_cache: Arc::new(RwLock::new(None)),
             space_id_cache: Arc::new(RwLock::new(HashMap::new())),
             site_id: if site.id.trim().is_empty() {
@@ -229,12 +439,63 @@ impl AtlassianClient {
         Self::new(config, auth)
     }
 
+    /// Copies workspace-wide defaults (default project/board/space, download directory,
+    /// sync interval, OAuth client) from the loaded configuration into this site client.
+    /// Site identity (URLs, deployment, profile, site lists) is left untouched.
+    pub fn with_workspace_defaults(mut self, base: &AppConfig) -> Self {
+        self.config.default_project = base.default_project.clone();
+        self.config.default_board_id = base.default_board_id;
+        self.config.default_space_key = base.default_space_key.clone();
+        self.config.download_dir = base.download_dir.clone();
+        self.config.sync_interval_secs = base.sync_interval_secs;
+        self.config.oauth_client_id = base.oauth_client_id.clone();
+        self.config.oauth_client_secret = base.oauth_client_secret.clone();
+        self
+    }
+
+    /// Uses "auth" for every request under the Confluence root instead of the site credential.
+    pub fn with_confluence_auth(mut self, auth: AuthManager) -> Self {
+        self.confluence_auth = Some(auth);
+        self
+    }
+
     pub fn config(&self) -> &AppConfig {
         &self.config
     }
 
     pub fn auth(&self) -> &AuthManager {
         &self.auth
+    }
+
+    /// Credential used for Confluence requests (the site credential unless a separate one is set).
+    pub fn confluence_auth(&self) -> &AuthManager {
+        self.confluence_auth.as_ref().unwrap_or(&self.auth)
+    }
+
+    /// Account id of the separate Confluence credential, when one is configured.
+    pub fn confluence_credential_account(&self) -> Option<&str> {
+        self.confluence_auth.as_ref().map(|a| a.account_id())
+    }
+
+    /// True when "target_url" lies under this client's Confluence root at a path-segment
+    /// boundary ("https://wiki.corp/confluence2" is not under "https://wiki.corp/confluence").
+    pub(crate) fn is_confluence_url(&self, target_url: &str) -> bool {
+        let site_root = normalize_base_url(self.site_url());
+        [self.confluence_root_url(), self.confluence_api_base_url()]
+            .iter()
+            .map(|root| normalize_base_url(root))
+            // A Confluence root identical to the Jira root cannot be told apart by URL.
+            .filter(|root| !root.is_empty() && *root != site_root)
+            .any(|root| strip_url_prefix(target_url, &root).is_some())
+    }
+
+    /// Selects the credential for "target_url": the Confluence credential only for URLs
+    /// under the Confluence root, the site credential for everything else.
+    pub(crate) fn auth_for_url(&self, target_url: &str) -> &AuthManager {
+        match &self.confluence_auth {
+            Some(conf) if self.is_confluence_url(target_url) => conf,
+            _ => &self.auth,
+        }
     }
 
     pub fn site_id(&self) -> &str {
@@ -377,7 +638,7 @@ impl AtlassianClient {
     pub(crate) async fn get_json<T: DeserializeOwned>(&self, url: &str) -> Result<T> {
         let target_url = self.resolve_api_url(url);
         let resp = self
-            .send_with_retry(|auth_header| {
+            .send_with_retry(&target_url, |auth_header| {
                 Ok(self
                     .http
                     .get(&target_url)
@@ -413,6 +674,7 @@ impl AtlassianClient {
         let target_url = self.resolve_api_url(url);
         let resp = self
             .send_with_retry_policy(
+                &target_url,
                 |auth_header| {
                     Ok(self
                         .http
@@ -430,7 +692,7 @@ impl AtlassianClient {
     pub(crate) async fn post_json_empty<B: Serialize>(&self, url: &str, body: &B) -> Result<()> {
         let target_url = self.resolve_api_url(url);
         let _ = self
-            .send_with_retry(|auth_header| {
+            .send_with_retry(&target_url, |auth_header| {
                 Ok(self
                     .http
                     .post(&target_url)
@@ -449,7 +711,7 @@ impl AtlassianClient {
     ) -> Result<T> {
         let target_url = self.resolve_api_url(url);
         let resp = self
-            .send_with_retry(|auth_header| {
+            .send_with_retry(&target_url, |auth_header| {
                 Ok(self
                     .http
                     .put(&target_url)
@@ -464,7 +726,7 @@ impl AtlassianClient {
     pub(crate) async fn put_json_empty<B: Serialize>(&self, url: &str, body: &B) -> Result<()> {
         let target_url = self.resolve_api_url(url);
         let _ = self
-            .send_with_retry(|auth_header| {
+            .send_with_retry(&target_url, |auth_header| {
                 Ok(self
                     .http
                     .put(&target_url)
@@ -479,7 +741,7 @@ impl AtlassianClient {
     pub(crate) async fn delete_req(&self, url: &str) -> Result<()> {
         let target_url = self.resolve_api_url(url);
         let _ = self
-            .send_with_retry(|auth_header| {
+            .send_with_retry(&target_url, |auth_header| {
                 Ok(self
                     .http
                     .delete(&target_url)
@@ -492,7 +754,7 @@ impl AtlassianClient {
 
     pub(crate) async fn put_without_body(&self, url: &str) -> Result<()> {
         let target_url = self.resolve_api_url(url);
-        self.send_with_retry(|auth_header| {
+        self.send_with_retry(&target_url, |auth_header| {
             Ok(self
                 .http
                 .put(&target_url)
@@ -514,7 +776,7 @@ impl AtlassianClient {
     ) -> Result<Value> {
         let target_url = self.resolve_api_url(url);
         let resp = self
-            .send_with_retry(|auth_header| {
+            .send_with_retry(&target_url, |auth_header| {
                 let part = Part::bytes(bytes.clone())
                     .file_name(file_name.to_string())
                     .mime_str(mime_type)
@@ -541,15 +803,12 @@ impl AtlassianClient {
     /// and stripping it on cross-origin redirects (e.g., signed Atlassian Media / S3 CDN URLs).
     pub(crate) async fn get_bytes(&self, url: &str) -> Result<Vec<u8>> {
         let target_url = self.resolve_api_url(url);
-        let (mut auth_header, mut oauth_token) = self.resolve_auth_header().await?;
+        // Hop 0 picks the credential by target; cross-origin hops never receive it (below).
+        let auth = self.auth_for_url(&target_url);
+        let (mut auth_header, mut oauth_token) = self.resolve_auth_header(auth).await?;
         let initial_url = Url::parse(&target_url)
             .with_context(|| format!("Invalid attachment URL: {target_url}"))?;
-        let no_redirect_client = reqwest::Client::builder()
-            .user_agent(format!("atlassian-cli/{}", env!("CARGO_PKG_VERSION")))
-            .timeout(Duration::from_secs(60))
-            .redirect(reqwest::redirect::Policy::none())
-            .build()
-            .context("Failed to initialize download HTTP client")?;
+        let no_redirect_client = self.download_http_client()?;
 
         let mut current_url = initial_url.clone();
         let mut refreshed_on_401 = false;
@@ -574,8 +833,7 @@ impl AtlassianClient {
                             .downcast_ref::<HttpStatusError>()
                             .is_some_and(|e| e.status == StatusCode::UNAUTHORIZED);
                         if is_401 && send_auth && oauth_token.is_some() && !refreshed_on_401 {
-                            let refreshed = self
-                                .auth
+                            let refreshed = auth
                                 .force_refresh_credentials(
                                     &self.http,
                                     &self.oauth_auth_base,
@@ -628,14 +886,28 @@ impl AtlassianClient {
         bail!("Attachment download exceeded max redirects ({MAX_REDIRECT_HOPS}): {target_url}")
     }
 
-    async fn resolve_auth_header(&self) -> Result<(String, Option<String>)> {
-        let creds = self.auth.load_credentials()?.ok_or_else(|| {
+    /// No-redirect client for attachment downloads, built once per client (it loads the
+    /// OS trust store, which is too slow to repeat for every attachment).
+    fn download_http_client(&self) -> Result<reqwest::Client> {
+        if let Some(client) = self.download_http.get() {
+            return Ok(client.clone());
+        }
+        let client = build_http_client(|builder| {
+            builder
+                .timeout(Duration::from_secs(60))
+                .redirect(reqwest::redirect::Policy::none())
+        })
+        .context("Failed to initialize download HTTP client")?;
+        Ok(self.download_http.get_or_init(|| client).clone())
+    }
+
+    async fn resolve_auth_header(&self, auth: &AuthManager) -> Result<(String, Option<String>)> {
+        let creds = auth.load_credentials()?.ok_or_else(|| {
             anyhow!("Not signed in. Run `atlassian login` or `confluence login` first.")
         })?;
         match creds {
             StoredCredentials::CloudOAuth { .. } => {
-                let fresh = self
-                    .auth
+                let fresh = auth
                     .ensure_fresh_credentials(&self.http, &self.oauth_auth_base)
                     .await?;
                 let token = fresh.oauth_access_token().map(str::to_string);
@@ -645,32 +917,33 @@ impl AtlassianClient {
         }
     }
 
-    async fn send_with_retry<F>(&self, build_req: F) -> Result<reqwest::Response>
+    async fn send_with_retry<F>(&self, target_url: &str, build_req: F) -> Result<reqwest::Response>
     where
         F: FnMut(&str) -> Result<reqwest::RequestBuilder>,
     {
-        self.send_with_retry_policy(build_req, true).await
+        self.send_with_retry_policy(target_url, build_req, true).await
     }
 
+    /// Sends the request built by "build_req" with the credential that belongs to
+    /// "target_url" (the already gateway-resolved URL the request goes to).
     async fn send_with_retry_policy<F>(
         &self,
+        target_url: &str,
         mut build_req: F,
         retry_statuses: bool,
     ) -> Result<reqwest::Response>
     where
         F: FnMut(&str) -> Result<reqwest::RequestBuilder>,
     {
-        let (mut auth_header, mut oauth_token) = self.resolve_auth_header().await?;
+        let auth = self.auth_for_url(target_url);
+        let (mut auth_header, mut oauth_token) = self.resolve_auth_header(auth).await?;
         let mut refreshed_on_401 = false;
 
         loop {
             let mut attempt = 1usize;
             let result = loop {
                 let req = build_req(&auth_header)?;
-                let resp = req
-                    .send()
-                    .await
-                    .context("Failed to send Atlassian API request")?;
+                let resp = req.send().await.map_err(send_error)?;
                 let status = resp.status();
 
                 if status.is_success() || status.is_redirection() {
@@ -704,8 +977,7 @@ impl AtlassianClient {
                 Ok(resp) => return Ok(resp),
                 Err(Some(err)) => return Err(err),
                 Err(None) => {
-                    let refreshed = self
-                        .auth
+                    let refreshed = auth
                         .force_refresh_credentials(
                             &self.http,
                             &self.oauth_auth_base,
@@ -743,21 +1015,57 @@ impl SiteClientPool {
         api_gateway_base: Option<String>,
         oauth_auth_base: Option<String>,
     ) -> Result<Self> {
-        let mut accounts: HashMap<String, AuthManager> = HashMap::new();
+        // An isolated fallback file (tests, DI) never consults the process environment.
+        let env = if fallback_path.is_none() {
+            PoolEnv::from_process_env()
+        } else {
+            PoolEnv::default()
+        };
+        Self::from_config_with_env(config, fallback_path, api_gateway_base, oauth_auth_base, &env)
+    }
+
+    pub(crate) fn from_config_with_env(
+        config: &AppConfig,
+        fallback_path: Option<PathBuf>,
+        api_gateway_base: Option<String>,
+        oauth_auth_base: Option<String>,
+        env: &PoolEnv,
+    ) -> Result<Self> {
         let sites = config.effective_sites();
         let http = build_shared_http_client()?;
         let mut entries = Vec::with_capacity(sites.len());
 
-        for site in sites {
-            let acct_key = if site.account_id.trim().is_empty() {
+        let account_key = |site: &SiteProfile| {
+            if site.account_id.trim().is_empty() {
                 config.profile.clone()
             } else {
                 site.account_id.trim().to_string()
-            };
+            }
+        };
+
+        // Accounts are shared between sites, so an account gets the strongest policy of
+        // the sites using it.
+        let mut policies: HashMap<String, EnvCredentialPolicy> = HashMap::new();
+        for site in &sites {
+            let policy = env.policy_for_site(site, sites.len());
+            policies
+                .entry(account_key(site))
+                .and_modify(|p| *p = p.strongest(policy))
+                .or_insert(policy);
+        }
+
+        let site_count = sites.len();
+        let mut accounts: HashMap<String, AuthManager> = HashMap::new();
+        for site in sites {
+            let acct_key = account_key(&site);
+            let policy = policies
+                .get(&acct_key)
+                .copied()
+                .unwrap_or(EnvCredentialPolicy::Primary);
             let auth = accounts
                 .entry(acct_key.clone())
                 .or_insert_with(|| {
-                    let mut mgr = AuthManager::for_account(acct_key);
+                    let mut mgr = AuthManager::for_account(acct_key).with_env_policy(policy);
                     if let Some(ref p) = fallback_path {
                         mgr = mgr.with_fallback_path(p.clone());
                     }
@@ -770,9 +1078,15 @@ impl SiteClientPool {
                 auth,
                 http.clone(),
                 api_gateway_base.clone(),
-            );
+            )
+            .with_workspace_defaults(config);
             if let Some(ref auth_base) = oauth_auth_base {
                 client = client.with_oauth_auth_base(auth_base.clone());
+            }
+            if let Some(conf_auth) =
+                confluence_auth_for_site(&site, site_count, env, fallback_path.as_ref())
+            {
+                client = client.with_confluence_auth(conf_auth);
             }
             entries.push((site, client));
         }
@@ -851,6 +1165,117 @@ impl SiteClientPool {
     }
 }
 
+/// Environment inputs that scope credentials to sites when a pool is built.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct PoolEnv {
+    /// Site URL of the environment credentials ("None" when the environment has none).
+    pub credentials_site_url: Option<String>,
+    /// ATLASSIAN_CONFLUENCE_PAT / CONFLUENCE_PAT.
+    pub confluence_pat: Option<String>,
+    /// ATLASSIAN_CONFLUENCE_URL / CONFLUENCE_URL (normalized).
+    pub confluence_url: Option<String>,
+}
+
+impl PoolEnv {
+    pub(crate) fn from_process_env() -> Self {
+        Self {
+            credentials_site_url: crate::auth::env_credentials_site_url(),
+            confluence_pat: crate::auth::env_confluence_pat(),
+            confluence_url: crate::auth::env_confluence_url(),
+        }
+    }
+
+    /// True when the environment values are meant for "site": always for a single-site
+    /// configuration, otherwise only for the site whose URL they name.
+    fn applies_to_site(&self, site: &SiteProfile, site_count: usize) -> bool {
+        if site_count <= 1 {
+            return true;
+        }
+        let site_url = normalize_url_for_match(&site.site_url);
+        let matches_site = self
+            .credentials_site_url
+            .as_deref()
+            .map(normalize_url_for_match)
+            .is_some_and(|env_url| !env_url.is_empty() && env_url == site_url);
+        let conf_root = normalize_url_for_match(&site.effective_confluence_root());
+        let matches_confluence = self
+            .confluence_url
+            .as_deref()
+            .map(normalize_url_for_match)
+            .is_some_and(|env_url| !env_url.is_empty() && env_url == conf_root);
+        matches_site || matches_confluence
+    }
+
+    /// Unscoped environment credentials must not override every account: with several
+    /// sites they stay primary only for the site whose URL they name.
+    pub(crate) fn policy_for_site(&self, site: &SiteProfile, site_count: usize) -> EnvCredentialPolicy {
+        if site_count <= 1 {
+            return EnvCredentialPolicy::Primary;
+        }
+        let site_url = normalize_url_for_match(&site.site_url);
+        let matches = self
+            .credentials_site_url
+            .as_deref()
+            .map(normalize_url_for_match)
+            .is_some_and(|env_url| !env_url.is_empty() && env_url == site_url);
+        if matches {
+            EnvCredentialPolicy::Primary
+        } else {
+            EnvCredentialPolicy::FallbackOnly
+        }
+    }
+
+    /// Id of the site the environment credentials apply to as primary, if any.
+    pub(crate) fn credentials_site_id(&self, sites: &[SiteProfile]) -> Option<String> {
+        self.credentials_site_url.as_ref()?;
+        sites
+            .iter()
+            .find(|site| self.policy_for_site(site, sites.len()) == EnvCredentialPolicy::Primary)
+            .map(|site| site.id.clone())
+    }
+}
+
+/// Separate Confluence credential for a Data Center site, in priority order:
+/// ATLASSIAN_CONFLUENCE_PAT (scoped like other environment credentials), then the
+/// site's "confluence_account_id". Cloud sites never get one.
+fn confluence_auth_for_site(
+    site: &SiteProfile,
+    site_count: usize,
+    env: &PoolEnv,
+    fallback_path: Option<&PathBuf>,
+) -> Option<AuthManager> {
+    if site.deployment != DeploymentKind::DataCenter {
+        return None;
+    }
+    let conf_root = site.effective_confluence_root();
+    if conf_root.is_empty() {
+        return None;
+    }
+    if let Some(token) = env.confluence_pat.as_deref().filter(|t| !t.trim().is_empty()) {
+        if env.applies_to_site(site, site_count) {
+            return Some(AuthManager::with_credentials(
+                format!("{}#confluence", site.account_id.trim()),
+                StoredCredentials::BearerPat {
+                    site_url: conf_root,
+                    token: token.trim().to_string(),
+                    deployment: DeploymentKind::DataCenter,
+                },
+            ));
+        }
+    }
+    let account = site
+        .confluence_account_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|id| !id.is_empty())?;
+    // A stray ATLASSIAN_PAT (a Jira PAT) must never be sent to Confluence through this account.
+    let mut mgr = AuthManager::for_account(account).with_env_policy(EnvCredentialPolicy::Never);
+    if let Some(path) = fallback_path {
+        mgr = mgr.with_fallback_path(path.clone());
+    }
+    Some(mgr)
+}
+
 fn strip_url_prefix<'a>(url: &'a str, prefix: &str) -> Option<&'a str> {
     let rest = url.strip_prefix(prefix)?;
     if rest.is_empty() || rest.starts_with('/') || rest.starts_with('?') {
@@ -869,10 +1294,7 @@ where
 {
     for attempt in 1..=MAX_RETRY_ATTEMPTS {
         let req = build_req()?;
-        let resp = req
-            .send()
-            .await
-            .context("Failed to send Atlassian API request")?;
+        let resp = req.send().await.map_err(send_error)?;
         let status = resp.status();
 
         if status.is_success() || status.is_redirection() {
@@ -1452,6 +1874,7 @@ mod tests {
             account_id: "oauth-main".into(),
             enabled: true,
             scopes: vec!["read:jira-work".into()],
+            confluence_account_id: None,
         };
         let auth = AuthManager::with_credentials(
             "oauth-main",
@@ -1595,6 +2018,7 @@ mod tests {
                 account_id: "oauth-main".into(),
                 enabled: true,
                 scopes: Vec::new(),
+                confluence_account_id: None,
             },
             SiteProfile {
                 id: "site-2".into(),
@@ -1606,6 +2030,7 @@ mod tests {
                 account_id: "oauth-main".into(),
                 enabled: true,
                 scopes: Vec::new(),
+                confluence_account_id: None,
             },
             SiteProfile {
                 id: "disabled-dc".into(),
@@ -1617,6 +2042,7 @@ mod tests {
                 account_id: "dc".into(),
                 enabled: false,
                 scopes: Vec::new(),
+                confluence_account_id: None,
             },
         ];
 
@@ -1709,5 +2135,356 @@ mod tests {
             next_link_page_state(&serde_json::json!({ "_links": {} }), true, 0, 2),
             (Some(false), None)
         );
+    }
+
+    /// Two self-signed test roots (EC P-256, generated offline; not trusted by anything).
+    const TEST_ROOT_CA_BUNDLE: &str = "-----BEGIN CERTIFICATE-----\n\
+MIIBnzCCAUWgAwIBAgIUBqsPDduJ62TWB9cnMPdS94mretIwCgYIKoZIzj0EAwIw\n\
+JDEiMCAGA1UEAwwZYXRsYXNzaWFuLWNsaSB0ZXN0IHJvb3QgYTAgFw0yNjExMjMw\n\
+NzMyNDBaGA8yMTI2MTAzMDA3MzI0MFowJDEiMCAGA1UEAwwZYXRsYXNzaWFuLWNs\n\
+aSB0ZXN0IHJvb3QgYTBZMBMGByqGSM49AgEGCCqGSM49AwEHA0IABIgTZhTPsP4X\n\
+Q1bsDndVMfOReC3bvMA82Uzpi+jqYBRMueTdLY9ev6oXH/50ZCO3TGe/l250Ednv\n\
+7U/BDm9gY6CjUzBRMB0GA1UdDgQWBBSY6VjApxUeMeHqzt10Zm9tHMLJXTAfBgNV\n\
+HSMEGDAWgBSY6VjApxUeMeHqzt10Zm9tHMLJXTAPBgNVHRMBAf8EBTADAQH/MAoG\n\
+CCqGSM49BAMCA0gAMEUCIQCxU9Ru5mBL34Bi/OEf8qK69xsBWxmI0fg8LF5GMoei\n\
+rAIgNhumCc0M8Hq6m+g6DZb0H4HpmfSjASfc2BPgHUEwTI0=\n\
+-----END CERTIFICATE-----\n\
+-----BEGIN CERTIFICATE-----\n\
+MIIBnjCCAUWgAwIBAgIUI9q+MMnklGTAJLkxMrVD6DlGyHgwCgYIKoZIzj0EAwIw\n\
+JDEiMCAGA1UEAwwZYXRsYXNzaWFuLWNsaSB0ZXN0IHJvb3QgYjAgFw0yNjExMjMw\n\
+NzMyNDBaGA8yMTI2MTAzMDA3MzI0MFowJDEiMCAGA1UEAwwZYXRsYXNzaWFuLWNs\n\
+aSB0ZXN0IHJvb3QgYjBZMBMGByqGSM49AgEGCCqGSM49AwEHA0IABJYjnZHEM4Vt\n\
+68nfh26wEc4nLoIuRWfE996OkuCYhloaG2bye2L9G7kRWi60j13B5+r5Cv+qs5vz\n\
+k4IA3lq5LG+jUzBRMB0GA1UdDgQWBBT01YUGSYigUsUINk1+KaaVhhVnTTAfBgNV\n\
+HSMEGDAWgBT01YUGSYigUsUINk1+KaaVhhVnTTAPBgNVHRMBAf8EBTADAQH/MAoG\n\
+CCqGSM49BAMCA0cAMEQCIEhCliJhSOr4D5Sy/jvBAmbUxk73UbD+oqhcxg6hMuP0\n\
+AiA+cNCCx29pol4ocp9J/G0R/45YiLiv6VdSopzRWi3hcw==\n\
+-----END CERTIFICATE-----\n\
+";
+
+    fn env_lookup<'a>(pairs: &'a [(&'a str, String)]) -> impl Fn(&str) -> Option<String> + 'a {
+        move |name| {
+            pairs
+                .iter()
+                .find(|(key, _)| *key == name)
+                .map(|(_, value)| value.clone())
+        }
+    }
+
+    #[test]
+    fn extra_ca_reads_pem_bundle_from_env_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("corp-roots.pem");
+        std::fs::write(&path, TEST_ROOT_CA_BUNDLE).unwrap();
+        let path = path.display().to_string();
+
+        let pairs = [("ATLASSIAN_EXTRA_CA_PEM", path.clone())];
+        let (certs, warnings) = extra_ca_certificates_with(env_lookup(&pairs));
+        assert_eq!(certs.len(), 2);
+        assert!(warnings.is_empty(), "{warnings:?}");
+
+        // Every variable that is set is loaded, not only the first one.
+        let pairs = [
+            ("ATLASSIAN_EXTRA_CA_PEM", path.clone()),
+            ("SSL_CERT_FILE", path.clone()),
+            ("NODE_EXTRA_CA_CERTS", path.clone()),
+        ];
+        let (certs, sources) = load_extra_ca_sources(env_lookup(&pairs));
+        assert_eq!(certs.len(), 6);
+        assert_eq!(
+            sources.iter().map(|s| s.env).collect::<Vec<_>>(),
+            vec!["ATLASSIAN_EXTRA_CA_PEM", "SSL_CERT_FILE", "NODE_EXTRA_CA_CERTS"]
+        );
+        assert!(sources.iter().all(|s| s.certificates == 2 && s.error.is_none() && s.path == path));
+
+        // The loaded roots are accepted by the TLS backend.
+        let mut builder = base_http_client_builder();
+        for cert in certs {
+            builder = builder.add_root_certificate(cert);
+        }
+        builder.build().expect("client with extra roots");
+    }
+
+    #[test]
+    fn extra_ca_accepts_inline_pem() {
+        let pairs = [("ATLASSIAN_EXTRA_CA_PEM", TEST_ROOT_CA_BUNDLE.to_string())];
+        let (certs, sources) = load_extra_ca_sources(env_lookup(&pairs));
+        assert_eq!(certs.len(), 2);
+        assert_eq!(sources[0].path, "<inline PEM>");
+        assert!(sources[0].error.is_none());
+
+        // Inline text is only accepted in ATLASSIAN_EXTRA_CA_PEM; the others are file paths.
+        let pairs = [("SSL_CERT_FILE", TEST_ROOT_CA_BUNDLE.to_string())];
+        let (certs, warnings) = extra_ca_certificates_with(env_lookup(&pairs));
+        assert!(certs.is_empty());
+        assert_eq!(warnings.len(), 1);
+    }
+
+    #[test]
+    fn extra_ca_missing_file_warns_and_continues() {
+        let dir = tempfile::tempdir().unwrap();
+        let missing = dir.path().join("does-not-exist.pem").display().to_string();
+        let garbage = dir.path().join("garbage.pem");
+        std::fs::write(&garbage, "this is not a certificate").unwrap();
+
+        let pairs = [("ATLASSIAN_EXTRA_CA_PEM", missing.clone())];
+        let (certs, warnings) = extra_ca_certificates_with(env_lookup(&pairs));
+        assert!(certs.is_empty());
+        assert_eq!(warnings.len(), 1);
+        assert!(warnings[0].contains("ATLASSIAN_EXTRA_CA_PEM"), "{warnings:?}");
+        assert!(warnings[0].contains(&missing), "{warnings:?}");
+
+        let pairs = [("NODE_EXTRA_CA_CERTS", garbage.display().to_string())];
+        let (certs, warnings) = extra_ca_certificates_with(env_lookup(&pairs));
+        assert!(certs.is_empty());
+        assert_eq!(warnings.len(), 1);
+
+        // Unset or blank variables are not sources at all.
+        let pairs = [("SSL_CERT_FILE", "   ".to_string())];
+        let (certs, sources) = load_extra_ca_sources(env_lookup(&pairs));
+        assert!(certs.is_empty() && sources.is_empty());
+
+        // A bad extra bundle never prevents building a client.
+        build_http_client(|builder| builder).expect("client still builds");
+    }
+
+    #[test]
+    fn tls_recovery_hint_matches_unknown_issuer_chain() {
+        let err = anyhow!("invalid peer certificate: UnknownIssuer")
+            .context("client error (Connect)")
+            .context("error sending request for url (https://jira.corp.example/rest/api/2/myself)");
+        let chain = format!("{err:#}");
+        let hint = tls_recovery_hint(&chain, "jira.corp.example").expect("hint");
+        assert!(hint.contains("jira.corp.example"));
+        assert!(hint.contains("UnknownIssuer"));
+        assert!(hint.contains("ATLASSIAN_EXTRA_CA_PEM"));
+        assert!(hint.contains("SSL_CERT_FILE"));
+        assert!(hint.contains("NODE_EXTRA_CA_CERTS"));
+        assert!(hint.contains("atlassian doctor --probe"));
+
+        assert!(tls_recovery_hint("self-signed certificate in certificate chain", "h").is_some());
+        assert!(tls_recovery_hint("connection refused", "h").is_none());
+        assert!(tls_recovery_hint("operation timed out", "h").is_none());
+    }
+
+    fn dc_site(id: &str, site_url: &str, confluence_url: &str) -> SiteProfile {
+        SiteProfile {
+            id: id.into(),
+            name: id.into(),
+            site_url: site_url.into(),
+            confluence_url: confluence_url.into(),
+            deployment: DeploymentKind::DataCenter,
+            account_id: id.into(),
+            ..SiteProfile::default()
+        }
+    }
+
+    fn pat(token: &str, site_url: &str) -> StoredCredentials {
+        StoredCredentials::BearerPat {
+            site_url: site_url.into(),
+            token: token.into(),
+            deployment: DeploymentKind::DataCenter,
+        }
+    }
+
+    #[test]
+    fn pool_clients_inherit_workspace_defaults() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut cfg = AppConfig::default();
+        cfg.default_space_key = Some("DOCS".into());
+        cfg.default_board_id = Some(42);
+        cfg.default_project = Some("ENG".into());
+        cfg.sync_interval_secs = 90;
+        cfg.default_site = Some("corp".into());
+        cfg.sites = vec![dc_site("corp", "https://jira.corp.example/", "")];
+
+        let pool = SiteClientPool::from_config_with_options(
+            &cfg,
+            Some(dir.path().join("credentials.json")),
+            None,
+            None,
+        )
+        .unwrap();
+        let client = pool.client_for("corp").unwrap();
+        assert_eq!(client.config().default_space_key.as_deref(), Some("DOCS"));
+        assert_eq!(client.config().default_board_id, Some(42));
+        assert_eq!(client.config().default_project.as_deref(), Some("ENG"));
+        assert_eq!(client.config().sync_interval_secs, 90);
+        // Site identity is still the site's own, and site lists are not copied in.
+        assert_eq!(client.site_url(), "https://jira.corp.example");
+        assert_eq!(client.deployment(), DeploymentKind::DataCenter);
+        assert!(client.config().sites.is_empty());
+        assert!(client.config().default_site.is_none());
+    }
+
+    #[test]
+    fn auth_for_url_routes_confluence_root_to_confluence_auth() {
+        let site = dc_site("corp", "https://jira.corp.example", "https://wiki.corp.example/confluence");
+        let jira_auth = AuthManager::with_credentials("corp", pat("PAT-J", "https://jira.corp.example"));
+        let conf_auth = AuthManager::with_credentials(
+            "corp-confluence",
+            pat("PAT-C", "https://wiki.corp.example/confluence"),
+        );
+        let plain = AtlassianClient::for_site(&site, jira_auth.clone(), None).unwrap();
+        // Without a separate credential everything uses the site credential.
+        assert_eq!(
+            plain
+                .auth_for_url("https://wiki.corp.example/confluence/rest/api/space")
+                .account_id(),
+            "corp"
+        );
+        assert_eq!(plain.confluence_auth().account_id(), "corp");
+        assert_eq!(plain.confluence_credential_account(), None);
+
+        let split = plain.clone().with_confluence_auth(conf_auth);
+        assert_eq!(split.confluence_credential_account(), Some("corp-confluence"));
+        for url in [
+            "https://wiki.corp.example/confluence",
+            "https://wiki.corp.example/confluence/rest/api/space?limit=250",
+            "https://wiki.corp.example/confluence?x=1",
+        ] {
+            assert_eq!(split.auth_for_url(url).account_id(), "corp-confluence", "{url}");
+        }
+        for url in [
+            "https://jira.corp.example/rest/api/2/myself",
+            "https://jira.corp.example/rest/agile/1.0/board",
+            "https://cdn.example.net/confluence/file.png",
+        ] {
+            assert_eq!(split.auth_for_url(url).account_id(), "corp", "{url}");
+        }
+        assert_eq!(
+            split.auth_for_url("https://jira.corp.example/rest/api/2/myself").authorization_header().unwrap(),
+            "Bearer PAT-J"
+        );
+        assert_eq!(
+            split
+                .auth_for_url("https://wiki.corp.example/confluence/rest/api/space")
+                .authorization_header()
+                .unwrap(),
+            "Bearer PAT-C"
+        );
+    }
+
+    #[test]
+    fn auth_for_url_requires_segment_boundary() {
+        let site = dc_site("corp", "https://corp.example/jira", "https://wiki.corp/confluence");
+        let client = AtlassianClient::for_site(
+            &site,
+            AuthManager::with_credentials("corp", pat("PAT-J", "https://corp.example/jira")),
+            None,
+        )
+        .unwrap()
+        .with_confluence_auth(AuthManager::with_credentials(
+            "corp-confluence",
+            pat("PAT-C", "https://wiki.corp/confluence"),
+        ));
+        assert_eq!(
+            client.auth_for_url("https://wiki.corp/confluence2/rest/api/space").account_id(),
+            "corp"
+        );
+        assert_eq!(
+            client.auth_for_url("https://wiki.corp/confluence.evil/rest/api/space").account_id(),
+            "corp"
+        );
+        assert_eq!(
+            client.auth_for_url("https://wiki.corp/confluence/rest/api/space").account_id(),
+            "corp-confluence"
+        );
+
+        // A Confluence root identical to the Jira root cannot be separated by URL: the
+        // Confluence credential is then never substituted for the site credential.
+        let same_root = dc_site("one", "https://corp.example", "https://corp.example");
+        let client = AtlassianClient::for_site(
+            &same_root,
+            AuthManager::with_credentials("one", pat("PAT-J", "https://corp.example")),
+            None,
+        )
+        .unwrap()
+        .with_confluence_auth(AuthManager::with_credentials(
+            "one-confluence",
+            pat("PAT-C", "https://corp.example"),
+        ));
+        assert_eq!(
+            client.auth_for_url("https://corp.example/rest/api/space").account_id(),
+            "one"
+        );
+    }
+
+    #[test]
+    fn multi_site_env_pat_applies_only_to_matching_site_url() {
+        let dir = tempfile::tempdir().unwrap();
+        let cred_path = dir.path().join("credentials.json");
+        let env = PoolEnv {
+            credentials_site_url: Some("https://jira.b.example/".into()),
+            confluence_pat: Some("PAT-C".into()),
+            confluence_url: None,
+        };
+
+        let mut cfg = AppConfig::default();
+        cfg.sites = vec![
+            dc_site("a", "https://jira.a.example", "https://wiki.a.example"),
+            dc_site("b", "https://jira.b.example", "https://wiki.b.example"),
+        ];
+        let pool =
+            SiteClientPool::from_config_with_env(&cfg, Some(cred_path.clone()), None, None, &env)
+                .unwrap();
+        let a = pool.client_for("a").unwrap();
+        let b = pool.client_for("b").unwrap();
+        assert_eq!(a.auth().env_policy(), EnvCredentialPolicy::FallbackOnly);
+        assert_eq!(b.auth().env_policy(), EnvCredentialPolicy::Primary);
+        assert_eq!(env.credentials_site_id(&cfg.effective_sites()).as_deref(), Some("b"));
+        // The Confluence PAT follows the same scoping and is only ever built for site b.
+        assert_eq!(a.confluence_credential_account(), None);
+        assert_eq!(b.confluence_credential_account(), Some("b#confluence"));
+        assert_eq!(
+            b.auth_for_url("https://wiki.b.example/rest/api/space")
+                .authorization_header()
+                .unwrap(),
+            "Bearer PAT-C"
+        );
+
+        // A single-site configuration keeps today's behaviour: environment first.
+        let mut single = AppConfig::default();
+        single.sites = vec![dc_site("a", "https://jira.a.example", "https://wiki.a.example")];
+        let pool =
+            SiteClientPool::from_config_with_env(&single, Some(cred_path.clone()), None, None, &env)
+                .unwrap();
+        let only = pool.client_for("a").unwrap();
+        assert_eq!(only.auth().env_policy(), EnvCredentialPolicy::Primary);
+        assert_eq!(only.confluence_credential_account(), Some("a#confluence"));
+
+        // An account shared by both sites gets the strongest policy of its sites.
+        let mut shared = cfg.clone();
+        for site in &mut shared.sites {
+            site.account_id = "shared".into();
+        }
+        let pool =
+            SiteClientPool::from_config_with_env(&shared, Some(cred_path.clone()), None, None, &env)
+                .unwrap();
+        assert_eq!(
+            pool.client_for("a").unwrap().auth().env_policy(),
+            EnvCredentialPolicy::Primary
+        );
+
+        // No environment credentials: nothing is primary, and Cloud sites never get a
+        // separate Confluence credential.
+        let mut mixed = cfg.clone();
+        mixed.sites[0].deployment = DeploymentKind::Cloud;
+        mixed.sites[0].confluence_account_id = Some("ignored-on-cloud".into());
+        mixed.sites[1].confluence_account_id = Some("b-wiki".into());
+        let pool = SiteClientPool::from_config_with_env(
+            &mixed,
+            Some(cred_path),
+            None,
+            None,
+            &PoolEnv::default(),
+        )
+        .unwrap();
+        assert_eq!(PoolEnv::default().credentials_site_id(&mixed.effective_sites()), None);
+        assert_eq!(pool.client_for("a").unwrap().confluence_credential_account(), None);
+        let b = pool.client_for("b").unwrap();
+        assert_eq!(b.confluence_credential_account(), Some("b-wiki"));
+        // The stored Confluence account can never pick up a stray ATLASSIAN_PAT.
+        assert_eq!(b.confluence_auth().env_policy(), EnvCredentialPolicy::Never);
     }
 }

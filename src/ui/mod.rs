@@ -911,6 +911,7 @@ mod tests {
             account_id: "cloud-oauth".into(),
             enabled: true,
             scopes: vec![],
+            confluence_account_id: None,
         });
         cfg.upsert_site(SiteProfile {
             id: "corp-dc".into(),
@@ -922,6 +923,7 @@ mod tests {
             account_id: "corp-dc".into(),
             enabled: true,
             scopes: vec![],
+            confluence_account_id: None,
         });
 
         let auth = AuthManager::new("test");

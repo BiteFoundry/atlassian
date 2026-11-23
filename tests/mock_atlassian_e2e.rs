@@ -2383,6 +2383,7 @@ async fn e2e_multi_site_oauth_3lo_refresh_collision_free_sync_and_federation() {
         account_id: "corp-dc-acct".to_string(),
         enabled: true,
         scopes: Vec::new(),
+        confluence_account_id: None,
     });
     cfg.default_site = Some("acme-cloud".to_string());
 
@@ -4584,4 +4585,203 @@ async fn http_offline_issues_total_is_cache_count() {
         .unwrap();
     assert_eq!(detail["issue"]["description_raw"], "raw body");
     assert!(detail["issue"].get("omitted").is_none());
+}
+
+/// Mock Data Center pair for split-credential tests: Jira under "/jira" accepts only
+/// "PAT-J", Confluence under "/wiki" only "PAT-C". Every Authorization header is recorded
+/// per product so a test can assert that no credential crossed over.
+#[derive(Default)]
+struct SplitPatMock {
+    jira_auth: RwLock<Vec<String>>,
+    confluence_auth: RwLock<Vec<String>>,
+    requests: RwLock<Vec<String>>,
+}
+
+fn build_split_pat_router(state: Arc<SplitPatMock>) -> Router {
+    Router::new().fallback(move |uri: axum::http::Uri, headers: HeaderMap| {
+        let state = state.clone();
+        async move {
+            let path = uri.path().to_string();
+            let auth = headers
+                .get(header::AUTHORIZATION)
+                .and_then(|v| v.to_str().ok())
+                .unwrap_or("")
+                .to_string();
+            state.requests.write().unwrap().push(uri.to_string());
+            if path.starts_with("/wiki") {
+                state.confluence_auth.write().unwrap().push(auth);
+                if let Err(resp) = check_bearer_auth(&headers, "PAT-C") {
+                    return resp;
+                }
+                if path == "/wiki/rest/api/space" {
+                    return Json(json!({
+                        "results": [
+                            { "id": 1, "key": "AAA", "name": "Alpha", "type": "global", "_links": { "webui": "/display/AAA" } },
+                            { "id": 2, "key": "DOCS", "name": "Docs", "type": "global", "_links": { "webui": "/display/DOCS" } }
+                        ],
+                        "start": 0, "limit": 250, "size": 2, "_links": {}
+                    }))
+                    .into_response();
+                }
+                return Json(json!({ "results": [], "start": 0, "limit": 50, "size": 0, "_links": {} }))
+                    .into_response();
+            }
+            state.jira_auth.write().unwrap().push(auth);
+            if let Err(resp) = check_bearer_auth(&headers, "PAT-J") {
+                return resp;
+            }
+            match path.as_str() {
+                "/jira/rest/api/2/myself" => Json(json!({
+                    "name": "jdoe", "key": "jdoe", "displayName": "John Doe", "active": true
+                }))
+                .into_response(),
+                "/jira/rest/api/2/project" => Json(json!([
+                    { "id": "10000", "key": "ENG", "name": "Engineering" }
+                ]))
+                .into_response(),
+                _ => Json(json!({ "values": [], "issues": [], "total": 0, "isLast": true }))
+                    .into_response(),
+            }
+        }
+    })
+}
+
+fn split_pat_config(base_url: &str, confluence_account: Option<&str>) -> AppConfig {
+    let mut cfg = AppConfig::default();
+    cfg.site_url = format!("{base_url}/jira");
+    cfg.confluence_url = format!("{base_url}/wiki");
+    cfg.deployment = DeploymentKind::DataCenter;
+    cfg.default_site = Some("corp".into());
+    cfg.sites = vec![atlassian_cli::config::SiteProfile {
+        id: "corp".into(),
+        name: "Corp DC".into(),
+        site_url: format!("{base_url}/jira"),
+        confluence_url: format!("{base_url}/wiki"),
+        deployment: DeploymentKind::DataCenter,
+        account_id: "corp".into(),
+        confluence_account_id: confluence_account.map(str::to_string),
+        ..Default::default()
+    }];
+    cfg
+}
+
+#[tokio::test]
+async fn e2e_datacenter_split_pat_jira_and_confluence() {
+    use atlassian_cli::atlassian::SiteClientPool;
+
+    ensure_isolated_env();
+    let state = Arc::new(SplitPatMock::default());
+    let base_url = spawn_server(build_split_pat_router(state.clone())).await;
+
+    let dir = tempfile::tempdir().unwrap();
+    let cred_path = dir.path().join("credentials.json");
+    let dc_pat = |token: &str, site_url: String| StoredCredentials::BearerPat {
+        site_url,
+        token: token.into(),
+        deployment: DeploymentKind::DataCenter,
+    };
+    AuthManager::for_account("corp")
+        .with_fallback_path(cred_path.clone())
+        .save_credentials(&dc_pat("PAT-J", format!("{base_url}/jira")))
+        .unwrap();
+    AuthManager::for_account("corp-confluence")
+        .with_fallback_path(cred_path.clone())
+        .save_credentials(&dc_pat("PAT-C", format!("{base_url}/wiki")))
+        .unwrap();
+
+    // 1. With confluence_account_id each product gets its own PAT and nothing crosses over.
+    let cfg = split_pat_config(&base_url, Some("corp-confluence"));
+    let pool = SiteClientPool::from_config_with_options(&cfg, Some(cred_path.clone()), None, None)
+        .expect("pool");
+    let client = pool.client_for("corp").unwrap();
+    assert_eq!(client.confluence_credential_account(), Some("corp-confluence"));
+
+    let projects = client.list_projects().await.expect("jira with PAT-J");
+    assert_eq!(projects[0].key, "ENG");
+    let spaces = client.list_all_spaces().await.expect("confluence with PAT-C");
+    assert_eq!(
+        spaces.iter().map(|s| s.key.as_str()).collect::<Vec<_>>(),
+        vec!["AAA", "DOCS"]
+    );
+    assert_eq!(client.get_myself().await.unwrap().id, "jdoe");
+    {
+        let jira = state.jira_auth.read().unwrap();
+        let confluence = state.confluence_auth.read().unwrap();
+        assert!(!jira.is_empty() && jira.iter().all(|h| h == "Bearer PAT-J"), "{jira:?}");
+        assert!(
+            !confluence.is_empty() && confluence.iter().all(|h| h == "Bearer PAT-C"),
+            "{confluence:?}"
+        );
+    }
+
+    // 2. Without the Confluence credential the Jira PAT is sent to Confluence, which
+    //    rejects it with 401, while Jira keeps working.
+    state.jira_auth.write().unwrap().clear();
+    state.confluence_auth.write().unwrap().clear();
+    let cfg = split_pat_config(&base_url, None);
+    let pool = SiteClientPool::from_config_with_options(&cfg, Some(cred_path), None, None)
+        .expect("pool");
+    let client = pool.client_for("corp").unwrap();
+    assert_eq!(client.confluence_credential_account(), None);
+    assert_eq!(client.list_projects().await.unwrap()[0].key, "ENG");
+    let err = client.list_all_spaces().await.expect_err("confluence must reject PAT-J");
+    assert!(format!("{err:#}").contains("401"), "{err:#}");
+    assert!(state
+        .confluence_auth
+        .read()
+        .unwrap()
+        .iter()
+        .all(|h| h == "Bearer PAT-J"));
+}
+
+#[tokio::test]
+async fn regression_known_2_sync_uses_default_space_key() {
+    use atlassian_cli::{atlassian::SiteClientPool, sync};
+
+    ensure_isolated_env();
+    let state = Arc::new(SplitPatMock::default());
+    let base_url = spawn_server(build_split_pat_router(state.clone())).await;
+
+    let dir = tempfile::tempdir().unwrap();
+    let cred_path = dir.path().join("credentials.json");
+    let dc_pat = |token: &str, site_url: String| StoredCredentials::BearerPat {
+        site_url,
+        token: token.into(),
+        deployment: DeploymentKind::DataCenter,
+    };
+    AuthManager::for_account("corp")
+        .with_fallback_path(cred_path.clone())
+        .save_credentials(&dc_pat("PAT-J", format!("{base_url}/jira")))
+        .unwrap();
+    AuthManager::for_account("corp-confluence")
+        .with_fallback_path(cred_path.clone())
+        .save_credentials(&dc_pat("PAT-C", format!("{base_url}/wiki")))
+        .unwrap();
+
+    // The configured default space is the second one the server lists.
+    let mut cfg = split_pat_config(&base_url, Some("corp-confluence"));
+    cfg.default_space_key = Some("DOCS".into());
+    let pool = SiteClientPool::from_config_with_options(&cfg, Some(cred_path), None, None)
+        .expect("pool");
+    let client = pool.client_for("corp").unwrap();
+    assert_eq!(client.config().default_space_key.as_deref(), Some("DOCS"));
+
+    let storage = Storage::open_in_memory().unwrap();
+    sync::bootstrap_workspace_for_site("corp", &client, &storage)
+        .await
+        .expect("bootstrap");
+
+    let requests = state.requests.read().unwrap().clone();
+    let page_requests: Vec<&String> = requests
+        .iter()
+        .filter(|uri| uri.starts_with("/wiki") && !uri.starts_with("/wiki/rest/api/space?"))
+        .collect();
+    assert!(
+        page_requests.iter().any(|uri| uri.contains("DOCS")),
+        "root pages of the default space DOCS must be fetched: {requests:?}"
+    );
+    assert!(
+        !page_requests.iter().any(|uri| uri.contains("AAA")),
+        "the first listed space must not be used when a default is configured: {requests:?}"
+    );
 }
