@@ -34,7 +34,7 @@ use crate::{
     shell_alias::{
         self, AliasCommand, ShellKind, DEFAULT_CONF_ALIAS, DEFAULT_JIRA_ALIAS,
     },
-    storage::{SiteRecord, Storage},
+    storage::{IssueListFilter, SiteRecord, Storage},
     sync::{self, SiteSyncTarget},
     tui, updater,
 };
@@ -4250,8 +4250,12 @@ async fn refresh_cli_page_cache(client: &AtlassianClient, storage: &Storage, pag
 }
 
 async fn cmd_whoami(cfg: &AppConfig, persona: Persona, json_out: bool) -> Result<()> {
-    let (auth, client, _storage) = open_runtime(cfg, true)?;
+    let (auth, client, storage) = open_runtime(cfg, true)?;
     let probe = client.probe_identity().await;
+    // Issue assignees are Jira users, so only the Jira identity serves `issues --offline --mine`.
+    if let Some(user) = probe.jira_user() {
+        let _ = storage.save_identity_for_site(client.site_id(), user);
+    }
     // Non-zero exit only when no product accepts the credential.
     let me = match probe.jira_user().or(probe.confluence_user()) {
         Some(user) => user.clone(),
@@ -4834,6 +4838,38 @@ async fn cmd_board(
     Ok(())
 }
 
+const OFFLINE_JQL_ERROR: &str =
+    "--jql cannot be evaluated offline; use --project/--status/--mine or \"atlassian search <text>\"";
+const OFFLINE_MINE_ERROR: &str =
+    "--mine --offline needs a cached identity; run \"atlassian whoami\" once online";
+
+/// The cache filter for `issues --offline`: project (or the default project), status and, for
+/// `--mine`, the signed-in user `whoami` saved. JQL needs a server, so it is refused.
+fn offline_issue_filter<'a>(
+    cfg: &'a AppConfig,
+    project: Option<&'a str>,
+    jql: Option<&str>,
+    mine: bool,
+    status: Option<&'a str>,
+    me: Option<&'a str>,
+) -> Result<IssueListFilter<'a>> {
+    if jql.is_some_and(|raw| !raw.trim().is_empty()) {
+        bail!(OFFLINE_JQL_ERROR);
+    }
+    let nonempty = |s: &'a str| Some(s.trim()).filter(|s| !s.is_empty());
+    let assignee_id = if mine {
+        Some(me.and_then(nonempty).context(OFFLINE_MINE_ERROR)?)
+    } else {
+        None
+    };
+    Ok(IssueListFilter {
+        project: project.or(cfg.default_project.as_deref()).and_then(nonempty),
+        status_contains: status.and_then(nonempty),
+        assignee_id,
+        open_only: false,
+    })
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn cmd_issues(
     cfg: &AppConfig,
@@ -4852,13 +4888,16 @@ async fn cmd_issues(
     let limit = serve::clamp_limit(limit);
 
     let (issues, remote_page) = if offline {
-        let mut list = storage.list_issues_for_site(site_id, project, limit)?;
-        if let Some(st) = status {
-            let st_low = st.trim().to_ascii_lowercase();
-            list.retain(|i| i.status.name.to_ascii_lowercase().contains(&st_low));
-        }
-        list.truncate(limit);
-        (list, None)
+        let me = if mine {
+            client
+                .cached_me()
+                .or_else(|| storage.identity_for_site(site_id).ok().flatten())
+                .map(|user| user.id)
+        } else {
+            None
+        };
+        let filter = offline_issue_filter(cfg, project, jql, mine, status, me.as_deref())?;
+        (storage.list_issues_filtered_for_site(site_id, &filter, limit)?, None)
     } else {
         let effective_jql = if let Some(raw) = jql {
             raw.to_string()
@@ -6824,6 +6863,44 @@ mod tests {
     use super::*;
     use crate::atlassian::client::ProbeFailure;
     use crate::models::{BoardColumn, IssueStatus, UserSummary};
+
+    #[test]
+    fn offline_issue_query_rejects_jql() {
+        let cfg = AppConfig {
+            default_project: Some("ENG".into()),
+            ..AppConfig::default()
+        };
+        let err = offline_issue_filter(&cfg, None, Some("project = OPS"), false, None, None)
+            .unwrap_err();
+        assert_eq!(err.to_string(), OFFLINE_JQL_ERROR);
+        assert!(OFFLINE_JQL_ERROR.contains("atlassian search <text>"));
+
+        // Blank JQL is no JQL; the default project and the status filter apply.
+        assert_eq!(
+            offline_issue_filter(&cfg, None, Some("  "), false, Some(" In Progress "), None).unwrap(),
+            IssueListFilter {
+                project: Some("ENG"),
+                status_contains: Some("In Progress"),
+                ..Default::default()
+            }
+        );
+        assert_eq!(
+            offline_issue_filter(&cfg, Some("OPS"), None, false, None, None).unwrap().project,
+            Some("OPS")
+        );
+
+        // --mine filters by the saved identity and refuses to guess without one.
+        let err = offline_issue_filter(&cfg, None, None, true, None, None).unwrap_err();
+        assert_eq!(err.to_string(), OFFLINE_MINE_ERROR);
+        assert_eq!(
+            offline_issue_filter(&cfg, None, None, true, None, Some("acct-1")).unwrap().assignee_id,
+            Some("acct-1")
+        );
+        assert_eq!(
+            offline_issue_filter(&cfg, None, None, false, None, Some("acct-1")).unwrap().assignee_id,
+            None
+        );
+    }
 
     fn probe_user(id: &str) -> UserSummary {
         UserSummary {

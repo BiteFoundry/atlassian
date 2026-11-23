@@ -32,7 +32,7 @@ use crate::{
         OutgoingIssue, OutgoingPage, PageSummary, SearchHitKind, UnifiedSearchHit,
     },
     resolver::resolve_rejected_assignee,
-    storage::Storage,
+    storage::{IssueListFilter, Storage},
     sync::{self, SyncCommand},
 };
 
@@ -305,6 +305,9 @@ pub struct IssuesQuery {
     pub jql: Option<String>,
     #[serde(default)]
     pub project: Option<String>,
+    /// Status name: a `status = "..."` clause online, a case-insensitive substring offline.
+    #[serde(default)]
+    pub status: Option<String>,
     #[serde(default)]
     pub limit: Option<usize>,
     #[serde(default)]
@@ -1002,18 +1005,32 @@ async fn list_issues(
             "specify either 'page_token' or 'start_at', not both",
         ));
     }
-    let project = query
-        .project
-        .as_deref()
-        .map(str::trim)
-        .filter(|s| !s.is_empty());
+    fn nonempty(raw: Option<&str>) -> Option<&str> {
+        raw.map(str::trim).filter(|s| !s.is_empty())
+    }
+    let project = nonempty(query.project.as_deref())
+        .or_else(|| nonempty(state.config.default_project.as_deref()));
+    let status = nonempty(query.status.as_deref());
+    let jql = nonempty(query.jql.as_deref());
 
     if query.offline {
+        if jql.is_some() {
+            return Err(ApiError::bad_request(
+                "jql cannot be evaluated offline; use project and status, or GET /search?q=<text> for a cached full-text search",
+            ));
+        }
         let target_site = resolve_single_site_id(&state, query.site.as_deref())?;
-        let issues = state.storage.list_issues_for_site(&target_site, project, limit)?;
+        let filter = IssueListFilter {
+            project,
+            status_contains: status,
+            ..Default::default()
+        };
+        let issues = state
+            .storage
+            .list_issues_filtered_for_site(&target_site, &filter, limit)?;
         let total = state
             .storage
-            .count_issues_for_site(&target_site, project)?;
+            .count_issues_filtered_for_site(&target_site, &filter)?;
         return Ok(Json(json!({
             "site_id": target_site,
             "issues": issues,
@@ -1024,14 +1041,21 @@ async fn list_issues(
     }
 
     let (target_site, client) = resolve_site_client(&state, query.site.as_deref())?;
-    let jql = match query.jql.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+    let jql = match jql {
         Some(raw) => raw.to_string(),
-        None => match project.or(state.config.default_project.as_deref()) {
-            Some(proj) if !proj.trim().is_empty() => {
-                format!("project = \"{}\" ORDER BY updated DESC", escape_jql_str(proj.trim()))
+        None => {
+            let clauses: Vec<String> = [("project", project), ("status", status)]
+                .into_iter()
+                .filter_map(|(field, value)| {
+                    value.map(|v| format!("{field} = \"{}\"", escape_jql_str(v)))
+                })
+                .collect();
+            if clauses.is_empty() {
+                AtlassianClient::my_open_issues_jql().to_string()
+            } else {
+                format!("{} ORDER BY updated DESC", clauses.join(" AND "))
             }
-            _ => AtlassianClient::my_open_issues_jql().to_string(),
-        },
+        }
     };
 
     let page = client
