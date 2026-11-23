@@ -3172,10 +3172,16 @@ impl AppState {
             OpenItemTarget::JiraIssue { site_id, key } => {
                 let (sid, client) = self.site_id_and_client_for(Some(&site_id));
                 tokio::spawn(async move {
-                    let res = match client.list_issue_comments(&key).await {
-                        Ok(comments) => {
-                            let _ = storage.update_issue_comments_for_site(&sid, &key, &comments);
-                            Ok(comments)
+                    let res = match client.list_issue_comments_collected(&key).await {
+                        Ok((collected, total)) => {
+                            // The server total keeps comment_count right past the comment cap.
+                            let _ = storage.update_issue_comments_for_site_with_total(
+                                &sid,
+                                &key,
+                                &collected.items,
+                                total,
+                            );
+                            Ok(collected.items)
                         }
                         Err(e) => Err(e.to_string()),
                     };
