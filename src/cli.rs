@@ -4811,15 +4811,9 @@ async fn cmd_board(
     };
 
     let chosen_sprint_id = sprint_id.or_else(|| active_sprint.as_ref().map(|s| s.id));
-    let board_limit = 100usize;
-    let issues = client
-        .list_board_issues(board.id, chosen_sprint_id, board_limit)
-        .await?;
-    let _ = storage.upsert_board_issues_for_site(site_id, board.id, chosen_sprint_id, &issues);
-    if issues.len() < board_limit {
-        let keep: Vec<String> = issues.iter().map(|i| i.key.clone()).collect();
-        let _ = storage.prune_board_issues_for_site(site_id, board.id, chosen_sprint_id, &keep);
-    }
+    let issues =
+        sync::load_board_issues_for_site(&client, &storage, site_id, board.id, chosen_sprint_id)
+            .await?;
 
     if json_out {
         println!(

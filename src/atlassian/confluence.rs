@@ -101,30 +101,9 @@ impl AtlassianClient {
         Ok(self.list_spaces_page(limit, None).await?.items)
     }
 
+    /// Every space of the site (all pages, up to the space cap).
     pub async fn list_all_spaces(&self) -> Result<Vec<SpaceSummary>> {
-        let mut cursor: Option<String> = None;
-        let mut all = Vec::new();
-        let mut seen = HashSet::new();
-
-        loop {
-            let page = self.list_spaces_page(250, cursor.as_deref()).await?;
-            let mut added = 0usize;
-            for space in page.items {
-                if seen.insert(space.id.clone()) {
-                    all.push(space);
-                    added += 1;
-                }
-            }
-            if added == 0 {
-                break;
-            }
-            match page.next_cursor {
-                Some(next) => cursor = Some(next),
-                None => break,
-            }
-        }
-
-        Ok(all)
+        Ok(self.list_all_spaces_collected().await?.items)
     }
 
     pub async fn list_space_root_pages_page(
@@ -391,18 +370,39 @@ impl AtlassianClient {
         }
     }
 
-    /// Lightweight single-request Confluence page attachments query for panel refresh.
+    /// Every attachment of the page (all pages, up to the attachment cap).
     pub async fn list_page_attachments(
         &self,
         page_id: &str,
     ) -> Result<Vec<crate::models::AttachmentItem>> {
+        Ok(self.list_page_attachments_collected(page_id).await?.items)
+    }
+
+    /// One page of a Confluence page's attachments.
+    pub async fn list_page_attachments_page(
+        &self,
+        page_id: &str,
+        cursor: Option<&str>,
+    ) -> Result<ListPage<crate::models::AttachmentItem>> {
         let conf_root = self.require_confluence_root()?;
         let encoded_id = urlencoding::encode(page_id.trim());
-        let url = match self.deployment() {
-            DeploymentKind::Cloud => format!("{conf_root}/api/v2/pages/{encoded_id}/attachments"),
-            DeploymentKind::DataCenter => {
-                format!("{conf_root}/rest/api/content/{encoded_id}/child/attachment")
+        let cloud = self.deployment() == DeploymentKind::Cloud;
+        let mut start = 0usize;
+        let url = if cloud {
+            let mut url = format!("{conf_root}/api/v2/pages/{encoded_id}/attachments?limit=250");
+            if let Some(c) = cursor.map(str::trim).filter(|s| !s.is_empty()) {
+                url.push_str("&cursor=");
+                url.push_str(&urlencoding::encode(c));
             }
+            url
+        } else {
+            start = parse_offset_cursor(cursor).map_err(anyhow::Error::msg)?;
+            let mut url =
+                format!("{conf_root}/rest/api/content/{encoded_id}/child/attachment?limit=100");
+            if start > 0 {
+                url.push_str(&format!("&start={start}"));
+            }
+            url
         };
         let val: Value = self.get_json(&url).await?;
         let arr = val
@@ -410,10 +410,16 @@ impl AtlassianClient {
             .and_then(|v| v.as_array())
             .map(Vec::as_slice)
             .unwrap_or(&[]);
-        Ok(arr
+        let items: Vec<crate::models::AttachmentItem> = arr
             .iter()
             .map(|a| parse_attachment_item(a, &conf_root))
-            .collect())
+            .collect();
+        let (has_more, next_cursor) = next_link_page_state(&val, cloud, start, arr.len());
+        Ok(ListPage {
+            items,
+            has_more,
+            next_cursor,
+        })
     }
 
     pub async fn get_page(&self, page_id: &str) -> Result<PageDetail> {
@@ -490,7 +496,9 @@ impl AtlassianClient {
                 }
 
                 let (labels, labels_ok, labels_more) = match self
-                    .get_json::<Value>(&format!("{conf_root}/api/v2/pages/{encoded_id}/labels"))
+                    .get_json::<Value>(&format!(
+                        "{conf_root}/api/v2/pages/{encoded_id}/labels?limit=250"
+                    ))
                     .await
                 {
                     Ok(v) => (
@@ -512,7 +520,7 @@ impl AtlassianClient {
 
                 let (attachments, attachments_ok, attachments_more) = match self
                     .get_json::<Value>(&format!(
-                        "{conf_root}/api/v2/pages/{encoded_id}/attachments"
+                        "{conf_root}/api/v2/pages/{encoded_id}/attachments?limit=250"
                     ))
                     .await
                 {
@@ -1277,20 +1285,45 @@ impl AtlassianClient {
         Ok(format!("{root}/rest/api/content/{page}/label"))
     }
 
+    /// First page of a page's footer comments and whether more exist (single request, used
+    /// on the page-detail hot path).
     pub async fn list_page_comments_page(
         &self,
         page_id: &str,
     ) -> Result<(Vec<ConfluenceComment>, bool)> {
+        let page = self.list_page_comments_cursor_page(page_id, None).await?;
+        let has_more = page.has_more == Some(true);
+        Ok((page.items, has_more))
+    }
+
+    /// One page of a page's footer comments, starting at "cursor".
+    pub async fn list_page_comments_cursor_page(
+        &self,
+        page_id: &str,
+        cursor: Option<&str>,
+    ) -> Result<ListPage<ConfluenceComment>> {
         let conf_root = self.require_confluence_root()?;
         let encoded_id = urlencoding::encode(page_id.trim());
-
-        let url = match self.deployment() {
-            DeploymentKind::Cloud => format!(
-                "{conf_root}/api/v2/pages/{encoded_id}/footer-comments?body-format=atlas_doc_format"
-            ),
-            DeploymentKind::DataCenter => format!(
-                "{conf_root}/rest/api/content/{encoded_id}/child/comment?expand=body.storage,version"
-            ),
+        let cloud = self.deployment() == DeploymentKind::Cloud;
+        let mut start = 0usize;
+        let url = if cloud {
+            let mut url = format!(
+                "{conf_root}/api/v2/pages/{encoded_id}/footer-comments?body-format=atlas_doc_format&limit=100"
+            );
+            if let Some(c) = cursor.map(str::trim).filter(|s| !s.is_empty()) {
+                url.push_str("&cursor=");
+                url.push_str(&urlencoding::encode(c));
+            }
+            url
+        } else {
+            start = parse_offset_cursor(cursor).map_err(anyhow::Error::msg)?;
+            let mut url = format!(
+                "{conf_root}/rest/api/content/{encoded_id}/child/comment?expand=body.storage,version&limit=100"
+            );
+            if start > 0 {
+                url.push_str(&format!("&start={start}"));
+            }
+            url
         };
         let val: Value = self.get_json(&url).await?;
         let arr = val
@@ -1298,16 +1331,21 @@ impl AtlassianClient {
             .and_then(|v| v.as_array())
             .map(Vec::as_slice)
             .unwrap_or(&[]);
-        let comments = arr
+        let items: Vec<ConfluenceComment> = arr
             .iter()
             .map(|c| parse_confluence_comment(c, page_id))
             .collect();
-        let has_more = val.pointer("/_links/next").and_then(Value::as_str).is_some();
-        Ok((comments, has_more))
+        let (has_more, next_cursor) = next_link_page_state(&val, cloud, start, arr.len());
+        Ok(ListPage {
+            items,
+            has_more,
+            next_cursor,
+        })
     }
 
+    /// Every footer comment of the page (all pages, up to the comment cap).
     pub async fn list_page_comments(&self, page_id: &str) -> Result<Vec<ConfluenceComment>> {
-        Ok(self.list_page_comments_page(page_id).await?.0)
+        Ok(self.list_page_comments_collected(page_id).await?.items)
     }
 
     pub async fn add_page_comment(

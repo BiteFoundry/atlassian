@@ -120,7 +120,7 @@ Lists Jira Agile boards, optionally filtered by `project` key.
 
 ### `GET /boards/{board_id}/sprints?offline=false`
 
-Lists sprints for a Jira Agile board.
+Lists the active and future sprints of a Jira Agile board (every page, not only the first 50).
 
 ```json
 {
@@ -139,14 +139,16 @@ Lists sprints for a Jira Agile board.
 }
 ```
 
-### `GET /boards/{board_id}/issues?sprint_id=&limit=50&offline=false`
+### `GET /boards/{board_id}/issues?sprint_id=&limit=50&offline=false&cursor=`
 
-Lists issues on a Jira Agile board, optionally scoped to `sprint_id`.
+Lists issues on a Jira Agile board, optionally scoped to `sprint_id`, one page per request. Jira may answer fewer issues than `limit`; that is a page, not the end of the board. Pass `next_cursor` (an offset) as `cursor` while `has_more` is true. The cache drops issues that left the board only when the first page is also the last one.
 
 ```json
 {
   "board_id": 7,
   "sprint_id": 42,
+  "has_more": true,
+  "next_cursor": "50",
   "issues": []
 }
 ```
@@ -271,13 +273,13 @@ Lists comments on an issue, or adds a Markdown comment (`{"body_markdown": "..."
 
 ## Confluence Spaces & Pages
 
-### `GET /spaces?refresh=false&limit=50`
+### `GET /spaces?refresh=false&limit=50&cursor=`
 
-Lists Confluence spaces from local SQLite cache or refreshes from Confluence API.
+Lists Confluence spaces from local SQLite cache or refreshes from Confluence API. A refresh (or an empty cache) loads the whole space catalog, whatever `limit` says, so a later cached read is never a partial list. `has_more` / `next_cursor` page through the result (`cursor` is an offset).
 
-### `GET /spaces/{space}/pages?limit=50&offline=false`
+### `GET /spaces/{space}/pages?limit=50&offline=false&cursor=`
 
-Lists root pages in a Confluence space (`space` may be space key or ID).
+Lists root pages in a Confluence space (`space` may be space key or ID). One page per request: pass the answer's `next_cursor` as `cursor` while `has_more` is true. The cache drops vanished root pages only when the first page is also the last one.
 
 ### `POST /pages`
 
@@ -298,9 +300,9 @@ Fetches full Confluence page detail (`PageDetail`: summary, ancestors, labels, `
 
 `compact=true` returns `id`, `title`, `space_id`, `space_key`, `version_number`, and the full `body_markdown` inside the `page` envelope (without CLI/MCP `omitted` or `hint` fields). It works for live and offline reads. Detail endpoints reject unsupported query arguments.
 
-### `GET /pages/{id}/children?offline=false`
+### `GET /pages/{id}/children?offline=false&limit=100&cursor=`
 
-Lists direct child pages of page `{id}`.
+Lists direct child pages of page `{id}`, one page per request, with `has_more` / `next_cursor` as for root pages. An offline read without `limit` and `cursor` returns every cached child.
 
 ### `PUT /pages/{id}`
 

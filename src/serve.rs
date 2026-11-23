@@ -26,9 +26,10 @@ use crate::{
         AtlassianClient, SiteClientPool,
     },
     config::AppConfig,
+    config::DeploymentKind,
     models::{
-        FederatedSearchHit, IssueSummary, IssueUpdate, OutgoingIssue, OutgoingPage, PageSummary,
-        SearchHitKind, UnifiedSearchHit,
+        parse_offset_cursor, slice_page, FederatedSearchHit, IssueSummary, IssueUpdate, ListPage,
+        OutgoingIssue, OutgoingPage, PageSummary, SearchHitKind, UnifiedSearchHit,
     },
     resolver::resolve_rejected_assignee,
     storage::Storage,
@@ -289,6 +290,9 @@ pub struct BoardIssuesQuery {
     pub sprint_id: Option<i64>,
     #[serde(default)]
     pub limit: Option<usize>,
+    /// "next_cursor" of the previous answer; absent for the first page.
+    #[serde(default)]
+    pub cursor: Option<String>,
     #[serde(default)]
     pub offline: bool,
     #[serde(default)]
@@ -412,6 +416,22 @@ pub struct SpacesQuery {
     pub refresh: bool,
     #[serde(default)]
     pub limit: Option<usize>,
+    /// "next_cursor" of the previous answer; absent for the first page.
+    #[serde(default)]
+    pub cursor: Option<String>,
+    #[serde(default)]
+    pub site: Option<String>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+pub struct ChildPagesQuery {
+    #[serde(default)]
+    pub limit: Option<usize>,
+    /// "next_cursor" of the previous answer; absent for the first page.
+    #[serde(default)]
+    pub cursor: Option<String>,
+    #[serde(default)]
+    pub offline: bool,
     #[serde(default)]
     pub site: Option<String>,
 }
@@ -420,6 +440,9 @@ pub struct SpacesQuery {
 pub struct SpacePagesQuery {
     #[serde(default)]
     pub limit: Option<usize>,
+    /// "next_cursor" of the previous answer; absent for the first page.
+    #[serde(default)]
+    pub cursor: Option<String>,
     #[serde(default)]
     pub offline: bool,
     #[serde(default)]
@@ -900,39 +923,43 @@ async fn list_board_issues(
     Query(query): Query<BoardIssuesQuery>,
 ) -> Result<Json<Value>, ApiError> {
     let limit = clamp_limit(query.limit.unwrap_or(50));
+    let start = parse_offset_cursor(query.cursor.as_deref()).map_err(ApiError::bad_request)?;
     let target_site = resolve_single_site_id(&state, query.site.as_deref())?;
-    let issues = if query.offline {
-        state
-            .storage
-            .list_board_issues_for_site(&target_site, board_id, query.sprint_id, limit)?
-    } else {
-        let (target_site, client) = resolve_site_client(&state, query.site.as_deref())?;
-        let fetched = client
-            .list_board_issues(board_id, query.sprint_id, limit)
-            .await?;
-        let _ = state.storage.upsert_board_issues_for_site(
-            &target_site,
-            board_id,
-            query.sprint_id,
-            &fetched,
-        );
-        if fetched.len() < limit.min(100) {
-            let keep: Vec<String> = fetched.iter().map(|i| i.key.clone()).collect();
-            let _ = state.storage.prune_board_issues_for_site(
+    let page = if query.offline {
+        // One row past the page tells whether the cache holds more.
+        slice_page(
+            state.storage.list_board_issues_for_site(
                 &target_site,
                 board_id,
                 query.sprint_id,
-                &keep,
-            );
-        }
-        fetched
+                start.saturating_add(limit).saturating_add(1),
+            )?,
+            start,
+            limit,
+        )
+    } else {
+        let (target_site, client) = resolve_site_client(&state, query.site.as_deref())?;
+        let page = client
+            .list_board_issues_page(board_id, query.sprint_id, limit, start)
+            .await?;
+        // Prunes only on a first page the server marked as the last one.
+        let _ = state.storage.record_board_issues_page_for_site(
+            &target_site,
+            board_id,
+            query.sprint_id,
+            &page,
+            start == 0,
+        );
+        page
     };
 
     Ok(Json(json!({
         "site_id": target_site,
         "board_id": board_id,
         "sprint_id": query.sprint_id,
-        "issues": issues,
+        "has_more": page.has_more,
+        "next_cursor": page.next_cursor,
+        "issues": page.items,
     })))
 }
 
@@ -1353,14 +1380,17 @@ async fn list_spaces(
     Query(query): Query<SpacesQuery>,
 ) -> Result<Json<Value>, ApiError> {
     let limit = clamp_limit(query.limit.unwrap_or(50));
+    let start = parse_offset_cursor(query.cursor.as_deref()).map_err(ApiError::bad_request)?;
     let target_site = resolve_single_site_id(&state, query.site.as_deref())?;
     let cached = state.storage.list_spaces_for_site(&target_site)?;
-    let mut spaces = if query.refresh || cached.is_empty() {
+    let spaces = if query.refresh || cached.is_empty() {
         if !query.refresh && state.config.site_url.trim().is_empty() && state.config.sites.is_empty() {
             cached
         } else {
             let (target_site, client) = resolve_site_client(&state, query.site.as_deref())?;
-            let fetched = client.list_spaces(limit).await?;
+            // The whole catalog, whatever "limit" says: a partial catalog in the cache would
+            // be what every later request gets back.
+            let fetched = client.list_all_spaces().await?;
             let _ = state.storage.upsert_spaces_for_site(&target_site, &fetched);
             let stored = state.storage.list_spaces_for_site(&target_site)?;
             if stored.is_empty() {
@@ -1372,8 +1402,13 @@ async fn list_spaces(
     } else {
         cached
     };
-    spaces.truncate(limit);
-    Ok(Json(json!({ "site_id": target_site, "spaces": spaces })))
+    let page = slice_page(spaces, start, limit);
+    Ok(Json(json!({
+        "site_id": target_site,
+        "has_more": page.has_more,
+        "next_cursor": page.next_cursor,
+        "spaces": page.items,
+    })))
 }
 
 async fn list_space_pages(
@@ -1384,29 +1419,39 @@ async fn list_space_pages(
     let limit = clamp_limit(query.limit.unwrap_or(50));
     let space = space.trim();
     let target_site = resolve_single_site_id(&state, query.site.as_deref())?;
-    let mut pages = if query.offline {
-        state
-            .storage
-            .list_space_root_pages_for_site(&target_site, space)?
+    let cursor = query.cursor.as_deref().map(str::trim).filter(|c| !c.is_empty());
+    let page = if query.offline {
+        let start = parse_offset_cursor(cursor).map_err(ApiError::bad_request)?;
+        slice_page(
+            state
+                .storage
+                .list_space_root_pages_for_site(&target_site, space)?,
+            start,
+            limit,
+        )
     } else {
         let (target_site, client) = resolve_site_client(&state, query.site.as_deref())?;
-        let mut fetched = client.list_space_root_pages(space, limit).await?;
+        check_listing_cursor(&client, cursor)?;
+        let mut page = client.list_space_root_pages_page(space, limit, cursor).await?;
+        // Prunes only on a first page the server marked as the last one.
+        let _ = state.storage.record_root_pages_page_for_site(
+            &target_site,
+            space,
+            &page,
+            cursor.is_none(),
+        );
         let _ = state
             .storage
-            .upsert_authoritative_pages_for_site(&target_site, &fetched);
-        if fetched.len() < limit.min(250) {
-            let keep: Vec<String> = fetched.iter().map(|p| p.id.clone()).collect();
-            let _ = state
-                .storage
-                .prune_space_root_pages_for_site(&target_site, space, &keep);
-        }
-        let _ = state
-            .storage
-            .overlay_children_state_for_site(&target_site, &mut fetched);
-        fetched
+            .overlay_children_state_for_site(&target_site, &mut page.items);
+        page
     };
-    pages.truncate(limit);
-    Ok(Json(json!({ "site_id": target_site, "space": space, "pages": pages })))
+    Ok(Json(json!({
+        "site_id": target_site,
+        "space": space,
+        "has_more": page.has_more,
+        "next_cursor": page.next_cursor,
+        "pages": page.items,
+    })))
 }
 
 async fn get_page(
@@ -1456,28 +1501,50 @@ async fn get_page(
 async fn list_child_pages(
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,
-    Query(query): Query<OfflineQuery>,
+    Query(query): Query<ChildPagesQuery>,
 ) -> Result<Json<Value>, ApiError> {
     let id = id.trim();
     let target_site = resolve_single_site_id(&state, query.site.as_deref())?;
-    let pages = if query.offline {
-        state.storage.list_child_pages_for_site(&target_site, id)?
+    let cursor = query.cursor.as_deref().map(str::trim).filter(|c| !c.is_empty());
+    let page = if query.offline {
+        let cached = state.storage.list_child_pages_for_site(&target_site, id)?;
+        match (query.limit, cursor) {
+            // Without "limit" and "cursor" the cached children come back whole, as before.
+            (None, None) => ListPage {
+                items: cached,
+                has_more: Some(false),
+                next_cursor: None,
+            },
+            (limit, cursor) => slice_page(
+                cached,
+                parse_offset_cursor(cursor).map_err(ApiError::bad_request)?,
+                clamp_limit(limit.unwrap_or(100)),
+            ),
+        }
     } else {
         let (target_site, client) = resolve_site_client(&state, query.site.as_deref())?;
-        let mut fetched = client.list_child_pages(id).await?;
-        let _ = state.storage.upsert_pages_for_site(&target_site, &fetched);
-        if fetched.len() < 100 {
-            let keep: Vec<String> = fetched.iter().map(|p| p.id.clone()).collect();
-            let _ = state
-                .storage
-                .prune_child_pages_for_site(&target_site, id, &keep);
-        }
+        check_listing_cursor(&client, cursor)?;
+        let limit = clamp_limit(query.limit.unwrap_or(100));
+        let mut page = client.list_child_pages_page(id, limit, cursor).await?;
+        // Prunes only on a first page the server marked as the last one.
+        let _ = state.storage.record_child_pages_page_for_site(
+            &target_site,
+            id,
+            &page,
+            cursor.is_none(),
+        );
         let _ = state
             .storage
-            .overlay_children_state_for_site(&target_site, &mut fetched);
-        fetched
+            .overlay_children_state_for_site(&target_site, &mut page.items);
+        page
     };
-    Ok(Json(json!({ "site_id": target_site, "parent_id": id, "pages": pages })))
+    Ok(Json(json!({
+        "site_id": target_site,
+        "parent_id": id,
+        "has_more": page.has_more,
+        "next_cursor": page.next_cursor,
+        "pages": page.items,
+    })))
 }
 
 async fn create_page(
@@ -1712,6 +1779,15 @@ async fn sync_workspace(
         "summary": summary,
         "counts": counts,
     })))
+}
+
+/// A Data Center listing cursor is an offset; anything else is the caller's mistake (400),
+/// not a server failure. Cloud cursors are opaque and go to Atlassian as they are.
+fn check_listing_cursor(client: &AtlassianClient, cursor: Option<&str>) -> Result<(), ApiError> {
+    if client.deployment() == DeploymentKind::DataCenter {
+        parse_offset_cursor(cursor).map_err(ApiError::bad_request)?;
+    }
+    Ok(())
 }
 
 pub(crate) fn clamp_limit(limit: usize) -> usize {

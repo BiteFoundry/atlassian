@@ -984,11 +984,25 @@ impl AtlassianClient {
         self.put_json_empty(&url, &body).await
     }
 
+    /// Every comment of the issue (all pages, up to the comment cap).
     pub async fn list_issue_comments(&self, key: &str) -> Result<Vec<IssueComment>> {
+        Ok(self.list_issue_comments_collected(key).await?.0.items)
+    }
+
+    /// One page of issue comments plus the total the server reported, when it did.
+    pub async fn list_issue_comments_page(
+        &self,
+        key: &str,
+        limit: usize,
+        start: usize,
+    ) -> Result<(crate::models::ListPage<IssueComment>, Option<usize>)> {
         let base = self.require_site_url()?;
         let ver = self.jira_api_version();
         let encoded_key = urlencoding::encode(key);
-        let url = format!("{base}/rest/api/{ver}/issue/{encoded_key}/comment");
+        let max_results = limit.clamp(1, 100);
+        let url = format!(
+            "{base}/rest/api/{ver}/issue/{encoded_key}/comment?startAt={start}&maxResults={max_results}"
+        );
 
         let val: Value = self.get_json(&url).await?;
         let arr = val
@@ -997,11 +1011,20 @@ impl AtlassianClient {
             .or_else(|| val.as_array())
             .map(Vec::as_slice)
             .unwrap_or(&[]);
-
-        Ok(arr
+        let items: Vec<IssueComment> = arr
             .iter()
             .map(|c| parse_issue_comment(c, key, self.deployment()))
-            .collect())
+            .collect();
+        let total = val.get("total").and_then(Value::as_u64).map(|n| n as usize);
+        let (has_more, next_cursor) = offset_page_state(&val, start, items.len(), max_results);
+        Ok((
+            crate::models::ListPage {
+                items,
+                has_more,
+                next_cursor,
+            },
+            total,
+        ))
     }
 
     pub async fn add_issue_comment(&self, key: &str, body_markdown: &str) -> Result<IssueComment> {

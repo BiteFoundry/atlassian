@@ -21,9 +21,16 @@ use tokio::{
 };
 
 use crate::{
-    atlassian::{client::HttpStatusError, AtlassianClient},
+    atlassian::{
+        client::HttpStatusError,
+        collect::{SYNC_BOARD_ISSUE_CAP, SYNC_MY_ISSUE_CAP, SYNC_PROJECT_ISSUE_CAP, SYNC_ROOT_PAGE_CAP},
+        AtlassianClient,
+    },
     config::AppConfig,
-    models::{BoardSummary, CoreEvent, IssueSummary, OpenItemTarget, SpaceSummary, SprintSummary},
+    models::{
+        BoardSummary, Collected, CoreEvent, IssueSummary, OpenItemTarget, PageSummary, SpaceSummary,
+        SprintSummary,
+    },
     storage::Storage,
 };
 
@@ -1757,22 +1764,22 @@ async fn run_full_sync_for_site(
     if breakers.should_allow_site(site_id, SyncEndpoint::JiraIssues, Instant::now()) {
         attempted_steps += 1;
         match client
-            .search_issues_jql(AtlassianClient::my_open_issues_jql(), 50, None, None)
+            .search_all_issues_jql(AtlassianClient::my_open_issues_jql(), SYNC_MY_ISSUE_CAP)
             .await
         {
-            Ok(page) => {
+            Ok(collected) => {
                 breakers.record_success_site(site_id, SyncEndpoint::JiraIssues);
                 succeeded_steps += 1;
-                let fetched = page.issues.len();
+                let fetched = collected.items.len();
                 if fetched > issue_count {
                     issue_count = fetched;
                 }
-                if let Err(err) = storage.upsert_issues_for_site(site_id, &page.issues) {
+                if let Err(err) = storage.upsert_issues_for_site(site_id, &collected.items) {
                     record_err(err, SyncErrorKind::Transient);
                 } else if let Some(tx) = core_tx {
                     let _ = tx.send(CoreEvent::IssuesUpdated {
                         site_id: site_id.to_string(),
-                        issues: page.issues,
+                        issues: collected.items,
                     });
                 }
             }
@@ -1793,7 +1800,9 @@ async fn run_full_sync_for_site(
     // 4. Confluence spaces + default/first space root pages
     if breakers.should_allow_site(site_id, SyncEndpoint::ConfluenceSpaces, Instant::now()) {
         attempted_steps += 1;
-        match client.list_spaces(50).await {
+        // Every space, not the first 50: the space list has no prune, so a partial
+        // listing would simply hide the rest.
+        match client.list_all_spaces_collected().await.map(|all| all.items) {
             Ok(spaces) => {
                 breakers.record_success_site(site_id, SyncEndpoint::ConfluenceSpaces);
                 succeeded_steps += 1;
@@ -1917,16 +1926,12 @@ async fn sync_board_details_for_site(
     };
     let target_sprint_id = explicit_sprint_id.or_else(|| active_sprint.as_ref().map(|s| s.id));
 
-    let board_limit = 50usize;
-    let issues: Vec<IssueSummary> = client
-        .list_board_issues(board_id, target_sprint_id, board_limit)
+    let collected = client
+        .list_all_board_issues(board_id, target_sprint_id, SYNC_BOARD_ISSUE_CAP)
         .await?;
+    store_board_issues_for_site(storage, site_id, board_id, target_sprint_id, &collected)?;
+    let issues: Vec<IssueSummary> = collected.items;
     let count = issues.len();
-    storage.upsert_board_issues_for_site(site_id, board_id, target_sprint_id, &issues)?;
-    if count < board_limit {
-        let keep_keys: Vec<String> = issues.iter().map(|i| i.key.clone()).collect();
-        let _ = storage.prune_board_issues_for_site(site_id, board_id, target_sprint_id, &keep_keys);
-    }
 
     if let Some(tx) = core_tx {
         let _ = tx.send(CoreEvent::BoardIssuesUpdated {
@@ -1946,16 +1951,110 @@ async fn sync_project_issues(
     core_tx: Option<&mpsc::UnboundedSender<CoreEvent>>,
 ) -> Result<usize> {
     let jql = format!("project = \"{project_key}\" ORDER BY updated DESC");
-    let page = client.search_issues_jql(&jql, 50, None, None).await?;
-    let count = page.issues.len();
-    storage.upsert_issues_for_site(client.site_id(), &page.issues)?;
+    let issues = client
+        .search_all_issues_jql(&jql, SYNC_PROJECT_ISSUE_CAP)
+        .await?
+        .items;
+    let count = issues.len();
+    storage.upsert_issues_for_site(client.site_id(), &issues)?;
     if let Some(tx) = core_tx {
         let _ = tx.send(CoreEvent::IssuesUpdated {
             site_id: client.site_id().to_string(),
-            issues: page.issues,
+            issues,
         });
     }
     Ok(count)
+}
+
+/// Caches a walked board (or sprint) listing. The prune runs only when the walk was complete:
+/// every page was read and the server said there is no more.
+pub fn store_board_issues_for_site(
+    storage: &Storage,
+    site_id: &str,
+    board_id: i64,
+    sprint_id: Option<i64>,
+    collected: &Collected<IssueSummary>,
+) -> Result<()> {
+    storage.upsert_board_issues_for_site(site_id, board_id, sprint_id, &collected.items)?;
+    if collected.complete {
+        let keep: Vec<String> = collected.items.iter().map(|i| i.key.clone()).collect();
+        storage.prune_board_issues_for_site(site_id, board_id, sprint_id, &keep)?;
+    }
+    Ok(())
+}
+
+/// Caches a walked root-page listing of a space; prunes only when the walk was complete.
+pub fn store_space_root_pages_for_site(
+    storage: &Storage,
+    site_id: &str,
+    space_key: &str,
+    collected: &Collected<PageSummary>,
+) -> Result<()> {
+    storage.upsert_authoritative_pages_for_site(site_id, &collected.items)?;
+    if collected.complete {
+        let keep: Vec<String> = collected.items.iter().map(|p| p.id.clone()).collect();
+        storage.prune_space_root_pages_for_site(site_id, space_key, &keep)?;
+    }
+    Ok(())
+}
+
+/// Caches a walked child-page listing of one parent; prunes only when the walk was complete.
+pub fn store_child_pages_for_site(
+    storage: &Storage,
+    site_id: &str,
+    parent_id: &str,
+    collected: &Collected<PageSummary>,
+) -> Result<()> {
+    storage.upsert_pages_for_site(site_id, &collected.items)?;
+    if collected.complete {
+        let keep: Vec<String> = collected.items.iter().map(|p| p.id.clone()).collect();
+        storage.prune_child_pages_for_site(site_id, parent_id, &keep)?;
+    }
+    Ok(())
+}
+
+/// Fetches every issue of a board (or one sprint) and caches it. A cache write failure does
+/// not hide the fetched issues from the caller.
+pub async fn load_board_issues_for_site(
+    client: &AtlassianClient,
+    storage: &Storage,
+    site_id: &str,
+    board_id: i64,
+    sprint_id: Option<i64>,
+) -> Result<Vec<IssueSummary>> {
+    let collected = client
+        .list_all_board_issues(board_id, sprint_id, SYNC_BOARD_ISSUE_CAP)
+        .await?;
+    let _ = store_board_issues_for_site(storage, site_id, board_id, sprint_id, &collected);
+    Ok(collected.items)
+}
+
+/// Fetches every root page of a space and caches it.
+pub async fn load_space_root_pages_for_site(
+    client: &AtlassianClient,
+    storage: &Storage,
+    site_id: &str,
+    space_key: &str,
+) -> Result<Vec<PageSummary>> {
+    let collected = client
+        .list_all_space_root_pages(space_key, SYNC_ROOT_PAGE_CAP)
+        .await?;
+    let _ = store_space_root_pages_for_site(storage, site_id, space_key, &collected);
+    Ok(collected.items)
+}
+
+/// Fetches every direct child of a page and caches it.
+pub async fn load_child_pages_for_site(
+    client: &AtlassianClient,
+    storage: &Storage,
+    site_id: &str,
+    parent_id: &str,
+) -> Result<Vec<PageSummary>> {
+    let collected = client
+        .list_all_child_pages(parent_id, SYNC_ROOT_PAGE_CAP)
+        .await?;
+    let _ = store_child_pages_for_site(storage, site_id, parent_id, &collected);
+    Ok(collected.items)
 }
 
 async fn sync_space_pages(
@@ -1974,14 +2073,12 @@ async fn sync_space_pages_for_site(
     space_key: &str,
     core_tx: Option<&mpsc::UnboundedSender<CoreEvent>>,
 ) -> Result<usize> {
-    let page_limit = 50usize;
-    let pages = client.list_space_root_pages(space_key, page_limit).await?;
+    let collected = client
+        .list_all_space_root_pages(space_key, SYNC_ROOT_PAGE_CAP)
+        .await?;
+    store_space_root_pages_for_site(storage, site_id, space_key, &collected)?;
+    let pages = collected.items;
     let count = pages.len();
-    storage.upsert_authoritative_pages_for_site(site_id, &pages)?;
-    if count < page_limit {
-        let keep_ids: Vec<String> = pages.iter().map(|p| p.id.clone()).collect();
-        let _ = storage.prune_space_root_pages_for_site(site_id, space_key, &keep_ids);
-    }
     if let Some(tx) = core_tx {
         let _ = tx.send(CoreEvent::SpacePagesUpdated {
             site_id: site_id.to_string(),

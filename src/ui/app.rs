@@ -11,7 +11,10 @@ use tokio::sync::mpsc;
 
 use crate::{
     adf,
-    atlassian::{client::is_not_found_error, AtlassianClient, SiteClientPool},
+    atlassian::{
+        client::is_not_found_error, collect::SYNC_BOARD_ISSUE_CAP as BOARD_ISSUE_VIEW_CAP,
+        AtlassianClient, SiteClientPool,
+    },
     auth::{
         fetch_accessible_resources, run_oauth_loopback_login, AuthManager, OAuthLoopbackOptions,
         StoredCredentials, DEFAULT_OAUTH_API_BASE, DEFAULT_OAUTH_AUTH_BASE,
@@ -1188,7 +1191,7 @@ impl AppState {
                         }
                         if let Ok(bi) =
                             self.storage
-                                .list_board_issues_for_site(site_id, bid, None, 150)
+                                .list_board_issues_for_site(site_id, bid, None, BOARD_ISSUE_VIEW_CAP)
                         {
                             self.board_issues = bi;
                         }
@@ -1341,7 +1344,7 @@ impl AppState {
                         }
                         if let Ok(bi) = self
                             .storage
-                            .list_board_issues_for_site(first_sid, bid, None, 150)
+                            .list_board_issues_for_site(first_sid, bid, None, BOARD_ISSUE_VIEW_CAP)
                         {
                             self.board_issues = bi;
                         }
@@ -2081,27 +2084,16 @@ impl AppState {
                     .find(|s| s.state.eq_ignore_ascii_case("active"))
                     .map(|s| s.id)
             });
-            let board_limit = 150usize;
-            match client
-                .list_board_issues(board_id, effective_sprint, board_limit)
-                .await
+            match sync::load_board_issues_for_site(
+                &client,
+                &storage,
+                &site_id,
+                board_id,
+                effective_sprint,
+            )
+            .await
             {
                 Ok(issues) => {
-                    let _ = storage.upsert_board_issues_for_site(
-                        &site_id,
-                        board_id,
-                        effective_sprint,
-                        &issues,
-                    );
-                    if issues.len() < board_limit {
-                        let keep: Vec<String> = issues.iter().map(|i| i.key.clone()).collect();
-                        let _ = storage.prune_board_issues_for_site(
-                            &site_id,
-                            board_id,
-                            effective_sprint,
-                            &keep,
-                        );
-                    }
                     let _ = tx.send(UiMsg::BoardDataLoaded {
                         site_id,
                         board_id,
@@ -2879,14 +2871,8 @@ impl AppState {
         let tx = self.ui_tx.clone();
         let sk = space_key.to_string();
         tokio::spawn(async move {
-            let page_limit = 100usize;
-            match client.list_space_root_pages(&sk, page_limit).await {
+            match sync::load_space_root_pages_for_site(&client, &storage, &site_id, &sk).await {
                 Ok(pages) => {
-                    let _ = storage.upsert_authoritative_pages_for_site(&site_id, &pages);
-                    if pages.len() < page_limit {
-                        let keep: Vec<String> = pages.iter().map(|p| p.id.clone()).collect();
-                        let _ = storage.prune_space_root_pages_for_site(&site_id, &sk, &keep);
-                    }
                     let _ = tx.send(UiMsg::RootPagesLoaded {
                         site_id,
                         space_key: sk,
@@ -2932,13 +2918,8 @@ impl AppState {
         let tx = self.ui_tx.clone();
         let pid = page.id.clone();
         tokio::spawn(async move {
-            match client.list_child_pages(&pid).await {
+            match sync::load_child_pages_for_site(&client, &storage, &site_id, &pid).await {
                 Ok(children) => {
-                    let _ = storage.upsert_pages_for_site(&site_id, &children);
-                    if children.len() < 100 {
-                        let keep: Vec<String> = children.iter().map(|p| p.id.clone()).collect();
-                        let _ = storage.prune_child_pages_for_site(&site_id, &pid, &keep);
-                    }
                     let _ = tx.send(UiMsg::ChildPagesLoaded {
                         site_id,
                         parent_id: pid,

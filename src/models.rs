@@ -482,6 +482,14 @@ pub struct ListPage<T> {
     pub next_cursor: Option<String>,
 }
 
+/// Every page of a collection that could be walked.
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct Collected<T> {
+    pub items: Vec<T>,
+    /// True only when the server said there is nothing more. A cache prune needs this.
+    pub complete: bool,
+}
+
 pub(crate) const OFFSET_CURSOR_ERROR: &str =
     "cursor must be a non-negative integer offset taken from next_cursor";
 

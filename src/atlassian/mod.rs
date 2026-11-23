@@ -3,6 +3,7 @@
 pub mod agile;
 pub(crate) mod body;
 pub mod client;
+pub mod collect;
 pub mod confluence;
 pub mod jira;
 pub mod media;

@@ -275,8 +275,12 @@ impl AtlassianClient {
         })
     }
 
+    /// Every active and future sprint of the board (all pages, up to the sync cap).
     pub async fn list_board_sprints(&self, board_id: i64) -> Result<Vec<SprintSummary>> {
-        Ok(self.list_board_sprints_page(board_id, 50, 0).await?.items)
+        Ok(self
+            .list_all_board_sprints(board_id, super::collect::SYNC_SPRINT_CAP)
+            .await?
+            .items)
     }
 
     pub async fn list_board_issues_page(
