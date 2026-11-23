@@ -40,6 +40,8 @@ pub struct PendingPixelGraphic {
 #[derive(Debug, Clone)]
 pub struct ImagePreviewOverlay {
     pub owner_label: String,
+    /// Site of the issue or page that owns `items`; attachment ids are only unique per site.
+    pub site_id: Option<String>,
     pub items: Vec<AttachmentItem>,
     pub index: usize,
     /// Zoom percentage (`25..=200`, default `100`).
@@ -85,6 +87,7 @@ impl ImagePreviewOverlay {
         let caps = img_preview::detect_graphics_caps_auto();
         Some(Self {
             owner_label: owner_label.into(),
+            site_id: None,
             items,
             index: start,
             zoom_pct: 100,
@@ -271,6 +274,14 @@ impl ImagePreviewOverlay {
         self.protocol
     }
 
+    /// Cache identity of `att`: the attachment id, qualified by site when the owner's site is known.
+    pub fn cache_id(&self, att: &AttachmentItem) -> String {
+        match self.site_id.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+            Some(site) => format!("{}/{}", site.to_ascii_lowercase(), att.id),
+            None => att.id.clone(),
+        }
+    }
+
     /// Resolves the protocol-aware cache key and cached rendered image for the current attachment.
     pub fn lookup_cached<'a>(
         &self,
@@ -279,7 +290,8 @@ impl ImagePreviewOverlay {
     ) -> Option<(String, &'a RenderedTerminalImage)> {
         let cur = self.current()?;
         let (cols, rows) = self.target_dimensions(area.width, area.height);
-        let proto_key = img_preview::preview_cache_key(&cur.id, cols, rows, self.protocol);
+        let cache_id = self.cache_id(cur);
+        let proto_key = img_preview::preview_cache_key(&cache_id, cols, rows, self.protocol);
         if self.protocol.is_pixel() {
             return app
                 .pixel_image_cache
@@ -290,7 +302,7 @@ impl ImagePreviewOverlay {
             return Some((proto_key, rendered));
         }
         if self.protocol == TerminalImageProtocol::Halfblock {
-            let legacy_key = AppState::image_cache_key(&cur.id, cols, rows);
+            let legacy_key = AppState::image_cache_key(&cache_id, cols, rows);
             if let Some(rendered) = app.image_cache.get(&legacy_key) {
                 return Some((legacy_key, rendered));
             }

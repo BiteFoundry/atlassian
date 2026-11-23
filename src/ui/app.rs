@@ -504,6 +504,13 @@ struct InFlightPageDetail {
     seq: u64,
 }
 
+/// One Back (`Backspace`) step: the item that was open and the site it was open on.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NavEntry {
+    pub site_id: Option<String>,
+    pub target: CrossRefTarget,
+}
+
 pub struct AppState {
     pub config: AppConfig,
     pub persona: Persona,
@@ -520,6 +527,8 @@ pub struct AppState {
     pub sync_summary: String,
 
     pub projects: Vec<ProjectSummary>,
+    /// Site of each row of `projects` (parallel vector, same length).
+    pub project_site_ids: Vec<String>,
     pub boards: Vec<BoardSummary>,
     pub board_site_ids: Vec<String>,
     pub board_issue_site_id: Option<String>,
@@ -553,7 +562,7 @@ pub struct AppState {
     pub cache_counts: CacheCounts,
 
     /// Cross-App navigation stack (`Jira <-> Confluence`).
-    pub nav_history: Vec<CrossRefTarget>,
+    pub nav_history: Vec<NavEntry>,
 
     /// Decoded image cache (`"{att_id}:{cols}x{rows}[:{protocol}]"` -> `RenderedTerminalImage`).
     pub image_cache: DecodedImageCache,
@@ -628,6 +637,7 @@ impl AppState {
             syncing: false,
             sync_summary: String::new(),
             projects: Vec::new(),
+            project_site_ids: Vec::new(),
             boards: Vec::new(),
             board_site_ids: Vec::new(),
             board_issue_site_id: None,
@@ -690,7 +700,10 @@ impl AppState {
         (self.client.site_id().to_string(), self.client.clone())
     }
 
-    fn site_id_and_client_for(&self, explicit_site: Option<&str>) -> (String, AtlassianClient) {
+    pub(crate) fn site_id_and_client_for(
+        &self,
+        explicit_site: Option<&str>,
+    ) -> (String, AtlassianClient) {
         if let Some(sid) = explicit_site.map(str::trim).filter(|s| !s.is_empty()) {
             if sid.eq_ignore_ascii_case(self.client.site_id()) {
                 return (self.client.site_id().to_string(), self.client.clone());
@@ -700,6 +713,100 @@ impl AppState {
             }
         }
         self.effective_site_id_and_client()
+    }
+
+    /// Site id carried by a list event; an empty one (legacy daemon) means the effective site.
+    fn event_site_or_effective(&self, site_id: String) -> String {
+        if site_id.trim().is_empty() {
+            self.effective_site_id_and_client().0
+        } else {
+            site_id
+        }
+    }
+
+    fn reload_projects_all_sites(&mut self) {
+        if let Ok(projs) = self.storage.list_projects_all_sites() {
+            let filtered: Vec<(String, ProjectSummary)> = projs
+                .into_iter()
+                .filter(|(sid, _)| self.site_is_enabled_in_config(sid))
+                .collect();
+            self.project_site_ids = filtered.iter().map(|(s, _)| s.clone()).collect();
+            self.projects = filtered.into_iter().map(|(_, p)| p).collect();
+        }
+    }
+
+    /// Site of the Directory project row `row`, falling back to the effective site.
+    pub fn project_row_site(&self, row: usize) -> String {
+        self.project_site_ids
+            .get(row)
+            .cloned()
+            .unwrap_or_else(|| self.effective_site_id_and_client().0)
+    }
+
+    /// Site of the space row `row` (index into `spaces`), falling back to the effective site.
+    pub fn space_row_site(&self, row: usize) -> String {
+        self.space_site_ids
+            .get(row)
+            .cloned()
+            .unwrap_or_else(|| self.effective_site_id_and_client().0)
+    }
+
+    /// Removes `key` of `site_id` from My Work, keeping the parallel site vectors aligned.
+    pub(crate) fn remove_my_issue(&mut self, site_id: &str, key: &str) {
+        let mut idx = 0usize;
+        while idx < self.my_issues.len() {
+            let matches_site = self
+                .my_issue_site_ids
+                .get(idx)
+                .map(|s| s.eq_ignore_ascii_case(site_id))
+                .unwrap_or(true);
+            if matches_site && self.my_issues[idx].key == key {
+                self.my_issues.remove(idx);
+                if idx < self.my_issue_site_ids.len() {
+                    self.my_issue_site_ids.remove(idx);
+                }
+                if idx < self.my_issue_site_labels.len() {
+                    self.my_issue_site_labels.remove(idx);
+                }
+            } else {
+                idx += 1;
+            }
+        }
+    }
+
+    /// Removes page `page_id` of `site_id` from My Work, keeping the parallel site vectors aligned.
+    pub(crate) fn remove_my_page(&mut self, site_id: &str, page_id: &str) {
+        let mut idx = 0usize;
+        while idx < self.my_pages.len() {
+            let matches_site = self
+                .my_page_site_ids
+                .get(idx)
+                .map(|s| s.eq_ignore_ascii_case(site_id))
+                .unwrap_or(true);
+            if matches_site && self.my_pages[idx].id == page_id {
+                self.my_pages.remove(idx);
+                if idx < self.my_page_site_ids.len() {
+                    self.my_page_site_ids.remove(idx);
+                }
+                if idx < self.my_page_site_labels.len() {
+                    self.my_page_site_labels.remove(idx);
+                }
+            } else {
+                idx += 1;
+            }
+        }
+    }
+
+    /// Persistent draft key for `base` (an overlay's `draft_key()`). With more than one site
+    /// configured the site is prefixed, so two sites' `ENG-1` keep separate drafts; a
+    /// single-site config keeps the unprefixed key so existing drafts still restore.
+    pub fn scoped_draft_key(&self, site_id: Option<&str>, base: String) -> String {
+        match site_id.map(str::trim).filter(|s| !s.is_empty()) {
+            Some(site) if self.config.sites.len() > 1 => {
+                format!("site:{}:{base}", site.to_ascii_lowercase())
+            }
+            _ => base,
+        }
     }
 
     fn clear_draft_and_save(&mut self, key: &str) {
@@ -1200,6 +1307,7 @@ impl AppState {
         match self.site_scope.site_id().map(str::to_string) {
             Some(ref site_id) => {
                 if let Ok(projs) = self.storage.list_projects_for_site(site_id) {
+                    self.project_site_ids = vec![site_id.clone(); projs.len()];
                     self.projects = projs;
                 }
                 if let Ok(boards) = self.storage.list_boards_for_site(site_id, None) {
@@ -1352,13 +1460,7 @@ impl AppState {
                 }
             }
             None => {
-                if let Ok(projs) = self.storage.list_projects_all_sites() {
-                    self.projects = projs
-                        .into_iter()
-                        .filter(|(sid, _)| self.site_is_enabled_in_config(sid))
-                        .map(|(_, p)| p)
-                        .collect();
-                }
+                self.reload_projects_all_sites();
                 if let Ok(boards) = self.storage.list_boards_all_sites(None) {
                     let filtered: Vec<(String, BoardSummary)> = boards
                         .into_iter()
@@ -1923,6 +2025,28 @@ impl AppState {
         (String::new(), Vec::new())
     }
 
+    /// Site of the issue or page `current_cross_ref(tab)` names.
+    pub fn current_item_site(&self, tab: WorkspaceTab) -> Option<String> {
+        match tab {
+            WorkspaceTab::Confluence => self.active_page_site_id.clone(),
+            _ => self.active_issue_site_id.clone(),
+        }
+    }
+
+    /// Site of the item `current_attachments(ui)` lists the attachments of.
+    pub fn current_attachments_site(&self, ui: &UiState) -> Option<String> {
+        if (ui.active_tab == WorkspaceTab::Confluence
+            || (ui.active_tab == WorkspaceTab::MyWork && ui.my_work_ui.active_column == 1))
+            && self.active_page.is_some()
+        {
+            return self.active_page_site_id.clone();
+        }
+        if self.active_issue.is_some() {
+            return self.active_issue_site_id.clone();
+        }
+        self.active_page_site_id.clone()
+    }
+
     pub fn current_cross_ref(&self, tab: WorkspaceTab) -> Option<CrossRefTarget> {
         match tab {
             WorkspaceTab::Confluence => self.active_page.as_ref().map(|p| CrossRefTarget::ConfluencePage {
@@ -2044,8 +2168,11 @@ impl AppState {
         target: CrossRefTarget,
     ) {
         if let Some(current) = self.current_cross_ref(ui.active_tab) {
-            if self.nav_history.last() != Some(&current) && current != target {
-                self.nav_history.push(current);
+            if self.nav_history.last().map(|e| &e.target) != Some(&current) && current != target {
+                self.nav_history.push(NavEntry {
+                    site_id: self.current_item_site(ui.active_tab),
+                    target: current,
+                });
             }
         }
         self.open_cross_ref_without_push_for_site(ui, site_id, target);
@@ -2055,7 +2182,7 @@ impl AppState {
         let Some(prev) = self.nav_history.pop() else {
             return false;
         };
-        self.open_cross_ref_without_push(ui, prev);
+        self.open_cross_ref_without_push_for_site(ui, prev.site_id.as_deref(), prev.target);
         true
     }
 
@@ -2132,17 +2259,22 @@ impl AppState {
     // Async requests
     // ------------------------------------------------------------------
 
-    pub fn request_board_load(&self, ui: &mut UiState, board_id: i64, sprint_id: Option<i64>) {
+    /// Board id and site of the BOARDS row `row`. Board ids are only unique per site, so the
+    /// site comes from the row itself, never from a lookup by id.
+    pub fn board_row_target(&self, row: usize) -> Option<(i64, Option<&str>)> {
+        let board = self.boards.get(row)?;
+        Some((board.id, self.board_site_ids.get(row).map(String::as_str)))
+    }
+
+    /// Loads the board shown in BOARDS row `row` (and `sprint_id`, when given) from that row's site.
+    pub fn request_board_load(&self, ui: &mut UiState, row: usize, sprint_id: Option<i64>) {
         if tokio::runtime::Handle::try_current().is_err() {
             return;
         }
+        let Some((board_id, board_site)) = self.board_row_target(row) else {
+            return;
+        };
         ui.tasks.begin(format!("Board #{board_id}"));
-        let board_site = self
-            .boards
-            .iter()
-            .position(|b| b.id == board_id)
-            .and_then(|idx| self.board_site_ids.get(idx))
-            .map(String::as_str);
         let (site_id, client) = self.site_id_and_client_for(board_site);
         let storage = self.storage.clone();
         let tx = self.ui_tx.clone();
@@ -2187,11 +2319,21 @@ impl AppState {
     }
 
     pub fn request_jql_search(&self, ui: &mut UiState, jql: String, label: String) {
+        self.request_jql_search_for_site(ui, None, jql, label);
+    }
+
+    pub fn request_jql_search_for_site(
+        &self,
+        ui: &mut UiState,
+        explicit_site: Option<&str>,
+        jql: String,
+        label: String,
+    ) {
         if tokio::runtime::Handle::try_current().is_err() {
             return;
         }
         ui.tasks.begin(format!("JQL: {label}"));
-        let (site_id, client) = self.effective_site_id_and_client();
+        let (site_id, client) = self.site_id_and_client_for(explicit_site);
         let storage = self.storage.clone();
         let tx = self.ui_tx.clone();
         tokio::spawn(async move {
@@ -3756,14 +3898,8 @@ impl AppState {
         let dest = self.config.resolved_download_dir();
         let task_label = format!("Download: {}", att.filename);
         ui.tasks.begin(&task_label);
-        let explicit_site = if ui.active_tab == WorkspaceTab::Confluence {
-            self.active_page_site_id.as_deref()
-        } else {
-            self.active_issue_site_id
-                .as_deref()
-                .or(self.active_page_site_id.as_deref())
-        };
-        let (_, client) = self.site_id_and_client_for(explicit_site);
+        let explicit_site = self.current_attachments_site(ui);
+        let (_, client) = self.site_id_and_client_for(explicit_site.as_deref());
         let tx = self.ui_tx.clone();
         tokio::spawn(async move {
             let res = client
@@ -3789,13 +3925,13 @@ impl AppState {
             return;
         };
         let (cols, rows) = ov.target_dimensions(ui.term_width, ui.term_height);
-        let cache_key = img_preview::preview_cache_key(&att.id, cols, rows, ov.protocol);
+        let cache_key = img_preview::preview_cache_key(&ov.cache_id(&att), cols, rows, ov.protocol);
         if self.image_cache.contains_key(&cache_key)
             || tokio::runtime::Handle::try_current().is_err()
         {
             return;
         }
-        let client = self.client.clone();
+        let (_, client) = self.site_id_and_client_for(ov.site_id.as_deref());
         let tx = self.ui_tx.clone();
         let caps = ov.graphics_caps();
         let bg_rgb = match ui.theme.card_bg {
@@ -3840,13 +3976,14 @@ impl AppState {
     pub fn request_load_html_attachment(
         &self,
         ui: &mut UiState,
+        site_id: Option<&str>,
         title: String,
         att: AttachmentItem,
     ) {
         if tokio::runtime::Handle::try_current().is_err() {
             return;
         }
-        let client = self.client.clone();
+        let (_, client) = self.site_id_and_client_for(site_id);
         let tx = self.ui_tx.clone();
         let source_url = att.content_url.clone();
         let task_label = format!("HTML: {}", att.filename);
@@ -4088,20 +4225,24 @@ impl AppState {
                 ui.tasks.finish("Sync", None);
                 ui.success(summary);
             }
-            CoreEvent::ProjectsUpdated(projects) => {
-                if !self.is_multi_site_all_mode() {
-                    self.projects = projects;
-                } else if let Ok(projs) = self.storage.list_projects_all_sites() {
-                    self.projects = projs
-                        .into_iter()
-                        .filter(|(sid, _)| self.site_is_enabled_in_config(sid))
-                        .map(|(_, p)| p)
-                        .collect();
+            CoreEvent::ProjectsUpdated { site_id, items } => {
+                let sid = self.event_site_or_effective(site_id);
+                if !self.site_scope.matches(&sid) {
+                    // Another site's list must not replace the one this scope shows.
+                } else if !self.is_multi_site_all_mode() {
+                    self.project_site_ids = vec![sid; items.len()];
+                    self.projects = items;
+                } else {
+                    self.reload_projects_all_sites();
                 }
             }
-            CoreEvent::BoardsUpdated(boards) => {
-                if !self.is_multi_site_all_mode() {
-                    self.boards = boards;
+            CoreEvent::BoardsUpdated { site_id, items } => {
+                let sid = self.event_site_or_effective(site_id);
+                if !self.site_scope.matches(&sid) {
+                    // Another site's list must not replace the one this scope shows.
+                } else if !self.is_multi_site_all_mode() {
+                    self.board_site_ids = vec![sid; items.len()];
+                    self.boards = items;
                 } else if let Ok(all) = self.storage.list_boards_all_sites(None) {
                     let filtered: Vec<(String, BoardSummary)> = all
                         .into_iter()
@@ -4193,9 +4334,13 @@ impl AppState {
                     );
                 }
             }
-            CoreEvent::SpacesUpdated(spaces) => {
-                if !self.is_multi_site_all_mode() {
-                    self.spaces = spaces;
+            CoreEvent::SpacesUpdated { site_id, items } => {
+                let sid = self.event_site_or_effective(site_id);
+                if !self.site_scope.matches(&sid) {
+                    // Another site's list must not replace the one this scope shows.
+                } else if !self.is_multi_site_all_mode() {
+                    self.space_site_ids = vec![sid; items.len()];
+                    self.spaces = items;
                 } else if let Ok(all) = self.storage.list_spaces_all_sites() {
                     let filtered: Vec<(String, SpaceSummary)> = all
                         .into_iter()
@@ -4472,7 +4617,7 @@ impl AppState {
                             {
                                 self.board_issues.retain(|i| i.key != key);
                             }
-                            self.my_issues.retain(|i| i.key != key);
+                            self.remove_my_issue(&site_id, &key);
                             if self
                                 .active_issue
                                 .as_ref()
@@ -4832,7 +4977,7 @@ impl AppState {
                                     children.retain(|p| p.id != page_id);
                                 }
                             }
-                            self.my_pages.retain(|p| p.id != page_id);
+                            self.remove_my_page(&site_id, &page_id);
                             if self
                                 .active_page
                                 .as_ref()
@@ -5837,7 +5982,7 @@ mod tests {
         assert_eq!(ui.active_tab, WorkspaceTab::Confluence);
         assert_eq!(app.nav_history.len(), 1);
         assert!(matches!(
-            app.nav_history[0],
+            app.nav_history[0].target,
             CrossRefTarget::JiraIssue { ref key, .. } if key == "ATL-10"
         ));
 
@@ -6629,5 +6774,219 @@ mod tests {
         }
 
         srv.abort();
+    }
+    fn board(id: i64, name: &str) -> BoardSummary {
+        BoardSummary {
+            id,
+            name: name.into(),
+            ..Default::default()
+        }
+    }
+
+    #[tokio::test]
+    async fn my_work_404_removal_keeps_site_vectors_aligned() {
+        let (mut app, _ui) = two_site_app();
+        let row = |k: &str| sample_issue(k, "To Do", StatusCategory::Todo);
+        app.my_issues = vec![row("SHARED-1"), row("SHARED-1"), row("B-2")];
+        app.my_issue_site_ids = vec!["site-a".into(), "site-b".into(), "site-b".into()];
+        app.my_issue_site_labels = vec![Some("A".into()), Some("B".into()), Some("B".into())];
+        app.remove_my_issue("site-b", "SHARED-1");
+        let keys: Vec<&str> = app.my_issues.iter().map(|i| i.key.as_str()).collect();
+        assert_eq!(keys, vec!["SHARED-1", "B-2"]);
+        assert_eq!(app.my_issue_site_ids, vec!["site-a".to_string(), "site-b".to_string()]);
+        assert_eq!(app.my_issue_site_labels, vec![Some("A".to_string()), Some("B".to_string())]);
+
+        app.my_pages = vec![page("1", "ENG", "A"), page("1", "ENG", "B"), page("2", "ENG", "B2")];
+        app.my_page_site_ids = vec!["site-a".into(), "site-b".into(), "site-b".into()];
+        app.my_page_site_labels = vec![Some("A".into()), Some("B".into()), Some("B".into())];
+        app.remove_my_page("site-b", "1");
+        let titles: Vec<&str> = app.my_pages.iter().map(|p| p.title.as_str()).collect();
+        assert_eq!(titles, vec!["A", "B2"]);
+        assert_eq!(app.my_page_site_ids, vec!["site-a".to_string(), "site-b".to_string()]);
+        assert_eq!(app.my_page_site_labels, vec![Some("A".to_string()), Some("B".to_string())]);
+    }
+
+    #[tokio::test]
+    async fn boards_updated_for_other_site_is_ignored_in_single_site_scope() {
+        let (mut app, mut ui) = two_site_app();
+        app.site_scope = SiteScope::Only("site-a".into());
+        app.boards = vec![board(1, "A board")];
+        app.board_site_ids = vec!["site-a".into()];
+
+        app.handle_core_event(
+            &mut ui,
+            CoreEvent::BoardsUpdated {
+                site_id: "site-b".into(),
+                items: vec![board(2, "B board")],
+            },
+        );
+        assert_eq!(app.boards[0].name, "A board", "site B list must not replace site A's");
+        app.handle_core_event(
+            &mut ui,
+            CoreEvent::ProjectsUpdated {
+                site_id: "site-b".into(),
+                items: vec![ProjectSummary {
+                    key: "BPROJ".into(),
+                    ..Default::default()
+                }],
+            },
+        );
+        assert!(app.projects.is_empty());
+        app.handle_core_event(
+            &mut ui,
+            CoreEvent::SpacesUpdated {
+                site_id: "site-b".into(),
+                items: vec![space("BSPACE")],
+            },
+        );
+        assert!(app.spaces.is_empty());
+
+        app.handle_core_event(
+            &mut ui,
+            CoreEvent::BoardsUpdated {
+                site_id: "SITE-A".into(),
+                items: vec![board(3, "A board 2"), board(4, "A board 3")],
+            },
+        );
+        assert_eq!(app.boards.len(), 2);
+        assert_eq!(app.board_site_ids, vec!["SITE-A".to_string(); 2]);
+
+        // A legacy daemon sends no site: it is the effective site's list.
+        app.handle_core_event(
+            &mut ui,
+            CoreEvent::SpacesUpdated {
+                site_id: String::new(),
+                items: vec![space("ENG")],
+            },
+        );
+        assert_eq!(app.spaces.len(), 1);
+        assert_eq!(app.space_site_ids, vec!["site-a".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn pin_toggle_writes_to_row_site() {
+        let (mut app, mut ui) = two_site_app();
+        let proj = ProjectSummary {
+            id: "1".into(),
+            key: "ENG".into(),
+            name: "Engineering".into(),
+            ..Default::default()
+        };
+        for sid in ["site-a", "site-b"] {
+            app.storage
+                .upsert_projects_for_site(sid, std::slice::from_ref(&proj))
+                .unwrap();
+            app.storage.upsert_spaces_for_site(sid, &[space("DOC")]).unwrap();
+        }
+        app.site_scope = SiteScope::All;
+        app.reload_projects_all_sites();
+        app.spaces = vec![space("DOC"), space("DOC")];
+        app.space_site_ids = vec!["site-a".into(), "site-b".into()];
+        let b_row = app
+            .project_site_ids
+            .iter()
+            .position(|s| s == "site-b")
+            .expect("site B project row");
+
+        ui.active_tab = WorkspaceTab::Directory;
+        ui.directory_ui.section = 0;
+        ui.directory_ui.selected_project = b_row;
+        crate::ui::action::dispatch(crate::ui::keymap::Action::TogglePin, &mut app, &mut ui);
+        let pinned = |sid: &str| app.storage.list_projects_for_site(sid).unwrap()[0].pinned;
+        assert!(pinned("site-b"), "site B row pinned");
+        assert!(!pinned("site-a"), "site A project with the same key untouched");
+
+        ui.directory_ui.section = 1;
+        ui.directory_ui.selected_space = 1;
+        crate::ui::action::dispatch(crate::ui::keymap::Action::TogglePin, &mut app, &mut ui);
+        let space_pinned = |sid: &str| app.storage.list_spaces_for_site(sid).unwrap()[0].pinned;
+        assert!(space_pinned("site-b"));
+        assert!(!space_pinned("site-a"));
+    }
+
+    #[tokio::test]
+    async fn board_load_uses_site_of_selected_row_when_ids_collide() {
+        let (mut app, _ui) = two_site_app();
+        app.site_scope = SiteScope::All;
+        app.boards = vec![board(10, "A board"), board(10, "B board")];
+        app.board_site_ids = vec!["site-a".into(), "site-b".into()];
+        assert_eq!(app.board_row_target(1), Some((10, Some("site-b"))));
+        assert_eq!(app.board_row_target(0), Some((10, Some("site-a"))));
+        assert_eq!(app.board_row_target(2), None);
+        let (sid, _client) = app.site_id_and_client_for(app.board_row_target(1).unwrap().1);
+        assert_eq!(sid, "site-b");
+    }
+    #[tokio::test]
+    async fn drafts_are_site_scoped_only_with_multiple_sites() {
+        let (mut app, _ui) = two_site_app();
+        assert_eq!(
+            app.scoped_draft_key(Some("Site-B"), "comment:issue:ENG-1".into()),
+            "site:site-b:comment:issue:ENG-1"
+        );
+        assert_ne!(
+            app.scoped_draft_key(Some("site-a"), "comment:issue:ENG-1".into()),
+            app.scoped_draft_key(Some("site-b"), "comment:issue:ENG-1".into())
+        );
+        assert_eq!(app.scoped_draft_key(None, "issue:new".into()), "issue:new");
+        // Single-site users keep the keys their saved drafts already use.
+        app.config.sites.truncate(1);
+        assert_eq!(
+            app.scoped_draft_key(Some("site-a"), "comment:issue:ENG-1".into()),
+            "comment:issue:ENG-1"
+        );
+    }
+
+    #[tokio::test]
+    async fn back_history_and_cross_links_keep_the_source_site() {
+        let (mut app, mut ui) = two_site_app();
+        shared_key_rows(&mut app, &mut ui);
+        app.active_issue_site_id = Some("site-b".into());
+        ui.issue_ui.selected_issue = 0;
+
+        crate::ui::action::dispatch(crate::ui::keymap::Action::OpenCrossLinks, &mut app, &mut ui);
+        match ui.overlays.last() {
+            Some(Overlay::CrossLink(ov)) => assert_eq!(ov.site_id.as_deref(), Some("site-b")),
+            other => panic!("expected cross-link overlay, got {other:?}"),
+        }
+        ui.pop_overlay();
+
+        app.jump_to_cross_ref_for_site(
+            &mut ui,
+            Some("site-b"),
+            CrossRefTarget::ConfluencePage {
+                page_id: "555".into(),
+                title: None,
+            },
+        );
+        assert_eq!(app.nav_history.len(), 1);
+        assert_eq!(app.nav_history[0].site_id.as_deref(), Some("site-b"));
+
+        // Back reopens SHARED-1 on site B: the site-B row is selected, not site A's.
+        assert!(app.pop_nav_history(&mut ui));
+        assert_eq!(ui.active_tab, WorkspaceTab::Issues);
+        assert_eq!(ui.issue_ui.selected_issue, 1);
+    }
+
+    #[tokio::test]
+    async fn image_preview_is_keyed_and_fetched_by_owner_site() {
+        let (mut app, mut ui) = two_site_app();
+        shared_key_rows(&mut app, &mut ui);
+        app.active_issue_site_id = Some("site-b".into());
+        app.active_issue.as_mut().unwrap().attachments = vec![AttachmentItem {
+            id: "10".into(),
+            filename: "shot.png".into(),
+            mime_type: "image/png".into(),
+            ..Default::default()
+        }];
+        crate::ui::action::dispatch(crate::ui::keymap::Action::OpenImagePreview, &mut app, &mut ui);
+        let Some(Overlay::ImagePreview(ov)) = ui.overlays.last() else {
+            panic!("expected image preview overlay, got {:?}", ui.overlays.last());
+        };
+        assert_eq!(ov.site_id.as_deref(), Some("site-b"));
+        let att = ov.current().unwrap().clone();
+        assert_eq!(ov.cache_id(&att), "site-b/10");
+        let mut unsited = ov.clone();
+        unsited.site_id = None;
+        assert_eq!(unsited.cache_id(&att), "10");
     }
 }

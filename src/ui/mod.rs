@@ -1086,9 +1086,12 @@ mod tests {
         use crate::ui::overlays::{image_preview::ImagePreviewOverlay, Overlay, OverlayKind};
 
         let (mut app, mut ui) = test_app(Persona::Jira);
-        app.nav_history.push(CrossRefTarget::ConfluencePage {
-            page_id: "p1".into(),
-            title: Some("System Architecture".into()),
+        app.nav_history.push(crate::ui::app::NavEntry {
+            site_id: None,
+            target: CrossRefTarget::ConfluencePage {
+                page_id: "p1".into(),
+                title: Some("System Architecture".into()),
+            },
         });
 
         // 1. Board view: status bar has BackHistory, CommandPalette, Help; board header has ToggleDrawer

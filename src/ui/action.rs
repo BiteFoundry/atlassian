@@ -216,7 +216,9 @@ pub fn dispatch(action: Action, app: &mut AppState, ui: &mut UiState) -> bool {
         }
         Action::OpenCrossLinks => {
             let (label, targets) = app.collect_cross_links(ui.active_tab);
-            ui.push_overlay(Overlay::CrossLink(CrossLinkOverlay::new(label, targets)));
+            let mut ov = CrossLinkOverlay::new(label, targets);
+            ov.site_id = app.current_item_site(ui.active_tab);
+            ui.push_overlay(Overlay::CrossLink(ov));
         }
         Action::OpenLinks => {
             ui.push_overlay(Overlay::Links(LinksOverlay::from_app(app, ui)));
@@ -636,7 +638,7 @@ fn close_top_overlay_and_save_draft(app: &mut AppState, ui: &mut UiState) {
     };
     match top {
         Overlay::Comment(ov) => {
-            let key = ov.draft_key();
+            let key = app.scoped_draft_key(ov.site_id.as_deref(), ov.draft_key());
             if ov.has_unsent_content() {
                 app.drafts.set(key, ov.draft_text());
                 let _ = app.save_drafts();
@@ -646,7 +648,7 @@ fn close_top_overlay_and_save_draft(app: &mut AppState, ui: &mut UiState) {
             }
         }
         Overlay::IssueForm(ov) => {
-            let key = ov.draft_key();
+            let key = app.scoped_draft_key(ov.site_id.as_deref(), ov.draft_key());
             if ov.has_unsent_content() {
                 app.drafts.set(key, ov.to_draft_json());
                 let _ = app.save_drafts();
@@ -656,7 +658,7 @@ fn close_top_overlay_and_save_draft(app: &mut AppState, ui: &mut UiState) {
             }
         }
         Overlay::PageForm(ov) => {
-            let key = ov.draft_key();
+            let key = app.scoped_draft_key(ov.site_id.as_deref(), ov.draft_key());
             if ov.has_unsent_content() {
                 app.drafts.set(key, ov.to_draft_json());
                 let _ = app.save_drafts();
@@ -831,7 +833,7 @@ fn handle_overlay_dispatch(action: Action, app: &mut AppState, ui: &mut UiState)
                     }
                 }
                 Overlay::IssueForm(ov) => {
-                    let draft_key = ov.draft_key();
+                    let draft_key = app.scoped_draft_key(ov.site_id.as_deref(), ov.draft_key());
                     if ov.has_unsent_content() {
                         app.drafts.set(draft_key.clone(), ov.to_draft_json());
                         let _ = app.save_drafts();
@@ -839,7 +841,7 @@ fn handle_overlay_dispatch(action: Action, app: &mut AppState, ui: &mut UiState)
                     app.request_submit_issue_form(ui, &ov, Some(draft_key));
                 }
                 Overlay::PageForm(ov) => {
-                    let draft_key = ov.draft_key();
+                    let draft_key = app.scoped_draft_key(ov.site_id.as_deref(), ov.draft_key());
                     if ov.has_unsent_content() {
                         app.drafts.set(draft_key.clone(), ov.to_draft_json());
                         let _ = app.save_drafts();
@@ -847,7 +849,7 @@ fn handle_overlay_dispatch(action: Action, app: &mut AppState, ui: &mut UiState)
                     app.request_submit_page_form(ui, &ov, Some(draft_key));
                 }
                 Overlay::Comment(ov) => {
-                    let draft_key = ov.draft_key();
+                    let draft_key = app.scoped_draft_key(ov.site_id.as_deref(), ov.draft_key());
                     if ov.has_unsent_content() {
                         app.drafts.set(draft_key.clone(), ov.draft_text());
                         let _ = app.save_drafts();
@@ -856,7 +858,7 @@ fn handle_overlay_dispatch(action: Action, app: &mut AppState, ui: &mut UiState)
                 }
                 Overlay::CrossLink(ov) => {
                     if let Some(target) = ov.selected_target().cloned() {
-                        app.jump_to_cross_ref(ui, target);
+                        app.jump_to_cross_ref_for_site(ui, ov.site_id.as_deref(), target);
                     }
                 }
                 Overlay::PathInput(ov) => {
@@ -984,16 +986,14 @@ fn handle_mouse_click(row: u16, col: u16, app: &mut AppState, ui: &mut UiState) 
             ui.focus = PaneFocus::Nav;
             ui.board_ui.nav_section = 0;
             ui.board_ui.selected_board = idx;
-            if let Some(b) = app.boards.get(idx) {
-                app.request_board_load(ui, b.id, None);
-            }
+            app.request_board_load(ui, idx, None);
         }
         HitTarget::SprintItem(idx) => {
             ui.focus = PaneFocus::Nav;
             ui.board_ui.nav_section = 1;
             ui.board_ui.selected_sprint = idx;
-            if let (Some(b), Some(sp)) = (app.active_board(ui), app.sprints.get(idx)) {
-                app.request_board_load(ui, b.id, Some(sp.id));
+            if let Some(sp) = app.sprints.get(idx) {
+                app.request_board_load(ui, ui.board_ui.selected_board, Some(sp.id));
             }
         }
         HitTarget::KanbanCard { col: c, row: r } => {
@@ -1337,14 +1337,9 @@ fn activate_selection(app: &mut AppState, ui: &mut UiState) {
         WorkspaceTab::Board => match ui.focus {
             PaneFocus::Nav => {
                 if ui.board_ui.nav_section == 0 {
-                    if let Some(b) = app.boards.get(ui.board_ui.selected_board) {
-                        app.request_board_load(ui, b.id, None);
-                    }
-                } else if let (Some(b), Some(sp)) = (
-                    app.active_board(ui),
-                    app.sprints.get(ui.board_ui.selected_sprint),
-                ) {
-                    app.request_board_load(ui, b.id, Some(sp.id));
+                    app.request_board_load(ui, ui.board_ui.selected_board, None);
+                } else if let Some(sp) = app.sprints.get(ui.board_ui.selected_sprint) {
+                    app.request_board_load(ui, ui.board_ui.selected_board, Some(sp.id));
                 }
             }
             _ => {
@@ -1449,18 +1444,24 @@ fn activate_selection(app: &mut AppState, ui: &mut UiState) {
         }
         WorkspaceTab::Directory => {
             if ui.directory_ui.section == 0 {
-                if let Some(proj) = app.projects.get(ui.directory_ui.selected_project).cloned() {
+                let row = ui.directory_ui.selected_project;
+                if let Some(proj) = app.projects.get(row).cloned() {
+                    let site_id = app.project_row_site(row);
                     ui.active_tab = WorkspaceTab::Issues;
                     let jql = format!("project = {} ORDER BY updated DESC", proj.key);
                     ui.issue_ui.jql.set_text(jql.clone());
-                    app.request_jql_search(ui, jql, proj.key);
+                    app.request_jql_search_for_site(ui, Some(&site_id), jql, proj.key);
                 }
-            } else if let Some(sp) = app.spaces.get(ui.directory_ui.selected_space).cloned() {
-                if let Some(pos) = app.spaces.iter().position(|s| s.key == sp.key) {
-                    ui.confluence_ui.selected_space = pos;
+            } else {
+                // Directory and SPACES list the same `spaces` rows, so the row index (not the
+                // key, which two sites can share) carries the selection over.
+                let row = ui.directory_ui.selected_space;
+                if let Some(sp) = app.spaces.get(row).cloned() {
+                    let site_id = app.space_row_site(row);
+                    ui.confluence_ui.selected_space = row;
+                    ui.active_tab = WorkspaceTab::Confluence;
+                    app.request_space_root_pages_for_site(ui, Some(&site_id), &sp.key);
                 }
-                ui.active_tab = WorkspaceTab::Confluence;
-                app.request_space_root_pages(ui, &sp.key);
             }
         }
     }
@@ -1481,13 +1482,15 @@ fn open_comment(app: &mut AppState, ui: &mut UiState) {
                 page_id: page.summary.id.clone(),
                 title: page.summary.title.clone(),
             };
-            let overlay = if let Some(saved) = app.drafts.get(&target.draft_key()) {
+            let site = app.active_page_site_id.clone();
+            let key = app.scoped_draft_key(site.as_deref(), target.draft_key());
+            let overlay = if let Some(saved) = app.drafts.get(&key) {
                 ui.info("Restored saved comment draft");
                 CommentOverlay::with_draft(target, saved)
             } else {
                 CommentOverlay::new(target)
             }
-            .with_site(app.active_page_site_id.clone());
+            .with_site(site);
             ui.push_overlay(Overlay::Comment(overlay));
             app.request_comments_refresh(ui);
             return;
@@ -1495,7 +1498,8 @@ fn open_comment(app: &mut AppState, ui: &mut UiState) {
     }
     if let Some((site, key)) = app.selected_issue_ref(ui) {
         let target = CommentTarget::Issue(key);
-        let overlay = if let Some(saved) = app.drafts.get(&target.draft_key()) {
+        let draft_key = app.scoped_draft_key(Some(&site), target.draft_key());
+        let overlay = if let Some(saved) = app.drafts.get(&draft_key) {
             ui.info("Restored saved comment draft");
             CommentOverlay::with_draft(target, saved)
         } else {
@@ -1535,7 +1539,8 @@ fn open_new_item(app: &AppState, ui: &mut UiState) {
             .map(|p| p.summary.id.clone());
         let mut form = PageFormOverlay::new_page(space_key, parent_id);
         form.site_id = Some(space_site);
-        if let Some(saved) = app.drafts.get(&form.draft_key()) {
+        let draft_key = app.scoped_draft_key(form.site_id.as_deref(), form.draft_key());
+        if let Some(saved) = app.drafts.get(&draft_key) {
             if form.apply_draft_raw(saved) {
                 ui.info("Restored saved page draft");
             }
@@ -1550,7 +1555,8 @@ fn open_new_item(app: &AppState, ui: &mut UiState) {
             .unwrap_or_default();
         let mut form = IssueFormOverlay::new_issue(&default_proj);
         form.site_id = app.selected_issue_ref(ui).map(|(site, _)| site);
-        if let Some(saved) = app.drafts.get(&form.draft_key()) {
+        let draft_key = app.scoped_draft_key(form.site_id.as_deref(), form.draft_key());
+        if let Some(saved) = app.drafts.get(&draft_key) {
             if form.apply_draft_raw(saved) {
                 ui.info("Restored saved issue draft");
             }
@@ -1564,7 +1570,8 @@ fn open_edit_item(app: &AppState, ui: &mut UiState) {
         if let Some(page) = &app.active_page {
             let mut form = PageFormOverlay::edit_page(page);
             form.site_id = app.active_page_site_id.clone();
-            if let Some(saved) = app.drafts.get(&form.draft_key()) {
+            let draft_key = app.scoped_draft_key(form.site_id.as_deref(), form.draft_key());
+            if let Some(saved) = app.drafts.get(&draft_key) {
                 if form.apply_draft_raw(saved) {
                     ui.info("Restored saved page edit draft");
                 }
@@ -1576,7 +1583,8 @@ fn open_edit_item(app: &AppState, ui: &mut UiState) {
     } else if let Some(issue) = &app.active_issue {
         let mut form = IssueFormOverlay::edit_issue(issue);
         form.site_id = app.active_issue_site_id.clone();
-        if let Some(saved) = app.drafts.get(&form.draft_key()) {
+        let draft_key = app.scoped_draft_key(form.site_id.as_deref(), form.draft_key());
+        if let Some(saved) = app.drafts.get(&draft_key) {
             if form.apply_draft_raw(saved) {
                 ui.info("Restored saved issue edit draft");
             }
@@ -1676,6 +1684,7 @@ fn open_image_preview_with(
         }
     }
     if let Some(mut ov) = ImagePreviewOverlay::from_attachments(label.clone(), atts, preferred_idx) {
+        ov.site_id = app.current_attachments_site(ui);
         ov.apply_graphics_caps(ui.graphics_caps);
         if app.config.image_protocol != ConfigImageProtocol::Auto {
             ov.protocol = ui.graphics_caps.protocol;
@@ -1747,7 +1756,8 @@ fn open_html_attachment_preview(
     };
     let ov = HtmlPreviewOverlay::loading(title.clone(), att.content_url.clone());
     ui.push_overlay(Overlay::HtmlPreview(ov));
-    app.request_load_html_attachment(ui, title, att);
+    let site = app.current_attachments_site(ui);
+    app.request_load_html_attachment(ui, site.as_deref(), title, att);
 }
 
 fn apply_html_preview_commands(
@@ -1792,18 +1802,25 @@ fn open_in_browser(app: &AppState, ui: &mut UiState) {
 fn toggle_pin(app: &mut AppState, ui: &mut UiState) {
     if ui.active_tab == WorkspaceTab::Directory {
         if ui.directory_ui.section == 0 {
-            if let Some(p) = app.projects.get_mut(ui.directory_ui.selected_project) {
+            let row = ui.directory_ui.selected_project;
+            let site_id = app.project_row_site(row);
+            if let Some(p) = app.projects.get_mut(row) {
                 p.pinned = !p.pinned;
-                let _ = app.storage.set_project_pinned(&p.key, p.pinned);
+                let _ = app.storage.set_project_pinned_for_site(&site_id, &p.key, p.pinned);
                 ui.info(format!(
                     "{} {}",
                     p.key,
                     if p.pinned { "pinned" } else { "unpinned" }
                 ));
             }
-        } else if let Some(s) = app.spaces.get_mut(ui.directory_ui.selected_space) {
+        } else {
+            let row = ui.directory_ui.selected_space;
+            let site_id = app.space_row_site(row);
+            let Some(s) = app.spaces.get_mut(row) else {
+                return;
+            };
             s.pinned = !s.pinned;
-            let _ = app.storage.set_space_pinned(&s.key, s.pinned);
+            let _ = app.storage.set_space_pinned_for_site(&site_id, &s.key, s.pinned);
             ui.info(format!(
                 "{} {}",
                 s.key,

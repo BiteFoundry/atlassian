@@ -585,7 +585,8 @@ impl PixelPreviewRuntime {
         }
 
         let (cols, rows) = ov.target_dimensions(ui.term_width, ui.term_height);
-        let cache_key = img_preview::preview_cache_key(&att.id, cols, rows, ov.protocol);
+        let att_id = ov.cache_id(&att);
+        let cache_key = img_preview::preview_cache_key(&att_id, cols, rows, ov.protocol);
 
         if let Some(cached) = self.decoded_cache.get(&cache_key) {
             if !app.pixel_image_cache.contains_key(&cache_key) {
@@ -602,13 +603,12 @@ impl PixelPreviewRuntime {
         }
 
         self.in_flight.insert(cache_key.clone());
-        let cached_raw = self.raw_cache.get(&att.id).cloned();
-        let client = app.client.clone();
+        let cached_raw = self.raw_cache.get(&att_id).cloned();
+        let (_, client) = app.site_id_and_client_for(ov.site_id.as_deref());
         let tx = self.pixel_tx.clone();
         let ui_tx = app.ui_tx.clone();
         let caps = ov.graphics_caps();
         let bg_rgb = theme_preview_bg_rgb(&ui.theme);
-        let att_id = att.id.clone();
 
         tokio::spawn(async move {
             let (raw_opt, bytes_res): (Option<Arc<[u8]>>, Result<Arc<[u8]>, String>) =

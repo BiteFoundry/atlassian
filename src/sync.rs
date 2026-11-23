@@ -1770,7 +1770,10 @@ async fn run_full_sync_for_site(
                     let stored = storage
                         .list_projects_for_site(site_id)
                         .unwrap_or(projects);
-                    let _ = tx.send(CoreEvent::ProjectsUpdated(stored));
+                    let _ = tx.send(CoreEvent::ProjectsUpdated {
+                        site_id: site_id.to_string(),
+                        items: stored,
+                    });
                 }
             }
             Err(err) => {
@@ -1813,7 +1816,10 @@ async fn run_full_sync_for_site(
                     }
                 }
                 if let Some(tx) = core_tx {
-                    let _ = tx.send(CoreEvent::BoardsUpdated(boards));
+                    let _ = tx.send(CoreEvent::BoardsUpdated {
+                        site_id: site_id.to_string(),
+                        items: boards,
+                    });
                 }
             }
             Err(err) => {
@@ -1883,7 +1889,10 @@ async fn run_full_sync_for_site(
                     let stored = storage
                         .list_spaces_for_site(site_id)
                         .unwrap_or_else(|_| spaces.clone());
-                    let _ = tx.send(CoreEvent::SpacesUpdated(stored));
+                    let _ = tx.send(CoreEvent::SpacesUpdated {
+                        site_id: site_id.to_string(),
+                        items: stored,
+                    });
                 }
                 if let Some(target_space) = select_default_space(&spaces, client.config()) {
                     if breakers.should_allow_site(
@@ -1966,7 +1975,10 @@ async fn sync_board(
             b.columns = cols;
             let _ = storage.upsert_boards_for_site(site_id, &boards);
             if let Some(tx) = core_tx {
-                let _ = tx.send(CoreEvent::BoardsUpdated(boards));
+                let _ = tx.send(CoreEvent::BoardsUpdated {
+                    site_id: site_id.to_string(),
+                    items: boards,
+                });
             }
         }
     }

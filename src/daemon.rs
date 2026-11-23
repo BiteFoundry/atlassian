@@ -162,8 +162,8 @@ enum WireCoreEvent {
     SyncFinished {
         summary: String,
     },
-    ProjectsUpdated(Vec<ProjectSummary>),
-    BoardsUpdated(Vec<BoardSummary>),
+    ProjectsUpdated(WireSiteList<ProjectSummary>),
+    BoardsUpdated(WireSiteList<BoardSummary>),
     BoardIssuesUpdated {
         #[serde(default)]
         site_id: String,
@@ -176,7 +176,7 @@ enum WireCoreEvent {
         site_id: String,
         issues: Vec<IssueSummary>,
     },
-    SpacesUpdated(Vec<SpaceSummary>),
+    SpacesUpdated(WireSiteList<SpaceSummary>),
     SpacePagesUpdated {
         #[serde(default)]
         site_id: String,
@@ -196,13 +196,45 @@ enum WireCoreEvent {
     SyncError(String),
 }
 
+/// Site-scoped list payload of `projects_updated` / `boards_updated` / `spaces_updated`.
+///
+/// Written as `{"site_id": .., "items": [..]}`. A daemon older than 0.8.1 wrote a bare array;
+/// that shape still parses, with an empty site id that the TUI resolves to its effective site.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(untagged)]
+enum WireSiteList<T> {
+    Scoped {
+        #[serde(default)]
+        site_id: String,
+        items: Vec<T>,
+    },
+    Legacy(Vec<T>),
+}
+
+impl<T> WireSiteList<T> {
+    fn scoped(site_id: String, items: Vec<T>) -> Self {
+        Self::Scoped { site_id, items }
+    }
+
+    fn into_parts(self) -> (String, Vec<T>) {
+        match self {
+            Self::Scoped { site_id, items } => (site_id, items),
+            Self::Legacy(items) => (String::new(), items),
+        }
+    }
+}
+
 impl From<CoreEvent> for WireCoreEvent {
     fn from(ev: CoreEvent) -> Self {
         match ev {
             CoreEvent::SyncStarted => Self::SyncStarted,
             CoreEvent::SyncFinished { summary } => Self::SyncFinished { summary },
-            CoreEvent::ProjectsUpdated(v) => Self::ProjectsUpdated(v),
-            CoreEvent::BoardsUpdated(v) => Self::BoardsUpdated(v),
+            CoreEvent::ProjectsUpdated { site_id, items } => {
+                Self::ProjectsUpdated(WireSiteList::scoped(site_id, items))
+            }
+            CoreEvent::BoardsUpdated { site_id, items } => {
+                Self::BoardsUpdated(WireSiteList::scoped(site_id, items))
+            }
             CoreEvent::BoardIssuesUpdated {
                 site_id,
                 board_id,
@@ -217,7 +249,9 @@ impl From<CoreEvent> for WireCoreEvent {
             CoreEvent::IssuesUpdated { site_id, issues } => {
                 Self::IssuesUpdated { site_id, issues }
             }
-            CoreEvent::SpacesUpdated(v) => Self::SpacesUpdated(v),
+            CoreEvent::SpacesUpdated { site_id, items } => {
+                Self::SpacesUpdated(WireSiteList::scoped(site_id, items))
+            }
             CoreEvent::SpacePagesUpdated {
                 site_id,
                 space_key,
@@ -243,8 +277,14 @@ impl From<WireCoreEvent> for CoreEvent {
         match wire {
             WireCoreEvent::SyncStarted => Self::SyncStarted,
             WireCoreEvent::SyncFinished { summary } => Self::SyncFinished { summary },
-            WireCoreEvent::ProjectsUpdated(v) => Self::ProjectsUpdated(v),
-            WireCoreEvent::BoardsUpdated(v) => Self::BoardsUpdated(v),
+            WireCoreEvent::ProjectsUpdated(v) => {
+                let (site_id, items) = v.into_parts();
+                Self::ProjectsUpdated { site_id, items }
+            }
+            WireCoreEvent::BoardsUpdated(v) => {
+                let (site_id, items) = v.into_parts();
+                Self::BoardsUpdated { site_id, items }
+            }
             WireCoreEvent::BoardIssuesUpdated {
                 site_id,
                 board_id,
@@ -259,7 +299,10 @@ impl From<WireCoreEvent> for CoreEvent {
             WireCoreEvent::IssuesUpdated { site_id, issues } => {
                 Self::IssuesUpdated { site_id, issues }
             }
-            WireCoreEvent::SpacesUpdated(v) => Self::SpacesUpdated(v),
+            WireCoreEvent::SpacesUpdated(v) => {
+                let (site_id, items) = v.into_parts();
+                Self::SpacesUpdated { site_id, items }
+            }
             WireCoreEvent::SpacePagesUpdated {
                 site_id,
                 space_key,
@@ -452,11 +495,11 @@ impl DaemonSharedState {
                     guard.last_error = None;
                 }
             }
-            CoreEvent::ProjectsUpdated(_)
-            | CoreEvent::BoardsUpdated(_)
+            CoreEvent::ProjectsUpdated { .. }
+            | CoreEvent::BoardsUpdated { .. }
             | CoreEvent::BoardIssuesUpdated { .. }
             | CoreEvent::IssuesUpdated { .. }
-            | CoreEvent::SpacesUpdated(_)
+            | CoreEvent::SpacesUpdated { .. }
             | CoreEvent::SpacePagesUpdated { .. }
             | CoreEvent::OpenIssueRevision { .. }
             | CoreEvent::OpenPageRevision { .. } => {
@@ -1470,23 +1513,33 @@ async fn run_initial_bootstrap(
     let _ = event_tx.send(CoreEvent::SyncStarted);
     match sync::bootstrap_workspace(&client, &storage).await {
         Ok(summary) => {
+            let site_id = client.site_id().to_string();
             let st_proj = storage.clone();
             if let Ok(Ok(projects)) =
                 tokio::task::spawn_blocking(move || st_proj.list_projects()).await
             {
-                let _ = event_tx.send(CoreEvent::ProjectsUpdated(projects));
+                let _ = event_tx.send(CoreEvent::ProjectsUpdated {
+                    site_id: site_id.clone(),
+                    items: projects,
+                });
             }
             let st_boards = storage.clone();
             if let Ok(Ok(boards)) =
                 tokio::task::spawn_blocking(move || st_boards.list_boards(None)).await
             {
-                let _ = event_tx.send(CoreEvent::BoardsUpdated(boards));
+                let _ = event_tx.send(CoreEvent::BoardsUpdated {
+                    site_id: site_id.clone(),
+                    items: boards,
+                });
             }
             let st_spaces = storage.clone();
             if let Ok(Ok(spaces)) =
                 tokio::task::spawn_blocking(move || st_spaces.list_spaces()).await
             {
-                let _ = event_tx.send(CoreEvent::SpacesUpdated(spaces));
+                let _ = event_tx.send(CoreEvent::SpacesUpdated {
+                    site_id: site_id.clone(),
+                    items: spaces,
+                });
             }
             let _ = event_tx.send(CoreEvent::SyncFinished { summary });
         }
@@ -1879,31 +1932,62 @@ async fn send_lag_recovery_snapshots<W: AsyncWrite + Unpin>(
     storage: &Storage,
     write_half: &mut W,
 ) -> Result<()> {
+    // One snapshot per cached site, so a TUI scoped to one site keeps only its own lists.
     let st_proj = storage.clone();
-    if let Ok(Ok(projects)) = tokio::task::spawn_blocking(move || st_proj.list_projects()).await {
-        write_json_line(
-            write_half,
-            &ServerFrame::Event(WireCoreEvent::ProjectsUpdated(projects)),
-        )
-        .await?;
+    if let Ok(Ok(projects)) =
+        tokio::task::spawn_blocking(move || st_proj.list_projects_all_sites()).await
+    {
+        for (site_id, items) in group_rows_by_site(projects) {
+            write_json_line(
+                write_half,
+                &ServerFrame::Event(WireCoreEvent::ProjectsUpdated(WireSiteList::scoped(
+                    site_id, items,
+                ))),
+            )
+            .await?;
+        }
     }
     let st_boards = storage.clone();
-    if let Ok(Ok(boards)) = tokio::task::spawn_blocking(move || st_boards.list_boards(None)).await {
-        write_json_line(
-            write_half,
-            &ServerFrame::Event(WireCoreEvent::BoardsUpdated(boards)),
-        )
-        .await?;
+    if let Ok(Ok(boards)) =
+        tokio::task::spawn_blocking(move || st_boards.list_boards_all_sites(None)).await
+    {
+        for (site_id, items) in group_rows_by_site(boards) {
+            write_json_line(
+                write_half,
+                &ServerFrame::Event(WireCoreEvent::BoardsUpdated(WireSiteList::scoped(
+                    site_id, items,
+                ))),
+            )
+            .await?;
+        }
     }
     let st_spaces = storage.clone();
-    if let Ok(Ok(spaces)) = tokio::task::spawn_blocking(move || st_spaces.list_spaces()).await {
-        write_json_line(
-            write_half,
-            &ServerFrame::Event(WireCoreEvent::SpacesUpdated(spaces)),
-        )
-        .await?;
+    if let Ok(Ok(spaces)) =
+        tokio::task::spawn_blocking(move || st_spaces.list_spaces_all_sites()).await
+    {
+        for (site_id, items) in group_rows_by_site(spaces) {
+            write_json_line(
+                write_half,
+                &ServerFrame::Event(WireCoreEvent::SpacesUpdated(WireSiteList::scoped(
+                    site_id, items,
+                ))),
+            )
+            .await?;
+        }
     }
     Ok(())
+}
+
+/// Groups `(site_id, row)` pairs by site, keeping first-seen site order and row order.
+fn group_rows_by_site<T>(rows: Vec<(String, T)>) -> Vec<(String, Vec<T>)> {
+    let mut out: Vec<(String, Vec<T>)> = Vec::new();
+    for (site_id, row) in rows {
+        match out.iter_mut().find(|(sid, _)| *sid == site_id) {
+            Some((_, items)) => items.push(row),
+            None => out.push((site_id, vec![row])),
+        }
+    }
+    out
 }
 
 #[cfg(test)]
@@ -2119,17 +2203,23 @@ mod tests {
             CoreEvent::SyncFinished {
                 summary: "Synced 1 projects, 1 boards, 2 issues, 1 spaces".into(),
             },
-            CoreEvent::ProjectsUpdated(vec![ProjectSummary {
-                id: "1".into(),
-                key: "ENG".into(),
-                name: "Engineering".into(),
-                ..Default::default()
-            }]),
-            CoreEvent::BoardsUpdated(vec![BoardSummary {
-                id: 10,
-                name: "ENG Board".into(),
-                ..Default::default()
-            }]),
+            CoreEvent::ProjectsUpdated {
+                site_id: "default".into(),
+                items: vec![ProjectSummary {
+                    id: "1".into(),
+                    key: "ENG".into(),
+                    name: "Engineering".into(),
+                    ..Default::default()
+                }],
+            },
+            CoreEvent::BoardsUpdated {
+                site_id: "default".into(),
+                items: vec![BoardSummary {
+                    id: 10,
+                    name: "ENG Board".into(),
+                    ..Default::default()
+                }],
+            },
             CoreEvent::BoardIssuesUpdated {
                 site_id: "default".into(),
                 board_id: 10,
@@ -2146,12 +2236,15 @@ mod tests {
                 site_id: "default".into(),
                 issues: vec![],
             },
-            CoreEvent::SpacesUpdated(vec![SpaceSummary {
-                id: "sp-1".into(),
-                key: "ENG".into(),
-                name: "Engineering".into(),
-                ..Default::default()
-            }]),
+            CoreEvent::SpacesUpdated {
+                site_id: "default".into(),
+                items: vec![SpaceSummary {
+                    id: "sp-1".into(),
+                    key: "ENG".into(),
+                    name: "Engineering".into(),
+                    ..Default::default()
+                }],
+            },
             CoreEvent::SpacePagesUpdated {
                 site_id: "default".into(),
                 space_key: "ENG".into(),
@@ -2166,6 +2259,91 @@ mod tests {
             let parsed: ServerFrame = serde_json::from_str(&raw).unwrap();
             assert!(matches!(parsed, ServerFrame::Event(_)));
         }
+    }
+
+    #[test]
+    fn wire_core_event_roundtrips_site_id() {
+        let ev = CoreEvent::BoardsUpdated {
+            site_id: "site-b".into(),
+            items: vec![BoardSummary {
+                id: 10,
+                name: "B board".into(),
+                ..Default::default()
+            }],
+        };
+        let raw = serde_json::to_string(&ServerFrame::Event(ev.into())).unwrap();
+        assert!(raw.contains("\"site_id\":\"site-b\""), "{raw}");
+        let ServerFrame::Event(wire) = serde_json::from_str::<ServerFrame>(&raw).unwrap() else {
+            panic!("expected event frame: {raw}");
+        };
+        match CoreEvent::from(wire) {
+            CoreEvent::BoardsUpdated { site_id, items } => {
+                assert_eq!(site_id, "site-b");
+                assert_eq!(items.len(), 1);
+                assert_eq!(items[0].id, 10);
+            }
+            other => panic!("unexpected event: {other:?}"),
+        }
+
+        for ev in [
+            CoreEvent::ProjectsUpdated {
+                site_id: "site-a".into(),
+                items: vec![],
+            },
+            CoreEvent::SpacesUpdated {
+                site_id: "site-a".into(),
+                items: vec![],
+            },
+        ] {
+            let raw = serde_json::to_string(&WireCoreEvent::from(ev)).unwrap();
+            let back: CoreEvent = serde_json::from_str::<WireCoreEvent>(&raw).unwrap().into();
+            match back {
+                CoreEvent::ProjectsUpdated { site_id, .. } | CoreEvent::SpacesUpdated { site_id, .. } => {
+                    assert_eq!(site_id, "site-a")
+                }
+                other => panic!("unexpected event: {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn wire_core_event_accepts_legacy_shape() {
+        // Pre-0.8.1 daemons sent the list as a bare array payload.
+        let legacy_space = SpaceSummary {
+            id: "sp-1".into(),
+            key: "ENG".into(),
+            name: "Engineering".into(),
+            ..Default::default()
+        };
+        let raw = serde_json::json!({ "event": "spaces_updated", "payload": [legacy_space] });
+        let wire: WireCoreEvent = serde_json::from_value(raw).unwrap();
+        match CoreEvent::from(wire) {
+            CoreEvent::SpacesUpdated { site_id, items } => {
+                assert_eq!(site_id, "");
+                assert_eq!(items.len(), 1);
+                assert_eq!(items[0].key, "ENG");
+            }
+            other => panic!("unexpected event: {other:?}"),
+        }
+        let raw = r#"{"event":"projects_updated","payload":[]}"#;
+        let wire: WireCoreEvent = serde_json::from_str(raw).unwrap();
+        assert!(matches!(
+            CoreEvent::from(wire),
+            CoreEvent::ProjectsUpdated { ref site_id, ref items } if site_id.is_empty() && items.is_empty()
+        ));
+    }
+
+    #[test]
+    fn group_rows_by_site_keeps_site_and_row_order() {
+        let grouped = group_rows_by_site(vec![
+            ("b".to_string(), 1),
+            ("a".to_string(), 2),
+            ("b".to_string(), 3),
+        ]);
+        assert_eq!(
+            grouped,
+            vec![("b".to_string(), vec![1, 3]), ("a".to_string(), vec![2])]
+        );
     }
 
     #[tokio::test]

@@ -22,6 +22,8 @@ use crate::{
 #[derive(Debug, Clone)]
 pub struct CrossLinkOverlay {
     pub source_label: String,
+    /// Site of the issue or page the links were collected from; the targets live there too.
+    pub site_id: Option<String>,
     pub targets: Vec<CrossRefTarget>,
     pub selected: usize,
 }
@@ -30,6 +32,7 @@ impl CrossLinkOverlay {
     pub fn new(source_label: impl Into<String>, targets: Vec<CrossRefTarget>) -> Self {
         Self {
             source_label: source_label.into(),
+            site_id: None,
             targets,
             selected: 0,
         }

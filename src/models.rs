@@ -744,8 +744,14 @@ pub enum CoreEvent {
     SyncFinished {
         summary: String,
     },
-    ProjectsUpdated(Vec<ProjectSummary>),
-    BoardsUpdated(Vec<BoardSummary>),
+    ProjectsUpdated {
+        site_id: String,
+        items: Vec<ProjectSummary>,
+    },
+    BoardsUpdated {
+        site_id: String,
+        items: Vec<BoardSummary>,
+    },
     BoardIssuesUpdated {
         site_id: String,
         board_id: i64,
@@ -756,7 +762,10 @@ pub enum CoreEvent {
         site_id: String,
         issues: Vec<IssueSummary>,
     },
-    SpacesUpdated(Vec<SpaceSummary>),
+    SpacesUpdated {
+        site_id: String,
+        items: Vec<SpaceSummary>,
+    },
     SpacePagesUpdated {
         site_id: String,
         space_key: String,
