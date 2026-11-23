@@ -12,21 +12,25 @@ confluence serve                # same API server under the confluence persona
 atlassian serve --port 9000          # custom port
 atlassian serve --bind 127.0.0.1 --port 8789
 atlassian serve --token secret123    # require Authorization: Bearer secret123
+atlassian serve --cors-origin http://localhost:5173   # let one browser origin call the API
 atlassian api                        # alias for `serve`
 ```
 
-- `--bind` defaults to `127.0.0.1` (loopback only).
+- `--bind` defaults to `127.0.0.1` (loopback only). Binding any other address (for example `0.0.0.0`) requires `--token`; without it `serve` refuses to start.
 - `--port` defaults to `8789`.
-- `--token` is optional; when set, every endpoint except `GET /health` requires `Authorization: Bearer <token>`.
+- `--token` is optional on a loopback bind; when set, every endpoint except `GET /health` requires `Authorization: Bearer <token>`.
+- `--cors-origin <ORIGIN>` (repeatable) allows one exact browser origin such as `http://localhost:5173`. The default is none, and `*` is rejected.
 - Requires an existing login (`atlassian login` or `confluence login`) for live/remote endpoints; `?offline=true` routes and local `/search` read directly from SQLite.
 - On startup, `serve` spawns the background sync engine and requests `SyncCommand::RefreshAll`.
 
 ## Conventions
 
 - All responses are JSON (`Content-Type: application/json`).
-- Errors use `{"error": "<message>"}` with HTTP `400`, `401`, `404`, or `500`.
+- Errors use `{"error": "<message>"}` with HTTP `400`, `401`, `403`, `404`, or `500`.
 - `limit` defaults to `50` (`30` for `/search`) and is clamped to `1..=1000`. Live board issue queries return at most `100` items per call and live space root page queries return at most `250` items per call.
-- Permissive CORS (`CorsLayer::permissive()`) is enabled for local browser-based agent UIs.
+- Browser access is closed by default. A request with an `Origin` header gets `403` unless that origin was passed with `--cors-origin` (or is the server's own origin); this includes requests that never send a CORS preflight, such as a plain `GET` or a form `POST`. Allowed origins receive CORS headers for `GET`, `POST`, `PUT`, `PATCH`, `DELETE` with `Authorization` and `Content-Type`.
+- On a loopback bind the `Host` header must be `127.0.0.1`, `localhost`, or `[::1]` (any port); other names get `403`. This stops DNS rebinding from a web page.
+- Requests without an `Origin` header (curl, scripts, agents) are not affected by either check.
 
 ---
 

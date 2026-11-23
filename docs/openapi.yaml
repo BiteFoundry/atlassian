@@ -9,7 +9,14 @@ info:
     (Cloud and Data Center), local SQLite WAL/FTS5 caching, and the background
     sync engine. Binds to `127.0.0.1:8789` by default. When started with
     `--token`, every endpoint except `GET /health` requires
-    `Authorization: Bearer <token>`.
+    `Authorization: Bearer <token>`. Binding a non-loopback address
+    requires `--token`.
+
+    Browser access is closed by default: a request with an `Origin` header
+    is answered with `403` unless that exact origin was allowed with
+    `--cors-origin <origin>`, and on a loopback bind the `Host` header
+    must be `127.0.0.1`, `localhost` or `[::1]`. Requests without an
+    `Origin` header are not affected.
 
     All errors return `{"error": "<message>"}` with an appropriate HTTP status.
 servers:

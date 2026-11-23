@@ -678,8 +678,12 @@ pub enum Command {
         bind: String,
         #[arg(long, default_value_t = DEFAULT_SERVE_PORT)]
         port: u16,
+        /// Require "Authorization: Bearer <TOKEN>" (mandatory unless --bind is a loopback address)
         #[arg(long)]
         token: Option<String>,
+        /// Browser origin allowed to call the API cross-origin, e.g. http://localhost:5173 (repeatable; default: none)
+        #[arg(long = "cors-origin", value_name = "ORIGIN")]
+        cors_origin: Vec<String>,
     },
     /// Run the stdio MCP (JSON-RPC 2.0) server for AI agents
     #[command(visible_alias = "mcp-server")]
@@ -975,8 +979,12 @@ pub enum ConfluenceCommand {
         bind: String,
         #[arg(long, default_value_t = DEFAULT_SERVE_PORT)]
         port: u16,
+        /// Require "Authorization: Bearer <TOKEN>" (mandatory unless --bind is a loopback address)
         #[arg(long)]
         token: Option<String>,
+        /// Browser origin allowed to call the API cross-origin, e.g. http://localhost:5173 (repeatable; default: none)
+        #[arg(long = "cors-origin", value_name = "ORIGIN")]
+        cors_origin: Vec<String>,
     },
     /// Run the stdio MCP (JSON-RPC 2.0) server for AI agents
     #[command(visible_alias = "mcp-server")]
@@ -2238,14 +2246,24 @@ async fn dispatch_jira_cli(
             let mut run_cfg = apply_site_override(cfg, site_override.as_deref())?;
             Box::pin(cmd_tui(&mut run_cfg, persona)).await
         }
-        Some(Command::Serve { bind, port, token }) => {
+        Some(Command::Serve {
+            bind,
+            port,
+            token,
+            cors_origin,
+        }) => {
             let scoped = apply_site_override(cfg, site_override.as_deref())?;
             let (_auth, client, storage) = open_runtime(&scoped, false)?;
             Box::pin(serve::run(
                 scoped,
                 client,
                 storage,
-                ServeOptions { bind, port, token },
+                ServeOptions {
+                    bind,
+                    port,
+                    token,
+                    cors_origins: cors_origin,
+                },
             ))
             .await
         }
@@ -2518,14 +2536,24 @@ async fn dispatch_confluence_cli(
             let mut run_cfg = apply_site_override(cfg, site_override.as_deref())?;
             Box::pin(cmd_tui(&mut run_cfg, persona)).await
         }
-        Some(ConfluenceCommand::Serve { bind, port, token }) => {
+        Some(ConfluenceCommand::Serve {
+            bind,
+            port,
+            token,
+            cors_origin,
+        }) => {
             let scoped = apply_site_override(cfg, site_override.as_deref())?;
             let (_auth, client, storage) = open_runtime(&scoped, false)?;
             Box::pin(serve::run(
                 scoped,
                 client,
                 storage,
-                ServeOptions { bind, port, token },
+                ServeOptions {
+                    bind,
+                    port,
+                    token,
+                    cors_origins: cors_origin,
+                },
             ))
             .await
         }
@@ -6954,6 +6982,31 @@ mod tests {
     }
 
     #[test]
+    fn serve_accepts_repeated_cors_origin() {
+        let cli = Cli::try_parse_from([
+            "atlassian",
+            "serve",
+            "--cors-origin",
+            "http://localhost:5173",
+            "--cors-origin",
+            "http://localhost:3000",
+        ])
+        .unwrap();
+        match cli.command {
+            Some(Command::Serve { cors_origin, token, .. }) => {
+                assert_eq!(cors_origin, vec!["http://localhost:5173", "http://localhost:3000"]);
+                assert_eq!(token, None);
+            }
+            other => panic!("expected serve, got {other:?}"),
+        }
+        let plain = Cli::try_parse_from(["atlassian", "serve"]).unwrap();
+        assert!(matches!(
+            plain.command,
+            Some(Command::Serve { cors_origin, .. }) if cors_origin.is_empty()
+        ));
+    }
+
+    #[test]
     fn doctor_reports_config_dir_override() {
         assert_eq!(config_dir_source(Some("D:\\atl")), "env:ATLASSIAN_CONFIG_DIR");
         assert_eq!(config_dir_source(Some("  ")), "default");
@@ -7103,7 +7156,9 @@ mod tests {
         ])
         .unwrap();
         match cli.command.unwrap() {
-            Command::Serve { bind, port, token } => {
+            Command::Serve {
+                bind, port, token, ..
+            } => {
                 assert_eq!(bind, "0.0.0.0");
                 assert_eq!(port, 9000);
                 assert_eq!(token.as_deref(), Some("sec"));

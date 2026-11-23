@@ -1,11 +1,14 @@
 //! Local HTTP JSON API (`atlassian serve` / `confluence serve`, default `127.0.0.1:8789`) powered by `axum`.
 
-use std::{net::SocketAddr, sync::Arc};
+use std::{
+    net::{IpAddr, SocketAddr},
+    sync::Arc,
+};
 
-use anyhow::{Context, Result};
+use anyhow::{anyhow, bail, Context, Result};
 use axum::{
     extract::{Path, Query, Request, State},
-    http::{header, StatusCode},
+    http::{header, HeaderValue, Method, StatusCode},
     middleware::{self, Next},
     response::{IntoResponse, Response},
     routing::{get, post, put},
@@ -14,7 +17,7 @@ use axum::{
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use tokio::{net::TcpListener, sync::mpsc};
-use tower_http::cors::CorsLayer;
+use tower_http::cors::{AllowOrigin, CorsLayer};
 
 use crate::{
     atlassian::{
@@ -37,6 +40,9 @@ pub struct ServeOptions {
     pub bind: String,
     pub port: u16,
     pub token: Option<String>,
+    /// Exact browser origins ("http://localhost:5173") allowed to call the API cross-origin.
+    /// Empty (the default) means no cross-origin browser access at all.
+    pub cors_origins: Vec<String>,
 }
 
 impl Default for ServeOptions {
@@ -45,8 +51,138 @@ impl Default for ServeOptions {
             bind: "127.0.0.1".to_string(),
             port: crate::config::DEFAULT_SERVE_PORT,
             token: None,
+            cors_origins: Vec::new(),
         }
     }
+}
+
+const CROSS_ORIGIN_REFUSED: &str =
+    "cross-origin request refused; start serve with --cors-origin <origin>";
+const HOST_REFUSED: &str =
+    "request refused: the Host header is not a loopback name (DNS rebinding protection)";
+
+/// Validates one "--cors-origin" value and returns it in the form browsers send
+/// (scheme://host[:port], default port omitted).
+pub fn normalize_cors_origin(raw: &str) -> Result<String> {
+    let trimmed = raw.trim();
+    if trimmed == "*" {
+        bail!(
+            "`--cors-origin *` is not accepted: every website open in the browser could then call this API with your Atlassian credentials. List exact origins, for example `--cors-origin http://localhost:5173`."
+        );
+    }
+    let invalid = || {
+        anyhow!("Invalid `--cors-origin {trimmed}`: expected an exact origin such as http://localhost:5173.")
+    };
+    let url = url::Url::parse(trimmed).map_err(|_| invalid())?;
+    let exact = matches!(url.scheme(), "http" | "https")
+        && url.host_str().is_some()
+        && matches!(url.path(), "" | "/")
+        && url.query().is_none()
+        && url.fragment().is_none()
+        && url.username().is_empty()
+        && url.password().is_none()
+        && !trimmed.contains('*');
+    if !exact {
+        return Err(invalid());
+    }
+    Ok(url.origin().ascii_serialization())
+}
+
+/// Browser-facing request policy derived from [ServeOptions]: which "Origin" values may
+/// call the API and whether "Host" must be a loopback name.
+#[derive(Debug, Clone, Default)]
+pub struct RequestGuard {
+    cors_origins: Vec<String>,
+    same_origins: Vec<String>,
+    loopback_bind: bool,
+}
+
+impl RequestGuard {
+    /// Invalid "cors_origins" entries are dropped here; [run] rejects them before serving.
+    pub fn new(opts: &ServeOptions) -> Self {
+        let bind = opts.bind.trim();
+        let bind_ip = bind.parse::<IpAddr>().ok();
+        let bind_host = match bind_ip {
+            Some(IpAddr::V6(ip)) => format!("[{ip}]"),
+            _ => bind.to_string(),
+        };
+        let same_origins = [bind_host.as_str(), "localhost", "127.0.0.1", "[::1]"]
+            .iter()
+            .filter_map(|host| url::Url::parse(&format!("http://{host}:{}", opts.port)).ok())
+            .map(|url| url.origin().ascii_serialization())
+            .collect();
+        Self {
+            cors_origins: opts
+                .cors_origins
+                .iter()
+                .filter_map(|origin| normalize_cors_origin(origin).ok())
+                .collect(),
+            same_origins,
+            loopback_bind: bind_ip.map_or(bind.eq_ignore_ascii_case("localhost"), |ip| ip.is_loopback()),
+        }
+    }
+
+    /// True when a request carrying this "Origin" header may proceed.
+    fn origin_allowed(&self, origin: &str) -> bool {
+        let Ok(url) = url::Url::parse(origin.trim()) else {
+            return false;
+        };
+        let origin = url.origin().ascii_serialization();
+        self.cors_origins.contains(&origin) || self.same_origins.contains(&origin)
+    }
+
+    fn cors_layer(&self) -> Option<CorsLayer> {
+        let origins: Vec<HeaderValue> = self
+            .cors_origins
+            .iter()
+            .filter_map(|origin| HeaderValue::from_str(origin).ok())
+            .collect();
+        if origins.is_empty() {
+            return None;
+        }
+        Some(
+            CorsLayer::new()
+                .allow_origin(AllowOrigin::list(origins))
+                .allow_methods([Method::GET, Method::POST, Method::PUT, Method::PATCH, Method::DELETE])
+                .allow_headers([header::AUTHORIZATION, header::CONTENT_TYPE]),
+        )
+    }
+}
+
+/// True for "127.0.0.1[:port]", "localhost[:port]" and "[::1][:port]".
+fn is_loopback_host(host: &str) -> bool {
+    let host = host.trim();
+    let name = if let Some(rest) = host.strip_prefix('[') {
+        match rest.split_once(']') {
+            Some((inner, _)) => inner,
+            None => return false,
+        }
+    } else {
+        host.rsplit_once(':').map_or(host, |(name, _port)| name)
+    };
+    match name.parse::<IpAddr>() {
+        Ok(ip) => ip.is_loopback(),
+        Err(_) => name.eq_ignore_ascii_case("localhost"),
+    }
+}
+
+/// A non-loopback listener without a token would expose the user's Atlassian access to
+/// the whole network.
+pub(crate) fn validate_bind(addr: &SocketAddr, token: Option<&str>) -> Result<()> {
+    let has_token = token.is_some_and(|t| !t.trim().is_empty());
+    if !addr.ip().is_loopback() && !has_token {
+        bail!("Refusing to bind {addr} without --token. Pass --token <secret> or bind 127.0.0.1.");
+    }
+    Ok(())
+}
+
+/// Compares two byte strings without stopping at the first difference.
+fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
+    let mut diff = a.len() ^ b.len();
+    for i in 0..a.len().max(b.len()) {
+        diff |= usize::from(a.get(i).copied().unwrap_or(0) ^ b.get(i).copied().unwrap_or(0));
+    }
+    diff == 0
 }
 
 /// Shared state passed to every axum request handler.
@@ -56,6 +192,7 @@ pub struct AppState {
     pub site_pool: SiteClientPool,
     pub storage: Storage,
     pub token: Option<String>,
+    pub guard: RequestGuard,
 }
 
 /// JSON error returned by every failing handler.
@@ -331,12 +468,18 @@ pub struct SearchQuery {
 }
 
 /// Build the `axum::Router` for the unified Jira & Confluence HTTP JSON API.
+///
+/// Cross-origin browser requests are refused unless their origin is listed in
+/// "opts.cors_origins"; requests without an "Origin" header (curl, agents) are unaffected.
 pub fn build_router(
     config: AppConfig,
     client: AtlassianClient,
     storage: Storage,
-    token: Option<String>,
+    opts: ServeOptions,
 ) -> Router {
+    let guard = RequestGuard::new(&opts);
+    let cors = guard.cors_layer();
+    let token = opts.token;
     let site_pool = SiteClientPool::from_config(&config).unwrap_or_else(|_| {
         let auth = client.auth().clone();
         SiteClientPool::new(Vec::new(), move |_| auth.clone(), None, None)
@@ -348,9 +491,10 @@ pub fn build_router(
         site_pool,
         storage,
         token,
+        guard,
     });
 
-    Router::new()
+    let router = Router::new()
         .route("/health", get(health))
         .route("/api/v1/sites", get(list_sites))
         .route("/sites", get(list_sites))
@@ -387,8 +531,15 @@ pub fn build_router(
         )
         .route("/search", get(search))
         .route("/sync", post(sync_workspace))
-        .layer(middleware::from_fn_with_state(state.clone(), auth_middleware))
-        .layer(CorsLayer::permissive())
+        .layer(middleware::from_fn_with_state(state.clone(), auth_middleware));
+    // No CORS layer at all unless origins were allowlisted; the origin guard is outermost,
+    // so it also stops "simple" cross-origin requests that never send a preflight.
+    let router = match cors {
+        Some(cors) => router.layer(cors),
+        None => router,
+    };
+    router
+        .layer(middleware::from_fn_with_state(state.clone(), origin_guard))
         .with_state(state)
 }
 
@@ -399,6 +550,14 @@ pub async fn run(
     storage: Storage,
     opts: ServeOptions,
 ) -> Result<()> {
+    let addr: SocketAddr = format!("{}:{}", opts.bind, opts.port)
+        .parse()
+        .with_context(|| format!("Invalid bind address: {}:{}", opts.bind, opts.port))?;
+    validate_bind(&addr, opts.token.as_deref())?;
+    for origin in &opts.cors_origins {
+        normalize_cors_origin(origin)?;
+    }
+
     let (event_tx, mut event_rx) = mpsc::unbounded_channel();
     tokio::spawn(async move { while event_rx.recv().await.is_some() {} });
 
@@ -406,11 +565,8 @@ pub async fn run(
         sync::spawn_sync_engine(config.clone(), client.clone(), storage.clone(), event_tx);
     sync_ctl.request(SyncCommand::RefreshAll);
 
-    let app = build_router(config, client, storage, opts.token);
+    let app = build_router(config, client, storage, opts);
 
-    let addr: SocketAddr = format!("{}:{}", opts.bind, opts.port)
-        .parse()
-        .with_context(|| format!("Invalid bind address: {}:{}", opts.bind, opts.port))?;
     let listener = TcpListener::bind(addr)
         .await
         .with_context(|| format!("Failed to bind listener: {addr}"))?;
@@ -422,6 +578,32 @@ pub async fn run(
         .context("HTTP server error")?;
 
     Ok(())
+}
+
+/// Refuses browser requests from origins that were not allowlisted and, on a loopback
+/// listener, requests whose "Host" is not a loopback name.
+async fn origin_guard(
+    State(state): State<Arc<AppState>>,
+    request: Request,
+    next: Next,
+) -> Result<Response, ApiError> {
+    let guard = &state.guard;
+    if guard.loopback_bind {
+        let host = request
+            .headers()
+            .get(header::HOST)
+            .map(|value| value.to_str().unwrap_or("").to_string())
+            .or_else(|| request.uri().authority().map(|a| a.as_str().to_string()));
+        if host.is_some_and(|host| !is_loopback_host(&host)) {
+            return Err(ApiError::new(StatusCode::FORBIDDEN, HOST_REFUSED));
+        }
+    }
+    if let Some(origin) = request.headers().get(header::ORIGIN) {
+        if !guard.origin_allowed(origin.to_str().unwrap_or("")) {
+            return Err(ApiError::new(StatusCode::FORBIDDEN, CROSS_ORIGIN_REFUSED));
+        }
+    }
+    Ok(next.run(request).await)
 }
 
 async fn auth_middleware(
@@ -437,7 +619,7 @@ async fn auth_middleware(
                 .and_then(|value| value.to_str().ok())
                 .and_then(|value| value.strip_prefix("Bearer "));
 
-            if presented != Some(expected.as_str()) {
+            if !presented.is_some_and(|p| constant_time_eq(p.as_bytes(), expected.as_bytes())) {
                 return Err(ApiError::new(
                     StatusCode::UNAUTHORIZED,
                     "missing or invalid bearer token",
@@ -1769,6 +1951,14 @@ mod tests {
     };
 
     async fn spawn_test_server(token: Option<String>) -> (String, Storage) {
+        spawn_test_server_with(ServeOptions {
+            token,
+            ..ServeOptions::default()
+        })
+        .await
+    }
+
+    async fn spawn_test_server_with(opts: ServeOptions) -> (String, Storage) {
         let cfg = AppConfig {
             site_url: "https://acme.atlassian.net".to_string(),
             deployment: DeploymentKind::Cloud,
@@ -1777,7 +1967,7 @@ mod tests {
         let auth = AuthManager::new("test");
         let client = AtlassianClient::new(cfg.clone(), auth).unwrap();
         let storage = Storage::open_in_memory().unwrap();
-        let router = build_router(cfg, client, storage.clone(), token);
+        let router = build_router(cfg, client, storage.clone(), opts);
 
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
@@ -1785,6 +1975,203 @@ mod tests {
             axum::serve(listener, router).await.unwrap();
         });
         (format!("http://{addr}"), storage)
+    }
+
+    const EVIL_ORIGIN: &str = "https://evil.example";
+
+    #[tokio::test]
+    async fn cors_is_not_permissive_by_default() {
+        let (base, _storage) = spawn_test_server(None).await;
+        let res = reqwest::Client::new()
+            .request(reqwest::Method::OPTIONS, format!("{base}/issues/ENG-1"))
+            .header("Origin", EVIL_ORIGIN)
+            .header("Access-Control-Request-Method", "DELETE")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::FORBIDDEN);
+        assert!(res.headers().get("access-control-allow-origin").is_none());
+        assert!(res.headers().get("access-control-allow-methods").is_none());
+    }
+
+    #[tokio::test]
+    async fn cross_origin_request_is_refused_without_allowlist() {
+        let (base, _storage) = spawn_test_server(None).await;
+        let http = reqwest::Client::new();
+        // The guard answers before any handler (and so before any Atlassian call) runs.
+        let res = http
+            .delete(format!("{base}/issues/ENG-1"))
+            .header("Origin", EVIL_ORIGIN)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::FORBIDDEN);
+        assert!(res.headers().get("access-control-allow-origin").is_none());
+        let body: Value = res.json().await.unwrap();
+        assert_eq!(body["error"], CROSS_ORIGIN_REFUSED);
+
+        // "Simple" requests never trigger a preflight, so they are refused here too.
+        for origin in [EVIL_ORIGIN, "null"] {
+            let res = http
+                .post(format!("{base}/sync"))
+                .header("Origin", origin)
+                .header("Content-Type", "application/x-www-form-urlencoded")
+                .body("a=b")
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(res.status(), StatusCode::FORBIDDEN, "{origin}");
+            let res = http
+                .get(format!("{base}/health"))
+                .header("Origin", origin)
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(res.status(), StatusCode::FORBIDDEN, "{origin}");
+        }
+    }
+
+    #[tokio::test]
+    async fn allowlisted_origin_gets_cors_headers() {
+        let allowed = "http://localhost:5173";
+        let (base, _storage) = spawn_test_server_with(ServeOptions {
+            cors_origins: vec![format!("{allowed}/")],
+            ..ServeOptions::default()
+        })
+        .await;
+        let http = reqwest::Client::new();
+
+        let preflight = http
+            .request(reqwest::Method::OPTIONS, format!("{base}/issues/ENG-1"))
+            .header("Origin", allowed)
+            .header("Access-Control-Request-Method", "DELETE")
+            .header("Access-Control-Request-Headers", "authorization,content-type")
+            .send()
+            .await
+            .unwrap();
+        assert!(preflight.status().is_success(), "{}", preflight.status());
+        assert_eq!(preflight.headers()["access-control-allow-origin"], allowed);
+        let methods = preflight.headers()["access-control-allow-methods"].to_str().unwrap();
+        assert!(methods.contains("DELETE") && methods.contains("PATCH"), "{methods}");
+        let headers = preflight.headers()["access-control-allow-headers"]
+            .to_str()
+            .unwrap()
+            .to_ascii_lowercase();
+        assert!(headers.contains("authorization") && headers.contains("content-type"), "{headers}");
+
+        let res = http
+            .get(format!("{base}/health"))
+            .header("Origin", allowed)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        assert_eq!(res.headers()["access-control-allow-origin"], allowed);
+
+        // Other origins stay refused and get no CORS headers.
+        let res = http
+            .get(format!("{base}/health"))
+            .header("Origin", EVIL_ORIGIN)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::FORBIDDEN);
+        assert!(res.headers().get("access-control-allow-origin").is_none());
+    }
+
+    #[tokio::test]
+    async fn request_without_origin_still_works() {
+        let (base, _storage) = spawn_test_server(None).await;
+        let http = reqwest::Client::new();
+        let res = http.get(format!("{base}/health")).send().await.unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        assert!(res.headers().get("access-control-allow-origin").is_none());
+        let res = http.get(format!("{base}/issues?offline=true")).send().await.unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn rebinding_host_header_is_refused_on_loopback() {
+        let (base, _storage) = spawn_test_server(None).await;
+        let http = reqwest::Client::new();
+        let res = http
+            .get(format!("{base}/health"))
+            .header(reqwest::header::HOST, "evil.example:8789")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::FORBIDDEN);
+        let body: Value = res.json().await.unwrap();
+        assert_eq!(body["error"], HOST_REFUSED);
+
+        for host in ["localhost:8789", "127.0.0.1", "[::1]:8789"] {
+            let res = http
+                .get(format!("{base}/health"))
+                .header(reqwest::header::HOST, host)
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(res.status(), StatusCode::OK, "{host}");
+        }
+        assert!(!is_loopback_host("127.0.0.1.evil.example"));
+        assert!(!is_loopback_host("localhost.evil.example:8789"));
+        assert!(!is_loopback_host(""));
+
+        // A listener on a routable address is reached by name, so Host is not checked there.
+        let lan = RequestGuard::new(&ServeOptions {
+            bind: "192.168.1.5".into(),
+            token: Some("secret".into()),
+            ..ServeOptions::default()
+        });
+        assert!(!lan.loopback_bind);
+        assert!(RequestGuard::new(&ServeOptions::default()).loopback_bind);
+    }
+
+    #[test]
+    fn non_loopback_bind_requires_token() {
+        let addr = |text: &str| text.parse::<SocketAddr>().unwrap();
+        for open in ["0.0.0.0:8789", "192.168.1.5:8789", "[::]:8789"] {
+            let err = validate_bind(&addr(open), None).unwrap_err().to_string();
+            assert!(err.contains("Refusing to bind") && err.contains("--token"), "{err}");
+            assert!(validate_bind(&addr(open), Some("  ")).is_err(), "{open}");
+            assert!(validate_bind(&addr(open), Some("secret")).is_ok(), "{open}");
+        }
+        for loopback in ["127.0.0.1:8789", "[::1]:8789"] {
+            assert!(validate_bind(&addr(loopback), None).is_ok(), "{loopback}");
+        }
+    }
+
+    #[test]
+    fn cors_origin_values_are_exact_origins() {
+        assert_eq!(normalize_cors_origin(" http://localhost:5173/ ").unwrap(), "http://localhost:5173");
+        assert_eq!(normalize_cors_origin("https://App.Example:443").unwrap(), "https://app.example");
+        let wildcard = normalize_cors_origin("*").unwrap_err().to_string();
+        assert!(wildcard.contains("every website"), "{wildcard}");
+        for bad in ["http://*.example.com", "localhost:5173", "http://localhost:5173/app", "null", "file:///x"] {
+            assert!(normalize_cors_origin(bad).is_err(), "{bad}");
+        }
+
+        let guard = RequestGuard::new(&ServeOptions {
+            cors_origins: vec!["http://localhost:5173".into(), "*".into()],
+            ..ServeOptions::default()
+        });
+        assert!(guard.origin_allowed("http://localhost:5173"));
+        // Same-origin with the listener (default port 8789).
+        assert!(guard.origin_allowed("http://127.0.0.1:8789"));
+        assert!(guard.origin_allowed("http://localhost:8789"));
+        assert!(!guard.origin_allowed("http://localhost:5174"));
+        assert!(!guard.origin_allowed("https://localhost:5173"));
+        assert!(!guard.origin_allowed("null"));
+        assert!(!guard.origin_allowed(""));
+    }
+
+    #[test]
+    fn bearer_token_comparison_is_exact() {
+        assert!(constant_time_eq(b"secret-token", b"secret-token"));
+        assert!(!constant_time_eq(b"secret-token", b"secret-tokeN"));
+        assert!(!constant_time_eq(b"secret", b"secret-token"));
+        assert!(!constant_time_eq(b"", b"x"));
+        assert!(constant_time_eq(b"", b""));
     }
 
     #[tokio::test]

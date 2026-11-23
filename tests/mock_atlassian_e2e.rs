@@ -1660,7 +1660,10 @@ async fn e2e_serve_http_mcp_image_preview_and_self_updater() {
         cfg.clone(),
         client.clone(),
         storage.clone(),
-        Some(api_token.to_string()),
+        serve::ServeOptions {
+            token: Some(api_token.to_string()),
+            ..serve::ServeOptions::default()
+        },
     ))
     .await;
 
@@ -2488,7 +2491,7 @@ async fn e2e_multi_site_oauth_3lo_refresh_collision_free_sync_and_federation() {
 
     // 6. Verify HTTP GET /api/v1/sites & ?site= scoping + MCP list_sites & site argument
     let default_client = pool.client_for("acme-cloud").unwrap();
-    let api_router = serve::build_router(cfg.clone(), default_client.clone(), storage.clone(), None);
+    let api_router = serve::build_router(cfg.clone(), default_client.clone(), storage.clone(), serve::ServeOptions::default());
     let api_base = spawn_server(api_router).await;
 
     let sites_resp: Value = http
@@ -2899,7 +2902,7 @@ async fn regression_atlassian_bug_01_cloud_footer_comment_endpoint_and_controls(
     assert_eq!(mcp_payload["comment"]["id"], "cm-cloud-2");
 
     // 3. Local HTTP entry point
-    let api_router = serve::build_router(cfg.clone(), cloud_client.clone(), storage.clone(), None);
+    let api_router = serve::build_router(cfg.clone(), cloud_client.clone(), storage.clone(), serve::ServeOptions::default());
     let api_base = spawn_server(api_router).await;
     let http = reqwest::Client::new();
     let http_resp = http
@@ -3031,7 +3034,7 @@ async fn regression_atlassian_bug_04_plain_text_vs_explicit_jql_cql() {
         ..Default::default()
     };
     let storage = Storage::open_in_memory().expect("storage");
-    let api_router = serve::build_router(cfg.clone(), client.clone(), storage.clone(), None);
+    let api_router = serve::build_router(cfg.clone(), client.clone(), storage.clone(), serve::ServeOptions::default());
     let api_base = spawn_server(api_router).await;
     let http = reqwest::Client::new();
     let profile = tempfile::tempdir().unwrap();
@@ -3384,7 +3387,7 @@ async fn regression_atlassian_bug_05_dc_jira_search_start_at_pagination() {
     assert_eq!(mcp_keys, vec!["DC-1", "DC-2", "DC-3", "DC-4", "DC-5", "DC-6", "DC-7"]);
 
     // 2. HTTP DC pagination: 0 -> 3 -> 6 with limit 3 over 7 issues (3/3/1, 0 duplicates, last next_start_at=null)
-    let api_router = serve::build_router(dc_cfg.clone(), dc_client.clone(), dc_storage.clone(), None);
+    let api_router = serve::build_router(dc_cfg.clone(), dc_client.clone(), dc_storage.clone(), serve::ServeOptions::default());
     let api_base = spawn_server(api_router).await;
     let http = reqwest::Client::new();
 
@@ -3631,7 +3634,7 @@ async fn regression_atlassian_bug_09_remote_unified_search_global_ordering() {
         ..Default::default()
     };
     let storage = Storage::open_in_memory().unwrap();
-    let api_router = serve::build_router(cfg.clone(), client.clone(), storage.clone(), None);
+    let api_router = serve::build_router(cfg.clone(), client.clone(), storage.clone(), serve::ServeOptions::default());
     let api_base = spawn_server(api_router).await;
     let http = reqwest::Client::new();
 
@@ -4549,7 +4552,7 @@ async fn http_offline_issues_total_is_cache_count() {
     let cfg = AppConfig::default();
     let auth = AuthManager::new("http-offline-total");
     let client = AtlassianClient::new(cfg.clone(), auth).unwrap();
-    let serve_url = spawn_server(serve::build_router(cfg, client, storage, None)).await;
+    let serve_url = spawn_server(serve::build_router(cfg, client, storage, serve::ServeOptions::default())).await;
 
     let http = reqwest::Client::new();
     let r2: Value = http
