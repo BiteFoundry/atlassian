@@ -3400,9 +3400,7 @@ async fn cmd_login(
     }
 
     if use_multi_site {
-        if cfg.sites.is_empty() && !cfg.site_url.trim().is_empty() {
-            cfg.sites = cfg.effective_sites();
-        }
+        cfg.materialize_legacy_site();
         cfg.upsert_site(candidate_profile.clone());
         if target_site.is_none() {
             cfg.default_site = Some(resolved_site_id.clone());
@@ -3595,6 +3593,8 @@ async fn cmd_login_oauth(
     auth.save_credentials(&creds)?;
 
     let storage = Storage::open(&config::cache_db_path(&cfg.profile))?;
+    // Keep a site configured the legacy way (top-level site_url) next to the new ones.
+    cfg.materialize_legacy_site();
     let mut registered = Vec::with_capacity(resources.len());
     for res in &resources {
         let profile = res.to_site_profile(&account_id);
@@ -3746,6 +3746,7 @@ async fn cmd_login_cloud_account(
             last_synced_at: None,
             last_error: None,
         });
+        cfg.materialize_legacy_site();
         cfg.upsert_site(profile.clone());
         if cfg.default_site.is_none() {
             cfg.default_site = Some(site_id);
@@ -3917,9 +3918,7 @@ async fn cmd_sites(cfg: &mut AppConfig, action: SitesCommand) -> Result<()> {
                 })?;
             }
 
-            if cfg.sites.is_empty() && !cfg.site_url.trim().is_empty() {
-                cfg.sites = cfg.effective_sites();
-            }
+            cfg.materialize_legacy_site();
 
             let profile = SiteProfile {
                 id: site_id.clone(),
@@ -4034,6 +4033,7 @@ async fn cmd_sites(cfg: &mut AppConfig, action: SitesCommand) -> Result<()> {
                 resources
             };
 
+            cfg.materialize_legacy_site();
             let mut discovered = Vec::with_capacity(resources.len());
             for res in &resources {
                 let profile = res.to_site_profile(&candidate_account);
@@ -4082,13 +4082,12 @@ async fn cmd_sites(cfg: &mut AppConfig, action: SitesCommand) -> Result<()> {
             Ok(())
         }
         SitesCommand::Default { id, json } => {
-            if cfg.sites.is_empty() {
-                cfg.sites = cfg.effective_sites();
-            }
-            let Some(found) = cfg.find_effective_site(&id) else {
-                bail!("Site '{id}' not found.");
-            };
-            cfg.default_site = Some(found.id.clone());
+            // "cfg" here is the configuration as loaded from disk (no --site override), so a
+            // cleared active_site is the persisted TUI selection.
+            let cleared_active_site = cfg.set_default_site(&id)?;
+            let found = cfg
+                .default_site_profile()
+                .context("default site vanished after it was set")?;
             cfg.save()?;
             if json {
                 println!(
@@ -4096,10 +4095,14 @@ async fn cmd_sites(cfg: &mut AppConfig, action: SitesCommand) -> Result<()> {
                     serde_json::to_string_pretty(&json!({
                         "ok": true,
                         "default_site": found.id,
+                        "cleared_active_site": cleared_active_site,
                     }))?
                 );
             } else {
                 println!("Default site set to '{}' ({}).", found.id, found.site_url);
+                if let Some(previous) = cleared_active_site {
+                    println!("Cleared the site selected in the TUI ('{previous}'), which took precedence over the default.");
+                }
             }
             Ok(())
         }
@@ -4188,24 +4191,22 @@ async fn cmd_sites(cfg: &mut AppConfig, action: SitesCommand) -> Result<()> {
                 None
             };
             delete_gate(yes, json, answer.as_deref())?;
-            if cfg.sites.is_empty() {
-                cfg.sites = cfg.effective_sites();
-            }
-            if !cfg.remove_site(&id) {
+            let Some(removed) = cfg.remove_effective_site(&id) else {
                 bail!("Site '{id}' not found.");
-            }
-            let _ = storage.delete_site_data(&id);
+            };
+            // The cache is keyed by the canonical id, whatever spelling the user typed.
+            let _ = storage.delete_site_data(&removed.id);
             cfg.save()?;
             if json {
                 println!(
                     "{}",
                     serde_json::to_string_pretty(&json!({
                         "ok": true,
-                        "removed": id,
+                        "removed": removed.id,
                     }))?
                 );
             } else {
-                println!("Removed site '{id}' and purged its cached data.");
+                println!("Removed site '{}' and purged its cached data.", removed.id);
             }
             Ok(())
         }

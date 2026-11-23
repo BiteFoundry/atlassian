@@ -33,7 +33,7 @@ use tokio::{
 };
 
 use crate::{
-    atlassian::AtlassianClient,
+    atlassian::{AtlassianClient, SiteClientPool},
     auth::AuthManager,
     config::AppConfig,
     models::{
@@ -1375,18 +1375,54 @@ async fn try_connect_tui_at(cfg: &AppConfig, paths: &DaemonPaths) -> Option<TuiD
 }
 
 /// Runs the background sync daemon in the foreground until a `Shutdown` RPC or Ctrl+C arrives.
+/// What "daemon run" serves, decided from the configured sites.
+pub(crate) enum DaemonMode {
+    /// One logged-in site: the single-site engine with that site's pool client
+    /// (which keeps its cloud_id and per-product credentials).
+    Single(AtlassianClient),
+    /// Two or more logged-in sites: the multi-site engine.
+    Multi(Vec<sync::SiteSyncTarget>),
+    NotLoggedIn,
+}
+
+pub(crate) fn plan_daemon_mode(pool: &SiteClientPool) -> DaemonMode {
+    let mut targets: Vec<sync::SiteSyncTarget> = sync::sync_targets(pool)
+        .into_iter()
+        .filter(|t| t.client.auth().is_logged_in())
+        .collect();
+    match targets.len() {
+        0 => DaemonMode::NotLoggedIn,
+        1 => DaemonMode::Single(targets.remove(0).client),
+        _ => DaemonMode::Multi(targets),
+    }
+}
+
 pub async fn run_daemon_foreground(cfg: AppConfig) -> Result<()> {
-    let auth = AuthManager::new(&cfg.profile);
-    if !auth.is_logged_in() {
+    let pool = SiteClientPool::from_config(&cfg)?;
+    let mode = plan_daemon_mode(&pool);
+    if matches!(mode, DaemonMode::NotLoggedIn) {
         bail!("Not logged in. Run 'atlassian login' or 'confluence login' first.");
     }
 
     let db_path = crate::config::cache_db_path(&cfg.profile);
     let storage = Storage::open(&db_path)?;
-    let client = AtlassianClient::new(cfg.clone(), auth)?;
     let paths = DaemonPaths::for_config(&cfg);
 
-    run_daemon_inner(cfg, paths, client, storage, true, true).await
+    match mode {
+        DaemonMode::Single(client) => run_daemon_inner(cfg, paths, client, storage, true, true).await,
+        DaemonMode::Multi(targets) => {
+            run_daemon_multi_site_inner(
+                cfg,
+                paths,
+                targets,
+                storage,
+                sync::DEFAULT_MULTI_SITE_CONCURRENCY,
+                true,
+            )
+            .await
+        }
+        DaemonMode::NotLoggedIn => unreachable!("handled above"),
+    }
 }
 
 async fn run_daemon_inner(
@@ -1939,6 +1975,82 @@ mod tests {
         }
     }
 
+    fn daemon_test_pool(sites: Vec<crate::config::SiteProfile>, logged_in: &[&str]) -> (tempfile::TempDir, SiteClientPool) {
+        use crate::auth::StoredCredentials;
+        let dir = tempfile::tempdir().unwrap();
+        let cred_path = dir.path().join("credentials.json");
+        for site in &sites {
+            if logged_in.contains(&site.id.as_str()) {
+                AuthManager::for_account(&site.account_id)
+                    .with_fallback_path(cred_path.clone())
+                    .save_credentials(&StoredCredentials::ApiToken {
+                        site_url: site.site_url.clone(),
+                        email: "me@example.com".into(),
+                        api_token: "tok".into(),
+                        deployment: site.deployment,
+                    })
+                    .unwrap();
+            }
+        }
+        let cfg = AppConfig {
+            sites,
+            ..AppConfig::default()
+        };
+        let pool = SiteClientPool::from_config_with_options(&cfg, Some(cred_path), None, None).unwrap();
+        (dir, pool)
+    }
+
+    fn daemon_test_site(id: &str, cloud_id: Option<&str>) -> crate::config::SiteProfile {
+        crate::config::SiteProfile {
+            id: id.into(),
+            name: id.into(),
+            site_url: format!("https://{id}.atlassian.net"),
+            account_id: id.into(),
+            cloud_id: cloud_id.map(str::to_string),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn daemon_mode_is_multi_for_two_logged_in_sites() {
+        let (_dir, pool) = daemon_test_pool(
+            vec![daemon_test_site("acme", None), daemon_test_site("beta", None)],
+            &["acme", "beta"],
+        );
+        match plan_daemon_mode(&pool) {
+            DaemonMode::Multi(targets) => {
+                let ids: Vec<&str> = targets.iter().map(|t| t.site_id.as_str()).collect();
+                assert_eq!(ids, ["acme", "beta"]);
+            }
+            _ => panic!("two logged-in sites must run the multi-site engine"),
+        }
+    }
+
+    #[test]
+    fn daemon_mode_single_uses_pool_client_with_cloud_id() {
+        // "beta" has no credential, so only "acme" is served, by its own pool client.
+        let (_dir, pool) = daemon_test_pool(
+            vec![daemon_test_site("acme", Some("cloud-123")), daemon_test_site("beta", None)],
+            &["acme"],
+        );
+        match plan_daemon_mode(&pool) {
+            DaemonMode::Single(client) => {
+                assert_eq!(client.site_id(), "acme");
+                assert_eq!(client.cloud_id(), Some("cloud-123"));
+            }
+            _ => panic!("one logged-in site must run the single-site engine"),
+        }
+    }
+
+    #[test]
+    fn daemon_mode_not_logged_in_when_no_site_has_credentials() {
+        let (_dir, pool) = daemon_test_pool(
+            vec![daemon_test_site("acme", None), daemon_test_site("beta", None)],
+            &[],
+        );
+        assert!(matches!(plan_daemon_mode(&pool), DaemonMode::NotLoggedIn));
+    }
+
     #[test]
     fn test_daemon_status_and_ipc_frame_serialization_roundtrip() {
         let status = DaemonStatus {
@@ -1968,6 +2080,7 @@ mod tests {
                 cmd: Some(SyncCommand::RefreshBoard {
                     board_id: 77,
                     sprint_id: Some(12),
+                    site_id: None,
                 }),
             },
         };
@@ -1979,7 +2092,8 @@ mod tests {
             ClientOp::Nudge {
                 cmd: Some(SyncCommand::RefreshBoard {
                     board_id: 77,
-                    sprint_id: Some(12)
+                    sprint_id: Some(12),
+                    site_id: None,
                 })
             }
         ));
@@ -1987,12 +2101,13 @@ mod tests {
         // ClientStreamCmd roundtrip (Command + Ping)
         let stream_cmd = ClientStreamCmd::Command(SyncCommand::RefreshSpace {
             space_key: "ENG".into(),
+            site_id: None,
         });
         let sc_json = serde_json::to_string(&stream_cmd).unwrap();
         let sc_back: ClientStreamCmd = serde_json::from_str(&sc_json).unwrap();
         assert!(matches!(
             sc_back,
-            ClientStreamCmd::Command(SyncCommand::RefreshSpace { ref space_key }) if space_key == "ENG"
+            ClientStreamCmd::Command(SyncCommand::RefreshSpace { ref space_key, .. }) if space_key == "ENG"
         ));
         let ping_json = serde_json::to_string(&ClientStreamCmd::Ping).unwrap();
         let ping_back: ClientStreamCmd = serde_json::from_str(&ping_json).unwrap();
@@ -2151,6 +2266,7 @@ mod tests {
         // Forward SyncCommand from attached TUI client -> daemon.
         assert!(conn.sync_ctrl.request(SyncCommand::RefreshSpace {
             space_key: "ENG".into(),
+            site_id: None,
         }));
         let forwarded = tokio::time::timeout(Duration::from_secs(1), harness.cmd_rx.recv())
             .await
@@ -2159,7 +2275,8 @@ mod tests {
         assert_eq!(
             forwarded,
             SyncCommand::RefreshSpace {
-                space_key: "ENG".into()
+                space_key: "ENG".into(),
+                site_id: None,
             }
         );
 

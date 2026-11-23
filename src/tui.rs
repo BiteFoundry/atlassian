@@ -989,15 +989,7 @@ pub async fn run_with_persona(
 
     let sync_ctrl = match crate::atlassian::SiteClientPool::from_config(&config) {
         Ok(pool) if pool.enabled_clients().len() > 1 => {
-            let targets: Vec<sync::SiteSyncTarget> = pool
-                .enabled_clients()
-                .into_iter()
-                .map(|(site, c)| sync::SiteSyncTarget {
-                    site_id: site.id.clone(),
-                    site_name: site.display_name().to_string(),
-                    client: c,
-                })
-                .collect();
+            let targets = sync::sync_targets(&pool);
             sync::spawn_multi_site_sync_engine(
                 config.clone(),
                 targets,

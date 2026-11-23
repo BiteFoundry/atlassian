@@ -35,7 +35,7 @@ use crate::{
         page_to_hit,
     },
     storage::Storage,
-    sync::{self, SiteSyncTarget},
+    sync,
 };
 
 const SUPPORTED_PROTOCOL_VERSIONS: &[&str] = &["2024-11-05", "2025-03-26", "2025-06-18"];
@@ -156,7 +156,9 @@ async fn run_with_storage<'a>(
     Ok(())
 }
 
-async fn bootstrap_if_empty(config: &AppConfig, client: &AtlassianClient, storage: &Storage) {
+/// True when the serving site has a URL and nothing of it is cached yet. The client's own
+/// URL counts, not the legacy top-level site_url, which "[[sites]]"-only configs leave empty.
+fn needs_bootstrap(client: &AtlassianClient, storage: &Storage) -> bool {
     let site = client.site_id();
     let projects_empty = storage
         .list_projects_for_site(site)
@@ -166,7 +168,12 @@ async fn bootstrap_if_empty(config: &AppConfig, client: &AtlassianClient, storag
         .list_spaces_for_site(site)
         .unwrap_or_default()
         .is_empty();
-    if projects_empty && spaces_empty && !config.site_url.trim().is_empty() {
+    projects_empty && spaces_empty && !client.site_url().trim().is_empty()
+}
+
+async fn bootstrap_if_empty(_config: &AppConfig, client: &AtlassianClient, storage: &Storage) {
+    let site = client.site_id();
+    if needs_bootstrap(client, storage) {
         if let Err(err) = sync::bootstrap_workspace_for_site(site, client, storage).await {
             eprintln!("{SERVER_NAME} MCP warning: initial workspace bootstrap failed: {err:#}");
         }
@@ -198,7 +205,7 @@ fn tool_uses_current_site_cache(
     };
     reads_cache
         && resolve_mcp_site_id(config, client, arguments.get("site").and_then(Value::as_str))
-            .map_or(true, |site| site.eq_ignore_ascii_case(client.site_id()))
+            .is_ok_and(|scope| scope.map_or(true, |site| site.eq_ignore_ascii_case(client.site_id())))
 }
 
 /// Single-line JSON-RPC handler exposed for deterministic unit & integration testing.
@@ -296,23 +303,38 @@ async fn handle_rpc_line_with_bootstrap<'a>(
     }
 }
 
+/// Site scope of a tool call: Ok(None) means every site. See [AppConfig::resolve_site_scope].
 fn resolve_mcp_site_id(
     config: &AppConfig,
     fallback_client: &AtlassianClient,
     raw_site: Option<&str>,
-) -> Option<String> {
-    let trimmed = raw_site.map(str::trim).filter(|s| !s.is_empty())?;
-    if trimmed.eq_ignore_ascii_case("all") {
-        return None;
-    }
-    if let Some(found) = config.find_effective_site(trimmed) {
-        return Some(found.id);
-    }
-    if trimmed.eq_ignore_ascii_case(fallback_client.site_id()) {
-        return Some(fallback_client.site_id().to_string());
-    }
-    Some(trimmed.to_string())
+) -> Result<Option<String>, String> {
+    config.resolve_site_scope(raw_site, fallback_client.site_id())
 }
+
+/// Tools that change Atlassian data; they need one named site, never "all".
+const WRITE_TOOLS: &[&str] = &[
+    "create_jira_issue",
+    "update_jira_issue",
+    "transition_jira_issue",
+    "assign_jira_issue",
+    "add_jira_comment",
+    "set_jira_parent",
+    "update_jira_custom_fields",
+    "create_jira_issue_link",
+    "move_jira_issues_to_sprint",
+    "add_jira_worklog",
+    "upload_jira_attachment",
+    "delete_jira_issue",
+    "create_confluence_page",
+    "update_confluence_page",
+    "add_confluence_comment",
+    "upload_confluence_attachment",
+    "move_confluence_page",
+    "add_confluence_labels",
+    "remove_confluence_label",
+    "delete_confluence_page",
+];
 
 fn resolve_mcp_single_site_id(
     config: &AppConfig,
@@ -407,7 +429,10 @@ async fn call_tool(
 ) -> Result<Value, String> {
     let args = Args::new(arguments);
     let site_arg = args.optional_str("site")?;
-    let scoped_site = resolve_mcp_site_id(config, client, site_arg.as_deref());
+    let scoped_site = resolve_mcp_site_id(config, client, site_arg.as_deref())?;
+    if WRITE_TOOLS.contains(&name) {
+        config.reject_all_sites_for_write(site_arg.as_deref())?;
+    }
 
     match name {
         // -------------------------------------------------------------------
@@ -1594,18 +1619,11 @@ async fn call_tool(
         }
 
         "sync_workspace" => {
+            // No site (and no --site) or "site=all": every enabled site; a named site: that one.
             if scoped_site.is_none() {
                 if let Ok(pool) = SiteClientPool::from_config(config) {
-                    let enabled = pool.enabled_clients();
-                    if enabled.len() > 1 {
-                        let targets: Vec<SiteSyncTarget> = enabled
-                            .into_iter()
-                            .map(|(site, c)| SiteSyncTarget {
-                                site_id: site.id.clone(),
-                                site_name: site.display_name().to_string(),
-                                client: c,
-                            })
-                            .collect();
+                    let targets = sync::sync_targets(&pool);
+                    if targets.len() > 1 {
                         let mut breakers = sync::CircuitBreakerMap::new();
                         let outcome = sync::run_multi_site_sync(
                             &targets,
@@ -1632,7 +1650,7 @@ async fn call_tool(
                 }
             }
             let (target_site, target_client) =
-                resolve_mcp_client(config, client, site_arg.as_deref())?;
+                resolve_mcp_client(config, client, scoped_site.as_deref())?;
             let summary = sync::bootstrap_workspace_for_site(&target_site, &target_client, storage)
                 .await
                 .map_err(format_error)?;
@@ -2935,6 +2953,75 @@ mod tests {
         config::DeploymentKind,
         models::{IssueDetail, IssueSummary, PageDetail, PageSummary},
     };
+
+    fn site_scope_config() -> AppConfig {
+        let site = |id: &str| crate::config::SiteProfile {
+            id: id.into(),
+            name: id.into(),
+            site_url: format!("https://{id}.atlassian.net"),
+            account_id: id.into(),
+            ..Default::default()
+        };
+        AppConfig {
+            sites: vec![site("acme"), site("beta")],
+            ..AppConfig::default()
+        }
+    }
+
+    #[test]
+    fn mcp_site_resolution_falls_back_to_active_site() {
+        let mut cfg = site_scope_config();
+        let client = AtlassianClient::new(cfg.clone(), AuthManager::new("scope-test")).unwrap();
+        assert_eq!(resolve_mcp_site_id(&cfg, &client, None).unwrap(), None);
+        cfg.active_site = Some("beta".into());
+        assert_eq!(resolve_mcp_site_id(&cfg, &client, None).unwrap().as_deref(), Some("beta"));
+        // A per-call site still wins.
+        assert_eq!(resolve_mcp_site_id(&cfg, &client, Some("ACME")).unwrap().as_deref(), Some("acme"));
+    }
+
+    #[test]
+    fn mcp_unknown_site_is_an_error() {
+        let cfg = site_scope_config();
+        let client = AtlassianClient::new(cfg.clone(), AuthManager::new("scope-test")).unwrap();
+        let err = resolve_mcp_site_id(&cfg, &client, Some("acmee")).unwrap_err();
+        assert!(err.contains("unknown site 'acmee'") && err.contains("acme, beta"), "{err}");
+        // The legacy "default" id is always accepted.
+        assert_eq!(resolve_mcp_site_id(&cfg, &client, Some("default")).unwrap().as_deref(), Some("default"));
+    }
+
+    #[test]
+    fn mcp_bootstrap_runs_for_site_without_legacy_site_url() {
+        let cfg = site_scope_config();
+        assert!(cfg.site_url.is_empty(), "a [[sites]]-only config has no legacy site_url");
+        let pool = crate::atlassian::SiteClientPool::from_config(&cfg).unwrap();
+        let client = pool.client_for("acme").unwrap();
+        let storage = Storage::open_in_memory().unwrap();
+        assert!(needs_bootstrap(&client, &storage));
+        storage
+            .upsert_spaces_for_site(
+                "acme",
+                &[crate::models::SpaceSummary {
+                    id: "1".into(),
+                    key: "ENG".into(),
+                    name: "Eng".into(),
+                    ..Default::default()
+                }],
+            )
+            .unwrap();
+        assert!(!needs_bootstrap(&client, &storage), "a cached site is not bootstrapped again");
+    }
+
+    #[test]
+    fn mcp_site_all_means_federated() {
+        let mut cfg = site_scope_config();
+        cfg.active_site = Some("beta".into());
+        let client = AtlassianClient::new(cfg.clone(), AuthManager::new("scope-test")).unwrap();
+        assert_eq!(resolve_mcp_site_id(&cfg, &client, Some("all")).unwrap(), None);
+        assert!(cfg.reject_all_sites_for_write(Some("all")).is_err());
+        assert!(cfg.reject_all_sites_for_write(Some("acme")).is_ok());
+        assert!(WRITE_TOOLS.contains(&"create_jira_issue") && !WRITE_TOOLS.contains(&"search_all"));
+    }
+
 
     fn test_ctx() -> (AppConfig, AtlassianClient, Storage) {
         let cfg = AppConfig {

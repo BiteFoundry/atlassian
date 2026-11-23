@@ -33,7 +33,7 @@ use crate::{
     },
     resolver::resolve_rejected_assignee,
     storage::Storage,
-    sync::{self, SiteSyncTarget, SyncCommand},
+    sync::{self, SyncCommand},
 };
 
 #[derive(Debug, Clone)]
@@ -584,8 +584,21 @@ pub async fn run(
     let (event_tx, mut event_rx) = mpsc::unbounded_channel();
     tokio::spawn(async move { while event_rx.recv().await.is_some() {} });
 
-    let sync_ctl =
-        sync::spawn_sync_engine(config.clone(), client.clone(), storage.clone(), event_tx);
+    // Every enabled site is kept in sync, as the TUI does; one site keeps the single-site engine.
+    let targets = SiteClientPool::from_config(&config)
+        .map(|pool| sync::sync_targets(&pool))
+        .unwrap_or_default();
+    let sync_ctl = if targets.len() > 1 {
+        sync::spawn_multi_site_sync_engine(
+            config.clone(),
+            targets,
+            storage.clone(),
+            sync::DEFAULT_MULTI_SITE_CONCURRENCY,
+            event_tx,
+        )
+    } else {
+        sync::spawn_sync_engine(config.clone(), client.clone(), storage.clone(), event_tx)
+    };
     sync_ctl.request(SyncCommand::RefreshAll);
 
     let app = build_router(config, client, storage, opts);
@@ -664,21 +677,32 @@ async fn health(State(state): State<Arc<AppState>>) -> Json<HealthResponse> {
     })
 }
 
-fn resolve_site_id(state: &AppState, raw_site: Option<&str>) -> Option<String> {
-    let trimmed = raw_site.map(str::trim).filter(|s| !s.is_empty())?;
-    if trimmed.eq_ignore_ascii_case("all") {
-        return None;
+/// Site scope of a request: Ok(None) means every site; a mistyped site is a 400.
+/// See [AppConfig::resolve_site_scope].
+fn resolve_site_id(state: &AppState, raw_site: Option<&str>) -> Result<Option<String>, ApiError> {
+    if let Some(found) = raw_site
+        .map(str::trim)
+        .filter(|s| !s.is_empty() && !s.eq_ignore_ascii_case("all"))
+        .and_then(|s| state.site_pool.site_for(s))
+    {
+        return Ok(Some(found.id.clone()));
     }
-    if let Some(found) = state.config.find_effective_site(trimmed) {
-        return Some(found.id);
-    }
-    if trimmed.eq_ignore_ascii_case(state.client.site_id()) {
-        return Some(state.client.site_id().to_string());
-    }
-    if let Some(found) = state.site_pool.site_for(trimmed) {
-        return Some(found.id.clone());
-    }
-    Some(trimmed.to_string())
+    state
+        .config
+        .resolve_site_scope(raw_site, state.client.site_id())
+        .map_err(ApiError::bad_request)
+}
+
+/// The client of the one site a write goes to; "site=all" is refused (400).
+fn resolve_write_client(
+    state: &AppState,
+    raw_site: Option<&str>,
+) -> Result<(String, AtlassianClient), ApiError> {
+    state
+        .config
+        .reject_all_sites_for_write(raw_site)
+        .map_err(ApiError::bad_request)?;
+    resolve_site_client(state, raw_site)
 }
 
 fn resolve_single_site_id(state: &AppState, raw_site: Option<&str>) -> Result<String, ApiError> {
@@ -1044,7 +1068,7 @@ async fn create_issue(
     };
 
     let (target_site, client) =
-        resolve_site_client(&state, query.site.as_deref().or(body.site.as_deref()))?;
+        resolve_write_client(&state, query.site.as_deref().or(body.site.as_deref()))?;
     let (assignee_id, raw_assignee) = match body.assignee_id.as_deref().map(str::trim) {
         None | Some("") => (None, None),
         Some(raw) if raw.eq_ignore_ascii_case("me") => {
@@ -1173,7 +1197,7 @@ async fn patch_issue(
     }
 
     let (target_site, client) =
-        resolve_site_client(&state, query.site.as_deref().or(body.site.as_deref()))?;
+        resolve_write_client(&state, query.site.as_deref().or(body.site.as_deref()))?;
     let raw_assignee = match patch.assignee_id.take() {
         Some(Some(raw)) => {
             let trimmed = raw.trim();
@@ -1236,7 +1260,7 @@ async fn delete_issue(
     if key.is_empty() {
         return Err(ApiError::bad_request("issue key must not be empty"));
     }
-    let (target_site, client) = resolve_site_client(&state, query.site.as_deref())?;
+    let (target_site, client) = resolve_write_client(&state, query.site.as_deref())?;
     client.delete_issue(key).await?;
     let _ = state.storage.delete_issue_for_site(&target_site, key);
     Ok(Json(json!({ "ok": true, "site_id": target_site, "key": key })))
@@ -1270,7 +1294,7 @@ async fn transition_issue(
         ));
     }
     let (target_site, client) =
-        resolve_site_client(&state, query.site.as_deref().or(body.site.as_deref()))?;
+        resolve_write_client(&state, query.site.as_deref().or(body.site.as_deref()))?;
     let executed = client
         .transition_issue(key, transition, body.comment.as_deref())
         .await?;
@@ -1303,7 +1327,7 @@ async fn assign_issue(
         return Err(ApiError::bad_request("issue key must not be empty"));
     }
     let (target_site, client) =
-        resolve_site_client(&state, query.site.as_deref().or(body.site.as_deref()))?;
+        resolve_write_client(&state, query.site.as_deref().or(body.site.as_deref()))?;
     let (mut resolved, raw_assignee) = match body.assignee_id.as_deref().map(str::trim) {
         None | Some("") => (None, None),
         Some(raw) if raw.eq_ignore_ascii_case("me") => {
@@ -1367,7 +1391,7 @@ async fn add_issue_comment(
         return Err(ApiError::bad_request("body_markdown must not be empty"));
     }
     let (target_site, client) =
-        resolve_site_client(&state, query.site.as_deref().or(body.site.as_deref()))?;
+        resolve_write_client(&state, query.site.as_deref().or(body.site.as_deref()))?;
     let comment = client
         .add_issue_comment(key, &body.body_markdown)
         .await?;
@@ -1561,7 +1585,7 @@ async fn create_page(
         return Err(ApiError::bad_request("title must not be empty"));
     }
     let (target_site, client) =
-        resolve_site_client(&state, query.site.as_deref().or(body.site.as_deref()))?;
+        resolve_write_client(&state, query.site.as_deref().or(body.site.as_deref()))?;
     let req = OutgoingPage {
         space_id_or_key: space.to_string(),
         parent_id: body.parent_id.filter(|s| !s.trim().is_empty()),
@@ -1588,7 +1612,7 @@ async fn update_page(
     )
     .map_err(anyhow::Error::from)?;
     let (target_site, client) =
-        resolve_site_client(&state, query.site.as_deref().or(body.site.as_deref()))?;
+        resolve_write_client(&state, query.site.as_deref().or(body.site.as_deref()))?;
 
     let detail = client
         .edit_page(
@@ -1616,7 +1640,7 @@ async fn delete_page(
     if id.is_empty() {
         return Err(ApiError::bad_request("page id must not be empty"));
     }
-    let (target_site, client) = resolve_site_client(&state, query.site.as_deref())?;
+    let (target_site, client) = resolve_write_client(&state, query.site.as_deref())?;
     client.delete_page(id).await?;
     let _ = state.storage.delete_page_for_site(&target_site, id);
     Ok(Json(json!({ "ok": true, "site_id": target_site, "id": id })))
@@ -1644,7 +1668,7 @@ async fn add_page_comment(
         return Err(ApiError::bad_request("body_markdown must not be empty"));
     }
     let (target_site, client) =
-        resolve_site_client(&state, query.site.as_deref().or(body.site.as_deref()))?;
+        resolve_write_client(&state, query.site.as_deref().or(body.site.as_deref()))?;
     let comment = client
         .add_page_comment(id, &body.body_markdown)
         .await?;
@@ -1673,7 +1697,7 @@ async fn search(
         )));
     }
     let limit = clamp_limit(query.limit.unwrap_or(30));
-    let scoped_site = resolve_site_id(&state, query.site.as_deref());
+    let scoped_site = resolve_site_id(&state, query.site.as_deref())?;
 
     let hits: Vec<FederatedSearchHit> = if !query.remote {
         let scoped_hits = match scope.as_str() {
@@ -1742,17 +1766,10 @@ async fn sync_workspace(
     State(state): State<Arc<AppState>>,
     Query(query): Query<SiteQuery>,
 ) -> Result<Json<Value>, ApiError> {
-    if query.site.is_none() && state.site_pool.enabled_clients().len() > 1 {
-        let targets: Vec<SiteSyncTarget> = state
-            .site_pool
-            .enabled_clients()
-            .into_iter()
-            .map(|(site, client)| SiteSyncTarget {
-                site_id: site.id.clone(),
-                site_name: site.display_name().to_string(),
-                client,
-            })
-            .collect();
+    // No site (and no --site) or "site=all": every enabled site; a named site: that one.
+    let scope = resolve_site_id(&state, query.site.as_deref())?;
+    if scope.is_none() && state.site_pool.enabled_clients().len() > 1 {
+        let targets = sync::sync_targets(&state.site_pool);
         let mut breakers = sync::CircuitBreakerMap::new();
         let outcome = sync::run_multi_site_sync(
             &targets,
@@ -1770,7 +1787,7 @@ async fn sync_workspace(
             "counts": counts,
         })));
     }
-    let (site_id, client) = resolve_site_client(&state, query.site.as_deref())?;
+    let (site_id, client) = resolve_site_client(&state, scope.as_deref())?;
     let summary = sync::bootstrap_workspace_for_site(&site_id, &client, &state.storage).await?;
     let counts = state.storage.cache_counts()?;
     Ok(Json(json!({
@@ -2297,6 +2314,77 @@ mod tests {
         assert_eq!(res.status(), StatusCode::OK);
         let data: Value = res.json().await.unwrap();
         assert!(data["issues"].is_array());
+    }
+
+    #[tokio::test]
+    async fn http_sync_site_all_runs_federated_sync() {
+        let site = |id: &str| crate::config::SiteProfile {
+            id: id.into(),
+            name: id.into(),
+            site_url: "http://127.0.0.1:9".into(),
+            account_id: format!("http-sync-{id}-no-credentials"),
+            ..Default::default()
+        };
+        let cfg = AppConfig {
+            sites: vec![site("acme"), site("beta")],
+            ..AppConfig::default()
+        };
+        let client = AtlassianClient::new(cfg.clone(), AuthManager::new("http-sync-test")).unwrap();
+        let router = build_router(cfg, client, Storage::open_in_memory().unwrap(), ServeOptions::default());
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        tokio::spawn(async move {
+            axum::serve(listener, router).await.unwrap();
+        });
+
+        // No site is logged in, so every site fails fast; the shape tells which path ran.
+        let body: Value = reqwest::Client::new()
+            .post(format!("{base}/sync?site=all"))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        let sites = body["sites"].as_array().unwrap_or_else(|| panic!("federated answer expected: {body}"));
+        assert_eq!(sites.len(), 2, "{body}");
+        assert!(body.get("site_id").is_none(), "{body}");
+    }
+
+    #[tokio::test]
+    async fn http_unknown_site_returns_400() {
+        let (base, _storage) = spawn_test_server(None).await;
+        let res = reqwest::Client::new()
+            .get(format!("{base}/search?q=release&site=acmee"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::BAD_REQUEST);
+        let body: Value = res.json().await.unwrap();
+        assert!(body.to_string().contains("unknown site 'acmee'"), "{body}");
+    }
+
+    #[tokio::test]
+    async fn http_write_with_site_all_is_rejected() {
+        let (base, _storage) = spawn_test_server(None).await;
+        let http = reqwest::Client::new();
+        let res = http
+            .post(format!("{base}/issues/ENG-1/comments?site=all"))
+            .json(&json!({ "body_markdown": "hello" }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::BAD_REQUEST);
+        let body: Value = res.json().await.unwrap();
+        assert!(body.to_string().contains("cannot be used for a write"), "{body}");
+
+        // Reads keep accepting "all" (federated cache search).
+        let res = http
+            .get(format!("{base}/search?q=release&site=all"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
     }
 
     #[tokio::test]

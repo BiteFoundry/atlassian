@@ -22,6 +22,7 @@ use tokio::{
 
 use crate::{
     atlassian::{
+        SiteClientPool,
         client::HttpStatusError,
         collect::{SYNC_BOARD_ISSUE_CAP, SYNC_MY_ISSUE_CAP, SYNC_PROJECT_ISSUE_CAP, SYNC_ROOT_PAGE_CAP},
         AtlassianClient,
@@ -705,15 +706,23 @@ pub enum SyncCommand {
     RefreshSite {
         site_id: String,
     },
+    /// "site_id" names the site to refresh (multi-site engine); None means the first site.
+    /// Absent on the wire from older clients, hence the serde default.
     RefreshBoard {
         board_id: i64,
         sprint_id: Option<i64>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        site_id: Option<String>,
     },
     RefreshProjectIssues {
         project_key: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        site_id: Option<String>,
     },
     RefreshSpace {
         space_key: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        site_id: Option<String>,
     },
     WatchOpenItem {
         target: Option<OpenItemTarget>,
@@ -731,6 +740,52 @@ pub struct SiteSyncTarget {
     pub site_id: String,
     pub site_name: String,
     pub client: AtlassianClient,
+}
+
+/// The target a site-scoped refresh goes to: the named site (case-insensitive), or the first
+/// site when none is named. An unknown name is an error, never a refresh of another site.
+fn refresh_target<'a>(
+    targets: &'a [SiteSyncTarget],
+    site_id: Option<&str>,
+    what: &str,
+) -> std::result::Result<&'a SiteSyncTarget, String> {
+    match site_id.map(str::trim).filter(|s| !s.is_empty()) {
+        Some(id) => targets
+            .iter()
+            .find(|t| t.site_id.eq_ignore_ascii_case(id))
+            .ok_or_else(|| {
+                let ids: Vec<&str> = targets.iter().map(|t| t.site_id.as_str()).collect();
+                format!("Cannot sync {what}: unknown site '{id}' (syncing: {})", ids.join(", "))
+            }),
+        None => targets
+            .first()
+            .ok_or_else(|| format!("No sites configured to sync {what}")),
+    }
+}
+
+/// The single-site engine refreshes only its own site; a refresh naming another site is
+/// reported instead of silently refreshing the wrong one.
+fn refresh_names_other_site(client: &AtlassianClient, site_id: Option<&str>) -> Option<String> {
+    let id = site_id.map(str::trim).filter(|s| !s.is_empty())?;
+    (!id.eq_ignore_ascii_case(client.site_id())).then(|| {
+        format!(
+            "Cannot refresh site '{id}': this engine syncs only '{}'",
+            client.site_id()
+        )
+    })
+}
+
+/// One sync target per enabled site of the pool, in configuration order. Shared by the TUI,
+/// "serve", MCP and the daemon so they all sync the same sites.
+pub fn sync_targets(pool: &SiteClientPool) -> Vec<SiteSyncTarget> {
+    pool.enabled_clients()
+        .into_iter()
+        .map(|(site, client)| SiteSyncTarget {
+            site_id: site.id.clone(),
+            site_name: site.display_name().to_string(),
+            client,
+        })
+        .collect()
 }
 
 /// Per-site outcome emitted by `run_multi_site_sync`.
@@ -896,7 +951,11 @@ pub fn spawn_sync_engine(
                             let outcome = run_full_sync(&client, &storage, Some(&core_tx), &mut breakers).await;
                             emit_full_sync_events(&core_tx, outcome, &mut breakers, false);
                         }
-                        SyncCommand::RefreshBoard { board_id, sprint_id } => {
+                        SyncCommand::RefreshBoard { board_id, sprint_id, site_id } => {
+                            if let Some(err) = refresh_names_other_site(&client, site_id.as_deref()) {
+                                let _ = core_tx.send(CoreEvent::SyncError(err));
+                                continue;
+                            }
                             breakers.reset_endpoint(SyncEndpoint::JiraAgileBoards);
                             let _ = core_tx.send(CoreEvent::SyncStarted);
                             match sync_board(&client, &storage, board_id, sprint_id, Some(&core_tx)).await {
@@ -926,7 +985,11 @@ pub fn spawn_sync_engine(
                                 }
                             }
                         }
-                        SyncCommand::RefreshProjectIssues { project_key } => {
+                        SyncCommand::RefreshProjectIssues { project_key, site_id } => {
+                            if let Some(err) = refresh_names_other_site(&client, site_id.as_deref()) {
+                                let _ = core_tx.send(CoreEvent::SyncError(err));
+                                continue;
+                            }
                             breakers.reset_endpoint(SyncEndpoint::JiraIssues);
                             let _ = core_tx.send(CoreEvent::SyncStarted);
                             match sync_project_issues(&client, &storage, &project_key, Some(&core_tx)).await {
@@ -958,7 +1021,11 @@ pub fn spawn_sync_engine(
                                 }
                             }
                         }
-                        SyncCommand::RefreshSpace { space_key } => {
+                        SyncCommand::RefreshSpace { space_key, site_id } => {
+                            if let Some(err) = refresh_names_other_site(&client, site_id.as_deref()) {
+                                let _ = core_tx.send(CoreEvent::SyncError(err));
+                                continue;
+                            }
                             breakers.reset_endpoint(SyncEndpoint::ConfluencePages);
                             let _ = core_tx.send(CoreEvent::SyncStarted);
                             match sync_space_pages(&client, &storage, &space_key, Some(&core_tx)).await {
@@ -1225,12 +1292,13 @@ pub fn spawn_multi_site_sync_engine_with_status(
                             }
                             emit_multi_site_sync_events(&core_tx, outcome, false);
                         }
-                        SyncCommand::RefreshBoard { board_id, sprint_id } => {
-                            let Some(primary) = targets.first() else {
-                                let _ = core_tx.send(CoreEvent::SyncError(
-                                    "No sites configured to sync board".to_string(),
-                                ));
-                                continue;
+                        SyncCommand::RefreshBoard { board_id, sprint_id, site_id } => {
+                            let primary = match refresh_target(&targets, site_id.as_deref(), "board") {
+                                Ok(target) => target,
+                                Err(err) => {
+                                    let _ = core_tx.send(CoreEvent::SyncError(err));
+                                    continue;
+                                }
                             };
                             breakers.reset_site_endpoint(
                                 &primary.site_id,
@@ -1276,12 +1344,13 @@ pub fn spawn_multi_site_sync_engine_with_status(
                                 }
                             }
                         }
-                        SyncCommand::RefreshProjectIssues { project_key } => {
-                            let Some(primary) = targets.first() else {
-                                let _ = core_tx.send(CoreEvent::SyncError(
-                                    "No sites configured to sync project issues".to_string(),
-                                ));
-                                continue;
+                        SyncCommand::RefreshProjectIssues { project_key, site_id } => {
+                            let primary = match refresh_target(&targets, site_id.as_deref(), "project issues") {
+                                Ok(target) => target,
+                                Err(err) => {
+                                    let _ = core_tx.send(CoreEvent::SyncError(err));
+                                    continue;
+                                }
                             };
                             breakers.reset_site_endpoint(
                                 &primary.site_id,
@@ -1328,12 +1397,13 @@ pub fn spawn_multi_site_sync_engine_with_status(
                                 }
                             }
                         }
-                        SyncCommand::RefreshSpace { space_key } => {
-                            let Some(primary) = targets.first() else {
-                                let _ = core_tx.send(CoreEvent::SyncError(
-                                    "No sites configured to sync space".to_string(),
-                                ));
-                                continue;
+                        SyncCommand::RefreshSpace { space_key, site_id } => {
+                            let primary = match refresh_target(&targets, site_id.as_deref(), "space") {
+                                Ok(target) => target,
+                                Err(err) => {
+                                    let _ = core_tx.send(CoreEvent::SyncError(err));
+                                    continue;
+                                }
                             };
                             breakers.reset_site_endpoint(
                                 &primary.site_id,
@@ -2904,6 +2974,85 @@ mod tests {
         srv_b.abort();
         srv_c.abort();
         srv_bad.abort();
+    }
+
+    #[test]
+    fn sync_command_site_id_defaults_when_absent_on_wire() {
+        // The shape an older client sends over the daemon pipe.
+        let old: SyncCommand =
+            serde_json::from_str(r#"{"type":"refresh_board","board_id":7,"sprint_id":null}"#).unwrap();
+        assert_eq!(
+            old,
+            SyncCommand::RefreshBoard { board_id: 7, sprint_id: None, site_id: None }
+        );
+        let space: SyncCommand =
+            serde_json::from_str(r#"{"type":"refresh_space","space_key":"ENG"}"#).unwrap();
+        assert_eq!(space, SyncCommand::RefreshSpace { space_key: "ENG".into(), site_id: None });
+        // And a command without a site serializes exactly as before.
+        let wire = serde_json::to_string(&SyncCommand::RefreshProjectIssues {
+            project_key: "ENG".into(),
+            site_id: None,
+        })
+        .unwrap();
+        assert!(!wire.contains("site_id"), "{wire}");
+    }
+
+    #[tokio::test]
+    async fn refresh_board_routes_to_named_site() {
+        async fn counting_site(hits: Arc<AtomicUsize>) -> (String, tokio::task::JoinHandle<()>) {
+            let app = Router::new().fallback(move || {
+                let hits = hits.clone();
+                async move {
+                    hits.fetch_add(1, Ordering::SeqCst);
+                    (axum::http::StatusCode::NOT_FOUND, "no such board")
+                }
+            });
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let url = format!("http://{}", listener.local_addr().unwrap());
+            let handle = tokio::spawn(async move {
+                axum::serve(listener, app).await.unwrap();
+            });
+            (url, handle)
+        }
+        let hits_a = Arc::new(AtomicUsize::new(0));
+        let hits_b = Arc::new(AtomicUsize::new(0));
+        let (url_a, srv_a) = counting_site(hits_a.clone()).await;
+        let (url_b, srv_b) = counting_site(hits_b.clone()).await;
+        let targets = vec![
+            SiteSyncTarget { site_id: "acme-cloud".into(), site_name: "Acme".into(), client: make_mock_client(&url_a) },
+            SiteSyncTarget { site_id: "corp-dc".into(), site_name: "Corp".into(), client: make_mock_client(&url_b) },
+        ];
+        let cfg = AppConfig { sync_interval_secs: 300, ..Default::default() };
+        let (core_tx, mut core_rx) = mpsc::unbounded_channel();
+        let ctrl = spawn_multi_site_sync_engine(cfg, targets, Storage::open_in_memory().unwrap(), 2, core_tx);
+
+        async fn next_outcome(rx: &mut mpsc::UnboundedReceiver<CoreEvent>) -> CoreEvent {
+            let deadline = Instant::now() + Duration::from_secs(3);
+            while Instant::now() < deadline {
+                if let Ok(Some(ev)) = tokio::time::timeout(Duration::from_millis(200), rx.recv()).await {
+                    if matches!(ev, CoreEvent::SyncError(_) | CoreEvent::SyncFinished { .. }) {
+                        return ev;
+                    }
+                }
+            }
+            panic!("no sync outcome");
+        }
+
+        assert!(ctrl.request(SyncCommand::RefreshBoard { board_id: 5, sprint_id: None, site_id: Some("CORP-DC".into()) }));
+        next_outcome(&mut core_rx).await;
+        assert!(hits_b.load(Ordering::SeqCst) > 0, "the named site is refreshed");
+        assert_eq!(hits_a.load(Ordering::SeqCst), 0, "the first site is not touched");
+
+        assert!(ctrl.request(SyncCommand::RefreshBoard { board_id: 5, sprint_id: None, site_id: Some("nope".into()) }));
+        match next_outcome(&mut core_rx).await {
+            CoreEvent::SyncError(msg) => assert!(msg.contains("unknown site 'nope'"), "{msg}"),
+            other => panic!("expected SyncError, got {other:?}"),
+        }
+        assert_eq!(hits_a.load(Ordering::SeqCst), 0);
+
+        assert!(ctrl.request(SyncCommand::Shutdown));
+        srv_a.abort();
+        srv_b.abort();
     }
 
     #[tokio::test]

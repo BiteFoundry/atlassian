@@ -659,6 +659,117 @@ impl AppConfig {
         self.sites.push(site);
     }
 
+    /// Copies a legacy single-site configuration (top-level site_url) into "sites" before a
+    /// first [Self::upsert_site], so adding a site never drops the one configured the old way.
+    pub fn materialize_legacy_site(&mut self) {
+        if self.sites.is_empty() && !self.site_url.trim().is_empty() {
+            self.sites = self.effective_sites();
+        }
+    }
+
+    /// Makes the site matching "query" the default site and mirrors it into the legacy
+    /// site_url / confluence_url / deployment fields. A persisted TUI selection
+    /// (active_site) naming another site would shadow the new default, so it is cleared;
+    /// the cleared id is returned.
+    pub fn set_default_site(&mut self, query: &str) -> Result<Option<String>> {
+        self.materialize_legacy_site();
+        let found = self
+            .find_effective_site(query)
+            .ok_or_else(|| anyhow::anyhow!("Site '{}' not found.", query.trim()))?;
+        self.default_site = Some(found.id.clone());
+        self.site_url = found.site_url.clone();
+        self.confluence_url = found.confluence_url.clone();
+        self.deployment = found.deployment;
+        let shadows = self
+            .active_site
+            .as_deref()
+            .map(|active| {
+                self.find_effective_site(active)
+                    .map_or(true, |site| !site.id.eq_ignore_ascii_case(&found.id))
+            })
+            .unwrap_or(false);
+        Ok(if shadows { self.active_site.take() } else { None })
+    }
+
+    /// The site scope of one request (MCP tool call, HTTP request). A per-call "site" wins:
+    /// "all" means every site (Ok(None)), a configured site its canonical id, anything else is
+    /// an error naming the configured sites. Without a per-call site the launch-time --site
+    /// (active_site) applies, else every site. "current_site_id" (the serving client's site)
+    /// and the legacy "default" id are always accepted.
+    pub fn resolve_site_scope(
+        &self,
+        raw_site: Option<&str>,
+        current_site_id: &str,
+    ) -> std::result::Result<Option<String>, String> {
+        match raw_site.map(str::trim).filter(|s| !s.is_empty()) {
+            Some(site) if site.eq_ignore_ascii_case("all") => Ok(None),
+            Some(site) => self
+                .canonical_site_id(site, current_site_id)
+                .map(Some)
+                .ok_or_else(|| self.unknown_site_message(site)),
+            None => Ok(self.active_site.as_deref().map(|active| {
+                self.canonical_site_id(active, current_site_id)
+                    .unwrap_or_else(|| active.trim().to_string())
+            })),
+        }
+    }
+
+    fn canonical_site_id(&self, query: &str, current_site_id: &str) -> Option<String> {
+        let q = query.trim();
+        if let Some(found) = self.find_effective_site(q) {
+            return Some(found.id);
+        }
+        if q.eq_ignore_ascii_case(current_site_id) {
+            return Some(current_site_id.to_string());
+        }
+        q.eq_ignore_ascii_case("default").then(|| "default".to_string())
+    }
+
+    /// "unknown site 'x'; configured sites: a, b" (the error of a mistyped per-call site).
+    pub fn unknown_site_message(&self, raw_site: &str) -> String {
+        let ids: Vec<String> = self.effective_sites().into_iter().map(|s| s.id).collect();
+        if ids.is_empty() {
+            format!("unknown site '{}'; no sites are configured", raw_site.trim())
+        } else {
+            format!("unknown site '{}'; configured sites: {}", raw_site.trim(), ids.join(", "))
+        }
+    }
+
+    /// A write goes to exactly one site, so "site=all" is refused with the configured sites.
+    pub fn reject_all_sites_for_write(&self, raw_site: Option<&str>) -> std::result::Result<(), String> {
+        if raw_site.map(str::trim).is_some_and(|s| s.eq_ignore_ascii_case("all")) {
+            let ids: Vec<String> = self.effective_sites().into_iter().map(|s| s.id).collect();
+            return Err(format!(
+                "site 'all' cannot be used for a write; name one site ({})",
+                if ids.is_empty() { "none configured".to_string() } else { ids.join(", ") }
+            ));
+        }
+        Ok(())
+    }
+
+    /// Removes the site matching "query" (id, name or URL) and returns it with its canonical
+    /// id, for deleting its cache. Removing the last site also clears the legacy URL fields,
+    /// which would otherwise bring it back as the implicit "default" site.
+    pub fn remove_effective_site(&mut self, query: &str) -> Option<SiteProfile> {
+        self.materialize_legacy_site();
+        let found = self.find_effective_site(query)?;
+        if !self.remove_site(&found.id) {
+            return None;
+        }
+        if self.sites.is_empty() {
+            self.site_url.clear();
+            self.confluence_url.clear();
+        } else if let Some(next) = self.default_site_profile() {
+            // Keep the legacy mirror pointing at a site that still exists.
+            if normalize_base_url(&self.site_url) == found.site_url {
+                self.site_url = next.site_url.clone();
+                self.confluence_url = next.confluence_url.clone();
+                self.deployment = next.deployment;
+            }
+        }
+        Some(found)
+    }
+
     /// Removes a site profile by ID (case-insensitive). Returns `true` if removed.
     pub fn remove_site(&mut self, id: &str) -> bool {
         let target = id.trim();
@@ -1168,6 +1279,109 @@ fn expand_tilde(input: &str) -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn lifecycle_site(id: &str, url: &str, deployment: DeploymentKind) -> SiteProfile {
+        SiteProfile {
+            id: id.into(),
+            name: id.into(),
+            site_url: url.into(),
+            deployment,
+            account_id: id.into(),
+            ..SiteProfile::default()
+        }
+    }
+
+    fn two_site_config() -> AppConfig {
+        AppConfig {
+            sites: vec![
+                lifecycle_site("acme", "https://acme.atlassian.net", DeploymentKind::Cloud),
+                lifecycle_site("corp", "https://jira.corp.example", DeploymentKind::DataCenter),
+            ],
+            default_site: Some("acme".into()),
+            site_url: "https://acme.atlassian.net".into(),
+            ..AppConfig::default()
+        }
+    }
+
+    #[test]
+    fn set_default_site_clears_stale_active_site() {
+        let mut cfg = two_site_config();
+        cfg.active_site = Some("acme".into());
+        let cleared = cfg.set_default_site("corp").unwrap();
+        assert_eq!(cleared.as_deref(), Some("acme"));
+        assert!(cfg.active_site.is_none());
+        assert_eq!(cfg.resolved_site_profile().unwrap().id, "corp");
+    }
+
+    #[test]
+    fn set_default_site_syncs_legacy_url_fields() {
+        let mut cfg = two_site_config();
+        cfg.set_default_site("CORP").unwrap();
+        assert_eq!(cfg.default_site.as_deref(), Some("corp"));
+        assert_eq!(cfg.site_url, "https://jira.corp.example");
+        assert_eq!(cfg.deployment, DeploymentKind::DataCenter);
+        assert!(cfg.set_default_site("nope").is_err());
+    }
+
+    #[test]
+    fn set_default_site_keeps_matching_active_site() {
+        let mut cfg = two_site_config();
+        cfg.active_site = Some("corp".into());
+        assert_eq!(cfg.set_default_site("corp").unwrap(), None);
+        assert_eq!(cfg.active_site.as_deref(), Some("corp"));
+    }
+
+    #[test]
+    fn oauth_login_keeps_existing_legacy_dc_site() {
+        // A legacy single-site Data Center configuration, then a discovered Cloud site.
+        let mut cfg = AppConfig {
+            site_url: "https://jira.corp.example".into(),
+            deployment: DeploymentKind::DataCenter,
+            ..AppConfig::default()
+        };
+        cfg.materialize_legacy_site();
+        cfg.upsert_site(lifecycle_site("acme", "https://acme.atlassian.net", DeploymentKind::Cloud));
+        let urls: Vec<String> = cfg.effective_sites().into_iter().map(|s| s.site_url).collect();
+        assert_eq!(urls.len(), 2, "{urls:?}");
+        assert!(urls.contains(&"https://jira.corp.example".to_string()));
+        assert!(urls.contains(&"https://acme.atlassian.net".to_string()));
+
+        // Without the migration the legacy site would be shadowed by "sites".
+        let mut plain = AppConfig {
+            site_url: "https://jira.corp.example".into(),
+            ..AppConfig::default()
+        };
+        plain.upsert_site(lifecycle_site("acme", "https://acme.atlassian.net", DeploymentKind::Cloud));
+        assert_eq!(plain.effective_sites().len(), 1);
+    }
+
+    #[test]
+    fn sites_remove_uses_canonical_id_for_cache_delete() {
+        let mut cfg = two_site_config();
+        let removed = cfg.remove_effective_site("ACME").expect("found case-insensitively");
+        assert_eq!(removed.id, "acme", "the cache is keyed by the canonical id");
+        assert!(cfg.default_site.is_none());
+        // The legacy mirror no longer names the removed site.
+        assert_eq!(cfg.site_url, "https://jira.corp.example");
+        assert!(cfg.remove_effective_site("acme").is_none());
+    }
+
+    #[test]
+    fn removing_last_site_clears_legacy_urls() {
+        let mut cfg = AppConfig {
+            sites: vec![lifecycle_site("corp", "https://jira.corp.example", DeploymentKind::DataCenter)],
+            site_url: "https://jira.corp.example".into(),
+            confluence_url: "https://wiki.corp.example".into(),
+            default_site: Some("corp".into()),
+            active_site: Some("corp".into()),
+            ..AppConfig::default()
+        };
+        cfg.remove_effective_site("corp").unwrap();
+        assert!(cfg.site_url.is_empty() && cfg.confluence_url.is_empty());
+        assert!(cfg.effective_sites().is_empty(), "no implicit 'default' site comes back");
+        assert!(cfg.default_site.is_none() && cfg.active_site.is_none());
+    }
+
 
     #[test]
     fn density_mode_toggle_and_labels() {
