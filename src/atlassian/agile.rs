@@ -250,10 +250,8 @@ impl AtlassianClient {
             .iter()
             .map(|s| SprintSummary {
                 id: s.get("id").and_then(|v| v.as_i64()).unwrap_or(0),
-                board_id: s
-                    .get("originBoardId")
-                    .and_then(|v| v.as_i64())
-                    .unwrap_or(board_id),
+                board_id,
+                origin_board_id: s.get("originBoardId").and_then(|v| v.as_i64()),
                 name: first_nonempty_str(s, &["name"]),
                 state: first_nonempty_str(s, &["state"]).to_ascii_lowercase(),
                 start_date: s
@@ -714,5 +712,44 @@ mod tests {
         assert_eq!(sp2.items.len(), 10);
         assert_eq!(sp2.has_more, Some(false));
         assert_eq!(sp2.next_cursor, None);
+    }
+
+    #[tokio::test]
+    async fn sprint_board_id_is_queried_board_and_origin_is_kept() {
+        let app = Router::new().route(
+            "/rest/agile/1.0/board/20/sprint",
+            get(|| async {
+                Json(json!({
+                    "isLast": true,
+                    "values": [
+                        { "id": 7, "name": "Shared sprint", "state": "ACTIVE", "originBoardId": 10 },
+                        { "id": 8, "name": "Own sprint", "state": "future", "originBoardId": 20 },
+                        { "id": 9, "name": "No origin", "state": "future" }
+                    ]
+                }))
+            }),
+        );
+
+        let base_url = spawn_router(app).await;
+        let auth = AuthManager::with_credentials(
+            "test",
+            StoredCredentials::BearerPat {
+                site_url: base_url.clone(),
+                token: "tok".into(),
+                deployment: DeploymentKind::Cloud,
+            },
+        );
+        let client =
+            AtlassianClient::with_base_urls(&base_url, "", DeploymentKind::Cloud, auth).unwrap();
+
+        let page = client.list_board_sprints_page(20, 50, 0).await.unwrap();
+        assert_eq!(page.items.len(), 3);
+        // Every sprint is reported under the board that was queried, shared or not.
+        assert!(page.items.iter().all(|s| s.board_id == 20));
+        assert_eq!(page.items[0].id, 7);
+        assert_eq!(page.items[0].origin_board_id, Some(10));
+        assert_eq!(page.items[0].state, "active");
+        assert_eq!(page.items[1].origin_board_id, Some(20));
+        assert_eq!(page.items[2].origin_board_id, None);
     }
 }

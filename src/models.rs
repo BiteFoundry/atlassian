@@ -104,7 +104,12 @@ pub struct BoardSummary {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub struct SprintSummary {
     pub id: i64,
+    /// The board this sprint was listed under.
     pub board_id: i64,
+    /// The board that owns the sprint (Jira `originBoardId`); differs from `board_id` when a
+    /// sprint is shared across boards.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub origin_board_id: Option<i64>,
     pub name: String,
     /// `"active"` | `"future"` | `"closed"`
     pub state: String,

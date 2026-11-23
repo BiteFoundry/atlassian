@@ -67,6 +67,18 @@ CREATE TABLE IF NOT EXISTS sprints (
 );
 ";
 
+/// Which boards list which sprints. A sprint shared across boards has one `sprints` row and one
+/// link per board. Additive to schema v2: binaries that predate it ignore the table, so it is
+/// created and backfilled on open without changing `PRAGMA user_version`.
+const BOARD_SPRINTS_TABLE_SQL: &str = "
+CREATE TABLE IF NOT EXISTS board_sprints (
+    site_id   TEXT    NOT NULL DEFAULT 'default',
+    board_id  INTEGER NOT NULL,
+    sprint_id INTEGER NOT NULL,
+    PRIMARY KEY (site_id, board_id, sprint_id)
+);
+";
+
 const V2_ISSUES_TABLE_SQL: &str = "
 CREATE TABLE IF NOT EXISTS issues (
     site_id TEXT NOT NULL DEFAULT 'default',
@@ -267,7 +279,25 @@ fn init_connection(conn: &Connection, is_memory: bool) -> Result<()> {
         }
     }
     ensure_detail_freshness_columns(conn)?;
+    ensure_board_sprints(conn)?;
 
+    Ok(())
+}
+
+/// Creates `board_sprints` and links every cached sprint to the board stored on its row. Runs on
+/// every open and is idempotent, so sprints written by a binary without the table (first upgrade,
+/// or a downgrade and re-upgrade) get their link.
+fn ensure_board_sprints(conn: &Connection) -> Result<()> {
+    conn.execute_batch(BOARD_SPRINTS_TABLE_SQL)
+        .context("Failed to create board_sprints table")?;
+    if table_exists(conn, "sprints")? {
+        conn.execute(
+            "INSERT OR IGNORE INTO board_sprints (site_id, board_id, sprint_id)
+             SELECT site_id, board_id, id FROM sprints",
+            [],
+        )
+        .context("Failed to backfill board_sprints from sprints")?;
+    }
     Ok(())
 }
 

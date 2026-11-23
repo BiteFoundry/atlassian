@@ -554,7 +554,9 @@ impl Storage {
     }
 
     /// Removes cached root pages in `(site_id, space_key)` that are absent from a complete
-    /// root-page listing snapshot. Never touches child pages or other spaces/sites.
+    /// root-page listing snapshot, together with every page cached below them, and returns the
+    /// number of page rows removed. The space key is matched case-insensitively. Pages in
+    /// `keep_ids` are never removed. Never touches other spaces/sites.
     pub fn prune_space_root_pages_for_site(
         &self,
         site_id: &str,
@@ -566,37 +568,31 @@ impl Storage {
         let tx = conn.transaction()?;
         let existing_ids: Vec<String> = {
             let mut stmt = tx.prepare(
-                "SELECT id FROM pages WHERE site_id = ?1 AND space_key = ?2 AND (parent_id IS NULL OR parent_id = '')",
+                "SELECT id FROM pages WHERE site_id = ?1 AND space_key = ?2 COLLATE NOCASE AND (parent_id IS NULL OR parent_id = '')",
             )?;
             let rows = stmt.query_map(params![site_id, space_key], |r| r.get(0))?;
             rows.collect::<rusqlite::Result<Vec<_>>>()?
         };
-        let mut removed = 0usize;
-        for pid in existing_ids {
-            if !keep.contains(pid.as_str()) {
-                tx.execute(
-                    "DELETE FROM pages_fts WHERE site_id = ?1 AND page_id = ?2",
-                    params![site_id, &pid],
-                )?;
-                tx.execute(
-                    "DELETE FROM pages WHERE site_id = ?1 AND id = ?2",
-                    params![site_id, &pid],
-                )?;
-                removed += 1;
-            }
-        }
+        let doomed: Vec<String> = existing_ids
+            .into_iter()
+            .filter(|pid| !keep.contains(pid.as_str()))
+            .collect();
+        let removed = delete_pages_with_descendants(&tx, site_id, doomed, &keep)?;
         tx.commit()?;
         Ok(removed)
     }
 
-    /// Removes cached child pages under `(site_id, parent_id)` absent from a complete child listing.
+    /// Removes cached child pages under `(site_id, parent_id)` absent from a complete child
+    /// listing, together with every page cached below them, and returns the number of page rows
+    /// removed. Pages in `keep_ids` and `parent_id` itself are never removed.
     pub fn prune_child_pages_for_site(
         &self,
         site_id: &str,
         parent_id: &str,
         keep_ids: &[String],
     ) -> Result<usize> {
-        let keep: HashSet<&str> = keep_ids.iter().map(String::as_str).collect();
+        let mut keep: HashSet<&str> = keep_ids.iter().map(String::as_str).collect();
+        keep.insert(parent_id);
         let mut conn = self.lock_conn()?;
         let tx = conn.transaction()?;
         let existing_ids: Vec<String> = {
@@ -605,20 +601,11 @@ impl Storage {
             let rows = stmt.query_map(params![site_id, parent_id], |r| r.get(0))?;
             rows.collect::<rusqlite::Result<Vec<_>>>()?
         };
-        let mut removed = 0usize;
-        for pid in existing_ids {
-            if !keep.contains(pid.as_str()) {
-                tx.execute(
-                    "DELETE FROM pages_fts WHERE site_id = ?1 AND page_id = ?2",
-                    params![site_id, &pid],
-                )?;
-                tx.execute(
-                    "DELETE FROM pages WHERE site_id = ?1 AND id = ?2",
-                    params![site_id, &pid],
-                )?;
-                removed += 1;
-            }
-        }
+        let doomed: Vec<String> = existing_ids
+            .into_iter()
+            .filter(|pid| !keep.contains(pid.as_str()))
+            .collect();
+        let removed = delete_pages_with_descendants(&tx, site_id, doomed, &keep)?;
         tx.commit()?;
         Ok(removed)
     }
@@ -1378,6 +1365,51 @@ fn map_page_hit_row(
     ))
 }
 
+/// Deletes `doomed` pages of `site_id` and every page cached below them (following `parent_id`)
+/// from `pages` and `pages_fts`, so a removed page leaves no orphaned subtree behind. Pages in
+/// `keep` are never deleted and nothing below them is visited. Returns the page rows deleted.
+fn delete_pages_with_descendants(
+    conn: &Connection,
+    site_id: &str,
+    doomed: Vec<String>,
+    keep: &HashSet<&str>,
+) -> Result<usize> {
+    let mut seen: HashSet<String> = doomed.iter().cloned().collect();
+    let mut queue = doomed;
+    {
+        let mut children =
+            conn.prepare("SELECT id FROM pages WHERE site_id = ?1 AND parent_id = ?2")?;
+        let mut next = 0;
+        while next < queue.len() {
+            let pid = queue[next].clone();
+            next += 1;
+            if pid.is_empty() {
+                // An empty `parent_id` marks a root page, not a child of a page with an empty id.
+                continue;
+            }
+            let rows = children.query_map(params![site_id, &pid], |r| r.get::<_, String>(0))?;
+            for child in rows.collect::<rusqlite::Result<Vec<_>>>()? {
+                if !keep.contains(child.as_str()) && seen.insert(child.clone()) {
+                    queue.push(child);
+                }
+            }
+        }
+    }
+
+    let mut removed = 0usize;
+    for pid in &queue {
+        conn.execute(
+            "DELETE FROM pages_fts WHERE site_id = ?1 AND page_id = ?2",
+            params![site_id, pid],
+        )?;
+        removed += conn.execute(
+            "DELETE FROM pages WHERE site_id = ?1 AND id = ?2",
+            params![site_id, pid],
+        )?;
+    }
+    Ok(removed)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1805,5 +1837,103 @@ mod tests {
         let remaining = storage.list_child_pages_for_site("default", "P").unwrap();
         assert_eq!(remaining.len(), 1);
         assert_eq!(remaining[0].id, "A");
+    }
+
+    fn cached_page_ids(storage: &Storage, site_id: &str) -> Vec<String> {
+        let conn = storage.lock_conn().unwrap();
+        let mut stmt = conn
+            .prepare("SELECT id FROM pages WHERE site_id = ?1 ORDER BY id")
+            .unwrap();
+        let rows = stmt.query_map([site_id], |r| r.get::<_, String>(0)).unwrap();
+        rows.collect::<rusqlite::Result<Vec<_>>>().unwrap()
+    }
+
+    fn cached_page_fts_ids(storage: &Storage, site_id: &str) -> Vec<String> {
+        let conn = storage.lock_conn().unwrap();
+        let mut stmt = conn
+            .prepare("SELECT page_id FROM pages_fts WHERE site_id = ?1 ORDER BY page_id")
+            .unwrap();
+        let rows = stmt.query_map([site_id], |r| r.get::<_, String>(0)).unwrap();
+        rows.collect::<rusqlite::Result<Vec<_>>>().unwrap()
+    }
+
+    #[test]
+    fn prune_root_pages_matches_space_key_case_insensitively() {
+        let storage = Storage::open_in_memory().unwrap();
+        storage
+            .upsert_pages_for_site(
+                "default",
+                &[
+                    sample_page("R1", None, "Root one", 1),
+                    sample_page("R2", None, "Root two", 2),
+                ],
+            )
+            .unwrap();
+
+        // Cached rows carry "ENG"; the caller spells the same space "eng".
+        let removed = storage
+            .prune_space_root_pages_for_site("default", "eng", &["R1".to_string()])
+            .unwrap();
+        assert_eq!(removed, 1);
+        assert_eq!(cached_page_ids(&storage, "default"), vec!["R1".to_string()]);
+    }
+
+    #[test]
+    fn prune_root_page_removes_cached_descendants() {
+        let storage = Storage::open_in_memory().unwrap();
+        let tree = [
+            sample_page("KEEP", None, "Kept root", 1),
+            sample_page("K1", Some("KEEP"), "Child of kept root", 1),
+            sample_page("GONE", None, "Removed root", 2),
+            sample_page("C1", Some("GONE"), "Child of removed root", 1),
+            sample_page("G1", Some("C1"), "Grandchild of removed root", 1),
+        ];
+        storage.upsert_pages_for_site("default", &tree).unwrap();
+        storage.upsert_pages_for_site("site-b", &tree).unwrap();
+        assert_eq!(cached_page_fts_ids(&storage, "default").len(), 5);
+
+        let removed = storage
+            .prune_space_root_pages_for_site("default", "ENG", &["KEEP".to_string()])
+            .unwrap();
+
+        // The root and everything cached below it are gone, from the table and from FTS.
+        let expected = vec!["K1".to_string(), "KEEP".to_string()];
+        assert_eq!(cached_page_ids(&storage, "default"), expected);
+        assert_eq!(cached_page_fts_ids(&storage, "default"), expected);
+        assert_eq!(removed, 3);
+        assert!(storage
+            .list_child_pages_for_site("default", "GONE")
+            .unwrap()
+            .is_empty());
+        // Same ids on another site are untouched.
+        assert_eq!(cached_page_ids(&storage, "site-b").len(), 5);
+        assert_eq!(cached_page_fts_ids(&storage, "site-b").len(), 5);
+    }
+
+    #[test]
+    fn prune_child_page_removes_cached_descendants() {
+        let storage = Storage::open_in_memory().unwrap();
+        storage
+            .upsert_pages_for_site(
+                "default",
+                &[
+                    sample_page("P", None, "Parent", 1),
+                    sample_page("A", Some("P"), "Kept child", 1),
+                    sample_page("A1", Some("A"), "Child of kept child", 1),
+                    sample_page("B", Some("P"), "Removed child", 2),
+                    sample_page("B1", Some("B"), "Grandchild", 1),
+                    sample_page("B2", Some("B1"), "Great-grandchild", 1),
+                ],
+            )
+            .unwrap();
+
+        let removed = storage
+            .prune_child_pages_for_site("default", "P", &["A".to_string()])
+            .unwrap();
+
+        let expected = vec!["A".to_string(), "A1".to_string(), "P".to_string()];
+        assert_eq!(cached_page_ids(&storage, "default"), expected);
+        assert_eq!(cached_page_fts_ids(&storage, "default"), expected);
+        assert_eq!(removed, 3);
     }
 }
