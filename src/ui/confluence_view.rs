@@ -12,10 +12,11 @@ use crate::{
     config::DensityMode,
     models::PageDetail,
     ui::{
-        app::{AppState, PaneFocus, UiState},
+        app::{space_group_key, AppState, PaneFocus, SpacePaneRow, UiState},
         doc_view::{blocks_or_markdown, render_blocks_with_options, truncate_width},
         draw_horizontal_hairline, fill_surface,
         hitmap::{ButtonId, HitMap, HitTarget},
+        visible_window,
     },
 };
 
@@ -88,149 +89,20 @@ fn draw_space_and_tree(frame: &mut Frame, area: Rect, app: &AppState, ui: &mut U
     } else {
         0
     };
-    let space_h = (app.spaces.len() as u16 + 1 + extra_group_rows)
-        .clamp(3, (inner.height / 2).max(7).min(12));
+    let filter_rows = u16::from(space_filter_shown(ui));
+    let space_h = u16::try_from(app.spaces.len())
+        .unwrap_or(u16::MAX)
+        .saturating_add(1 + filter_rows + extra_group_rows)
+        .clamp(3, (inner.height / 2).clamp(7, 12));
     let rows = Layout::default()
         .direction(Direction::Vertical)
         .constraints([Constraint::Length(space_h), Constraint::Min(2)])
         .split(inner);
 
-    // Space Selector (grouped by site with collapsible headers in multi-site All Sites mode)
-    let mut s_lines = vec![Line::from(Span::styled(" SPACES", theme.muted_style()))];
-    if app.spaces.is_empty() {
-        s_lines.push(Line::from(Span::styled("  (no spaces)", theme.muted_style())));
-    } else if multi_site {
-        let mut cursor_y = rows[0].y + 1;
-        let max_y = rows[0].bottom();
-        let mut site_order: Vec<String> = Vec::new();
-        for site in app.config.enabled_sites() {
-            if !site_order.iter().any(|s| s.eq_ignore_ascii_case(&site.id)) {
-                site_order.push(site.id);
-            }
-        }
-        for sid in &app.space_site_ids {
-            if !site_order.iter().any(|s| s.eq_ignore_ascii_case(sid)) {
-                site_order.push(sid.clone());
-            }
-        }
-        for site_id in site_order {
-            let group_indices: Vec<usize> = app
-                .spaces
-                .iter()
-                .enumerate()
-                .filter(|(i, _)| {
-                    app.space_site_ids
-                        .get(*i)
-                        .map(|s| s.eq_ignore_ascii_case(&site_id))
-                        .unwrap_or(false)
-                })
-                .map(|(i, _)| i)
-                .collect();
-            if group_indices.is_empty() || cursor_y >= max_y {
-                continue;
-            }
-            let collapse_key = format!("wiki:{site_id}");
-            let collapsed = ui.collapsed_site_groups.contains(&collapse_key);
-            let group_idx = ui.site_group_keys.len();
-            ui.site_group_keys.push(collapse_key);
-            let chevron = if collapsed { "▸" } else { "▾" };
-            let site_label = app.site_display_label(&site_id);
-            s_lines.push(Line::from(Span::styled(
-                truncate_width(
-                    &format!(" {chevron} {site_label} ({})", group_indices.len()),
-                    rows[0].width as usize,
-                ),
-                theme.accent_style().patch(sidebar_style),
-            )));
-            ui.hitmap.add_line(
-                rows[0].x,
-                cursor_y,
-                rows[0].width,
-                HitTarget::SiteGroupHeader(group_idx),
-            );
-            cursor_y += 1;
-
-            if collapsed {
-                continue;
-            }
-            for idx in group_indices {
-                if cursor_y >= max_y {
-                    break;
-                }
-                let sp = &app.spaces[idx];
-                let is_sel = ui.confluence_ui.selected_space == idx;
-                let style = if focused && ui.confluence_ui.nav_section == 0 && is_sel {
-                    theme.nav_selection()
-                } else if is_sel {
-                    if theme.no_color {
-                        Style::default().add_modifier(Modifier::BOLD)
-                    } else {
-                        Style::default()
-                            .fg(theme.confluence_teal)
-                            .add_modifier(Modifier::BOLD)
-                    }
-                } else {
-                    sidebar_style
-                };
-                let pfx = if is_sel { "  ▸ " } else { "    " };
-                let pin = if sp.pinned { "★ " } else { "" };
-                s_lines.push(Line::from(Span::styled(
-                    truncate_width(
-                        &format!("{pfx}{pin}{} ({})", sp.name, sp.key),
-                        rows[0].width as usize,
-                    ),
-                    style,
-                )));
-                ui.hitmap.add_line(
-                    rows[0].x,
-                    cursor_y,
-                    rows[0].width,
-                    HitTarget::SpaceItem(idx),
-                );
-                cursor_y += 1;
-            }
-        }
-    } else {
-        for (idx, sp) in app
-            .spaces
-            .iter()
-            .enumerate()
-            .take(rows[0].height.saturating_sub(1) as usize)
-        {
-            let is_sel = ui.confluence_ui.selected_space == idx;
-            let style = if focused && ui.confluence_ui.nav_section == 0 && is_sel {
-                theme.nav_selection()
-            } else if is_sel {
-                if theme.no_color {
-                    Style::default().add_modifier(Modifier::BOLD)
-                } else {
-                    Style::default()
-                        .fg(theme.confluence_teal)
-                        .add_modifier(Modifier::BOLD)
-                }
-            } else {
-                sidebar_style
-            };
-            let pfx = if is_sel { "▸ " } else { "  " };
-            let pin = if sp.pinned { "★ " } else { "" };
-            s_lines.push(Line::from(Span::styled(
-                truncate_width(
-                    &format!("{pfx}{pin}{} ({})", sp.name, sp.key),
-                    rows[0].width as usize,
-                ),
-                style,
-            )));
-            ui.hitmap.add_line(
-                rows[0].x,
-                rows[0].y + 1 + idx as u16,
-                rows[0].width,
-                HitTarget::SpaceItem(idx),
-            );
-        }
-    }
-    frame.render_widget(Paragraph::new(s_lines).style(sidebar_style), rows[0]);
+    draw_spaces_pane(frame, rows[0], app, ui, multi_site);
 
     // Expandable Hierarchical Page Tree
+    let theme = &ui.theme;
     let tree = app.current_confluence_tree(ui);
     let tree_h = rows[1].height.saturating_sub(1) as usize;
     let mut t_lines = vec![Line::from(Span::styled(
@@ -286,6 +158,168 @@ fn draw_space_and_tree(frame: &mut Frame, area: Rect, app: &AppState, ui: &mut U
         }
     }
     frame.render_widget(Paragraph::new(t_lines).style(sidebar_style), rows[1]);
+}
+
+/// True when the SPACES pane shows its filter row (typing, or a query is kept).
+fn space_filter_shown(ui: &UiState) -> bool {
+    ui.confluence_ui.space_filter_active || !ui.confluence_ui.space_filter.text.is_empty()
+}
+
+/// SPACES pane: title, optional filter row, and the window of rows that keeps the
+/// selected space on screen (grouped under site headers in All Sites mode).
+fn draw_spaces_pane(
+    frame: &mut Frame,
+    area: Rect,
+    app: &AppState,
+    ui: &mut UiState,
+    multi_site: bool,
+) {
+    let pane_rows = app.space_pane_rows(ui);
+    let show_filter = space_filter_shown(ui);
+    let selected = ui.confluence_ui.selected_space;
+    let sel_row = pane_rows
+        .iter()
+        .position(|row| *row == SpacePaneRow::Space(selected));
+    let list_h = (area.height as usize).saturating_sub(1 + usize::from(show_filter));
+    let (mut scroll, mut window) = visible_window(
+        sel_row.unwrap_or(ui.confluence_ui.space_scroll),
+        ui.confluence_ui.space_scroll,
+        list_h,
+        pane_rows.len(),
+    );
+    // Scrolling up onto a group's first space also brings its site header into view.
+    if let Some(r) = sel_row.filter(|&r| r == scroll && r > 0 && list_h > 1) {
+        if matches!(pane_rows[r - 1], SpacePaneRow::SiteHeader { .. }) {
+            scroll = r - 1;
+            window = scroll..(scroll + list_h).min(pane_rows.len());
+        }
+    }
+    ui.confluence_ui.space_scroll = scroll;
+
+    let theme = &ui.theme;
+    let focused = ui.focus == PaneFocus::Nav;
+    let sidebar_style = theme.surface_style(theme.bg_sidebar);
+    let is_space = |row: &SpacePaneRow| matches!(row, SpacePaneRow::Space(_));
+    let listed = pane_rows.iter().filter(|row| is_space(row)).count();
+    let matched: usize = if multi_site {
+        pane_rows
+            .iter()
+            .map(|row| match row {
+                SpacePaneRow::SiteHeader { spaces, .. } => *spaces,
+                SpacePaneRow::Space(_) => 0,
+            })
+            .sum()
+    } else {
+        listed
+    };
+
+    let mut title = " SPACES".to_string();
+    if window.start > 0 || window.end < pane_rows.len() {
+        let up = if window.start > 0 { "▲" } else { "" };
+        let down = if window.end < pane_rows.len() {
+            "▼"
+        } else {
+            ""
+        };
+        match sel_row {
+            Some(r) => {
+                let pos = pane_rows[..=r].iter().filter(|row| is_space(row)).count();
+                title.push_str(&format!(" {up}{down} {pos}/{listed}"));
+            }
+            None => title.push_str(&format!(" {up}{down} {listed}")),
+        }
+    }
+    let mut lines = vec![Line::from(Span::styled(
+        truncate_width(&title, area.width as usize),
+        theme.muted_style(),
+    ))];
+    if show_filter {
+        let cursor = if ui.confluence_ui.space_filter_active {
+            "▏"
+        } else {
+            ""
+        };
+        lines.push(Line::from(vec![
+            Span::styled(" / ", theme.accent_style()),
+            Span::raw(ui.confluence_ui.space_filter.text.clone()),
+            Span::styled(cursor, theme.accent_style()),
+            Span::styled(
+                format!("  {matched}/{}", app.spaces.len()),
+                theme.muted_style(),
+            ),
+        ]));
+    }
+
+    let list_y = area.y + 1 + u16::from(show_filter);
+    if app.spaces.is_empty() {
+        lines.push(Line::from(Span::styled(
+            "  (no spaces)",
+            theme.muted_style(),
+        )));
+    } else if pane_rows.is_empty() {
+        lines.push(Line::from(Span::styled(
+            "  (no matching spaces)",
+            theme.muted_style(),
+        )));
+    }
+    for (offset, row) in pane_rows[window].iter().enumerate() {
+        let y = list_y + offset as u16;
+        match row {
+            SpacePaneRow::SiteHeader {
+                site_id,
+                spaces,
+                collapsed,
+            } => {
+                let group_idx = ui.site_group_keys.len();
+                ui.site_group_keys.push(space_group_key(site_id));
+                let chevron = if *collapsed { "▸" } else { "▾" };
+                let site_label = app.site_display_label(site_id);
+                lines.push(Line::from(Span::styled(
+                    truncate_width(
+                        &format!(" {chevron} {site_label} ({spaces})"),
+                        area.width as usize,
+                    ),
+                    theme.accent_style().patch(sidebar_style),
+                )));
+                ui.hitmap
+                    .add_line(area.x, y, area.width, HitTarget::SiteGroupHeader(group_idx));
+            }
+            SpacePaneRow::Space(idx) => {
+                let sp = &app.spaces[*idx];
+                let is_sel = selected == *idx;
+                let style = if focused && ui.confluence_ui.nav_section == 0 && is_sel {
+                    theme.nav_selection()
+                } else if is_sel {
+                    if theme.no_color {
+                        Style::default().add_modifier(Modifier::BOLD)
+                    } else {
+                        Style::default()
+                            .fg(theme.confluence_teal)
+                            .add_modifier(Modifier::BOLD)
+                    }
+                } else {
+                    sidebar_style
+                };
+                let pfx = match (multi_site, is_sel) {
+                    (true, true) => "  ▸ ",
+                    (true, false) => "    ",
+                    (false, true) => "▸ ",
+                    (false, false) => "  ",
+                };
+                let pin = if sp.pinned { "★ " } else { "" };
+                lines.push(Line::from(Span::styled(
+                    truncate_width(
+                        &format!("{pfx}{pin}{} ({})", sp.name, sp.key),
+                        area.width as usize,
+                    ),
+                    style,
+                )));
+                ui.hitmap
+                    .add_line(area.x, y, area.width, HitTarget::SpaceItem(*idx));
+            }
+        }
+    }
+    frame.render_widget(Paragraph::new(lines).style(sidebar_style), area);
 }
 
 fn draw_wiki_reader(frame: &mut Frame, area: Rect, app: &AppState, ui: &mut UiState) {
@@ -641,4 +675,216 @@ fn draw_toc_drawer(frame: &mut Frame, area: Rect, app: &AppState, ui: &mut UiSta
         );
     }
     frame.render_widget(Paragraph::new(lines).style(sidebar_style), inner);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{
+        atlassian::AtlassianClient,
+        auth::AuthManager,
+        config::{AppConfig, DeploymentKind, Persona, SiteProfile},
+        models::{SiteScope, SpaceSummary},
+        storage::Storage,
+        sync,
+    };
+    use ratatui::{backend::TestBackend, Terminal};
+    use tokio::sync::mpsc;
+
+    fn app_and_ui(cfg: AppConfig) -> (AppState, UiState) {
+        let auth = AuthManager::new("test");
+        let client = AtlassianClient::new(cfg.clone(), auth.clone()).unwrap();
+        let storage = Storage::open_in_memory().unwrap();
+        let (core_tx, _) = mpsc::unbounded_channel();
+        let sync_ctrl =
+            sync::spawn_sync_engine(cfg.clone(), client.clone(), storage.clone(), core_tx);
+        let (ui_tx, _) = mpsc::unbounded_channel();
+        let app = AppState::new_with_persona(
+            cfg.clone(),
+            Persona::Confluence,
+            auth,
+            client,
+            storage,
+            sync_ctrl,
+            ui_tx,
+        );
+        let mut ui = UiState::from_config_with_persona(&cfg, Persona::Confluence);
+        ui.focus = PaneFocus::Nav;
+        (app, ui)
+    }
+
+    fn single_site() -> (AppState, UiState) {
+        app_and_ui(AppConfig {
+            site_url: "https://acme.atlassian.net".into(),
+            ..Default::default()
+        })
+    }
+
+    fn space(key: &str, name: &str) -> SpaceSummary {
+        SpaceSummary {
+            id: format!("id-{key}"),
+            key: key.into(),
+            name: name.into(),
+            space_type: "global".into(),
+            ..Default::default()
+        }
+    }
+
+    fn numbered_space(i: usize) -> SpaceSummary {
+        space(&format!("S{i:03}"), &format!("Space {i:03}"))
+    }
+
+    /// Draws the Confluence nav pane into a `width` x `height` buffer; returns its rows.
+    fn render_nav(app: &AppState, ui: &mut UiState, width: u16, height: u16) -> Vec<String> {
+        ui.hitmap.clear();
+        ui.site_group_keys.clear();
+        let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+        terminal
+            .draw(|f| draw_space_and_tree(f, Rect::new(0, 0, width, height), app, ui))
+            .unwrap();
+        let buf = terminal.backend().buffer();
+        (0..height)
+            .map(|y| (0..width).map(|x| buf[(x, y)].symbol()).collect())
+            .collect()
+    }
+
+    fn row_of(rows: &[String], text: &str) -> Option<u16> {
+        rows.iter().position(|r| r.contains(text)).map(|y| y as u16)
+    }
+
+    #[tokio::test]
+    async fn spaces_pane_scrolls_to_selected_row_beyond_height() {
+        let (mut app, mut ui) = single_site();
+        app.spaces = (0..300).map(numbered_space).collect();
+        ui.confluence_ui.selected_space = 250;
+
+        let rows = render_nav(&app, &mut ui, 40, 20);
+        let y = row_of(&rows, "Space 250 (S250)").expect("selected space 250 is on screen");
+        assert!(
+            rows[y as usize].contains("▸ Space 250"),
+            "row is marked selected"
+        );
+        assert_eq!(ui.hitmap.hit(y, 4), Some(HitTarget::SpaceItem(250)));
+        assert!(
+            row_of(&rows, "Space 000").is_none(),
+            "top of the list scrolled away"
+        );
+        assert!(
+            row_of(&rows, "SPACES ▲▼ 251/300").is_some(),
+            "clipped title shows position:\n{}",
+            rows.join("\n")
+        );
+
+        // Back to the top: the window follows the selection up again.
+        ui.confluence_ui.selected_space = 0;
+        let rows = render_nav(&app, &mut ui, 40, 20);
+        let y = row_of(&rows, "Space 000 (S000)").expect("space 0 is on screen");
+        assert_eq!(ui.hitmap.hit(y, 4), Some(HitTarget::SpaceItem(0)));
+        assert!(row_of(&rows, "Space 250").is_none());
+        assert!(
+            row_of(&rows, "SPACES ▼ 1/300").is_some(),
+            "{}",
+            rows.join("\n")
+        );
+    }
+
+    #[tokio::test]
+    async fn spaces_pane_filter_narrows_rows_and_keeps_real_indices() {
+        let (mut app, mut ui) = single_site();
+        app.spaces = vec![
+            space("ENG", "Engineering"),
+            space("OPS", "Operations"),
+            space("~jdoe", "John Doe"),
+            space("DOCS", "Engineering Docs"),
+            space("ENGX", "Experiments"),
+        ];
+        ui.confluence_ui.space_filter.set_text("eng");
+        ui.confluence_ui.space_filter_active = true;
+        ui.confluence_ui.selected_space = 3;
+
+        // Ranked: exact key, key prefix, then name word prefix; indices stay real.
+        assert_eq!(app.visible_space_indices(&ui), vec![0, 4, 3]);
+
+        let rows = render_nav(&app, &mut ui, 40, 24);
+        assert!(
+            row_of(&rows, "/ eng▏  3/5").is_some(),
+            "filter row:\n{}",
+            rows.join("\n")
+        );
+        let eng = row_of(&rows, "Engineering (ENG)").unwrap();
+        let engx = row_of(&rows, "Experiments (ENGX)").unwrap();
+        let docs = row_of(&rows, "Engineering Docs (DOCS)").unwrap();
+        assert!(eng < engx && engx < docs, "rows follow the ranking");
+        assert_eq!(ui.hitmap.hit(eng, 4), Some(HitTarget::SpaceItem(0)));
+        assert_eq!(ui.hitmap.hit(engx, 4), Some(HitTarget::SpaceItem(4)));
+        assert_eq!(ui.hitmap.hit(docs, 4), Some(HitTarget::SpaceItem(3)));
+        assert!(
+            rows[docs as usize].contains("▸ Engineering Docs"),
+            "selection kept"
+        );
+        assert!(row_of(&rows, "Operations").is_none());
+        assert!(row_of(&rows, "John Doe").is_none());
+
+        // `~` keeps personal spaces only.
+        ui.confluence_ui.space_filter.set_text("~");
+        assert_eq!(app.visible_space_indices(&ui), vec![2]);
+        let rows = render_nav(&app, &mut ui, 40, 24);
+        let jdoe = row_of(&rows, "John Doe (~jdoe)").unwrap();
+        assert_eq!(ui.hitmap.hit(jdoe, 4), Some(HitTarget::SpaceItem(2)));
+    }
+
+    #[tokio::test]
+    async fn spaces_pane_multi_site_scrolls_with_group_headers() {
+        let site = |id: &str, name: &str| SiteProfile {
+            id: id.into(),
+            name: name.into(),
+            site_url: format!("https://{id}.example.com"),
+            deployment: DeploymentKind::Cloud,
+            account_id: "default".into(),
+            enabled: true,
+            ..Default::default()
+        };
+        let (mut app, mut ui) = app_and_ui(AppConfig {
+            sites: vec![site("site-a", "Alpha"), site("site-b", "Beta")],
+            default_site: Some("site-a".into()),
+            ..Default::default()
+        });
+        app.site_scope = SiteScope::All;
+        app.spaces = (0..80).map(numbered_space).collect();
+        app.space_site_ids = (0..80)
+            .map(|i| if i < 40 { "site-a" } else { "site-b" }.to_string())
+            .collect();
+        assert!(app.is_multi_site_all_mode());
+
+        // Deep in the second group: Beta's space 75 scrolls into view.
+        ui.confluence_ui.selected_space = 75;
+        let rows = render_nav(&app, &mut ui, 40, 20);
+        let y = row_of(&rows, "Space 075 (S075)").expect("space 75 is on screen");
+        assert_eq!(ui.hitmap.hit(y, 4), Some(HitTarget::SpaceItem(75)));
+        assert!(
+            row_of(&rows, "Alpha (40)").is_none(),
+            "first group header scrolled away"
+        );
+        assert!(row_of(&rows, "76/80").is_some(), "{}", rows.join("\n"));
+
+        // First space of the second group: its header row is on screen and clickable.
+        ui.confluence_ui.selected_space = 40;
+        let rows = render_nav(&app, &mut ui, 40, 20);
+        let header = row_of(&rows, "▾ Beta (40)").expect("Beta header on screen");
+        let first = row_of(&rows, "Space 040 (S040)").unwrap();
+        assert_eq!(first, header + 1);
+        assert_eq!(ui.hitmap.hit(first, 4), Some(HitTarget::SpaceItem(40)));
+        match ui.hitmap.hit(header, 4) {
+            Some(HitTarget::SiteGroupHeader(idx)) => {
+                assert_eq!(ui.site_group_keys[idx], "wiki:site-b")
+            }
+            other => panic!("expected Beta group header, got {other:?}"),
+        }
+
+        // Navigation order is the display order: collapsing Alpha hides its spaces.
+        ui.collapsed_site_groups.insert("wiki:site-a".into());
+        let visible = app.visible_space_indices(&ui);
+        assert_eq!(visible.first(), Some(&40));
+        assert_eq!(visible.len(), 40);
+    }
 }

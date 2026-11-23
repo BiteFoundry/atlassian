@@ -93,6 +93,7 @@ Most Jira and Confluence integrations break agents in predictable ways: dumping 
 | `c` / `n` / `e` | Add comment / Create issue or child page / Edit (`Ctrl+E` `$EDITOR`) | Jira / Confluence |
 | `g` / `Backspace` | Jump across linked `Jira <-> Confluence` refs / navigate back | Global |
 | `Space` / `t` | Expand or collapse Confluence tree node / toggle TOC drawer | Confluence |
+| `/` | Filter the issue list, or the SPACES pane when it has focus (`~` = personal spaces; `Enter` opens, `Esc` clears, then closes) | Issues / Confluence |
 | `u` / `Ctrl+F` / `v` / `d` | Link Extractor / File Picker (`z` zoxide) / Image Preview / Download | Global |
 | `Ctrl+S` | Multi-Site Switcher (`All Sites` federated view, Cloud + DC) | Global |
 | `Ctrl+P` / `:` | Command Palette (fuzzy search every action) | Global |
