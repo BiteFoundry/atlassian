@@ -335,6 +335,15 @@ pub struct IssueSummary {
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
+pub struct IssueCustomField {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    pub value: serde_json::Value,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub markdown: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
 pub struct IssueDetail {
     pub summary: IssueSummary,
     pub description_raw: String,
@@ -350,6 +359,9 @@ pub struct IssueDetail {
     /// Collections this read could not confirm in full (failed or truncated subresource).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub incomplete: Vec<String>,
+    /// Populated Jira `customfield_*` entries keyed by field ID (excluding built-in story points / sprint).
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub custom_fields: std::collections::BTreeMap<String, IssueCustomField>,
 }
 
 const ISSUE_COMPACT_OMITTED_FIELDS: &[&str] = &[
@@ -406,6 +418,14 @@ impl IssueDetail {
                 serde_json::json!(len)
             }
         };
+        let custom_field_summaries: Vec<serde_json::Value> = self
+            .custom_fields
+            .iter()
+            .map(|(id, cf)| match cf.name.as_deref().filter(|s| !s.trim().is_empty()) {
+                Some(name) => serde_json::json!({ "id": id, "name": name }),
+                None => serde_json::json!({ "id": id }),
+            })
+            .collect();
         serde_json::json!({
             "key": self.summary.key,
             "summary": self.summary.summary,
@@ -421,9 +441,117 @@ impl IssueDetail {
                 "components": self.components.len(),
                 "labels": self.summary.labels.len(),
                 "fields": ISSUE_COMPACT_OMITTED_FIELDS,
+                "custom_fields": custom_field_summaries,
             },
             "hint": hint,
         })
+    }
+
+    /// Returns only the requested standard or custom fields by issue key, keeping responses compact
+    /// while distinguishing truly absent fields (`missing_fields`) from omitted ones.
+    pub(crate) fn projected_output(&self, requested_fields: &[String]) -> serde_json::Value {
+        let mut fields_out = serde_json::Map::new();
+        let mut missing_fields: Vec<String> = Vec::new();
+        let mut incomplete_out: Vec<String> = Vec::new();
+
+        let mut push_incomplete = |col: &str| {
+            if self.incomplete.iter().any(|n| n == col)
+                && !incomplete_out.iter().any(|n| n == col)
+            {
+                incomplete_out.push(col.to_string());
+            }
+        };
+
+        for raw in requested_fields {
+            let trimmed = raw.trim();
+            if trimmed.is_empty() {
+                continue;
+            }
+            let norm = trimmed.to_ascii_lowercase();
+            let stripped = norm
+                .strip_prefix("summary.")
+                .or_else(|| norm.strip_prefix("custom_fields."))
+                .unwrap_or(&norm);
+
+            let matched_standard = match stripped {
+                "id" => Some(("summary.id", serde_json::json!(self.summary.id))),
+                "key" => Some(("key", serde_json::json!(self.summary.key))),
+                "project_key" => Some(("summary.project_key", serde_json::json!(self.summary.project_key))),
+                "summary" => Some(("summary", serde_json::json!(self.summary.summary))),
+                "status" => Some(("status", serde_json::json!(self.summary.status))),
+                "priority" => Some(("summary.priority", serde_json::json!(self.summary.priority))),
+                "issue_type" => Some(("summary.issue_type", serde_json::json!(self.summary.issue_type))),
+                "assignee" => Some(("summary.assignee", serde_json::json!(self.summary.assignee))),
+                "reporter" => Some(("summary.reporter", serde_json::json!(self.summary.reporter))),
+                "parent_key" => Some(("summary.parent_key", serde_json::json!(self.summary.parent_key))),
+                "parent_summary" => Some(("summary.parent_summary", serde_json::json!(self.summary.parent_summary))),
+                "labels" => Some(("labels", serde_json::json!(self.summary.labels))),
+                "story_points" => Some(("summary.story_points", serde_json::json!(self.summary.story_points))),
+                "sprint_id" => Some(("summary.sprint_id", serde_json::json!(self.summary.sprint_id))),
+                "sprint_name" => Some(("summary.sprint_name", serde_json::json!(self.summary.sprint_name))),
+                "comment_count" => Some(("summary.comment_count", serde_json::json!(self.summary.comment_count))),
+                "attachment_count" => Some(("summary.attachment_count", serde_json::json!(self.summary.attachment_count))),
+                "created_at" => Some(("summary.created_at", serde_json::json!(self.summary.created_at))),
+                "updated_at" => Some(("summary.updated_at", serde_json::json!(self.summary.updated_at))),
+                "web_url" => Some(("summary.web_url", serde_json::json!(self.summary.web_url))),
+                "description_markdown" | "description" => {
+                    Some(("description_markdown", serde_json::json!(self.description_markdown)))
+                }
+                "description_raw" => Some(("description_raw", serde_json::json!(self.description_raw))),
+                "description_blocks" => Some(("description_blocks", serde_json::json!(self.description_blocks))),
+                "fix_versions" => Some(("fix_versions", serde_json::json!(self.fix_versions))),
+                "components" => Some(("components", serde_json::json!(self.components))),
+                "subtasks" => Some(("subtasks", serde_json::json!(self.subtasks))),
+                "linked_issues" => Some(("linked_issues", serde_json::json!(self.linked_issues))),
+                "linked_pages" => {
+                    push_incomplete("linked_pages");
+                    Some(("linked_pages", serde_json::json!(self.linked_pages)))
+                }
+                "attachments" => Some(("attachments", serde_json::json!(self.attachments))),
+                "comments" => {
+                    push_incomplete("comments");
+                    Some(("comments", serde_json::json!(self.comments)))
+                }
+                "custom_fields" => Some(("custom_fields", serde_json::json!(self.custom_fields))),
+                _ => None,
+            };
+
+            if let Some((out_key, val)) = matched_standard {
+                fields_out.insert(out_key.to_string(), val);
+                continue;
+            }
+
+            // Match populated custom field by ID (case-insensitive) or human display name.
+            let mut matched_custom = false;
+            for (cf_id, cf) in &self.custom_fields {
+                let id_matches = cf_id.eq_ignore_ascii_case(stripped);
+                let name_matches = cf
+                    .name
+                    .as_deref()
+                    .map(|n| n.trim().eq_ignore_ascii_case(trimmed))
+                    .unwrap_or(false);
+                if id_matches || name_matches {
+                    fields_out.insert(cf_id.clone(), serde_json::json!(cf));
+                    matched_custom = true;
+                }
+            }
+
+            if !matched_custom && !missing_fields.iter().any(|m| m == trimmed) {
+                missing_fields.push(trimmed.to_string());
+            }
+        }
+
+        let mut out = serde_json::json!({
+            "key": self.summary.key,
+            "fields": fields_out,
+        });
+        if !missing_fields.is_empty() {
+            out["missing_fields"] = serde_json::json!(missing_fields);
+        }
+        if !incomplete_out.is_empty() {
+            out["incomplete"] = serde_json::json!(incomplete_out);
+        }
+        out
     }
 
     pub(crate) fn write_output(&self) -> serde_json::Value {
@@ -1187,5 +1315,90 @@ mod tests {
             ..page
         };
         assert!(clean_page.output(false).get("incomplete").is_none());
+    }
+
+    #[test]
+    fn compact_surfaces_custom_fields_and_projected_output_fetches_by_id_or_name() {
+        let mut custom_fields = std::collections::BTreeMap::new();
+        custom_fields.insert(
+            "customfield_10042".to_string(),
+            IssueCustomField {
+                name: Some("Acceptance Criteria".to_string()),
+                value: serde_json::json!("- Must return 200 OK\n- Must log audit event"),
+                markdown: None,
+            },
+        );
+        custom_fields.insert(
+            "customfield_10099".to_string(),
+            IssueCustomField {
+                name: None,
+                value: serde_json::json!("Tier-1"),
+                markdown: None,
+            },
+        );
+
+        let issue = IssueDetail {
+            summary: IssueSummary {
+                key: "ENG-99".into(),
+                summary: "Ship AC projection".into(),
+                assignee: Some(UserSummary {
+                    id: "u1".into(),
+                    display_name: "Elena Park".into(),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            },
+            description_markdown: "Main body".into(),
+            comments: vec![IssueComment {
+                id: "c1".into(),
+                body_markdown: "Looks good".into(),
+                ..Default::default()
+            }],
+            incomplete: vec!["linked_pages".into()],
+            custom_fields,
+            ..Default::default()
+        };
+
+        let compact = issue.compact_output("get_jira_issue with fields:[...] or compact:false");
+        assert_eq!(
+            compact["omitted"]["custom_fields"],
+            serde_json::json!([
+                { "id": "customfield_10042", "name": "Acceptance Criteria" },
+                { "id": "customfield_10099" }
+            ])
+        );
+
+        // Fetch by custom field display name, standard shorthand, customfield ID, and unknown field.
+        let projected = issue.projected_output(&[
+            "Acceptance Criteria".to_string(),
+            "assignee".to_string(),
+            "customfield_10099".to_string(),
+            "linked_pages".to_string(),
+            "nonexistent_field".to_string(),
+        ]);
+        assert_eq!(projected["key"], "ENG-99");
+        assert_eq!(
+            projected["fields"]["customfield_10042"]["name"],
+            "Acceptance Criteria"
+        );
+        assert_eq!(
+            projected["fields"]["customfield_10042"]["value"],
+            "- Must return 200 OK\n- Must log audit event"
+        );
+        assert_eq!(
+            projected["fields"]["summary.assignee"]["display_name"],
+            "Elena Park"
+        );
+        assert_eq!(projected["fields"]["customfield_10099"]["value"], "Tier-1");
+        assert_eq!(
+            projected["missing_fields"],
+            serde_json::json!(["nonexistent_field"])
+        );
+        assert_eq!(projected["incomplete"], serde_json::json!(["linked_pages"]));
+        // Compact/full backwards compatibility when deserializing legacy JSON without custom_fields
+        let legacy: IssueDetail =
+            serde_json::from_str(r#"{"summary":{"id":"","key":"OLD-1","project_key":"","summary":"","status":{"id":"","name":"","category":"todo"},"priority":null,"issue_type":{"id":"","name":"","subtask":false,"epic":false},"assignee":null,"reporter":null,"parent_key":null,"parent_summary":null,"labels":[],"story_points":null,"sprint_id":null,"sprint_name":null,"comment_count":0,"attachment_count":0,"created_at":"","updated_at":"","web_url":""},"description_raw":"","description_markdown":"","description_blocks":[],"fix_versions":[],"components":[],"subtasks":[],"linked_issues":[],"linked_pages":[],"attachments":[],"comments":[]}"#)
+                .unwrap();
+        assert!(legacy.custom_fields.is_empty());
     }
 }

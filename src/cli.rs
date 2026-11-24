@@ -457,6 +457,9 @@ pub enum Command {
         /// Return the full structure: native body, blocks, comments, attachments
         #[arg(short = 'f', long, requires = "json", conflicts_with = "compact")]
         full: bool,
+        /// Comma-separated omitted standard fields, customfield_<id>, or custom field display names
+        #[arg(long = "fields", value_delimiter = ',', requires = "json", conflicts_with = "full")]
+        fields: Vec<String>,
     },
     /// Create a new Jira issue
     #[command(visible_alias = "new")]
@@ -1236,6 +1239,9 @@ pub enum JiraSubcommand {
         /// Return the full structure: native body, blocks, comments, attachments
         #[arg(short = 'f', long, requires = "json", conflicts_with = "compact")]
         full: bool,
+        /// Comma-separated omitted standard fields, customfield_<id>, or custom field display names
+        #[arg(long = "fields", value_delimiter = ',', requires = "json", conflicts_with = "full")]
+        fields: Vec<String>,
     },
     /// Create a new Jira issue
     #[command(visible_alias = "new")]
@@ -2054,6 +2060,7 @@ async fn dispatch_jira_cli(
             json,
             compact: _,
             full,
+            fields,
         }) => {
             let scoped = apply_site_override(cfg, site_override.as_deref())?;
             Box::pin(cmd_issue_view(
@@ -2063,6 +2070,7 @@ async fn dispatch_jira_cli(
                 offline,
                 json,
                 !full,
+                &fields,
             ))
             .await
         }
@@ -2770,6 +2778,7 @@ async fn dispatch_jira_subcommand(cfg: &AppConfig, command: JiraSubcommand) -> R
             json,
             compact: _,
             full,
+            fields,
         } => {
             Box::pin(cmd_issue_view(
                 cfg,
@@ -2778,6 +2787,7 @@ async fn dispatch_jira_subcommand(cfg: &AppConfig, command: JiraSubcommand) -> R
                 offline,
                 json,
                 !full,
+                &fields,
             ))
             .await
         }
@@ -4979,6 +4989,7 @@ async fn cmd_issue_view(
     offline: bool,
     json_out: bool,
     compact: bool,
+    fields: &[String],
 ) -> Result<()> {
     let (_auth, client, storage) = open_runtime(cfg, !offline)?;
     let site_id = client.site_id();
@@ -5009,8 +5020,10 @@ async fn cmd_issue_view(
     };
 
     if json_out {
-        let body = if compact {
-            let mut hint = format!("atlassian view {key} --json --full");
+        let body = if !fields.is_empty() {
+            detail.projected_output(fields)
+        } else if compact {
+            let mut hint = format!("atlassian view {key} --json --fields <field> (or --full)");
             if offline {
                 hint.push_str(" --offline");
             }

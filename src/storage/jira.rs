@@ -1840,6 +1840,7 @@ mod tests {
             attachments: vec![],
             comments: vec![],
             incomplete: vec![],
+            custom_fields: Default::default(),
         };
         storage.upsert_issue_detail(&detail).unwrap();
 

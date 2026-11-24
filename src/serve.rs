@@ -335,6 +335,8 @@ struct DetailQuery {
     offline: bool,
     #[serde(default)]
     compact: bool,
+    #[serde(default)]
+    fields: Option<String>,
     site: Option<String>,
 }
 
@@ -1153,6 +1155,26 @@ async fn get_issue(
         return Err(ApiError::bad_request("issue key must not be empty"));
     }
 
+    let requested_fields: Vec<String> = query
+        .fields
+        .as_deref()
+        .map(|s| {
+            s.split(',')
+                .map(str::trim)
+                .filter(|f| !f.is_empty())
+                .map(str::to_string)
+                .collect()
+        })
+        .unwrap_or_default();
+
+    let format_issue = |detail: &crate::models::IssueDetail| -> Value {
+        if !requested_fields.is_empty() {
+            detail.projected_output(&requested_fields)
+        } else {
+            detail.output(query.compact)
+        }
+    };
+
     if query.offline {
         let target_site = resolve_single_site_id(&state, query.site.as_deref())?;
         let detail = state
@@ -1166,7 +1188,7 @@ async fn get_issue(
         return Ok(Json(json!({
             "site_id": target_site,
             "detail_stale": stale,
-            "issue": detail.output(query.compact),
+            "issue": format_issue(&detail),
         })));
     }
 
@@ -1187,7 +1209,7 @@ async fn get_issue(
     );
 
     Ok(Json(
-        json!({ "site_id": target_site, "detail_stale": false, "issue": fetched.output(query.compact) }),
+        json!({ "site_id": target_site, "detail_stale": false, "issue": format_issue(&fetched) }),
     ))
 }
 

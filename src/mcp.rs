@@ -769,6 +769,17 @@ async fn call_tool(
             let key = args.required_str("key")?;
             let offline = args.optional_bool("offline")?.unwrap_or(false);
             let compact = args.optional_bool("compact")?.unwrap_or(true);
+            let fields = args.optional_str_array("fields")?;
+            let hint = "get_jira_issue with fields:[...] or compact:false";
+            let format_issue = |detail: &crate::models::IssueDetail| -> Value {
+                if !fields.is_empty() {
+                    detail.projected_output(&fields)
+                } else if compact {
+                    detail.compact_output(hint)
+                } else {
+                    detail.output(false)
+                }
+            };
             if offline {
                 let target_site =
                     resolve_mcp_single_site_id(config, client, site_arg.as_deref())?;
@@ -782,11 +793,7 @@ async fn call_tool(
                 return Ok(json!({
                     "site_id": target_site,
                     "detail_stale": stale,
-                    "issue": if compact {
-                        detail.compact_output("get_jira_issue with compact:false")
-                    } else {
-                        detail.output(false)
-                    },
+                    "issue": format_issue(&detail),
                 }));
             }
             let (target_site, target_client) =
@@ -808,11 +815,7 @@ async fn call_tool(
             Ok(json!({
                 "site_id": target_site,
                 "detail_stale": false,
-                "issue": if compact {
-                    fetched.compact_output("get_jira_issue with compact:false")
-                } else {
-                    fetched.output(false)
-                },
+                "issue": format_issue(&fetched),
             }))
         }
 
@@ -2619,13 +2622,18 @@ fn tool_catalog() -> Vec<Value> {
         }),
         json!({
             "name": "get_jira_issue",
-            "description": "Get the Jira issue key, summary, status, and full Markdown description. Use compact: false for links, attachments, comments, and the full issue structure. The omitted object lists what was left out; null means the count is unknown.",
+            "description": "Get the Jira issue key, summary, status, and full Markdown description. The omitted object lists skipped counts, standard fields, and populated custom fields (null means count unknown). Pass fields: [...] to fetch only specific omitted or custom fields by key (by field name, customfield_<id>, or custom field display name), or compact: false for the full ticket.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
                     "key": { "type": "string", "minLength": 1 },
                     "offline": { "type": "boolean", "default": false },
-                    "compact": { "type": "boolean", "default": true, "description": "Set false for the full response structure." }
+                    "compact": { "type": "boolean", "default": true, "description": "Set false for the full response structure." },
+                    "fields": {
+                        "type": "array",
+                        "items": { "type": "string", "minLength": 1 },
+                        "description": "Optional list of omitted standard fields, customfield_<id> keys, or custom field display names to project without loading the full ticket."
+                    }
                 },
                 "required": ["key"],
                 "additionalProperties": false
@@ -3197,7 +3205,10 @@ mod tests {
             return first.clone();
         }
         match key {
-            "fields" => return json!({ "customfield_10000": 1 }),
+            "fields" if schema.get("type").and_then(Value::as_str) == Some("object") => {
+                return json!({ "customfield_10000": 1 })
+            }
+            "fields" => return json!(["comments"]),
             "replace_text" => return json!({ "old_text": "a", "new_text": "b" }),
             "replace_section" => return json!({ "heading": "h", "markdown": "m" }),
             _ => {}
@@ -3787,6 +3798,104 @@ mod tests {
                 _ => {}
             }
         }
+    }
+
+    #[tokio::test]
+    async fn get_jira_issue_surfaces_custom_fields_and_projects_omitted_fields_by_key() {
+        let (cfg, client, storage) = test_ctx();
+        let mut custom_fields = std::collections::BTreeMap::new();
+        custom_fields.insert(
+            "customfield_10042".to_string(),
+            crate::models::IssueCustomField {
+                name: Some("Acceptance Criteria".to_string()),
+                value: json!("All smoke tests pass with zero 5xx"),
+                markdown: None,
+            },
+        );
+        storage
+            .upsert_issue_detail(&IssueDetail {
+                summary: IssueSummary {
+                    id: "42".to_string(),
+                    key: "ENG-42".to_string(),
+                    project_key: "ENG".to_string(),
+                    summary: "Verify AC custom field".to_string(),
+                    comment_count: 1,
+                    ..Default::default()
+                },
+                description_markdown: "Base description without AC".to_string(),
+                comments: vec![crate::models::IssueComment {
+                    id: "c1".to_string(),
+                    body_markdown: "Confirmed".to_string(),
+                    ..Default::default()
+                }],
+                custom_fields,
+                ..Default::default()
+            })
+            .unwrap();
+
+        // 1. Default compact read surfaces populated custom field name + ID in omitted.custom_fields
+        let compact_req = json!({
+            "jsonrpc": "2.0",
+            "id": 201,
+            "method": "tools/call",
+            "params": {
+                "name": "get_jira_issue",
+                "arguments": { "key": "ENG-42", "offline": true }
+            }
+        })
+        .to_string();
+        let compact_resp = handle_rpc_line(&cfg, &client, &storage, &compact_req)
+            .await
+            .unwrap();
+        assert_eq!(compact_resp["result"]["isError"], false);
+        let compact_payload: Value = serde_json::from_str(
+            compact_resp["result"]["content"][0]["text"]
+                .as_str()
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            compact_payload["issue"]["omitted"]["custom_fields"],
+            json!([{ "id": "customfield_10042", "name": "Acceptance Criteria" }])
+        );
+
+        // 2. Selective fields projection fetches ONLY requested fields without pulling full ticket
+        let proj_req = json!({
+            "jsonrpc": "2.0",
+            "id": 202,
+            "method": "tools/call",
+            "params": {
+                "name": "get_jira_issue",
+                "arguments": {
+                    "key": "ENG-42",
+                    "offline": true,
+                    "fields": ["Acceptance Criteria", "comments", "missing_field"]
+                }
+            }
+        })
+        .to_string();
+        let proj_resp = handle_rpc_line(&cfg, &client, &storage, &proj_req)
+            .await
+            .unwrap();
+        assert_eq!(proj_resp["result"]["isError"], false);
+        let proj_payload: Value = serde_json::from_str(
+            proj_resp["result"]["content"][0]["text"].as_str().unwrap(),
+        )
+        .unwrap();
+        assert_eq!(proj_payload["issue"]["key"], "ENG-42");
+        assert!(proj_payload["issue"].get("description_markdown").is_none());
+        assert_eq!(
+            proj_payload["issue"]["fields"]["customfield_10042"]["value"],
+            "All smoke tests pass with zero 5xx"
+        );
+        assert_eq!(
+            proj_payload["issue"]["fields"]["comments"][0]["body_markdown"],
+            "Confirmed"
+        );
+        assert_eq!(
+            proj_payload["issue"]["missing_fields"],
+            json!(["missing_field"])
+        );
     }
 
     #[tokio::test]

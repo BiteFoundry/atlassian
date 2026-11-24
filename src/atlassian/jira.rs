@@ -307,9 +307,11 @@ impl AtlassianClient {
         let encoded_key = urlencoding::encode(key);
         let url = match self.deployment() {
             DeploymentKind::Cloud => {
-                format!("{base}/rest/api/3/issue/{encoded_key}?expand=renderedFields")
+                format!("{base}/rest/api/3/issue/{encoded_key}?expand=renderedFields,names")
             }
-            DeploymentKind::DataCenter => format!("{base}/rest/api/2/issue/{encoded_key}"),
+            DeploymentKind::DataCenter => {
+                format!("{base}/rest/api/2/issue/{encoded_key}?expand=names")
+            }
         };
 
         let val: Value = self.get_json(&url).await?;
@@ -401,6 +403,8 @@ impl AtlassianClient {
             incomplete.push("comments".to_string());
         }
 
+        let custom_fields = extract_issue_custom_fields(&val, fields);
+
         Ok((
             IssueDetail {
                 summary,
@@ -415,6 +419,7 @@ impl AtlassianClient {
                 attachments,
                 comments,
                 incomplete,
+                custom_fields,
             },
             IssueSubresourceStatus { remote_links_ok },
         ))
@@ -1271,6 +1276,64 @@ pub(crate) fn normalize_issue_summary(
         updated_at,
         web_url,
     }
+}
+
+fn is_nonempty_custom_field_value(val: &Value) -> bool {
+    match val {
+        Value::Null => false,
+        Value::String(s) => !s.trim().is_empty(),
+        Value::Array(arr) => !arr.is_empty(),
+        Value::Object(map) => !map.is_empty(),
+        Value::Bool(_) | Value::Number(_) => true,
+    }
+}
+
+fn extract_issue_custom_fields(
+    issue_val: &Value,
+    fields: &Value,
+) -> std::collections::BTreeMap<String, crate::models::IssueCustomField> {
+    let mut out = std::collections::BTreeMap::new();
+    let Some(map) = fields.as_object() else {
+        return out;
+    };
+    let names = issue_val.get("names").and_then(|v| v.as_object());
+
+    for (key, value) in map {
+        if !key.starts_with("customfield_")
+            || key == "customfield_10016"
+            || key == "customfield_10020"
+            || !is_nonempty_custom_field_value(value)
+        {
+            continue;
+        }
+        let name = names
+            .and_then(|n| n.get(key))
+            .and_then(|v| v.as_str())
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string);
+        let markdown = if value.get("type").and_then(|v| v.as_str()) == Some("doc")
+            && value.get("content").is_some()
+        {
+            let md = blocks_to_markdown(&parse_adf_value(value));
+            if md.trim().is_empty() {
+                None
+            } else {
+                Some(md)
+            }
+        } else {
+            None
+        };
+        out.insert(
+            key.clone(),
+            crate::models::IssueCustomField {
+                name,
+                value: value.clone(),
+                markdown,
+            },
+        );
+    }
+    out
 }
 
 fn parse_project_summary(val: &Value) -> ProjectSummary {
@@ -2193,5 +2256,73 @@ mod tests {
         let base_url = spawn_router(app).await;
         let client = make_client(&base_url, DeploymentKind::Cloud);
         assert!(client.list_projects().await.is_err());
+    }
+
+    #[tokio::test]
+    async fn get_issue_expands_names_and_extracts_nonempty_custom_fields() {
+        use axum::extract::Query;
+        use std::collections::HashMap;
+        let app = Router::new()
+            .route(
+                "/rest/api/3/issue/ENG-55",
+                get(|Query(q): Query<HashMap<String, String>>| async move {
+                    let expand = q.get("expand").cloned().unwrap_or_default();
+                    assert!(
+                        expand.contains("renderedFields") && expand.contains("names"),
+                        "expected renderedFields,names in expand, got {expand}"
+                    );
+                    Json(json!({
+                        "id": "55",
+                        "key": "ENG-55",
+                        "names": {
+                            "customfield_10042": "Acceptance Criteria",
+                            "customfield_10050": "Notes ADF",
+                            "customfield_10060": "Empty Field"
+                        },
+                        "fields": {
+                            "summary": "Custom field test",
+                            "status": { "id": "1", "name": "In Progress", "statusCategory": { "key": "indeterminate" } },
+                            "issuetype": { "id": "10", "name": "Story", "subtask": false },
+                            "project": { "key": "ENG" },
+                            "customfield_10016": 5.0,
+                            "customfield_10020": [{ "id": 12, "name": "Sprint 12", "state": "active" }],
+                            "customfield_10042": "1. Zero regressions\n2. Audit log emitted",
+                            "customfield_10050": {
+                                "type": "doc",
+                                "version": 1,
+                                "content": [
+                                    { "type": "paragraph", "content": [{ "type": "text", "text": "Verify rollback." }] }
+                                ]
+                            },
+                            "customfield_10060": null,
+                            "customfield_10061": "   "
+                        }
+                    }))
+                }),
+            )
+            .route(
+                "/rest/api/3/issue/ENG-55/remotelink",
+                get(|| async { Json(json!([])) }),
+            );
+
+        let base_url = spawn_router(app).await;
+        let client = make_client(&base_url, DeploymentKind::Cloud);
+        let detail = client.get_issue("ENG-55").await.unwrap();
+
+        assert_eq!(detail.summary.story_points, Some(5.0));
+        assert_eq!(detail.summary.sprint_name.as_deref(), Some("Sprint 12"));
+        assert!(!detail.custom_fields.contains_key("customfield_10016"));
+        assert!(!detail.custom_fields.contains_key("customfield_10020"));
+        assert!(!detail.custom_fields.contains_key("customfield_10060"));
+        assert!(!detail.custom_fields.contains_key("customfield_10061"));
+
+        let ac = detail.custom_fields.get("customfield_10042").unwrap();
+        assert_eq!(ac.name.as_deref(), Some("Acceptance Criteria"));
+        assert_eq!(ac.value, "1. Zero regressions\n2. Audit log emitted");
+        assert!(ac.markdown.is_none());
+
+        let adf = detail.custom_fields.get("customfield_10050").unwrap();
+        assert_eq!(adf.name.as_deref(), Some("Notes ADF"));
+        assert_eq!(adf.markdown.as_deref(), Some("Verify rollback."));
     }
 }
