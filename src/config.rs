@@ -1115,8 +1115,9 @@ pub fn slugify_site_id(url_or_name: &str) -> String {
 
 pub fn config_dir() -> PathBuf {
     if let Ok(override_dir) = std::env::var("ATLASSIAN_CONFIG_DIR") {
-        if !override_dir.trim().is_empty() {
-            return PathBuf::from(override_dir);
+        let trimmed = override_dir.trim();
+        if !trimmed.is_empty() {
+            return expand_tilde(trimmed);
         }
     }
     dirs::config_dir()
@@ -1125,15 +1126,54 @@ pub fn config_dir() -> PathBuf {
 }
 
 pub fn data_dir(profile: &str) -> PathBuf {
+    if let Ok(override_dir) = std::env::var("ATLASSIAN_DATA_DIR") {
+        let trimmed = override_dir.trim();
+        if !trimmed.is_empty() {
+            return expand_tilde(trimmed).join(profile);
+        }
+    }
     if let Ok(override_dir) = std::env::var("ATLASSIAN_CONFIG_DIR") {
-        if !override_dir.trim().is_empty() {
-            return PathBuf::from(override_dir).join(profile);
+        let trimmed = override_dir.trim();
+        if !trimmed.is_empty() {
+            return expand_tilde(trimmed).join(profile);
         }
     }
     dirs::data_local_dir()
         .unwrap_or_else(config_dir)
         .join("atlassian-cli")
         .join(profile)
+}
+
+/// Canonicalizes the deepest existing ancestor of `path` and re-appends the remaining
+/// non-existent tail components, falling back to `std::path::absolute`.
+pub fn canonicalize_existing_ancestor(path: &Path) -> PathBuf {
+    if let Ok(canon) = fs::canonicalize(path) {
+        return canon;
+    }
+    let abs = std::path::absolute(path).unwrap_or_else(|_| path.to_path_buf());
+    if let Ok(canon) = fs::canonicalize(&abs) {
+        return canon;
+    }
+
+    let mut tail: Vec<std::ffi::OsString> = Vec::new();
+    let mut cur = abs.as_path();
+    while let Some(parent) = cur.parent() {
+        let Some(comp) = cur.components().next_back() else {
+            break;
+        };
+        tail.push(comp.as_os_str().to_os_string());
+        cur = parent;
+        if cur.as_os_str().is_empty() {
+            break;
+        }
+        if let Ok(mut canon) = fs::canonicalize(cur) {
+            for part in tail.into_iter().rev() {
+                canon.push(part);
+            }
+            return canon;
+        }
+    }
+    abs
 }
 
 pub fn config_file_path() -> PathBuf {
@@ -1186,12 +1226,41 @@ pub fn write_atomic_0600(path: &Path, data: &[u8]) -> Result<()> {
 }
 
 fn write_atomic_with_mode(path: &Path, data: &[u8], mode_0600: bool) -> Result<()> {
-    ensure_parent(path)?;
-    let parent = path
+    let target_path: PathBuf = match fs::symlink_metadata(path) {
+        Ok(meta) if meta.file_type().is_symlink() => {
+            if mode_0600 {
+                anyhow::bail!(
+                    "Refusing to write secret file through symlink: {}",
+                    path.display()
+                );
+            }
+            let resolved = fs::canonicalize(path).with_context(|| {
+                format!(
+                    "Refusing to write through dangling symlink: {}",
+                    path.display()
+                )
+            })?;
+            if resolved.is_dir() {
+                anyhow::bail!(
+                    "Refusing to overwrite directory through symlink: {} -> {}",
+                    path.display(),
+                    resolved.display()
+                );
+            }
+            resolved
+        }
+        _ => path.to_path_buf(),
+    };
+
+    ensure_parent(&target_path)?;
+    let parent = target_path
         .parent()
         .filter(|p| !p.as_os_str().is_empty())
         .unwrap_or_else(|| Path::new("."));
-    let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("file");
+    let name = target_path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("file");
     let pid = std::process::id();
     let seq = ATOMIC_TMP_SEQ.fetch_add(1, Ordering::Relaxed);
     let tmp = parent.join(format!(".{name}.{pid}.{seq}.tmp"));
@@ -1222,9 +1291,9 @@ fn write_atomic_with_mode(path: &Path, data: &[u8], mode_0600: bool) -> Result<(
         return Err(err);
     }
 
-    if let Err(rename_err) = fs::rename(&tmp, path) {
+    if let Err(rename_err) = fs::rename(&tmp, &target_path) {
         if let Err(replace_err) =
-            replace_existing_with_backup(&tmp, path, parent, name, pid, seq, rename_err)
+            replace_existing_with_backup(&tmp, &target_path, parent, name, pid, seq, rename_err)
         {
             let _ = fs::remove_file(&tmp);
             return Err(replace_err);
@@ -1261,7 +1330,7 @@ fn replace_existing_with_backup(
     }
 }
 
-fn expand_tilde(input: &str) -> PathBuf {
+pub(crate) fn expand_tilde(input: &str) -> PathBuf {
     if input == "~" {
         return dirs::home_dir().unwrap_or_else(|| PathBuf::from("~"));
     }
@@ -1728,6 +1797,172 @@ scopes = []
         assert_eq!(
             reparsed.sites[0].confluence_account_id.as_deref(),
             Some("corp-confluence")
+        );
+    }
+
+    #[test]
+    fn canonicalize_existing_ancestor_resolves_tail_and_normalizes_ancestors() {
+        let dir = tempfile::tempdir().unwrap();
+        let real_sub = dir.path().join("real");
+        fs::create_dir(&real_sub).unwrap();
+
+        let existing = canonicalize_existing_ancestor(&real_sub);
+        assert_eq!(existing, fs::canonicalize(&real_sub).unwrap());
+
+        let missing_tail = real_sub.join("deep").join("nonexistent").join("profile");
+        let resolved = canonicalize_existing_ancestor(&missing_tail);
+        assert_eq!(
+            resolved,
+            fs::canonicalize(&real_sub)
+                .unwrap()
+                .join("deep")
+                .join("nonexistent")
+                .join("profile")
+        );
+
+        let via_dotdot = real_sub.join("..").join("real").join("deep").join("nonexistent");
+        assert_eq!(
+            canonicalize_existing_ancestor(&via_dotdot),
+            fs::canonicalize(&real_sub)
+                .unwrap()
+                .join("deep")
+                .join("nonexistent")
+        );
+
+        let link = dir.path().join("link_to_real");
+        let linked = {
+            #[cfg(unix)]
+            {
+                std::os::unix::fs::symlink(&real_sub, &link).unwrap();
+                true
+            }
+            #[cfg(windows)]
+            {
+                match std::os::windows::fs::symlink_dir(&real_sub, &link) {
+                    Ok(()) => true,
+                    Err(e) if e.raw_os_error() == Some(1314) => false,
+                    Err(e) => panic!("unexpected symlink_dir error: {e}"),
+                }
+            }
+        };
+        if linked {
+            let via_link = link.join("future").join("leaf");
+            let via_real = real_sub.join("future").join("leaf");
+            assert_eq!(
+                canonicalize_existing_ancestor(&via_link),
+                canonicalize_existing_ancestor(&via_real)
+            );
+        }
+    }
+
+    #[test]
+    fn env_dir_overrides_expand_tilde() {
+        static DIR_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        let _lock = DIR_ENV_LOCK.lock().unwrap();
+
+        let prev_cfg = std::env::var("ATLASSIAN_CONFIG_DIR").ok();
+        let prev_data = std::env::var("ATLASSIAN_DATA_DIR").ok();
+
+        if let Some(home) = dirs::home_dir() {
+            std::env::set_var("ATLASSIAN_CONFIG_DIR", "~/.atlassian-custom-cfg");
+            std::env::remove_var("ATLASSIAN_DATA_DIR");
+            assert_eq!(config_dir(), home.join(".atlassian-custom-cfg"));
+            assert_eq!(
+                data_dir("work"),
+                home.join(".atlassian-custom-cfg").join("work")
+            );
+
+            std::env::set_var("ATLASSIAN_DATA_DIR", "~/custom-atlassian-data");
+            assert_eq!(
+                data_dir("work"),
+                home.join("custom-atlassian-data").join("work")
+            );
+        }
+
+        match prev_cfg {
+            Some(v) => std::env::set_var("ATLASSIAN_CONFIG_DIR", v),
+            None => std::env::remove_var("ATLASSIAN_CONFIG_DIR"),
+        }
+        match prev_data {
+            Some(v) => std::env::set_var("ATLASSIAN_DATA_DIR", v),
+            None => std::env::remove_var("ATLASSIAN_DATA_DIR"),
+        }
+    }
+
+    #[test]
+    fn write_atomic_symlink_policy_for_config_and_secrets() {
+        let dir = tempfile::tempdir().unwrap();
+        let dotfiles = dir.path().join("dotfiles");
+        let cfg_home = dir.path().join("config");
+        fs::create_dir_all(&dotfiles).unwrap();
+        fs::create_dir_all(&cfg_home).unwrap();
+
+        let real_cfg = dotfiles.join("config.toml");
+        fs::write(&real_cfg, b"old = true\n").unwrap();
+        let linked_cfg = cfg_home.join("config.toml");
+
+        let real_creds = dotfiles.join("credentials.json");
+        fs::write(&real_creds, b"{}\n").unwrap();
+        let linked_creds = cfg_home.join("credentials.json");
+
+        let dangling_cfg = cfg_home.join("dangling.toml");
+        let missing_target = dotfiles.join("missing.toml");
+
+        let symlinks_supported = {
+            #[cfg(unix)]
+            {
+                std::os::unix::fs::symlink(&real_cfg, &linked_cfg).unwrap();
+                std::os::unix::fs::symlink(&real_creds, &linked_creds).unwrap();
+                std::os::unix::fs::symlink(&missing_target, &dangling_cfg).unwrap();
+                true
+            }
+            #[cfg(windows)]
+            {
+                match std::os::windows::fs::symlink_file(&real_cfg, &linked_cfg) {
+                    Ok(()) => {
+                        std::os::windows::fs::symlink_file(&real_creds, &linked_creds).unwrap();
+                        std::os::windows::fs::symlink_file(&missing_target, &dangling_cfg)
+                            .unwrap();
+                        true
+                    }
+                    Err(e) if e.raw_os_error() == Some(1314) => false,
+                    Err(e) => panic!("unexpected symlink_file error: {e}"),
+                }
+            }
+        };
+
+        if !symlinks_supported {
+            return;
+        }
+
+        // Non-secret config through valid symlink updates real target and preserves the symlink.
+        write_atomic(&linked_cfg, b"updated = true\n").unwrap();
+        assert!(fs::symlink_metadata(&linked_cfg)
+            .unwrap()
+            .file_type()
+            .is_symlink());
+        assert_eq!(fs::read_to_string(&real_cfg).unwrap(), "updated = true\n");
+
+        // Dangling symlink is rejected cleanly for non-secret atomic writes.
+        let dangling_err = write_atomic(&dangling_cfg, b"nope = true\n").unwrap_err();
+        assert!(
+            format!("{dangling_err:#}").contains("dangling symlink"),
+            "unexpected error: {dangling_err:#}"
+        );
+
+        // Secret files (0600) refuse writing through any symlink.
+        let secret_err = write_atomic_0600(&linked_creds, b"{\"secret\":1}").unwrap_err();
+        assert!(
+            format!("{secret_err:#}").contains("Refusing to write secret file through symlink"),
+            "unexpected error: {secret_err:#}"
+        );
+        assert_eq!(fs::read_to_string(&real_creds).unwrap(), "{}\n");
+
+        // `write_atomic` also classifies `credentials.json` as 0600 secret and refuses symlink.
+        let auto_secret_err = write_atomic(&linked_creds, b"{\"secret\":2}").unwrap_err();
+        assert!(
+            format!("{auto_secret_err:#}").contains("Refusing to write secret file through symlink"),
+            "unexpected error: {auto_secret_err:#}"
         );
     }
 }

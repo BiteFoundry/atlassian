@@ -63,9 +63,12 @@ pub enum ShellKind {
     #[value(aliases = ["pwsh", "ps"])]
     Powershell,
     Zsh,
-    #[value(alias = "sh")]
     Bash,
     Fish,
+    Tcsh,
+    Csh,
+    #[value(aliases = ["dash", "ash", "ksh"])]
+    Sh,
 }
 
 impl ShellKind {
@@ -75,6 +78,9 @@ impl ShellKind {
             ShellKind::Zsh => "zsh",
             ShellKind::Bash => "bash",
             ShellKind::Fish => "fish",
+            ShellKind::Tcsh => "tcsh",
+            ShellKind::Csh => "csh",
+            ShellKind::Sh => "sh",
         }
     }
 }
@@ -137,26 +143,35 @@ pub enum AliasCommand {
     },
 }
 
-pub fn detect_shell() -> ShellKind {
-    if let Ok(shell_env) = env::var("SHELL") {
-        let lower = shell_env.to_ascii_lowercase();
-        if lower.contains("fish") {
-            return ShellKind::Fish;
-        }
-        if lower.contains("zsh") {
-            return ShellKind::Zsh;
-        }
-        if lower.contains("bash") {
-            return ShellKind::Bash;
-        }
+pub fn detect_shell() -> Result<ShellKind> {
+    detect_shell_from(env::var("SHELL").ok().as_deref())
+}
+
+fn detect_shell_from(shell_env: Option<&str>) -> Result<ShellKind> {
+    if let Some(raw) = shell_env.map(str::trim).filter(|s| !s.is_empty()) {
+        let base = raw.split(['/', '\\']).next_back().unwrap_or(raw);
+        let stripped = base.strip_prefix('-').unwrap_or(base).to_ascii_lowercase();
+        let name = stripped.strip_suffix(".exe").unwrap_or(&stripped);
+        return match name {
+            "tcsh" => Ok(ShellKind::Tcsh),
+            "csh" => Ok(ShellKind::Csh),
+            "zsh" => Ok(ShellKind::Zsh),
+            "fish" => Ok(ShellKind::Fish),
+            "bash" => Ok(ShellKind::Bash),
+            "sh" | "dash" | "ash" | "ksh" | "mksh" => Ok(ShellKind::Sh),
+            "pwsh" | "powershell" => Ok(ShellKind::Powershell),
+            _ => bail!(
+                "Unsupported shell '{raw}' detected from $SHELL. Pass --shell <powershell|zsh|bash|fish|tcsh|csh|sh> and/or --profile <path>."
+            ),
+        };
     }
     if cfg!(windows) {
-        return ShellKind::Powershell;
+        return Ok(ShellKind::Powershell);
     }
     if cfg!(target_os = "macos") {
-        return ShellKind::Zsh;
+        return Ok(ShellKind::Zsh);
     }
-    ShellKind::Bash
+    Ok(ShellKind::Bash)
 }
 
 pub fn validate_alias_name(name: &str, role: &str) -> Result<String> {
@@ -185,9 +200,36 @@ pub fn validate_alias_name(name: &str, role: &str) -> Result<String> {
     Ok(trimmed.to_string())
 }
 
+pub fn validate_alias_name_for_shell(
+    name: &str,
+    role: &str,
+    shell: ShellKind,
+) -> Result<String> {
+    let validated = validate_alias_name(name, role)?;
+    if shell == ShellKind::Sh && validated.contains('-') {
+        bail!(
+            "Invalid alias name '{validated}' for {role}: POSIX sh does not allow '-' in function names."
+        );
+    }
+    Ok(validated)
+}
+
 pub fn validate_alias_pair(jira: &str, conf: &str) -> Result<(String, String)> {
     let j = validate_alias_name(jira, "Jira")?;
     let c = validate_alias_name(conf, "Confluence")?;
+    if j.eq_ignore_ascii_case(&c) {
+        bail!("Jira alias ('{j}') and Confluence alias ('{c}') must be different.");
+    }
+    Ok((j, c))
+}
+
+pub fn validate_alias_pair_for_shell(
+    jira: &str,
+    conf: &str,
+    shell: ShellKind,
+) -> Result<(String, String)> {
+    let j = validate_alias_name_for_shell(jira, "Jira", shell)?;
+    let c = validate_alias_name_for_shell(conf, "Confluence", shell)?;
     if j.eq_ignore_ascii_case(&c) {
         bail!("Jira alias ('{j}') and Confluence alias ('{c}') must be different.");
     }
@@ -207,7 +249,7 @@ pub fn render_init_script(shell: ShellKind, jira: &str, conf: &str, force: bool)
                 )
             }
         }
-        ShellKind::Zsh | ShellKind::Bash => {
+        ShellKind::Zsh | ShellKind::Bash | ShellKind::Sh => {
             if force {
                 format!(
                     "unalias {jira} 2>/dev/null || true\n{jira}() {{ atlassian \"$@\"; }}\nunalias {conf} 2>/dev/null || true\n{conf}() {{ conf \"$@\"; }}\n"
@@ -229,12 +271,51 @@ pub fn render_init_script(shell: ShellKind, jira: &str, conf: &str, force: bool)
                 )
             }
         }
+        ShellKind::Tcsh | ShellKind::Csh => {
+            if force {
+                format!(
+                    "unalias {jira} >& /dev/null\nalias {jira} 'atlassian \\!*'\nunalias {conf} >& /dev/null\nalias {conf} 'conf \\!*'\n"
+                )
+            } else {
+                format!(
+                    "which {jira} >& /dev/null\nif ( $status != 0 ) alias {jira} 'atlassian \\!*'\nwhich {conf} >& /dev/null\nif ( $status != 0 ) alias {conf} 'conf \\!*'\n"
+                )
+            }
+        }
     }
 }
 
 pub fn render_managed_block(shell: ShellKind, jira: &str, conf: &str, force: bool) -> String {
     let body = render_init_script(shell, jira, conf, force);
     format!("{BLOCK_START}\n{body}{BLOCK_END}")
+}
+
+fn tcsh_profile_path(home: &Path) -> PathBuf {
+    let tcshrc = home.join(".tcshrc");
+    if tcshrc.exists() {
+        return tcshrc;
+    }
+    let cshrc = home.join(".cshrc");
+    if cshrc.exists() {
+        return cshrc;
+    }
+    tcshrc
+}
+
+fn bash_profile_path(home: &Path) -> PathBuf {
+    let bashrc = home.join(".bashrc");
+    let bash_profile = home.join(".bash_profile");
+    if !bashrc.exists() && bash_profile.exists() {
+        return bash_profile;
+    }
+    bashrc
+}
+
+fn sh_profile_path(home: &Path, env_var: Option<&std::ffi::OsStr>) -> PathBuf {
+    if let Some(p) = env_var.filter(|v| !v.is_empty() && !v.to_string_lossy().trim().is_empty()) {
+        return PathBuf::from(p);
+    }
+    home.join(".profile")
 }
 
 pub fn default_profile_paths(shell: ShellKind) -> Result<Vec<PathBuf>> {
@@ -280,14 +361,7 @@ pub fn default_profile_paths(shell: ShellKind) -> Result<Vec<PathBuf>> {
         }
         ShellKind::Bash => {
             let home = dirs::home_dir().context("Could not determine home directory")?;
-            if cfg!(target_os = "macos") {
-                let bashrc = home.join(".bashrc");
-                let bash_profile = home.join(".bash_profile");
-                if !bashrc.exists() && bash_profile.exists() {
-                    return Ok(vec![bash_profile]);
-                }
-            }
-            Ok(vec![home.join(".bashrc")])
+            Ok(vec![bash_profile_path(&home)])
         }
         ShellKind::Fish => {
             if let Some(xdg) = env::var_os("XDG_CONFIG_HOME").filter(|v| !v.is_empty()) {
@@ -295,6 +369,25 @@ pub fn default_profile_paths(shell: ShellKind) -> Result<Vec<PathBuf>> {
             }
             let home = dirs::home_dir().context("Could not determine home directory")?;
             Ok(vec![home.join(".config").join("fish").join("config.fish")])
+        }
+        ShellKind::Tcsh => {
+            let home = dirs::home_dir().context("Could not determine home directory")?;
+            Ok(vec![tcsh_profile_path(&home)])
+        }
+        ShellKind::Csh => {
+            let home = dirs::home_dir().context("Could not determine home directory")?;
+            Ok(vec![home.join(".cshrc")])
+        }
+        ShellKind::Sh => {
+            let env_val = env::var_os("ENV");
+            if let Some(p) = env_val
+                .as_deref()
+                .filter(|v| !v.is_empty() && !v.to_string_lossy().trim().is_empty())
+            {
+                return Ok(vec![PathBuf::from(p)]);
+            }
+            let home = dirs::home_dir().context("Could not determine home directory")?;
+            Ok(vec![sh_profile_path(&home, None)])
         }
     }
 }
@@ -451,9 +544,71 @@ pub fn remove_managed_block(existing: &str) -> (String, bool) {
 }
 
 pub fn cmd_init(shell: ShellKind, jira: &str, conf: &str, force: bool) -> Result<()> {
-    let (j, c) = validate_alias_pair(jira, conf)?;
+    let (j, c) = validate_alias_pair_for_shell(jira, conf, shell)?;
     print!("{}", render_init_script(shell, &j, &c, force));
     Ok(())
+}
+
+/// Resolves the write destination for a shell profile file so that valid symlinks are
+/// preserved in place and dangling symlinks have their target parent directory created
+/// cleanly (with clear context on failure or symlink loops) instead of an opaque ENOENT.
+fn prepare_profile_write_target(profile_path: &Path) -> Result<PathBuf> {
+    if let Ok(meta) = fs::symlink_metadata(profile_path) {
+        if meta.file_type().is_symlink() {
+            if profile_path.exists() {
+                return Ok(profile_path.to_path_buf());
+            }
+            let mut current = profile_path.to_path_buf();
+            for _ in 0..16 {
+                let raw_target = fs::read_link(&current).with_context(|| {
+                    format!(
+                        "Failed to read symlink target for shell profile {}",
+                        current.display()
+                    )
+                })?;
+                let resolved = if raw_target.is_absolute() {
+                    raw_target
+                } else {
+                    current
+                        .parent()
+                        .unwrap_or_else(|| Path::new("."))
+                        .join(raw_target)
+                };
+                match fs::symlink_metadata(&resolved) {
+                    Ok(next_meta) if next_meta.file_type().is_symlink() => {
+                        current = resolved;
+                    }
+                    _ => {
+                        if let Some(target_parent) = resolved.parent() {
+                            if !target_parent.as_os_str().is_empty() && !target_parent.exists() {
+                                fs::create_dir_all(target_parent).with_context(|| {
+                                    format!(
+                                        "Shell profile {} is a dangling symlink to {}; failed to create target directory {}",
+                                        profile_path.display(),
+                                        resolved.display(),
+                                        target_parent.display()
+                                    )
+                                })?;
+                            }
+                        }
+                        return Ok(resolved);
+                    }
+                }
+            }
+            bail!(
+                "Shell profile {} is a dangling symlink loop",
+                profile_path.display()
+            );
+        }
+    }
+    if let Some(parent) = profile_path.parent() {
+        if !parent.as_os_str().is_empty() && !parent.exists() {
+            fs::create_dir_all(parent).with_context(|| {
+                format!("Failed to create profile directory {}", parent.display())
+            })?;
+        }
+    }
+    Ok(profile_path.to_path_buf())
 }
 
 pub fn cmd_alias(action: AliasCommand) -> Result<()> {
@@ -467,8 +622,11 @@ pub fn cmd_alias(action: AliasCommand) -> Result<()> {
             dry_run,
             json: json_out,
         } => {
-            let shell = shell.unwrap_or_else(detect_shell);
-            let (j, c) = validate_alias_pair(&jira, &conf)?;
+            let shell = match shell {
+                Some(s) => s,
+                None => detect_shell()?,
+            };
+            let (j, c) = validate_alias_pair_for_shell(&jira, &conf, shell)?;
             let profile_paths = match profile {
                 Some(p) => vec![p],
                 None => default_profile_paths(shell)?,
@@ -495,17 +653,8 @@ pub fn cmd_alias(action: AliasCommand) -> Result<()> {
                 }
 
                 if !dry_run && changed {
-                    if let Some(parent) = profile_path.parent() {
-                        if !parent.as_os_str().is_empty() && !parent.exists() {
-                            fs::create_dir_all(parent).with_context(|| {
-                                format!(
-                                    "Failed to create profile directory {}",
-                                    parent.display()
-                                )
-                            })?;
-                        }
-                    }
-                    fs::write(profile_path, updated).with_context(|| {
+                    let write_target = prepare_profile_write_target(profile_path)?;
+                    fs::write(&write_target, updated).with_context(|| {
                         format!("Failed to write shell profile {}", profile_path.display())
                     })?;
                 }
@@ -596,7 +745,10 @@ pub fn cmd_alias(action: AliasCommand) -> Result<()> {
             dry_run,
             json: json_out,
         } => {
-            let shell = shell.unwrap_or_else(detect_shell);
+            let shell = match shell {
+                Some(s) => s,
+                None => detect_shell()?,
+            };
             let profile_paths = match profile {
                 Some(p) => vec![p],
                 None => default_profile_paths(shell)?,
@@ -675,8 +827,11 @@ pub fn cmd_alias(action: AliasCommand) -> Result<()> {
             conf,
             json: json_out,
         } => {
-            let shell = shell.unwrap_or_else(detect_shell);
-            let (j, c) = validate_alias_pair(&jira, &conf)?;
+            let shell = match shell {
+                Some(s) => s,
+                None => detect_shell()?,
+            };
+            let (j, c) = validate_alias_pair_for_shell(&jira, &conf, shell)?;
             let profile_paths = match profile {
                 Some(p) => vec![p],
                 None => default_profile_paths(shell)?,
@@ -753,8 +908,8 @@ pub fn cmd_alias(action: AliasCommand) -> Result<()> {
 
 fn reload_instruction(shell: ShellKind, profile_path: &Path) -> String {
     match shell {
-        ShellKind::Powershell => format!(". \"{}\"", profile_path.display()),
-        ShellKind::Zsh | ShellKind::Bash | ShellKind::Fish => {
+        ShellKind::Powershell | ShellKind::Sh => format!(". \"{}\"", profile_path.display()),
+        ShellKind::Zsh | ShellKind::Bash | ShellKind::Fish | ShellKind::Tcsh | ShellKind::Csh => {
             format!("source \"{}\"", profile_path.display())
         }
     }
@@ -906,5 +1061,201 @@ mod tests {
         })
         .unwrap();
         assert_eq!(fs::read_to_string(&profile).unwrap(), "# existing profile\n");
+    }
+
+    #[test]
+    fn detect_shell_from_handles_basenames_login_shells_and_rejects_unsupported() {
+        assert_eq!(detect_shell_from(Some("/bin/tcsh")).unwrap(), ShellKind::Tcsh);
+        assert_eq!(detect_shell_from(Some("/bin/csh")).unwrap(), ShellKind::Csh);
+        assert_eq!(detect_shell_from(Some("/bin/sh")).unwrap(), ShellKind::Sh);
+        assert_eq!(detect_shell_from(Some("/usr/bin/dash")).unwrap(), ShellKind::Sh);
+        assert_eq!(detect_shell_from(Some("/bin/ash")).unwrap(), ShellKind::Sh);
+        assert_eq!(detect_shell_from(Some("/bin/ksh")).unwrap(), ShellKind::Sh);
+        assert_eq!(detect_shell_from(Some("/bin/mksh")).unwrap(), ShellKind::Sh);
+        assert_eq!(detect_shell_from(Some("/bin/bash")).unwrap(), ShellKind::Bash);
+        assert_eq!(detect_shell_from(Some("/bin/zsh")).unwrap(), ShellKind::Zsh);
+        assert_eq!(detect_shell_from(Some("/usr/bin/fish")).unwrap(), ShellKind::Fish);
+
+        // Login shells prefixed with '-'
+        assert_eq!(detect_shell_from(Some("-tcsh")).unwrap(), ShellKind::Tcsh);
+        assert_eq!(detect_shell_from(Some("-zsh")).unwrap(), ShellKind::Zsh);
+
+        // Basename extraction avoids matching "bash" inside "/home/bashir/bin/tcsh"
+        assert_eq!(
+            detect_shell_from(Some("/home/bashir/bin/tcsh")).unwrap(),
+            ShellKind::Tcsh
+        );
+
+        // Windows path & .exe suffix stripping
+        assert_eq!(
+            detect_shell_from(Some(r"C:\Program Files\PowerShell\7\pwsh.exe")).unwrap(),
+            ShellKind::Powershell
+        );
+
+        // Unsupported shells error explicitly instead of silently falling back to bash
+        for unsupported in ["/usr/local/bin/nu", "xonsh", "/usr/bin/elvish"] {
+            let err = detect_shell_from(Some(unsupported)).unwrap_err();
+            let msg = err.to_string();
+            assert!(
+                msg.contains("Unsupported shell") && msg.contains(unsupported),
+                "unexpected error for {unsupported}: {msg}"
+            );
+        }
+
+        // Unset or empty falls back to platform default
+        let expected_default = if cfg!(windows) {
+            ShellKind::Powershell
+        } else if cfg!(target_os = "macos") {
+            ShellKind::Zsh
+        } else {
+            ShellKind::Bash
+        };
+        assert_eq!(detect_shell_from(None).unwrap(), expected_default);
+        assert_eq!(detect_shell_from(Some("   ")).unwrap(), expected_default);
+    }
+
+    #[test]
+    fn renders_scripts_and_validation_for_tcsh_csh_and_sh() {
+        for shell in [ShellKind::Tcsh, ShellKind::Csh] {
+            let guarded = render_init_script(shell, "j", "cf", false);
+            assert_eq!(
+                guarded,
+                "which j >& /dev/null\nif ( $status != 0 ) alias j 'atlassian \\!*'\nwhich cf >& /dev/null\nif ( $status != 0 ) alias cf 'conf \\!*'\n"
+            );
+            let forced = render_init_script(shell, "j", "cf", true);
+            assert_eq!(
+                forced,
+                "unalias j >& /dev/null\nalias j 'atlassian \\!*'\nunalias cf >& /dev/null\nalias cf 'conf \\!*'\n"
+            );
+            assert!(reload_instruction(shell, Path::new("/tmp/.tcshrc")).starts_with("source "));
+        }
+
+        let sh_guarded = render_init_script(ShellKind::Sh, "j", "cf", false);
+        assert_eq!(sh_guarded, render_init_script(ShellKind::Bash, "j", "cf", false));
+        let sh_forced = render_init_script(ShellKind::Sh, "j", "cf", true);
+        assert_eq!(sh_forced, render_init_script(ShellKind::Bash, "j", "cf", true));
+        assert!(reload_instruction(ShellKind::Sh, Path::new("/tmp/.profile")).starts_with(". "));
+        assert!(reload_instruction(ShellKind::Powershell, Path::new("p.ps1")).starts_with(". "));
+
+        // POSIX sh rejects hyphens in function identifiers
+        assert!(validate_alias_pair_for_shell("my-jira", "cf", ShellKind::Sh).is_err());
+        assert!(validate_alias_pair_for_shell("j", "my-conf", ShellKind::Sh).is_err());
+        assert_eq!(
+            validate_alias_pair_for_shell("my_jira", "my_conf", ShellKind::Sh).unwrap(),
+            ("my_jira".into(), "my_conf".into())
+        );
+        assert!(validate_alias_pair_for_shell("my-jira", "my-conf", ShellKind::Bash).is_ok());
+        assert!(validate_alias_pair_for_shell("my-jira", "my-conf", ShellKind::Tcsh).is_ok());
+    }
+
+    #[test]
+    fn tcsh_preserves_existing_cshrc_when_tcshrc_absent() {
+        let home = tempfile::tempdir().unwrap();
+        let tcshrc = home.path().join(".tcshrc");
+        let cshrc = home.path().join(".cshrc");
+
+        // Neither exists -> defaults to .tcshrc
+        assert_eq!(tcsh_profile_path(home.path()), tcshrc);
+
+        // Only .cshrc exists -> MUST pick .cshrc so tcsh doesn't ignore it
+        fs::write(&cshrc, "set prompt = '% '\n").unwrap();
+        assert_eq!(tcsh_profile_path(home.path()), cshrc);
+
+        // Both exist -> picks .tcshrc
+        fs::write(&tcshrc, "set prompt = '> '\n").unwrap();
+        assert_eq!(tcsh_profile_path(home.path()), tcshrc);
+
+        // Bash chooses .bash_profile when .bashrc is absent and .bash_profile exists
+        let bash_home = tempfile::tempdir().unwrap();
+        let bashrc = bash_home.path().join(".bashrc");
+        let bash_profile = bash_home.path().join(".bash_profile");
+        assert_eq!(bash_profile_path(bash_home.path()), bashrc);
+        fs::write(&bash_profile, "# bp\n").unwrap();
+        assert_eq!(bash_profile_path(bash_home.path()), bash_profile);
+        fs::write(&bashrc, "# rc\n").unwrap();
+        assert_eq!(bash_profile_path(bash_home.path()), bashrc);
+
+        // Sh honors ENV override if non-empty, else ~/.profile
+        assert_eq!(
+            sh_profile_path(bash_home.path(), Some(std::ffi::OsStr::new("/tmp/custom.sh"))),
+            PathBuf::from("/tmp/custom.sh")
+        );
+        assert_eq!(
+            sh_profile_path(bash_home.path(), None),
+            bash_home.path().join(".profile")
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn symlinked_and_dangling_rc_files_preserve_symlinks() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dotfiles = tmp.path().join("dotfiles");
+        let home = tmp.path().join("home");
+        fs::create_dir_all(&dotfiles).unwrap();
+        fs::create_dir_all(&home).unwrap();
+
+        // 1. Valid symlink is preserved on install and uninstall
+        let real_rc = dotfiles.join("tcshrc");
+        fs::write(&real_rc, "set autolist\n").unwrap();
+        let link_rc = home.join(".tcshrc");
+        std::os::unix::fs::symlink(&real_rc, &link_rc).unwrap();
+
+        cmd_alias(AliasCommand::Install {
+            shell: Some(ShellKind::Tcsh),
+            profile: Some(link_rc.clone()),
+            jira: "j".into(),
+            conf: "cf".into(),
+            force: false,
+            dry_run: false,
+            json: false,
+        })
+        .unwrap();
+        assert!(fs::symlink_metadata(&link_rc)
+            .unwrap()
+            .file_type()
+            .is_symlink());
+        let installed = fs::read_to_string(&real_rc).unwrap();
+        assert!(installed.contains("set autolist"));
+        assert!(installed.contains("alias j 'atlassian \\!*'"));
+
+        cmd_alias(AliasCommand::Uninstall {
+            shell: Some(ShellKind::Tcsh),
+            profile: Some(link_rc.clone()),
+            dry_run: false,
+            json: false,
+        })
+        .unwrap();
+        assert!(fs::symlink_metadata(&link_rc)
+            .unwrap()
+            .file_type()
+            .is_symlink());
+        assert_eq!(fs::read_to_string(&real_rc).unwrap(), "set autolist\n");
+
+        // 2. Dangling relative symlink with missing target parent directory creates target cleanly
+        let dangling_link = home.join(".profile");
+        std::os::unix::fs::symlink(Path::new("../dotfiles/nested/sh_profile"), &dangling_link)
+            .unwrap();
+        assert!(!dangling_link.exists());
+
+        cmd_alias(AliasCommand::Install {
+            shell: Some(ShellKind::Sh),
+            profile: Some(dangling_link.clone()),
+            jira: "j".into(),
+            conf: "cf".into(),
+            force: false,
+            dry_run: false,
+            json: false,
+        })
+        .unwrap();
+        assert!(fs::symlink_metadata(&dangling_link)
+            .unwrap()
+            .file_type()
+            .is_symlink());
+        let expected_target = dotfiles.join("nested").join("sh_profile");
+        assert!(expected_target.exists());
+        assert!(fs::read_to_string(&expected_target)
+            .unwrap()
+            .contains("j() { atlassian \"$@\"; }"));
     }
 }

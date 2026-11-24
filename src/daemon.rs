@@ -844,41 +844,67 @@ fn cleanup_owned_files(paths: &DaemonPaths, our_secret: &str, sock_path: Option<
     let _ = sock_path;
 }
 
+#[cfg(any(unix, windows, test))]
+fn data_dir_short_hash(data_dir: &Path) -> String {
+    let canonical = crate::config::canonicalize_existing_ancestor(data_dir);
+    let mut hasher = Sha256::new();
+    #[cfg(unix)]
+    {
+        use std::os::unix::ffi::OsStrExt;
+        hasher.update(canonical.as_os_str().as_bytes());
+    }
+    #[cfg(not(unix))]
+    {
+        hasher.update(canonical.to_string_lossy().as_bytes());
+    }
+    let digest = hex::encode(hasher.finalize());
+    digest[..12].to_string()
+}
+
+#[cfg(any(unix, test))]
+fn path_byte_len(path: &Path) -> usize {
+    #[cfg(unix)]
+    {
+        use std::os::unix::ffi::OsStrExt;
+        path.as_os_str().as_bytes().len()
+    }
+    #[cfg(not(unix))]
+    {
+        path.to_string_lossy().len()
+    }
+}
+
 #[cfg(windows)]
 fn select_windows_pipe_name(data_dir: &Path) -> String {
-    let mut hasher = Sha256::new();
-    hasher.update(data_dir.to_string_lossy().as_bytes());
-    let digest = hex::encode(hasher.finalize());
-    let short_hash = &digest[..12];
+    let short_hash = data_dir_short_hash(data_dir);
     format!(r"\\.\pipe\atlassian-cli-daemon-{short_hash}")
+}
+
+#[cfg(any(unix, test))]
+fn select_unix_socket_path_with_xdg(data_dir: &Path, xdg_runtime_dir: Option<&str>) -> PathBuf {
+    let candidate = data_dir.join("atlassian-daemon.sock");
+    if path_byte_len(&candidate) <= 90 {
+        return candidate;
+    }
+
+    let short_hash = data_dir_short_hash(data_dir);
+
+    if let Some(trimmed) = xdg_runtime_dir.map(str::trim).filter(|s| !s.is_empty()) {
+        let xdg_candidate = PathBuf::from(trimmed)
+            .join("atlassian-cli")
+            .join(format!("daemon-{short_hash}.sock"));
+        if path_byte_len(&xdg_candidate) <= 90 {
+            return xdg_candidate;
+        }
+    }
+
+    PathBuf::from(format!("/tmp/atlassian-cli-{short_hash}/atlassian-daemon.sock"))
 }
 
 #[cfg(unix)]
 fn select_unix_socket_path(data_dir: &Path) -> PathBuf {
-    use std::os::unix::ffi::OsStrExt;
-
-    let candidate = data_dir.join("atlassian-daemon.sock");
-    if candidate.as_os_str().as_bytes().len() <= 90 {
-        return candidate;
-    }
-
-    if let Ok(xdg) = std::env::var("XDG_RUNTIME_DIR") {
-        let trimmed = xdg.trim();
-        if !trimmed.is_empty() {
-            let xdg_candidate = PathBuf::from(trimmed)
-                .join("atlassian-cli")
-                .join("atlassian-daemon.sock");
-            if xdg_candidate.as_os_str().as_bytes().len() <= 90 {
-                return xdg_candidate;
-            }
-        }
-    }
-
-    let mut hasher = Sha256::new();
-    hasher.update(data_dir.as_os_str().as_bytes());
-    let digest = hex::encode(hasher.finalize());
-    let short_hash = &digest[..12];
-    PathBuf::from(format!("/tmp/atlassian-cli-{short_hash}/atlassian-daemon.sock"))
+    let xdg = std::env::var("XDG_RUNTIME_DIR").ok();
+    select_unix_socket_path_with_xdg(data_dir, xdg.as_deref())
 }
 
 #[cfg(unix)]
@@ -2841,5 +2867,81 @@ mod tests {
         drop(conn);
         assert!(stop_daemon_at(&paths).await.unwrap());
         handle.await.unwrap().unwrap();
+    }
+
+    #[test]
+    fn select_unix_socket_path_xdg_distinguishes_long_profiles() {
+        let long_base = format!("/home/{}", "verylongdirectorysegment/".repeat(5));
+        let profile_a = PathBuf::from(&long_base).join("profile-alpha");
+        let profile_b = PathBuf::from(&long_base).join("profile-beta");
+
+        let sock_a = select_unix_socket_path_with_xdg(&profile_a, Some("/run/user/1000"));
+        let sock_b = select_unix_socket_path_with_xdg(&profile_b, Some("/run/user/1000"));
+
+        assert_ne!(sock_a, sock_b, "distinct profiles must not collide in XDG_RUNTIME_DIR");
+        let hash_a = data_dir_short_hash(&profile_a);
+        let hash_b = data_dir_short_hash(&profile_b);
+        assert!(
+            sock_a.to_string_lossy().contains(&hash_a),
+            "expected hash {hash_a} in {}",
+            sock_a.display()
+        );
+        assert!(
+            sock_b.to_string_lossy().contains(&hash_b),
+            "expected hash {hash_b} in {}",
+            sock_b.display()
+        );
+        assert!(path_byte_len(&sock_a) <= 90);
+        assert!(path_byte_len(&sock_b) <= 90);
+    }
+
+    #[test]
+    fn data_dir_short_hash_is_stable_across_symlinks_and_canonical_paths() {
+        let tmp = tempfile::tempdir().unwrap();
+        let real_home = tmp.path().join("real-home");
+        fs::create_dir(&real_home).unwrap();
+
+        let real_data = real_home.join("atlassian-cli").join("default");
+        let non_canon_data = real_home
+            .join(".")
+            .join("..")
+            .join("real-home")
+            .join("atlassian-cli")
+            .join("default");
+        assert_eq!(
+            data_dir_short_hash(&real_data),
+            data_dir_short_hash(&non_canon_data)
+        );
+
+        let sym_home = tmp.path().join("sym-home");
+        let linked = {
+            #[cfg(unix)]
+            {
+                std::os::unix::fs::symlink(&real_home, &sym_home).unwrap();
+                true
+            }
+            #[cfg(windows)]
+            {
+                match std::os::windows::fs::symlink_dir(&real_home, &sym_home) {
+                    Ok(()) => true,
+                    Err(e) if e.raw_os_error() == Some(1314) => false,
+                    Err(e) => panic!("unexpected symlink_dir error: {e}"),
+                }
+            }
+        };
+        if linked {
+            let sym_data = sym_home.join("atlassian-cli").join("default");
+            assert_eq!(
+                data_dir_short_hash(&real_data),
+                data_dir_short_hash(&sym_data)
+            );
+            let long_suffix = "a".repeat(95);
+            let long_real = real_home.join(&long_suffix);
+            let long_sym = sym_home.join(&long_suffix);
+            assert_eq!(
+                select_unix_socket_path_with_xdg(&long_real, Some("/run/user/1000")),
+                select_unix_socket_path_with_xdg(&long_sym, Some("/run/user/1000"))
+            );
+        }
     }
 }

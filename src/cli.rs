@@ -8196,6 +8196,39 @@ mod tests {
             } if jira == "j" && conf == "cf"
         ));
 
+        for (raw_shell, expected_shell) in [
+            ("tcsh", ShellKind::Tcsh),
+            ("csh", ShellKind::Csh),
+            ("sh", ShellKind::Sh),
+            ("dash", ShellKind::Sh),
+            ("ash", ShellKind::Sh),
+            ("ksh", ShellKind::Sh),
+        ] {
+            let cli: Cli =
+                try_parse_cli_from("atlassian", ["atlassian", "init", raw_shell]).unwrap();
+            assert!(
+                matches!(
+                    cli.command.unwrap(),
+                    Command::Init { shell, .. } if shell == expected_shell
+                ),
+                "init {raw_shell} should parse as {expected_shell:?}"
+            );
+            let alias_cli: Cli = try_parse_cli_from(
+                "atlassian",
+                ["atlassian", "alias", "install", "--shell", raw_shell, "--dry-run"],
+            )
+            .unwrap();
+            assert!(
+                matches!(
+                    alias_cli.command.unwrap(),
+                    Command::Alias {
+                        action: AliasCommand::Install { shell: Some(s), .. }
+                    } if s == expected_shell
+                ),
+                "alias install --shell {raw_shell} should parse as {expected_shell:?}"
+            );
+        }
+
         // 6. JSON detection helper covers `--json`, `-j`, and combined short flags
         let to_os = |v: &[&str]| v.iter().map(OsString::from).collect::<Vec<_>>();
         assert!(argv_requests_json(&to_os(&["atlassian", "ENG-42", "--json"])));

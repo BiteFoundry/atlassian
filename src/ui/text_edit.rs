@@ -226,6 +226,12 @@ fn split_editor_command(raw: &str) -> Vec<String> {
     if Path::new(raw).is_file() {
         return vec![raw.to_string()];
     }
+    if raw.starts_with("~/") || raw.starts_with("~\\") {
+        let expanded = crate::config::expand_tilde(raw);
+        if expanded.is_file() {
+            return vec![expanded.to_string_lossy().into_owned()];
+        }
+    }
 
     let mut parts = Vec::new();
     let mut current: Option<String> = None;
@@ -248,12 +254,25 @@ fn split_editor_command(raw: &str) -> Vec<String> {
     parts
 }
 
+fn expand_editor_program(program: &str) -> String {
+    if program == "~" || program.starts_with("~/") || program.starts_with("~\\") {
+        crate::config::expand_tilde(program)
+            .to_string_lossy()
+            .into_owned()
+    } else {
+        program.to_string()
+    }
+}
+
 /// Program and arguments that launch the editor for `parts` (the program comes first).
 ///
 /// Windows cannot start a program without an extension (`code`) or a `.cmd`/`.bat` shim
 /// directly, so those run through `cmd /C`. The last argument is then a complete, already
 /// quoted command line that has to reach `cmd` unchanged.
-fn editor_invocation(parts: Vec<String>) -> (String, Vec<String>) {
+fn editor_invocation(mut parts: Vec<String>) -> (String, Vec<String>) {
+    if let Some(program) = parts.first_mut() {
+        *program = expand_editor_program(program);
+    }
     #[cfg(windows)]
     if parts.first().is_some_and(|program| needs_cmd_shim(program)) {
         let line = parts
@@ -308,12 +327,14 @@ fn quote_windows_arg(arg: &str) -> String {
     quoted
 }
 
-fn editor_command(parts: Vec<String>, file: &Path) -> Command {
+fn editor_command(mut parts: Vec<String>, file: &Path) -> Command {
+    if let Some(program) = parts.first_mut() {
+        *program = expand_editor_program(program);
+    }
     #[cfg(windows)]
     if parts.first().is_some_and(|program| needs_cmd_shim(program)) {
         use std::os::windows::process::CommandExt;
 
-        let mut parts = parts;
         parts.push(file.to_string_lossy().into_owned());
         let (program, args) = editor_invocation(parts);
         let mut command = Command::new(program);
@@ -467,5 +488,31 @@ mod tests {
                 "{program}"
             );
         }
+    }
+
+    #[test]
+    fn editor_command_expands_tilde_in_program_only() {
+        let Some(home) = dirs::home_dir() else {
+            return;
+        };
+        let expected = home.join("bin/my-editor.exe");
+        let cmd = editor_command(
+            vec![
+                "~/bin/my-editor.exe".to_string(),
+                "--config".to_string(),
+                "~/keep-arg".to_string(),
+            ],
+            Path::new("draft.md"),
+        );
+        assert_eq!(Path::new(cmd.get_program()), expected.as_path());
+        let args: Vec<String> = cmd
+            .get_args()
+            .map(|a| a.to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(args, ["--config", "~/keep-arg", "draft.md"]);
+
+        // Non-tilde programs stay untouched.
+        assert_eq!(expand_editor_program("vim"), "vim");
+        assert_eq!(expand_editor_program("~other/bin/vi"), "~other/bin/vi");
     }
 }

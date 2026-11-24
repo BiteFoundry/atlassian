@@ -1,6 +1,6 @@
 {
   "name": "@bitefoundry/atlassian-linux-x64",
-  "version": "0.8.2",
+  "version": "0.8.3",
   "description": "Prebuilt atlassian binary for Linux x64 (glibc)",
   "license": "MIT",
   "os": [

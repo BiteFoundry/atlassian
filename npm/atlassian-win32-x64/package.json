@@ -1,6 +1,6 @@
 {
   "name": "@bitefoundry/atlassian-win32-x64",
-  "version": "0.8.2",
+  "version": "0.8.3",
   "description": "Prebuilt atlassian binary for Windows x64",
   "license": "MIT",
   "os": [

@@ -31,10 +31,25 @@ struct GitHubAsset {
     browser_download_url: String,
 }
 
+/// Resolves a symlinked executable path to its canonical real binary so self-updates
+/// and `.old` cleanup operate on the real target instead of severing the symlink.
+pub(crate) fn resolve_target_executable(path: &Path) -> PathBuf {
+    if std::fs::symlink_metadata(path)
+        .map(|m| m.file_type().is_symlink())
+        .unwrap_or(false)
+    {
+        if let Ok(resolved) = std::fs::canonicalize(path) {
+            return resolved;
+        }
+    }
+    path.to_path_buf()
+}
+
 /// Silently cleans up any `<current_exe>.old` left behind by a previous Windows self-update.
 pub fn cleanup_stale_old_binary() {
     if let Ok(exe) = std::env::current_exe() {
-        let old_path = append_ext_suffix(&exe, ".old");
+        let target = resolve_target_executable(&exe);
+        let old_path = append_ext_suffix(&target, ".old");
         if old_path.exists() {
             let _ = std::fs::remove_file(&old_path);
         }
@@ -62,8 +77,9 @@ pub async fn check_or_apply_update_with_api_base(
     check_only: bool,
     force: bool,
 ) -> Result<UpdateCheckResult> {
-    let binary_path =
+    let current_exe =
         std::env::current_exe().context("Failed to determine current executable path")?;
+    let binary_path = resolve_target_executable(&current_exe);
     let token = discover_github_token(api_base_url).await;
     check_or_apply_update_at(api_base_url, repo, check_only, force, &binary_path, token).await
 }
@@ -543,8 +559,19 @@ fn find_file_recursive(dir: &Path, target_name: &str) -> Option<PathBuf> {
 }
 
 pub(crate) fn replace_executable_at(target_exe: &Path, new_bytes: &[u8]) -> Result<()> {
-    let new_path = append_ext_suffix(target_exe, ".new");
-    let old_path = append_ext_suffix(target_exe, ".old");
+    let target_exe = resolve_target_executable(target_exe);
+    let new_path = append_ext_suffix(&target_exe, ".new");
+    let old_path = append_ext_suffix(&target_exe, ".old");
+
+    if std::fs::symlink_metadata(&new_path)
+        .map(|m| m.file_type().is_symlink())
+        .unwrap_or(false)
+    {
+        bail!(
+            "Refusing to write update staging file through symlink: {}",
+            new_path.display()
+        );
+    }
 
     std::fs::write(&new_path, new_bytes)
         .with_context(|| format!("Failed to write new binary staging file: {}", new_path.display()))?;
@@ -563,7 +590,7 @@ pub(crate) fn replace_executable_at(target_exe: &Path, new_bytes: &[u8]) -> Resu
 
     let had_existing = target_exe.exists();
     if had_existing {
-        if let Err(err) = std::fs::rename(target_exe, &old_path) {
+        if let Err(err) = std::fs::rename(&target_exe, &old_path) {
             let _ = std::fs::remove_file(&new_path);
             return Err(err).with_context(|| {
                 format!(
@@ -575,9 +602,9 @@ pub(crate) fn replace_executable_at(target_exe: &Path, new_bytes: &[u8]) -> Resu
         }
     }
 
-    if let Err(err) = std::fs::rename(&new_path, target_exe) {
+    if let Err(err) = std::fs::rename(&new_path, &target_exe) {
         if had_existing && old_path.exists() {
-            let _ = std::fs::rename(&old_path, target_exe);
+            let _ = std::fs::rename(&old_path, &target_exe);
         }
         let _ = std::fs::remove_file(&new_path);
         return Err(err).with_context(|| {
@@ -925,5 +952,72 @@ mod tests {
         assert!(!append_ext_suffix(&fake_exe, ".old").exists());
 
         server.abort();
+    }
+
+    #[test]
+    fn resolve_target_executable_follows_symlink_and_preserves_link_on_replace() {
+        let tmp = tempfile::tempdir().unwrap();
+        let real_dir = tmp.path().join("cellar");
+        let bin_dir = tmp.path().join("bin");
+        std::fs::create_dir_all(&real_dir).unwrap();
+        std::fs::create_dir_all(&bin_dir).unwrap();
+
+        let real_bin = real_dir.join("atlassian");
+        std::fs::write(&real_bin, b"v1-binary").unwrap();
+        assert_eq!(resolve_target_executable(&real_bin), real_bin);
+
+        let link_bin = bin_dir.join("atlassian");
+        let symlinks_supported = {
+            #[cfg(unix)]
+            {
+                std::os::unix::fs::symlink(&real_bin, &link_bin).unwrap();
+                true
+            }
+            #[cfg(windows)]
+            {
+                match std::os::windows::fs::symlink_file(&real_bin, &link_bin) {
+                    Ok(()) => true,
+                    Err(e) if e.raw_os_error() == Some(1314) => false,
+                    Err(e) => panic!("unexpected symlink_file error: {e}"),
+                }
+            }
+        };
+        if !symlinks_supported {
+            return;
+        }
+
+        assert_eq!(
+            resolve_target_executable(&link_bin),
+            std::fs::canonicalize(&real_bin).unwrap()
+        );
+
+        // Replacing through the symlink updates the real target and preserves the symlink.
+        replace_executable_at(&link_bin, b"v2-binary").unwrap();
+        assert!(std::fs::symlink_metadata(&link_bin)
+            .unwrap()
+            .file_type()
+            .is_symlink());
+        assert_eq!(std::fs::read(&real_bin).unwrap(), b"v2-binary");
+        assert_eq!(
+            std::fs::read(append_ext_suffix(&real_bin, ".old")).unwrap(),
+            b"v1-binary"
+        );
+
+        // A `.new` staging path that is a symlink must be refused.
+        let decoy = tmp.path().join("decoy");
+        std::fs::write(&decoy, b"untouched").unwrap();
+        let staged_new = append_ext_suffix(&real_bin, ".new");
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(&decoy, &staged_new).unwrap();
+        #[cfg(windows)]
+        std::os::windows::fs::symlink_file(&decoy, &staged_new).unwrap();
+
+        let err = replace_executable_at(&real_bin, b"v3-binary").unwrap_err();
+        assert!(
+            format!("{err:#}").contains("Refusing to write update staging file through symlink"),
+            "unexpected error: {err:#}"
+        );
+        assert_eq!(std::fs::read(&decoy).unwrap(), b"untouched");
+        assert_eq!(std::fs::read(&real_bin).unwrap(), b"v2-binary");
     }
 }
