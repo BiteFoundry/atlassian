@@ -2528,11 +2528,16 @@ fn tool_catalog() -> Vec<Value> {
         "type": "object",
         "description": "Replace one unique occurrence within a single source text node.",
         "properties": {
-            "old_text": { "type": "string", "minLength": 1 },
-            "new_text": { "type": "string" }
+            "old_text": { "type": "string", "minLength": 1, "description": "Exact unique text snippet to replace within one text node." },
+            "new_text": { "type": "string", "description": "Replacement text that substitutes for old_text." }
         },
         "required": ["old_text", "new_text"],
         "additionalProperties": false
+    });
+    let offline_property = json!({
+        "type": "boolean",
+        "default": false,
+        "description": "Read from local SQLite cache only; default false calls the live API."
     });
     let mut tools = vec![
         // --- Jira ---
@@ -2552,7 +2557,7 @@ fn tool_catalog() -> Vec<Value> {
                 "type": "object",
                 "properties": {
                     "refresh": refresh_property.clone(),
-                    "limit": { "type": "integer", "minimum": 1, "maximum": 1000, "default": 50 },
+                    "limit": { "type": "integer", "minimum": 1, "maximum": 1000, "default": 50, "description": "Maximum number of projects to return (1–1000, default 50)." },
                     "cursor": { "type": "string", "description": "Offset from next_cursor." }
                 },
                 "additionalProperties": false
@@ -2566,7 +2571,7 @@ fn tool_catalog() -> Vec<Value> {
                 "properties": {
                     "project": { "type": "string", "description": "Optional Jira project key (e.g. ENG)." },
                     "refresh": refresh_property.clone(),
-                    "limit": { "type": "integer", "minimum": 1, "maximum": 1000, "default": 50 },
+                    "limit": { "type": "integer", "minimum": 1, "maximum": 1000, "default": 50, "description": "Maximum number of boards to return (1–1000, default 50)." },
                     "cursor": { "type": "string", "description": "Offset from next_cursor." }
                 },
                 "additionalProperties": false
@@ -2578,10 +2583,10 @@ fn tool_catalog() -> Vec<Value> {
             "inputSchema": {
                 "type": "object",
                 "properties": {
-                    "board_id": { "type": "integer" },
-                    "limit": { "type": "integer", "minimum": 1, "maximum": 1000, "default": 50 },
+                    "board_id": { "type": "integer", "description": "Numeric Jira Agile board ID from list_boards." },
+                    "limit": { "type": "integer", "minimum": 1, "maximum": 1000, "default": 50, "description": "Maximum number of sprints to return (1–1000, default 50)." },
                     "cursor": { "type": "string", "description": "Offset from next_cursor." },
-                    "offline": { "type": "boolean", "default": false }
+                    "offline": offline_property.clone()
                 },
                 "required": ["board_id"],
                 "additionalProperties": false
@@ -2593,11 +2598,11 @@ fn tool_catalog() -> Vec<Value> {
             "inputSchema": {
                 "type": "object",
                 "properties": {
-                    "board_id": { "type": "integer" },
-                    "sprint_id": { "type": "integer" },
-                    "limit": { "type": "integer", "minimum": 1, "maximum": 1000, "default": 50 },
+                    "board_id": { "type": "integer", "description": "Numeric Jira Agile board ID from list_boards." },
+                    "sprint_id": { "type": "integer", "description": "Optional numeric sprint ID from list_sprints to filter issues." },
+                    "limit": { "type": "integer", "minimum": 1, "maximum": 1000, "default": 50, "description": "Maximum number of issues to return (1–1000, default 50)." },
                     "cursor": { "type": "string", "description": "Offset from next_cursor." },
-                    "offline": { "type": "boolean", "default": false }
+                    "offline": offline_property.clone()
                 },
                 "required": ["board_id"],
                 "additionalProperties": false
@@ -2605,17 +2610,17 @@ fn tool_catalog() -> Vec<Value> {
         }),
         json!({
             "name": "search_jira_issues",
-            "description": "Search Jira issues using explicit JQL (jql), plain query text (query), project filter, or offline SQLite cache. For custom field expressions (e.g. `customField = \"foo\"`), pass `jql` explicitly.",
+            "description": "Search Jira-only issues using explicit JQL (jql), plain text (query), project filter, or offline SQLite cache. Use search_all for cross-product Jira + Confluence search; pass jql explicitly for custom fields (e.g. `customField = \"foo\"`).",
             "inputSchema": {
                 "type": "object",
                 "properties": {
                     "jql": { "type": "string", "description": "Explicit raw JQL expression (e.g. `customField = \"value\" ORDER BY updated DESC`). Takes precedence over query." },
                     "query": { "type": "string", "description": "Plain text search query (or compatible standard-field JQL expression)." },
-                    "project": { "type": "string" },
-                    "limit": { "type": "integer", "minimum": 1, "maximum": 1000, "default": 50 },
+                    "project": { "type": "string", "description": "Optional Jira project key filter (e.g. ENG)." },
+                    "limit": { "type": "integer", "minimum": 1, "maximum": 1000, "default": 50, "description": "Maximum number of issues to return (1–1000, default 50)." },
                     "page_token": { "type": "string", "description": "Cloud pagination cursor (`next_page_token`). Mutually exclusive with `start_at`." },
                     "start_at": { "type": "integer", "minimum": 0, "description": "Data Center 0-based pagination offset (`next_start_at`). Mutually exclusive with `page_token`." },
-                    "offline": { "type": "boolean", "default": false }
+                    "offline": { "type": "boolean", "default": false, "description": "Search local SQLite cache only (plain query/project); default false calls Jira." }
                 },
                 "additionalProperties": false
             }
@@ -2626,8 +2631,8 @@ fn tool_catalog() -> Vec<Value> {
             "inputSchema": {
                 "type": "object",
                 "properties": {
-                    "key": { "type": "string", "minLength": 1 },
-                    "offline": { "type": "boolean", "default": false },
+                    "key": { "type": "string", "minLength": 1, "description": "Jira issue key to fetch (e.g. ENG-42)." },
+                    "offline": offline_property.clone(),
                     "compact": { "type": "boolean", "default": true, "description": "Set false for the full response structure." },
                     "fields": {
                         "type": "array",
@@ -2641,18 +2646,18 @@ fn tool_catalog() -> Vec<Value> {
         }),
         json!({
             "name": "create_jira_issue",
-            "description": "Create a new Jira issue from Markdown description.",
+            "description": "Create a new Jira issue from a Markdown description and return the created issue key and summary (set compact: false for full details).",
             "inputSchema": {
                 "type": "object",
                 "properties": {
-                    "project_key": { "type": "string", "minLength": 1 },
-                    "issue_type": { "type": "string", "default": "Task" },
-                    "summary": { "type": "string", "minLength": 1 },
-                    "description_markdown": { "type": "string" },
-                    "priority": { "type": "string" },
+                    "project_key": { "type": "string", "minLength": 1, "description": "Target Jira project key (e.g. ENG)." },
+                    "issue_type": { "type": "string", "default": "Task", "description": "Jira issue type name, such as Task, Bug, or Story (default Task)." },
+                    "summary": { "type": "string", "minLength": 1, "description": "Concise single-line Jira issue title." },
+                    "description_markdown": { "type": "string", "description": "Optional issue description formatted in Markdown." },
+                    "priority": { "type": "string", "description": "Optional Jira priority name (e.g. High, Medium, Low)." },
                     "assignee_id": { "type": "string", "description": "Account ID or 'me'; a display name or email is resolved when the ID is rejected." },
-                    "labels": { "type": "array", "items": { "type": "string" } },
-                    "parent_key": { "type": "string" },
+                    "labels": { "type": "array", "items": { "type": "string" }, "description": "Optional list of Jira label strings to attach." },
+                    "parent_key": { "type": "string", "description": "Optional parent or epic issue key (e.g. ENG-10)." },
                     "compact": { "type": "boolean", "default": true, "description": "Set false for the full response structure." }
                 },
                 "required": ["project_key", "summary"],
@@ -2661,17 +2666,17 @@ fn tool_catalog() -> Vec<Value> {
         }),
         json!({
             "name": "update_jira_issue",
-            "description": "Update Jira issue fields. Choose one body operation per request. Set dry_run to preview the changes.",
+            "description": "Update standard Jira issue fields and Markdown description; use update_jira_custom_fields for customfield_<digits> keys. Choose one body operation per request; set dry_run: true to preview changes.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
-                    "key": { "type": "string", "minLength": 1 },
-                    "summary": { "type": "string" },
+                    "key": { "type": "string", "minLength": 1, "description": "Jira issue key to update (e.g. ENG-42)." },
+                    "summary": { "type": "string", "description": "New single-line title to replace the issue summary." },
                     "description_markdown": { "type": "string", "description": "Replace the entire body." },
                     "append_markdown": { "type": "string", "description": "Append without converting the original body." },
                     "replace_text": text_replacement.clone(),
                     "dry_run": { "type": "boolean", "default": false, "description": "Preview the computed changes without saving." },
-                    "priority": { "type": "string" },
+                    "priority": { "type": "string", "description": "New Jira priority name (e.g. High, Medium, Low)." },
                     "assignee_id": { "type": ["string", "null"], "description": "Account ID or 'me'; a display name or email is resolved when the ID is rejected." },
                     "labels": { "type": "array", "items": { "type": "string" }, "description": "Replaces all labels; pass [] to clear." },
                     "compact": { "type": "boolean", "default": true, "description": "Set false for the full response structure." }
@@ -2686,7 +2691,7 @@ fn tool_catalog() -> Vec<Value> {
             "inputSchema": {
                 "type": "object",
                 "properties": {
-                    "key": { "type": "string", "minLength": 1 }
+                    "key": { "type": "string", "minLength": 1, "description": "Jira issue key to inspect transitions for (e.g. ENG-42)." }
                 },
                 "required": ["key"],
                 "additionalProperties": false
@@ -2698,9 +2703,9 @@ fn tool_catalog() -> Vec<Value> {
             "inputSchema": {
                 "type": "object",
                 "properties": {
-                    "key": { "type": "string", "minLength": 1 },
+                    "key": { "type": "string", "minLength": 1, "description": "Jira issue key to transition (e.g. ENG-42)." },
                     "transition": { "type": "string", "minLength": 1, "description": "Transition ID or target status/transition name." },
-                    "comment_markdown": { "type": "string" }
+                    "comment_markdown": { "type": "string", "description": "Optional Markdown comment posted alongside the workflow transition." }
                 },
                 "required": ["key", "transition"],
                 "additionalProperties": false
@@ -2712,7 +2717,7 @@ fn tool_catalog() -> Vec<Value> {
             "inputSchema": {
                 "type": "object",
                 "properties": {
-                    "key": { "type": "string", "minLength": 1 },
+                    "key": { "type": "string", "minLength": 1, "description": "Jira issue key to assign or unassign (e.g. ENG-42)." },
                     "assignee_id": { "type": ["string", "null"], "description": "Account ID (Cloud), username (Data Center), or 'me'; a display name or email is resolved when the ID is rejected. null unassigns." }
                 },
                 "required": ["key", "assignee_id"],
@@ -2721,12 +2726,12 @@ fn tool_catalog() -> Vec<Value> {
         }),
         json!({
             "name": "add_jira_comment",
-            "description": "Add a Markdown comment to a Jira issue.",
+            "description": "Add a Markdown comment to a Jira issue and return the created comment metadata.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
-                    "key": { "type": "string", "minLength": 1 },
-                    "body_markdown": { "type": "string", "minLength": 1 }
+                    "key": { "type": "string", "minLength": 1, "description": "Jira issue key to comment on (e.g. ENG-42)." },
+                    "body_markdown": { "type": "string", "minLength": 1, "description": "Comment content formatted in Markdown." }
                 },
                 "required": ["key", "body_markdown"],
                 "additionalProperties": false
@@ -2734,12 +2739,12 @@ fn tool_catalog() -> Vec<Value> {
         }),
         json!({
             "name": "upload_jira_attachment",
-            "description": "Upload a local file as an attachment on a Jira issue.",
+            "description": "Upload a local file as an attachment on a Jira issue and return the created attachment metadata.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
-                    "key": { "type": "string", "minLength": 1 },
-                    "path": { "type": "string", "minLength": 1 }
+                    "key": { "type": "string", "minLength": 1, "description": "Jira issue key to attach the file to (e.g. ENG-42)." },
+                    "path": { "type": "string", "minLength": 1, "description": "Local filesystem path of the file to upload." }
                 },
                 "required": ["key", "path"],
                 "additionalProperties": false
@@ -2747,11 +2752,11 @@ fn tool_catalog() -> Vec<Value> {
         }),
         json!({
             "name": "delete_jira_issue",
-            "description": "Permanently delete a Jira issue. Requires confirm=true.",
+            "description": "Permanently delete a Jira issue and remove it from the local cache. Destructive: requires confirm: true.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
-                    "key": { "type": "string", "minLength": 1 },
+                    "key": { "type": "string", "minLength": 1, "description": "Jira issue key to permanently delete (e.g. ENG-42)." },
                     "confirm": { "const": true, "description": "Must be literal boolean true." }
                 },
                 "required": ["key", "confirm"],
@@ -2760,27 +2765,52 @@ fn tool_catalog() -> Vec<Value> {
         }),
         workflow_tool("set_jira_parent",
             "Set the parent of an existing Jira Cloud issue. On Data Center, assign an eligible non-subtask issue to an epic.",
-            json!({"key": {"type": "string"}, "parent_key": {"type": "string"}}),
+            json!({
+                "key": {"type": "string", "description": "Child Jira issue key to reparent (e.g. ENG-42)."},
+                "parent_key": {"type": "string", "description": "Target parent or epic issue key (e.g. ENG-10)."}
+            }),
             &["key", "parent_key"]),
         workflow_tool("update_jira_custom_fields",
-            "Set explicit customfield_<digits> values and return the values read back from Jira.",
-            json!({"key": {"type": "string"}, "fields": {"type": "object", "minProperties": 1,
-                "propertyNames": {"pattern": "^customfield_[0-9]+$"}}}),
+            "Set explicit customfield_<digits> values on a Jira issue and return the read-back values. Use update_jira_issue for standard fields or description edits.",
+            json!({
+                "key": {"type": "string", "description": "Jira issue key to update (e.g. ENG-42)."},
+                "fields": {
+                    "type": "object",
+                    "minProperties": 1,
+                    "propertyNames": {"pattern": "^customfield_[0-9]+$"},
+                    "description": "Non-empty map of customfield_<digits> keys to native JSON values."
+                }
+            }),
             &["key", "fields"]),
         workflow_tool("create_jira_issue_link",
             "Link two existing issues with a configured Jira link type name and return the link ID.",
-            json!({"inward_key": {"type": "string"}, "outward_key": {"type": "string"},
-                "link_type": {"type": "string"}}),
+            json!({
+                "inward_key": {"type": "string", "description": "Source issue key on inward end (for \"Blocks\", the blocking issue)."},
+                "outward_key": {"type": "string", "description": "Target issue key on outward end (for \"Blocks\", the blocked issue)."},
+                "link_type": {"type": "string", "description": "Configured Jira link type name (e.g. \"Blocks\", \"Relates\", \"Duplicate\")."}
+            }),
             &["inward_key", "outward_key", "link_type"]),
         workflow_tool("move_jira_issues_to_sprint",
             "Move existing issues to an open or active sprint and confirm membership.",
-            json!({"sprint_id": {"type": "integer", "minimum": 1}, "issue_keys": {
-                "type": "array", "minItems": 1, "maxItems": 50, "items": {"type": "string"}}}),
+            json!({
+                "sprint_id": {"type": "integer", "minimum": 1, "description": "Numeric target open or active sprint ID from list_sprints."},
+                "issue_keys": {
+                    "type": "array",
+                    "minItems": 1,
+                    "maxItems": 50,
+                    "items": {"type": "string"},
+                    "description": "Non-empty list of 1–50 Jira issue keys to move."
+                }
+            }),
             &["sprint_id", "issue_keys"]),
         workflow_tool("add_jira_worklog",
             "Log work in positive seconds and retain the remaining time estimate. Start time is RFC 3339 when supplied.",
-            json!({"key": {"type": "string"}, "seconds": {"type": "integer", "minimum": 1, "maximum": i32::MAX},
-                "started": {"type": "string", "format": "date-time"}, "comment_markdown": {"type": "string"}}),
+            json!({
+                "key": {"type": "string", "description": "Jira issue key to log work against (e.g. ENG-42)."},
+                "seconds": {"type": "integer", "minimum": 1, "maximum": i32::MAX, "description": "Positive integer duration spent in seconds (e.g. 1800 for 30m)."},
+                "started": {"type": "string", "format": "date-time", "description": "Optional worklog start timestamp in RFC 3339 format."},
+                "comment_markdown": {"type": "string", "description": "Optional Markdown description of the logged work."}
+            }),
             &["key", "seconds"]),
         // --- Confluence ---
         json!({
@@ -2790,7 +2820,7 @@ fn tool_catalog() -> Vec<Value> {
                 "type": "object",
                 "properties": {
                     "refresh": refresh_property.clone(),
-                    "limit": { "type": "integer", "minimum": 1, "maximum": 1000, "default": 50 },
+                    "limit": { "type": "integer", "minimum": 1, "maximum": 1000, "default": 50, "description": "Maximum number of spaces to return (1–1000, default 50)." },
                     "cursor": { "type": "string", "description": "Offset from next_cursor." }
                 },
                 "additionalProperties": false
@@ -2798,14 +2828,14 @@ fn tool_catalog() -> Vec<Value> {
         }),
         json!({
             "name": "list_space_pages",
-            "description": "List root pages in a Confluence space. A live call returns at most 250 pages; pass next_cursor as cursor to continue. has_children is null when unknown.",
+            "description": "List top-level root pages in a Confluence space (use list_child_pages for direct children of a page). A live call returns at most 250 pages; pass next_cursor as cursor to continue. has_children is null when unknown.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
-                    "space_key": { "type": "string", "minLength": 1 },
-                    "limit": { "type": "integer", "minimum": 1, "maximum": 1000, "default": 50 },
+                    "space_key": { "type": "string", "minLength": 1, "description": "Confluence space key from list_confluence_spaces (e.g. ENG)." },
+                    "limit": { "type": "integer", "minimum": 1, "maximum": 1000, "default": 50, "description": "Maximum number of pages to return (1–1000, default 50)." },
                     "cursor": { "type": "string", "description": "Value from next_cursor. Valid only with the same arguments." },
-                    "offline": { "type": "boolean", "default": false }
+                    "offline": offline_property.clone()
                 },
                 "required": ["space_key"],
                 "additionalProperties": false
@@ -2813,14 +2843,14 @@ fn tool_catalog() -> Vec<Value> {
         }),
         json!({
             "name": "list_child_pages",
-            "description": "List direct child pages of a Confluence page. A live call returns at most 250 pages; pass next_cursor as cursor to continue. has_children is null when unknown.",
+            "description": "List direct child pages of a Confluence page (use list_space_pages for top-level space roots). A live call returns at most 250 pages; pass next_cursor as cursor to continue. has_children is null when unknown.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
-                    "page_id": { "type": "string", "minLength": 1 },
-                    "limit": { "type": "integer", "minimum": 1, "maximum": 1000, "default": 100 },
+                    "page_id": { "type": "string", "minLength": 1, "description": "Parent Confluence page ID whose direct children to list." },
+                    "limit": { "type": "integer", "minimum": 1, "maximum": 1000, "default": 100, "description": "Maximum number of child pages to return (1–1000, default 100)." },
                     "cursor": { "type": "string", "description": "Value from next_cursor. Valid only with the same arguments." },
-                    "offline": { "type": "boolean", "default": false }
+                    "offline": offline_property.clone()
                 },
                 "required": ["page_id"],
                 "additionalProperties": false
@@ -2832,8 +2862,8 @@ fn tool_catalog() -> Vec<Value> {
             "inputSchema": {
                 "type": "object",
                 "properties": {
-                    "page_id": { "type": "string", "minLength": 1 },
-                    "offline": { "type": "boolean", "default": false },
+                    "page_id": { "type": "string", "minLength": 1, "description": "Confluence page ID to fetch." },
+                    "offline": offline_property.clone(),
                     "compact": { "type": "boolean", "default": true, "description": "Set false for the full response structure." }
                 },
                 "required": ["page_id"],
@@ -2842,14 +2872,14 @@ fn tool_catalog() -> Vec<Value> {
         }),
         json!({
             "name": "create_confluence_page",
-            "description": "Create a new Confluence page from Markdown.",
+            "description": "Create a new Confluence page from Markdown and return the created page ID, version, and title (set compact: false for full details).",
             "inputSchema": {
                 "type": "object",
                 "properties": {
-                    "space_id_or_key": { "type": "string", "minLength": 1 },
-                    "parent_id": { "type": "string" },
-                    "title": { "type": "string", "minLength": 1 },
-                    "body_markdown": { "type": "string" },
+                    "space_id_or_key": { "type": "string", "minLength": 1, "description": "Target Confluence space ID or space key (e.g. ENG)." },
+                    "parent_id": { "type": "string", "description": "Optional parent Confluence page ID to nest under." },
+                    "title": { "type": "string", "minLength": 1, "description": "Unique page title within the target Confluence space." },
+                    "body_markdown": { "type": "string", "description": "Optional initial page body formatted in Markdown." },
                     "compact": { "type": "boolean", "default": true, "description": "Set false for the full response structure." }
                 },
                 "required": ["space_id_or_key", "title"],
@@ -2862,8 +2892,8 @@ fn tool_catalog() -> Vec<Value> {
             "inputSchema": {
                 "type": "object",
                 "properties": {
-                    "page_id": { "type": "string", "minLength": 1 },
-                    "title": { "type": "string" },
+                    "page_id": { "type": "string", "minLength": 1, "description": "Confluence page ID to update." },
+                    "title": { "type": "string", "description": "Optional new title to rename the Confluence page." },
                     "body_markdown": { "type": "string", "description": "Replace the entire body." },
                     "append_markdown": { "type": "string", "description": "Append without converting the original body." },
                     "replace_text": text_replacement.clone(),
@@ -2871,15 +2901,15 @@ fn tool_catalog() -> Vec<Value> {
                         "type": "object",
                         "description": "Replace content under an exact top-level or layout-column heading on a Confluence Cloud ADF page.",
                         "properties": {
-                            "heading": { "type": "string", "minLength": 1 },
-                            "markdown": { "type": "string" }
+                            "heading": { "type": "string", "minLength": 1, "description": "Exact heading text identifying the section to replace." },
+                            "markdown": { "type": "string", "description": "Replacement Markdown body for the matched section." }
                         },
                         "required": ["heading", "markdown"],
                         "additionalProperties": false
                     },
                     "dry_run": { "type": "boolean", "default": false, "description": "Preview the computed changes without saving." },
-                    "prev_version": { "type": "integer", "minimum": 1 },
-                    "version_message": { "type": "string" },
+                    "prev_version": { "type": "integer", "minimum": 1, "description": "Current integer version_number from get_confluence_page (required for body edits)." },
+                    "version_message": { "type": "string", "description": "Optional short summary recorded in page version history." },
                     "compact": { "type": "boolean", "default": true, "description": "Set false for the full response structure." }
                 },
                 "required": ["page_id"],
@@ -2888,12 +2918,12 @@ fn tool_catalog() -> Vec<Value> {
         }),
         json!({
             "name": "add_confluence_comment",
-            "description": "Add a footer comment (Markdown) to a Confluence page.",
+            "description": "Add a Markdown footer comment to a Confluence page and return the created comment metadata.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
-                    "page_id": { "type": "string", "minLength": 1 },
-                    "body_markdown": { "type": "string", "minLength": 1 }
+                    "page_id": { "type": "string", "minLength": 1, "description": "Confluence page ID to comment on." },
+                    "body_markdown": { "type": "string", "minLength": 1, "description": "Footer comment content formatted in Markdown." }
                 },
                 "required": ["page_id", "body_markdown"],
                 "additionalProperties": false
@@ -2901,25 +2931,25 @@ fn tool_catalog() -> Vec<Value> {
         }),
         json!({
             "name": "search_confluence_pages",
-            "description": "Search Confluence pages locally (FTS5) or remotely via CQL. For custom field expressions (e.g. `customMeta = \"value\"`), pass `cql` explicitly.",
+            "description": "Search Confluence-only pages locally (SQLite FTS5) or remotely via CQL. Use search_all for cross-product Jira + Confluence search; pass cql explicitly for custom expressions (e.g. `customMeta = \"value\"`).",
             "inputSchema": {
                 "type": "object",
                 "properties": {
                     "query": { "type": "string", "description": "Plain text search query (or compatible standard-field CQL expression)." },
                     "cql": { "type": "string", "description": "Explicit raw CQL expression (e.g. `space = ENG AND title ~ \"Spec\"`). Takes precedence over query." },
-                    "remote": { "type": "boolean", "default": false },
-                    "limit": { "type": "integer", "minimum": 1, "maximum": 1000, "default": 30 }
+                    "remote": { "type": "boolean", "default": false, "description": "Search live Confluence API via CQL; default false searches local cache." },
+                    "limit": { "type": "integer", "minimum": 1, "maximum": 1000, "default": 30, "description": "Maximum number of pages to return (1–1000, default 30)." }
                 },
                 "additionalProperties": false
             }
         }),
         json!({
             "name": "delete_confluence_page",
-            "description": "Delete a Confluence page. Requires confirm=true.",
+            "description": "Delete a Confluence page and remove it from the local cache. Destructive: requires confirm: true.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
-                    "page_id": { "type": "string", "minLength": 1 },
+                    "page_id": { "type": "string", "minLength": 1, "description": "Confluence page ID to permanently delete." },
                     "confirm": { "const": true, "description": "Must be literal boolean true." }
                 },
                 "required": ["page_id", "confirm"],
@@ -2927,22 +2957,38 @@ fn tool_catalog() -> Vec<Value> {
             }
         }),
         workflow_tool("upload_confluence_attachment",
-            "Create an attachment from a local file using the same upload as the CLI attach command.",
-            json!({"page_id": {"type": "string"}, "path": {"type": "string"}}),
+            "Upload a local file as an attachment on a Confluence page and return the created attachment metadata.",
+            json!({
+                "page_id": {"type": "string", "description": "Confluence page ID to attach the file to."},
+                "path": {"type": "string", "description": "Local filesystem path of the file to upload."}
+            }),
             &["page_id", "path"]),
         workflow_tool("move_confluence_page",
             "Move a page under a parent. Data Center requires the current version and a parent in the same space.",
-            json!({"page_id": {"type": "string"}, "parent_id": {"type": "string"},
-                "prev_version": {"type": "integer", "minimum": 1}}),
+            json!({
+                "page_id": {"type": "string", "description": "Confluence page ID to move."},
+                "parent_id": {"type": "string", "description": "Destination parent Confluence page ID."},
+                "prev_version": {"type": "integer", "minimum": 1, "description": "Current integer version_number from get_confluence_page (required on Data Center)."}
+            }),
             &["page_id", "parent_id"]),
         workflow_tool("add_confluence_labels",
             "Add global labels to an existing page and keep its other labels.",
-            json!({"page_id": {"type": "string"}, "labels": {"type": "array", "minItems": 1,
-                "items": {"type": "string"}}}),
+            json!({
+                "page_id": {"type": "string", "description": "Confluence page ID to add labels to."},
+                "labels": {
+                    "type": "array",
+                    "minItems": 1,
+                    "items": {"type": "string"},
+                    "description": "Non-empty list of global label names to add."
+                }
+            }),
             &["page_id", "labels"]),
         workflow_tool("remove_confluence_label",
             "Remove one named label from an existing page.",
-            json!({"page_id": {"type": "string"}, "label": {"type": "string"}}),
+            json!({
+                "page_id": {"type": "string", "description": "Confluence page ID to remove the label from."},
+                "label": {"type": "string", "description": "Exact Confluence label name to remove."}
+            }),
             &["page_id", "label"]),
         // --- Unified & Multi-Site ---
         json!({
@@ -2956,14 +3002,14 @@ fn tool_catalog() -> Vec<Value> {
         }),
         json!({
             "name": "search_all",
-            "description": "Unified search across both Jira issues and Confluence pages (local SQLite FTS5 or remote JQL/CQL).",
+            "description": "Unified search across Jira issues and Confluence pages (local SQLite FTS5 or remote JQL/CQL). Prefer search_jira_issues for Jira-only JQL/pagination or search_confluence_pages for Confluence-only CQL.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
-                    "query": { "type": "string", "minLength": 1 },
-                    "scope": { "type": "string", "enum": ["all", "jira", "confluence"], "default": "all" },
-                    "remote": { "type": "boolean", "default": false },
-                    "limit": { "type": "integer", "minimum": 1, "maximum": 1000, "default": 30 }
+                    "query": { "type": "string", "minLength": 1, "description": "Search query text (or JQL/CQL expression when remote is true)." },
+                    "scope": { "type": "string", "enum": ["all", "jira", "confluence"], "default": "all", "description": "Products to search: all (default), jira, or confluence." },
+                    "remote": { "type": "boolean", "default": false, "description": "Query live Jira/Confluence APIs; default false searches local SQLite cache." },
+                    "limit": { "type": "integer", "minimum": 1, "maximum": 1000, "default": 30, "description": "Maximum number of combined hits to return (1–1000, default 30)." }
                 },
                 "required": ["query"],
                 "additionalProperties": false
@@ -3306,6 +3352,49 @@ mod tests {
             }
         }
         assert_eq!(with_refresh, ["list_projects", "list_boards", "list_confluence_spaces"]);
+    }
+
+    #[tokio::test]
+    async fn every_tool_property_in_tools_list_has_non_empty_description() {
+        fn assert_properties_described(path: &str, schema: &Value) {
+            let Some(props) = schema.get("properties").and_then(Value::as_object) else {
+                return;
+            };
+            for (prop_name, prop_schema) in props {
+                let prop_path = format!("{path}.{prop_name}");
+                let desc = prop_schema
+                    .get("description")
+                    .and_then(Value::as_str)
+                    .map(str::trim)
+                    .unwrap_or_default();
+                assert!(!desc.is_empty(), "{prop_path} is missing a non-empty description");
+                assert_properties_described(&prop_path, prop_schema);
+            }
+        }
+
+        let (cfg, client, storage) = test_ctx();
+        let req = json!({
+            "jsonrpc": "2.0",
+            "id": 11,
+            "method": "tools/list"
+        })
+        .to_string();
+        let resp = handle_rpc_line(&cfg, &client, &storage, &req)
+            .await
+            .unwrap();
+        let tools = resp["result"]["tools"].as_array().unwrap();
+        assert_eq!(tools.len(), 37);
+
+        for tool in tools {
+            let name = tool["name"].as_str().unwrap();
+            let tool_desc = tool
+                .get("description")
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .unwrap_or_default();
+            assert!(!tool_desc.is_empty(), "{name} is missing a tool description");
+            assert_properties_described(name, &tool["inputSchema"]);
+        }
     }
 
     #[tokio::test]
