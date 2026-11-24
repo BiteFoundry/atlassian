@@ -8,6 +8,7 @@
 [![platforms](https://img.shields.io/badge/platform-Windows%20%7C%20macOS%20%7C%20Linux-24292F?style=flat-square)](docs/NPM.md)
 [![Rust & Ratatui](https://img.shields.io/badge/built%20with-Rust%20%2B%20Ratatui-DEA584?style=flat-square&logo=rust)](https://github.com/BiteFoundry/atlassian/blob/master/Cargo.toml)
 [![License: MIT](https://img.shields.io/badge/license-MIT-00875A?style=flat-square)](LICENSE)
+[![BiteFoundry/atlassian MCP server](https://glama.ai/mcp/servers/BiteFoundry/atlassian/badges/score.svg)](https://glama.ai/mcp/servers/BiteFoundry/atlassian)
 
 [BiteFoundry](https://bitefoundry.dev/#app-atlassian) · [Watch 35s Launch Film](https://bitefoundry.dev/#app-atlassian) · [Latest release notes](https://github.com/BiteFoundry/atlassian/releases/latest)
 
