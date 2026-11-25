@@ -526,6 +526,10 @@ impl AppConfig {
     }
 
     pub fn save(&self) -> Result<()> {
+        #[cfg(test)]
+        if std::env::var_os("ATLASSIAN_CONFIG_DIR").is_none() {
+            return Ok(());
+        }
         self.save_to(&config_file_path())
     }
 
@@ -995,6 +999,10 @@ impl DraftStore {
     }
 
     pub fn save(&self) -> Result<()> {
+        #[cfg(test)]
+        if std::env::var_os("ATLASSIAN_CONFIG_DIR").is_none() {
+            return Ok(());
+        }
         self.save_to(&drafts_file_path())
     }
 
