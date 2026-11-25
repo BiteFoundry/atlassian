@@ -1556,14 +1556,11 @@ fn reject_non_raster_markup_bytes(bytes: &[u8]) -> Result<()> {
     if looks_like_html_bytes(bytes) {
         bail!("Received HTML document instead of raster image");
     }
-    if looks_like_svg_bytes(bytes) {
-        bail!("SVG vector image cannot be raster-decoded");
-    }
     Ok(())
 }
 
-/// Returns `true` if a MIME type or filename represents a supported raster image (`png`, `jpeg`, `jpg`, `gif`, `webp`).
-/// Never returns `true` for HTML/XHTML or SVG (`text/html`, `application/xhtml+xml`, `image/svg+xml`, `.html`, `.htm`, `.svg`).
+/// Returns `true` if a MIME type or filename represents a supported image (`png`, `jpeg`, `jpg`, `gif`, `webp`, `svg`).
+/// Never returns `true` for HTML/XHTML (`text/html`, `application/xhtml+xml`, `.html`, `.htm`, `.xhtml`).
 pub fn is_image_attachment(mime_type: &str, filename: &str) -> bool {
     let m_base = mime_type
         .split(';')
@@ -1571,26 +1568,16 @@ pub fn is_image_attachment(mime_type: &str, filename: &str) -> bool {
         .unwrap_or("")
         .trim()
         .to_ascii_lowercase();
-    if matches!(
-        m_base.as_str(),
-        "text/html" | "application/xhtml+xml" | "image/svg+xml"
-    ) || m_base.contains("svg")
-        || m_base.contains("html")
-    {
+    if matches!(m_base.as_str(), "text/html" | "application/xhtml+xml") || m_base.contains("html") {
         return false;
     }
 
     let f = filename.trim().to_ascii_lowercase();
-    if f.ends_with(".html")
-        || f.ends_with(".htm")
-        || f.ends_with(".xhtml")
-        || f.ends_with(".svg")
-        || f.ends_with(".svgz")
-    {
+    if f.ends_with(".html") || f.ends_with(".htm") || f.ends_with(".xhtml") {
         return false;
     }
 
-    if m_base.starts_with("image/") {
+    if m_base == "image/svg+xml" || m_base.starts_with("image/") {
         return true;
     }
     f.ends_with(".png")
@@ -1598,6 +1585,8 @@ pub fn is_image_attachment(mime_type: &str, filename: &str) -> bool {
         || f.ends_with(".jpeg")
         || f.ends_with(".gif")
         || f.ends_with(".webp")
+        || f.ends_with(".svg")
+        || f.ends_with(".svgz")
 }
 
 /// Returns `true` if a MIME type or optional filename looks like a supported raster image.
@@ -1645,6 +1634,25 @@ pub fn decode_and_render_halfblocks(
     )
 }
 
+fn svg_raster_bounds(fit: FitBox, cell_px: (u16, u16)) -> (u32, u32) {
+    let zoom = fit.zoom_pct.clamp(25, 300) as u32;
+    let max_px_w = ((fit.view_cols.max(1) as u32)
+        .saturating_mul(cell_px.0.max(1) as u32)
+        .saturating_mul(zoom)
+        / 100)
+        .clamp(64, MAX_RENDER_PX_W.min(2048));
+    let max_px_h = if fit.scrollable {
+        MAX_RENDER_PX_H.min(2048)
+    } else {
+        ((fit.view_rows.max(1) as u32)
+            .saturating_mul(cell_px.1.max(1) as u32)
+            .saturating_mul(zoom)
+            / 100)
+            .clamp(64, MAX_RENDER_PX_H.min(2048))
+    };
+    (max_px_w, max_px_h)
+}
+
 /// Decodes an image buffer and renders Truecolor Unicode Half-Blocks (`▀`) compensating for the
 /// terminal's actual cell pixel aspect ratio (`cell_px`) and compositing alpha over `bg_rgb`.
 pub fn decode_and_render_halfblocks_with_cell_px(
@@ -1654,9 +1662,20 @@ pub fn decode_and_render_halfblocks_with_cell_px(
     cell_px: (u16, u16),
 ) -> Result<RenderedTerminalImage> {
     reject_non_raster_markup_bytes(bytes)?;
-    let guessed = image::guess_format(bytes).ok();
-    let format_label = format_label_for(guessed);
-    let dyn_img = image::load_from_memory(bytes).context("Failed to decode image")?;
+    let svg_png;
+    let (decode_bytes, format_label): (&[u8], String) = if looks_like_svg_bytes(bytes) {
+        let (max_px_w, max_px_h) = svg_raster_bounds(fit, cell_px);
+        let rasterized = bitefoundry_html::graphics::rasterize_svg_to_png(
+            bytes, max_px_w, max_px_h, None,
+        )
+        .context("Failed to rasterize SVG image")?;
+        svg_png = rasterized.png_bytes;
+        (&svg_png[..], "SVG".to_string())
+    } else {
+        let guessed = image::guess_format(bytes).ok();
+        (bytes, format_label_for(guessed))
+    };
+    let dyn_img = image::load_from_memory(decode_bytes).context("Failed to decode image")?;
     let rgba = dyn_img.into_rgba8();
     let (width_px, height_px) = rgba.dimensions();
     if width_px == 0 || height_px == 0 {
@@ -1731,9 +1750,21 @@ pub fn decode_and_render_for_protocol(
         return decode_and_render_halfblocks_with_cell_px(bytes, fit, bg_rgb, caps.cell_px);
     }
 
-    let guessed = image::guess_format(bytes).ok();
-    let format_label = format_label_for(guessed);
-    let dyn_img = image::load_from_memory(bytes).context("Failed to decode image")?;
+    let svg_png;
+    let (decode_bytes, guessed, format_label): (&[u8], Option<ImageFormat>, String) =
+        if looks_like_svg_bytes(bytes) {
+            let (max_px_w, max_px_h) = svg_raster_bounds(fit, caps.cell_px);
+            let rasterized = bitefoundry_html::graphics::rasterize_svg_to_png(
+                bytes, max_px_w, max_px_h, None,
+            )
+            .context("Failed to rasterize SVG image")?;
+            svg_png = rasterized.png_bytes;
+            (&svg_png[..], Some(ImageFormat::Png), "SVG".to_string())
+        } else {
+            let guessed = image::guess_format(bytes).ok();
+            (bytes, guessed, format_label_for(guessed))
+        };
+    let dyn_img = image::load_from_memory(decode_bytes).context("Failed to decode image")?;
     let (width_px, height_px) = (dyn_img.width(), dyn_img.height());
     if width_px == 0 || height_px == 0 {
         bail!("Image dimensions are 0x0");
@@ -1763,7 +1794,7 @@ pub fn decode_and_render_for_protocol(
                 && width_px <= MAX_RENDER_PX_W
                 && height_px <= MAX_RENDER_PX_H
             {
-                bytes
+                decode_bytes
             } else {
                 png_owned = encode_png(&source_img)?;
                 &png_owned
@@ -1794,11 +1825,11 @@ pub fn decode_and_render_for_protocol(
                         | ImageFormat::Gif
                         | ImageFormat::WebP
                 )
-            ) && bytes.len() <= MAX_ITERM2_RAW_BYTES
+            ) && decode_bytes.len() <= MAX_ITERM2_RAW_BYTES
                 && width_px <= MAX_RENDER_PX_W
                 && height_px <= MAX_RENDER_PX_H
             {
-                bytes
+                decode_bytes
             } else {
                 encoded_owned = encode_png(&source_img)?;
                 &encoded_owned
@@ -2735,7 +2766,9 @@ mod tests {
         assert!(is_image_attachment("application/octet-stream", "photo.WEBP"));
         assert!(is_image_mime_or_name("image/jpeg", None));
         assert!(is_image_mime_or_name("application/octet-stream", Some("pic.GIF")));
-        assert!(!is_image_attachment("image/svg+xml", "diagram.svg"));
+        assert!(is_image_attachment("image/svg+xml", "diagram.svg"));
+        assert!(is_image_mime_or_name("image/svg+xml", Some("diagram.svg")));
+        assert!(is_image_mime_or_name("application/octet-stream", Some("vector.SVG")));
         assert!(!is_image_attachment("application/pdf", "spec.pdf"));
     }
 
@@ -3326,19 +3359,19 @@ mod tests {
 
     #[test]
     fn test_html_and_svg_sniff_and_mime_rejection() {
-        // MIME & filename classification must never accept HTML/XHTML/SVG
+        // MIME & filename classification must reject HTML/XHTML while natively accepting SVG
         assert!(!is_image_mime_or_name("text/html", Some("photo.png")));
         assert!(!is_image_mime_or_name("text/html; charset=utf-8", None));
         assert!(!is_image_mime_or_name("application/xhtml+xml", Some("x.png")));
-        assert!(!is_image_mime_or_name("image/svg+xml", Some("icon.svg")));
-        assert!(!is_image_mime_or_name("image/svg+xml; charset=utf-8", Some("logo.png")));
+        assert!(is_image_mime_or_name("image/svg+xml", Some("icon.svg")));
+        assert!(is_image_mime_or_name("image/svg+xml; charset=utf-8", Some("logo.png")));
         assert!(!is_image_mime_or_name("image/png", Some("login.html")));
         assert!(!is_image_mime_or_name("image/png", Some("page.HTM")));
-        assert!(!is_image_mime_or_name("application/octet-stream", Some("vector.SVG")));
+        assert!(is_image_mime_or_name("application/octet-stream", Some("vector.SVG")));
         assert!(!is_image_attachment("text/html", "attachment.png"));
-        assert!(!is_image_attachment("image/svg+xml", "diagram.svg"));
+        assert!(is_image_attachment("image/svg+xml", "diagram.svg"));
 
-        // Byte sniffing
+        // Byte sniffing: HTML-spoofed bytes remain strictly rejected across all protocols
         let html_samples: &[&[u8]] = &[
             b"<!DOCTYPE html><html><body>Login</body></html>",
             b"  \r\n<html><head><title>SSO</title></head></html>",
@@ -3381,34 +3414,53 @@ mod tests {
             }
         }
 
+        // Standalone SVG vector documents rasterize natively via bitefoundry-html/resvg
         let svg_samples: &[&[u8]] = &[
-            b"<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"10\" height=\"10\"></svg>",
-            b"<?xml version=\"1.0\"?><svg viewBox=\"0 0 10 10\"/>",
-            b"\xEF\xBB\xBF  <!-- icon -->\n<!DOCTYPE svg><SVG width=\"24\"></SVG>",
+            br##"<svg xmlns="http://www.w3.org/2000/svg" width="80" height="40"><rect width="80" height="40" fill="#e11d48"/></svg>"##,
+            br##"<?xml version="1.0"?><svg viewBox="0 0 60 30"><circle cx="30" cy="15" r="12" fill="#2563eb"/></svg>"##,
+            br##"<!-- icon --><svg width="64" height="32"><rect width="64" height="32" fill="#16a34a"/></svg>"##,
         ];
         for sample in svg_samples {
             assert!(looks_like_svg_bytes(sample), "expected SVG sniff for {:?}", sample);
             assert!(!looks_like_html_bytes(sample), "SVG should not sniff as HTML");
 
-            let err_hb = decode_and_render_halfblocks(sample, 40, 20, (0, 0, 0))
-                .unwrap_err()
-                .to_string();
+            let hb = decode_and_render_halfblocks(sample, 40, 20, (0, 0, 0))
+                .expect("standalone SVG should render as halfblocks");
+            assert_eq!(hb.format_label, "SVG");
+            assert_eq!(hb.protocol, TerminalImageProtocol::Halfblock);
+            assert!(!hb.lines.is_empty());
+            assert!(hb.cols > 0 && hb.rows > 0);
             assert!(
-                err_hb.contains("SVG vector image cannot be raster-decoded"),
-                "unexpected halfblock SVG error: {err_hb}"
+                hb.lines
+                    .iter()
+                    .flat_map(|l| l.spans.iter())
+                    .any(|s| s.content.contains('▀')),
+                "SVG halfblock output must contain halfblock glyphs"
             );
-            let caps = TerminalGraphicsCaps {
-                protocol: TerminalImageProtocol::Sixel,
-                ..Default::default()
-            };
-            let err_px =
-                decode_and_render_for_protocol(sample, FitBox::fit(40, 20), (0, 0, 0), caps)
-                    .unwrap_err()
-                    .to_string();
-            assert!(
-                err_px.contains("SVG vector image cannot be raster-decoded"),
-                "unexpected Sixel SVG error: {err_px}"
-            );
+
+            for proto in [
+                TerminalImageProtocol::Sixel,
+                TerminalImageProtocol::Kitty,
+                TerminalImageProtocol::ITerm2,
+            ] {
+                let caps = TerminalGraphicsCaps {
+                    protocol: proto,
+                    ..Default::default()
+                };
+                let px = decode_and_render_for_protocol(
+                    sample,
+                    FitBox::fit(40, 20),
+                    (0, 0, 0),
+                    caps,
+                )
+                .unwrap_or_else(|e| panic!("SVG should render under {proto:?}: {e}"));
+                assert_eq!(px.format_label, "SVG");
+                assert_eq!(px.protocol, proto);
+                assert!(
+                    px.pixel_payload.as_deref().is_some_and(|p| !p.is_empty()),
+                    "SVG {proto:?} payload should be non-empty"
+                );
+            }
         }
 
         // Valid PNG must not be misclassified as HTML or SVG

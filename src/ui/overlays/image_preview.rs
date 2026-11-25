@@ -32,12 +32,15 @@ use crate::{
     },
 };
 
-/// Pixel placement request emitted by [`ImagePreviewOverlay`] for synchronized post-frame rendering in `tui.rs`.
+/// Pixel placement request emitted by [`ImagePreviewOverlay`] or [`HtmlPreviewOverlay`] for
+/// synchronized post-frame rendering in `tui.rs`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PendingPixelGraphic {
     pub cache_key: String,
     pub rect: Rect,
     pub protocol: TerminalImageProtocol,
+    /// Optional pre-encoded/cropped pixel escape payload (used by `HtmlPreviewOverlay` inline graphics).
+    pub payload: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -396,6 +399,7 @@ impl ImagePreviewOverlay {
             cache_key: effective_key,
             rect,
             protocol: rendered.protocol,
+            payload: None,
         })
     }
 
@@ -696,6 +700,7 @@ impl ImagePreviewOverlay {
                         cache_key: effective_key.clone(),
                         rect: target_rect,
                         protocol: rendered.protocol,
+                        payload: None,
                     });
                     if self.active_pixel_graphic.as_ref()
                         == Some(&(effective_key, target_rect, rendered.protocol))

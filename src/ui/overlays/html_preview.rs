@@ -3,7 +3,11 @@
 //! only when `<script>` or `on*` handlers are present, dropped immediately on close) and
 //! lazy localhost Axum browser serving (`o` via `bitefoundry_html::NativeHtmlServer`).
 
-use std::fmt;
+use std::{
+    collections::HashMap,
+    fmt,
+    sync::{Arc, OnceLock},
+};
 
 use bitefoundry_html::{ContentKind, HtmlEffect, HtmlTheme, HtmlViewSession};
 use ratatui::{
@@ -16,10 +20,15 @@ use ratatui::{
     },
     Frame,
 };
+use regex::Regex;
+use scraper::{ElementRef, Html, Node};
 use unicode_width::UnicodeWidthStr;
 
 use crate::{
     adf,
+    img_preview::{
+        self, FitBox, RenderedTerminalImage, TerminalGraphicsCaps, TerminalImageProtocol,
+    },
     models::{IssueDetail, PageDetail},
     ui::{
         app::{AppState, UiState},
@@ -27,8 +36,8 @@ use crate::{
         hitmap::HitMap,
         keymap::Action,
         overlays::{
-            centered_rect, read_clipboard_text, register_modal_chrome, sanitize_single_line,
-            OverlayOutcome,
+            centered_rect, image_preview::PendingPixelGraphic, read_clipboard_text,
+            register_modal_chrome, sanitize_single_line, OverlayOutcome,
         },
         theme::Theme,
     },
@@ -60,6 +69,16 @@ pub struct HtmlPreviewOverlay {
     pub last_scroll_y: u16,
     last_mode_pill_rect: Rect,
     last_browser_pill_rect: Rect,
+    /// Decoded/encoded inline graphic cache keyed by `(node_id, width_cols, protocol)`.
+    /// Also tracks source `Arc<[u8]>` identity so dynamic JS canvas/SVG updates invalidate cleanly.
+    graphic_cache:
+        HashMap<(usize, u16, TerminalImageProtocol), (Arc<[u8]>, RenderedTerminalImage)>,
+}
+
+impl Drop for HtmlPreviewOverlay {
+    fn drop(&mut self) {
+        self.graphic_cache.clear();
+    }
 }
 
 impl fmt::Debug for HtmlPreviewOverlay {
@@ -112,6 +131,7 @@ impl HtmlPreviewOverlay {
             last_scroll_y: 0,
             last_mode_pill_rect: Rect::default(),
             last_browser_pill_rect: Rect::default(),
+            graphic_cache: HashMap::new(),
         };
         overlay.apply_effects(init_effects);
         overlay
@@ -136,12 +156,14 @@ impl HtmlPreviewOverlay {
             last_scroll_y: 0,
             last_mode_pill_rect: Rect::default(),
             last_browser_pill_rect: Rect::default(),
+            graphic_cache: HashMap::new(),
         }
     }
 
     /// Populates the overlay after an async HTML attachment fetch completes.
     pub fn set_loaded(&mut self, result: Result<String, String>) {
         self.loading = false;
+        self.graphic_cache.clear();
         match result {
             Ok(html) => {
                 self.error = None;
@@ -493,10 +515,10 @@ impl HtmlPreviewOverlay {
         frame: &mut Frame,
         area: Rect,
         _app: &AppState,
-        ui: &UiState,
+        ui: &mut UiState,
         hitmap: &mut HitMap,
     ) {
-        let theme = &ui.theme;
+        let theme = ui.theme.clone();
         let rect = Self::modal_rect(area);
         frame.render_widget(Clear, rect);
 
@@ -535,7 +557,7 @@ impl HtmlPreviewOverlay {
             .border_style(theme.border_style(true));
         let inner = block.inner(rect);
         frame.render_widget(block, rect);
-        register_modal_chrome(rect, frame, theme, hitmap, true);
+        register_modal_chrome(rect, frame, &theme, hitmap, true);
 
         if inner.width == 0 || inner.height < 2 {
             return;
@@ -561,7 +583,7 @@ impl HtmlPreviewOverlay {
         };
 
         // Pre-render session at available width so we know control count, scrollbar, and status.
-        let html_theme = theme_to_html_theme(theme);
+        let html_theme = theme_to_html_theme(&theme);
         let mut control_count = 0usize;
         let mut status_text: Option<String> = None;
 
@@ -577,12 +599,13 @@ impl HtmlPreviewOverlay {
                 content_area.width
             };
 
-            let (lines, total_lines, ctrl_len) = {
+            let (mut lines, total_lines, ctrl_len, graphics) = {
                 let rendered = sess.render(avail_w.max(12), &html_theme, ui.show_hrefs);
                 (
                     rendered.lines.clone(),
                     rendered.lines.len(),
                     rendered.controls.len(),
+                    rendered.graphics.clone(),
                 )
             };
             control_count = ctrl_len;
@@ -595,11 +618,136 @@ impl HtmlPreviewOverlay {
             self.last_content_rect =
                 Rect::new(content_area.x, content_area.y, avail_w, content_area.height);
 
+            // Render intersecting inline graphics (SVG / Canvas 2D / data:image/*) into their
+            // reserved vertical slots so scroll offsets and click_at(line, col) stay exact.
+            let view_start = sy as usize;
+            let view_end = view_start.saturating_add(content_area.height as usize);
+            let caps = ui.graphics_caps;
+            let proto = caps.protocol;
+            let bg_rgb = img_preview::color_to_rgb(
+                theme.card_bg,
+                img_preview::DEFAULT_PREVIEW_BG_RGB,
+            );
+            let mut pixel_skip_rects: Vec<Rect> = Vec::new();
+
+            if avail_w > 0 && content_area.height > 0 && !graphics.is_empty() {
+                for g in &graphics {
+                    let g_start = g.line_start;
+                    let g_end = g.line_start.saturating_add(g.line_count);
+                    if g.line_count == 0 || g_end <= view_start || g_start >= view_end {
+                        continue;
+                    }
+
+                    let cache_key = (g.node_id.0, avail_w, proto);
+                    let cache_hit = self
+                        .graphic_cache
+                        .get(&cache_key)
+                        .is_some_and(|(src, _)| Arc::ptr_eq(src, &g.image_bytes));
+                    if !cache_hit {
+                        let slot_rows = g.line_count.min(u16::MAX as usize) as u16;
+                        let fit = FitBox::fit(avail_w, slot_rows);
+                        let render_caps = TerminalGraphicsCaps {
+                            protocol: proto,
+                            cell_px: caps.cell_px,
+                            cell_px_exact: caps.cell_px_exact,
+                        };
+                        if let Ok(rendered_img) = img_preview::decode_and_render_for_protocol(
+                            &g.image_bytes,
+                            fit,
+                            bg_rgb,
+                            render_caps,
+                        ) {
+                            self.graphic_cache.insert(
+                                cache_key,
+                                (Arc::clone(&g.image_bytes), rendered_img),
+                            );
+                        }
+                    }
+
+                    let Some((_, rendered_img)) = self.graphic_cache.get(&cache_key) else {
+                        continue;
+                    };
+
+                    if rendered_img.protocol.is_pixel() && rendered_img.pixel_payload.is_some() {
+                        for row_offset in 0..g.line_count {
+                            let line_idx = g_start + row_offset;
+                            if line_idx < lines.len() {
+                                lines[line_idx] = Line::default();
+                            }
+                        }
+                        let vis_start = g_start.max(view_start);
+                        let vis_end = g_end.min(view_end);
+                        let crop_scroll_y = vis_start.saturating_sub(g_start) as u16;
+                        let vis_rows = vis_end.saturating_sub(vis_start) as u16;
+                        if vis_rows > 0 && crop_scroll_y < rendered_img.rows {
+                            if let Some((payload, draw_cols, draw_rows)) = rendered_img
+                                .viewport_pixel_payload(0, crop_scroll_y, avail_w, vis_rows)
+                            {
+                                let screen_y = self
+                                    .last_content_rect
+                                    .y
+                                    .saturating_add(vis_start.saturating_sub(view_start) as u16);
+                                let draw_w = draw_cols.min(avail_w);
+                                let draw_h = draw_rows.min(vis_rows);
+                                if draw_w > 0 && draw_h > 0 {
+                                    let target_rect = Rect::new(
+                                        self.last_content_rect.x,
+                                        screen_y,
+                                        draw_w,
+                                        draw_h,
+                                    );
+                                    let pending_key = format!(
+                                        "html:{}:{}x{}:{}#crop:0,{},{},{}",
+                                        g.node_id.0,
+                                        avail_w,
+                                        g.line_count,
+                                        proto.as_str(),
+                                        crop_scroll_y,
+                                        draw_w,
+                                        draw_h
+                                    );
+                                    ui.pending_pixel_graphics.push(PendingPixelGraphic {
+                                        cache_key: pending_key,
+                                        rect: target_rect,
+                                        protocol: rendered_img.protocol,
+                                        payload: Some(payload),
+                                    });
+                                    pixel_skip_rects.push(target_rect);
+                                }
+                            }
+                        }
+                    } else {
+                        for row_offset in 0..g.line_count {
+                            let line_idx = g_start + row_offset;
+                            if line_idx < lines.len() {
+                                lines[line_idx] = rendered_img
+                                    .lines
+                                    .get(row_offset)
+                                    .cloned()
+                                    .unwrap_or_default();
+                            }
+                        }
+                    }
+                }
+            }
+
             if avail_w > 0 && content_area.height > 0 {
                 frame.render_widget(
                     Paragraph::new(lines).style(modal_style).scroll((sy, 0)),
                     self.last_content_rect,
                 );
+                if !pixel_skip_rects.is_empty() {
+                    let buf = frame.buffer_mut();
+                    for target_rect in pixel_skip_rects {
+                        for y in target_rect.top()..target_rect.bottom() {
+                            for x in target_rect.left()..target_rect.right() {
+                                if let Some(cell) = buf.cell_mut((x, y)) {
+                                    cell.set_skip(true);
+                                }
+                            }
+                        }
+                    }
+                }
             }
 
             if show_scrollbar {
@@ -748,8 +896,323 @@ pub fn is_html_attachment(mime_type: &str, filename: &str) -> bool {
     bitefoundry_html::sniff_content_kind(mime, name, None) == ContentKind::Html
 }
 
+/// Pre-processes Confluence Storage XHTML (`ac:structured-macro`, `<ac:parameter>`, CDATA,
+/// `<ac:image>`, `<ac:task-list>`, `<ac:link>`) into clean standard HTML so `bitefoundry-html`
+/// renders macros without leaking `<ac:parameter>` or raw diagram CDATA source.
+pub fn normalize_confluence_storage_xhtml(raw: &str) -> String {
+    let lower = raw.to_ascii_lowercase();
+    if !lower.contains("<ac:") && !lower.contains("<ri:") && !lower.contains("<![cdata[") {
+        return raw.to_string();
+    }
+
+    static CDATA_RE: OnceLock<Regex> = OnceLock::new();
+    static SELF_CLOSING_RE: OnceLock<Regex> = OnceLock::new();
+    let cdata_re =
+        CDATA_RE.get_or_init(|| Regex::new(r"(?s)<!\[CDATA\[(.*?)\]\]>").expect("valid cdata regex"));
+    let self_closing_re = SELF_CLOSING_RE.get_or_init(|| {
+        Regex::new(r"<((?:ac|ri):[a-zA-Z0-9_-]+)([^>]*?)\s*/>")
+            .expect("valid self-closing xml regex")
+    });
+
+    let escaped_cdata = cdata_re.replace_all(raw, |caps: &regex::Captures<'_>| {
+        escape_html(&caps[1])
+    });
+    let normalized = self_closing_re.replace_all(&escaped_cdata, "<$1$2></$1>");
+
+    let fragment = Html::parse_fragment(&normalized);
+    let mut out = String::with_capacity(raw.len());
+    serialize_normalized_children(fragment.root_element(), &mut out);
+    out
+}
+
+fn is_void_html_tag(tag: &str) -> bool {
+    matches!(
+        tag,
+        "area"
+            | "base"
+            | "br"
+            | "col"
+            | "embed"
+            | "hr"
+            | "img"
+            | "input"
+            | "link"
+            | "meta"
+            | "param"
+            | "source"
+            | "track"
+            | "wbr"
+    )
+}
+
+fn collect_storage_raw_text(el: ElementRef<'_>) -> String {
+    let mut s = String::new();
+    for node in el.descendants() {
+        match node.value() {
+            Node::Text(t) => s.push_str(t),
+            Node::Comment(c) => {
+                let trimmed = c.trim();
+                if let Some(inner) = trimmed
+                    .strip_prefix("[CDATA[")
+                    .and_then(|rest| rest.strip_suffix("]]"))
+                {
+                    s.push_str(inner);
+                }
+            }
+            Node::Element(e) if e.name().eq_ignore_ascii_case("br") => s.push('\n'),
+            _ => {}
+        }
+    }
+    s
+}
+
+fn serialize_normalized_children(parent: ElementRef<'_>, out: &mut String) {
+    for child in parent.children() {
+        match child.value() {
+            Node::Text(t) => out.push_str(&escape_html(t)),
+            Node::Element(_) => {
+                if let Some(el) = ElementRef::wrap(child) {
+                    serialize_normalized_element(el, out);
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+fn serialize_normalized_element(el: ElementRef<'_>, out: &mut String) {
+    let tag = el.value().name().to_ascii_lowercase();
+    match tag.as_str() {
+        "ac:parameter" | "ac:plain-text-body" => {}
+        "ac:rich-text-body" | "ac:layout" | "ac:layout-section" | "ac:layout-cell" => {
+            serialize_normalized_children(el, out);
+        }
+        "ac:structured-macro" => {
+            let macro_name = el
+                .value()
+                .attr("ac:name")
+                .unwrap_or("")
+                .to_ascii_lowercase();
+            let mut params = HashMap::<String, String>::new();
+            let mut plain_body: Option<String> = None;
+            let mut rich_body_el: Option<ElementRef<'_>> = None;
+
+            for child in el.children().filter_map(ElementRef::wrap) {
+                let cname = child.value().name().to_ascii_lowercase();
+                if cname == "ac:parameter" {
+                    if let Some(pname) = child.value().attr("ac:name") {
+                        params.insert(
+                            pname.to_ascii_lowercase(),
+                            collect_storage_raw_text(child).trim().to_string(),
+                        );
+                    }
+                } else if cname == "ac:plain-text-body" {
+                    plain_body = Some(collect_storage_raw_text(child));
+                } else if cname == "ac:rich-text-body" {
+                    rich_body_el = Some(child);
+                }
+            }
+
+            match macro_name.as_str() {
+                "code" | "noformat" => {
+                    let lang = params
+                        .get("language")
+                        .map(|s| s.trim())
+                        .filter(|s| !s.is_empty());
+                    let code = plain_body
+                        .or_else(|| rich_body_el.map(collect_storage_raw_text))
+                        .unwrap_or_default();
+                    if let Some(l) = lang {
+                        out.push_str(&format!(
+                            "<pre><code class=\"language-{}\">{}</code></pre>",
+                            escape_html_attr(l),
+                            escape_html(&code)
+                        ));
+                    } else {
+                        out.push_str(&format!("<pre><code>{}</code></pre>", escape_html(&code)));
+                    }
+                }
+                "info" | "note" | "warning" | "tip" | "panel" => {
+                    out.push_str("<blockquote>");
+                    if let Some(title) = params
+                        .get("title")
+                        .map(|s| s.trim())
+                        .filter(|s| !s.is_empty())
+                    {
+                        out.push_str(&format!("<p><strong>{}</strong></p>", escape_html(title)));
+                    }
+                    if let Some(rich) = rich_body_el {
+                        serialize_normalized_children(rich, out);
+                    } else if let Some(plain) = plain_body.filter(|s| !s.trim().is_empty()) {
+                        out.push_str(&format!("<p>{}</p>", escape_html(plain.trim())));
+                    }
+                    out.push_str("</blockquote>");
+                }
+                "expand" => {
+                    let title = params
+                        .get("title")
+                        .map(|s| s.trim())
+                        .filter(|s| !s.is_empty())
+                        .unwrap_or("Details");
+                    out.push_str(&format!(
+                        "<details><summary>{}</summary>",
+                        escape_html(title)
+                    ));
+                    if let Some(rich) = rich_body_el {
+                        serialize_normalized_children(rich, out);
+                    }
+                    out.push_str("</details>");
+                }
+                "html" => {
+                    if let Some(html_body) = plain_body {
+                        out.push_str(&html_body);
+                    } else if let Some(rich) = rich_body_el {
+                        serialize_normalized_children(rich, out);
+                    }
+                }
+                "status" => {
+                    if let Some(title) = params
+                        .get("title")
+                        .map(|s| s.trim())
+                        .filter(|s| !s.is_empty())
+                    {
+                        out.push_str(&format!("<span>[{}]</span>", escape_html(title)));
+                    }
+                }
+                "jira" => {
+                    if let Some(key) = params
+                        .get("key")
+                        .map(|s| s.trim())
+                        .filter(|s| !s.is_empty())
+                    {
+                        out.push_str(&format!("<span>{}</span>", escape_html(key)));
+                    }
+                }
+                "mermaid" | "drawio" | "gliffy" | "plantuml" | "chart" => {
+                    out.push_str(&format!(
+                        "<blockquote><p>[◈ Diagram ({}) · Press o for Browser]</p></blockquote>",
+                        escape_html(&macro_name)
+                    ));
+                }
+                _ => {
+                    if let Some(rich) = rich_body_el {
+                        serialize_normalized_children(rich, out);
+                    }
+                }
+            }
+        }
+        "ac:image" => {
+            let alt = el
+                .value()
+                .attr("ac:alt")
+                .map(str::trim)
+                .filter(|s| !s.is_empty());
+            let mut src: Option<&str> = None;
+            for child in el.descendants().filter_map(ElementRef::wrap) {
+                let cname = child.value().name().to_ascii_lowercase();
+                if cname == "ri:url" {
+                    src = child.value().attr("ri:value");
+                } else if cname == "ri:attachment" && src.is_none() {
+                    src = child.value().attr("ri:filename");
+                }
+            }
+            let src_val = src.unwrap_or("");
+            let alt_val = alt.or(src).unwrap_or("image");
+            out.push_str(&format!(
+                "<img src=\"{}\" alt=\"{}\">",
+                escape_html_attr(src_val),
+                escape_html_attr(alt_val)
+            ));
+        }
+        "ac:link" => {
+            let mut label: Option<String> = None;
+            let mut fallback: Option<String> = None;
+            for child in el.descendants().filter_map(ElementRef::wrap) {
+                let cname = child.value().name().to_ascii_lowercase();
+                if cname == "ac:plain-text-link-body" || cname == "ac:link-body" {
+                    let t = collect_storage_raw_text(child).trim().to_string();
+                    if !t.is_empty() {
+                        label = Some(t);
+                    }
+                } else if cname == "ri:page" {
+                    if let Some(t) = child.value().attr("ri:content-title") {
+                        fallback = Some(t.to_string());
+                    }
+                } else if cname == "ri:user" {
+                    fallback = child
+                        .value()
+                        .attr("ri:username")
+                        .or_else(|| child.value().attr("ri:account-id"))
+                        .map(|u| format!("@{u}"));
+                }
+            }
+            if let Some(text) = label.or(fallback) {
+                out.push_str(&escape_html(&text));
+            }
+        }
+        "ac:task-list" => {
+            out.push_str("<ul>");
+            for child in el.children().filter_map(ElementRef::wrap) {
+                if child.value().name().eq_ignore_ascii_case("ac:task") {
+                    let mut checked = false;
+                    let mut body_el: Option<ElementRef<'_>> = None;
+                    for sub in child.children().filter_map(ElementRef::wrap) {
+                        let sname = sub.value().name().to_ascii_lowercase();
+                        if sname == "ac:task-status" {
+                            let status = collect_storage_raw_text(sub).trim().to_ascii_lowercase();
+                            checked = matches!(status.as_str(), "complete" | "completed" | "done");
+                        } else if sname == "ac:task-body" {
+                            body_el = Some(sub);
+                        }
+                    }
+                    out.push_str("<li><input type=\"checkbox\"");
+                    if checked {
+                        out.push_str(" checked");
+                    }
+                    out.push_str("> ");
+                    if let Some(b) = body_el {
+                        serialize_normalized_children(b, out);
+                    }
+                    out.push_str("</li>");
+                }
+            }
+            out.push_str("</ul>");
+        }
+        _ if tag.starts_with("ac:") || tag.starts_with("ri:") => {
+            serialize_normalized_children(el, out);
+        }
+        _ => {
+            let orig_name = el.value().name();
+            out.push('<');
+            out.push_str(orig_name);
+            for (k, v) in el.value().attrs() {
+                out.push(' ');
+                out.push_str(k);
+                out.push_str("=\"");
+                out.push_str(&escape_html_attr(v));
+                out.push('"');
+            }
+            out.push('>');
+            if !is_void_html_tag(&tag) {
+                if tag == "script" || tag == "style" {
+                    for child in el.children() {
+                        if let Node::Text(t) = child.value() {
+                            out.push_str(t);
+                        }
+                    }
+                } else {
+                    serialize_normalized_children(el, out);
+                }
+                out.push_str("</");
+                out.push_str(orig_name);
+                out.push('>');
+            }
+        }
+    }
+}
+
 /// Builds interactive HTML markup for a Confluence [`PageDetail`] (preserving Confluence storage/rendered
-/// HTML verbatim when present, otherwise converting Markdown / `DocBlock` AST to HTML).
+/// HTML after normalizing Confluence storage macros, otherwise converting Markdown / `DocBlock` AST to HTML).
 pub fn page_detail_to_html(page: &PageDetail) -> String {
     let raw = page.body_raw.trim();
     let rep = page.body_representation.trim().to_ascii_lowercase();
@@ -760,12 +1223,17 @@ pub fn page_detail_to_html(page: &PageDetail) -> String {
             || bitefoundry_html::looks_like_html_bytes(raw.as_bytes()));
 
     if raw_is_html {
-        let head_lower: String = raw.chars().take(256).collect::<String>().to_ascii_lowercase();
+        let normalized = normalize_confluence_storage_xhtml(raw);
+        let head_lower: String = normalized
+            .chars()
+            .take(256)
+            .collect::<String>()
+            .to_ascii_lowercase();
         if head_lower.contains("<!doctype") || head_lower.contains("<html") {
-            return raw.to_string();
+            return normalized;
         }
         return format!(
-            "<article><h1>{}</h1>\n{raw}\n</article>",
+            "<article><h1>{}</h1>\n{normalized}\n</article>",
             escape_html(&page.summary.title)
         );
     }
@@ -928,13 +1396,14 @@ mod tests {
     fn render_overlay_text(
         ov: &mut HtmlPreviewOverlay,
         app: &AppState,
-        ui: &UiState,
+        ui: &mut UiState,
         width: u16,
         height: u16,
     ) -> (String, HitMap) {
         let mut hitmap = HitMap::new();
         let backend = TestBackend::new(width, height);
         let mut terminal = Terminal::new(backend).unwrap();
+        ui.pending_pixel_graphics.clear();
         terminal
             .draw(|f| ov.draw(f, f.area(), app, ui, &mut hitmap))
             .unwrap();
@@ -950,7 +1419,7 @@ mod tests {
 
     #[tokio::test]
     async fn button_onclick_tab_activate_and_click_at_mutate_dom() {
-        let (app, ui, _rx) = make_test_app_and_ui();
+        let (app, mut ui, _rx) = make_test_app_and_ui();
         let html = r#"
             <h1>Interactive Counter</h1>
             <p id="status">Count: 0</p>
@@ -960,7 +1429,7 @@ mod tests {
         assert!(ov.is_js_active(), "inline onclick must spin up QuickJS on demand");
 
         // Initial render populates last_content_rect and control hit coordinates
-        let (screen0, hitmap) = render_overlay_text(&mut ov, &app, &ui, 90, 24);
+        let (screen0, hitmap) = render_overlay_text(&mut ov, &app, &mut ui, 90, 24);
         assert!(screen0.contains("Count: 0"), "expected initial DOM:\n{screen0}");
         assert!(screen0.contains("[ Increment ]"), "expected button:\n{screen0}");
         assert!(!hitmap.is_empty());
@@ -968,7 +1437,7 @@ mod tests {
         // Tab to focus the button and press Space to activate -> Count: 1
         assert_eq!(ov.handle(&Action::NextField), OverlayOutcome::Handled);
         assert_eq!(ov.handle(&Action::Input(' ')), OverlayOutcome::Handled);
-        let (screen1, _) = render_overlay_text(&mut ov, &app, &ui, 90, 24);
+        let (screen1, _) = render_overlay_text(&mut ov, &app, &mut ui, 90, 24);
         assert!(screen1.contains("Count: 1"), "expected Count: 1 after Tab+Space:\n{screen1}");
 
         // Mouse click directly on the button's screen coordinates -> Count: 2
@@ -984,13 +1453,13 @@ mod tests {
         let screen_col = ov.last_content_rect.x + btn_col;
         assert!(ov.handle_mouse_click(screen_row, screen_col));
 
-        let (screen2, _) = render_overlay_text(&mut ov, &app, &ui, 90, 24);
+        let (screen2, _) = render_overlay_text(&mut ov, &app, &mut ui, 90, 24);
         assert!(screen2.contains("Count: 2"), "expected Count: 2 after click_at:\n{screen2}");
     }
 
     #[tokio::test]
     async fn static_html_has_zero_js_and_toggles_raw_mode_and_text_input() {
-        let (app, ui, _rx) = make_test_app_and_ui();
+        let (app, mut ui, _rx) = make_test_app_and_ui();
         let html = r#"
             <form action="/save">
               <input type="text" name="note" value="hi" />
@@ -1000,7 +1469,7 @@ mod tests {
         let mut ov = HtmlPreviewOverlay::new("Static Form", html);
         assert!(!ov.is_js_active(), "static HTML must allocate 0 MB QuickJS");
 
-        let (screen0, _) = render_overlay_text(&mut ov, &app, &ui, 90, 24);
+        let (screen0, _) = render_overlay_text(&mut ov, &app, &mut ui, 90, 24);
         assert!(!screen0.contains("Hidden Secret"));
         assert!(screen0.contains("Static (0 MB JS)"));
 
@@ -1017,13 +1486,13 @@ mod tests {
         // Focus details summary and press Enter to expand
         ov.handle(&Action::NextField);
         ov.handle(&Action::Activate);
-        let (screen1, _) = render_overlay_text(&mut ov, &app, &ui, 90, 24);
+        let (screen1, _) = render_overlay_text(&mut ov, &app, &mut ui, 90, 24);
         assert!(screen1.contains("Hidden Secret"));
 
         // Press `m` to toggle Raw HTML mode
         ov.handle(&Action::Input('m'));
         assert!(ov.is_raw_mode());
-        let (raw_screen, _) = render_overlay_text(&mut ov, &app, &ui, 90, 24);
+        let (raw_screen, _) = render_overlay_text(&mut ov, &app, &mut ui, 90, 24);
         assert!(raw_screen.contains("<form action=\"/save\">"), "expected raw tags:\n{raw_screen}");
         assert!(raw_screen.contains("[m: Raw]"));
 
@@ -1074,5 +1543,205 @@ mod tests {
         assert!(resp.starts_with("HTTP/1.1 200 OK"), "unexpected response: {resp}");
         assert!(resp.contains("<h1>Atlassian Local Serve</h1>"));
         app.html_server.shutdown();
+    }
+
+    #[test]
+    fn page_detail_to_html_normalizes_confluence_storage_xhtml_with_zero_leaks() {
+        let mut page = PageDetail::default();
+        page.summary.title = "Architecture Spec".into();
+        page.body_representation = "storage".into();
+        page.body_raw = r#"
+            <style>@media (max-width: 600px) { .secret-css { color: red; } }</style>
+            <script>const SECRET_JS = 42;</script>
+            <ac:parameter ac:name="orphan">SECRET_ORPHAN_PARAM</ac:parameter>
+            <p>Main body paragraph.</p>
+            <ac:structured-macro ac:name="info">
+                <ac:parameter ac:name="title">Heads Up</ac:parameter>
+                <ac:rich-text-body><p>Important notice</p></ac:rich-text-body>
+            </ac:structured-macro>
+            <ac:structured-macro ac:name="code">
+                <ac:parameter ac:name="language">rust</ac:parameter>
+                <ac:plain-text-body><![CDATA[fn main() { println!("ok"); }]]></ac:plain-text-body>
+            </ac:structured-macro>
+            <ac:structured-macro ac:name="expand">
+                <ac:parameter ac:name="title">More Details</ac:parameter>
+                <ac:rich-text-body><p>Expanded copy</p></ac:rich-text-body>
+            </ac:structured-macro>
+            <ac:structured-macro ac:name="html">
+                <ac:parameter ac:name="sanitize">false</ac:parameter>
+                <ac:plain-text-body><![CDATA[<div class="embedded"><style>.inner-css-leak{display:none}</style><p>Unwrapped Embedded Content</p></div>]]></ac:plain-text-body>
+            </ac:structured-macro>
+            <ac:structured-macro ac:name="mermaid">
+                <ac:parameter ac:name="theme">dark</ac:parameter>
+                <ac:plain-text-body><![CDATA[graph TD; SECRET_MERMAID_CDATA --> END;]]></ac:plain-text-body>
+            </ac:structured-macro>
+        "#
+        .into();
+
+        let html = page_detail_to_html(&page);
+        assert!(html.contains("<blockquote>"));
+        assert!(html.contains("<pre><code class=\"language-rust\">"));
+        assert!(html.contains("<details><summary>More Details</summary>"));
+        assert!(html.contains("Unwrapped Embedded Content"));
+        assert!(!html.contains("<ac:parameter"));
+        assert!(!html.contains("SECRET_ORPHAN_PARAM"));
+        assert!(!html.contains("SECRET_MERMAID_CDATA"));
+
+        let mut sess = HtmlViewSession::new(Some(page.summary.title.clone()), html.clone());
+        let theme = HtmlTheme::dark();
+        let rendered = sess.render(90, &theme, false);
+        let visible_text: String = rendered
+            .lines
+            .iter()
+            .map(|l| {
+                l.spans
+                    .iter()
+                    .map(|s| s.content.as_ref())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        assert!(
+            visible_text.contains("Main body paragraph."),
+            "missing main body in rendered output:\nHTML:\n{html}\nVISIBLE:\n{visible_text}"
+        );
+        assert!(visible_text.contains("Heads Up"));
+        assert!(visible_text.contains("Important notice"));
+        assert!(visible_text.contains("Unwrapped Embedded Content"));
+        assert!(visible_text.contains("[◈ Diagram (mermaid) · Press o for Browser]"));
+
+        for forbidden in [
+            "secret-css",
+            "SECRET_JS",
+            "SECRET_ORPHAN_PARAM",
+            "inner-css-leak",
+            "SECRET_MERMAID_CDATA",
+            "<ac:parameter",
+            "ac:structured-macro",
+        ] {
+            assert!(
+                !visible_text.contains(forbidden),
+                "leaked `{forbidden}` into rendered HTML preview:\n{visible_text}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn html_preview_inline_svg_renders_halfblocks_and_preserves_button_click_coordinates() {
+        let (app, mut ui, _rx) = make_test_app_and_ui();
+        ui.graphics_caps = TerminalGraphicsCaps {
+            protocol: TerminalImageProtocol::Halfblock,
+            cell_px: (8, 16),
+            cell_px_exact: true,
+        };
+
+        let html = r##"
+            <h1>Vector Chart</h1>
+            <p id="status">Clicked: 0</p>
+            <svg width="160" height="80"><rect width="160" height="80" fill="#e11d48"/><circle cx="80" cy="40" r="24" fill="#38bdf8"/></svg>
+            <button id="go" onclick="window.__hits = (window.__hits || 0) + 1; document.getElementById('status').textContent = 'Clicked: ' + window.__hits;">Run Action</button>
+        "##;
+        let mut ov = HtmlPreviewOverlay::new("SVG + Button", html);
+
+        let (screen0, _) = render_overlay_text(&mut ov, &app, &mut ui, 90, 32);
+        assert!(screen0.contains("Vector Chart"), "expected heading:\n{screen0}");
+        assert!(screen0.contains("Clicked: 0"), "expected initial status:\n{screen0}");
+        assert!(
+            screen0.contains('▀'),
+            "expected Halfblock `▀` glyphs for inline <svg> in reserved slot:\n{screen0}"
+        );
+        assert!(screen0.contains("[ Run Action ]"), "expected button below SVG:\n{screen0}");
+
+        // Verify the graphic slot exists and the button sits strictly below the SVG slot
+        let (graphic_end, btn_line, btn_col) = {
+            let content_w = ov.last_content_rect.width;
+            let sess = ov.session_mut().unwrap();
+            let theme = theme_to_html_theme(&ui.theme);
+            let r = sess.render(content_w, &theme, false);
+            assert_eq!(r.graphics.len(), 1, "expected 1 inline SVG graphic");
+            let g = &r.graphics[0];
+            assert!(g.line_count >= 3, "expected reserved slot lines >= 3");
+            let ctrl = &r.controls[0];
+            assert!(
+                ctrl.line >= g.line_start + g.line_count,
+                "button line {} must be below graphic slot {}..{}",
+                ctrl.line,
+                g.line_start,
+                g.line_start + g.line_count
+            );
+            (g.line_start + g.line_count, ctrl.line as u16, ctrl.col_start + 1)
+        };
+        assert!(graphic_end > 0);
+        assert_eq!(ov.graphic_cache.len(), 1, "rendered SVG should be cached");
+
+        // Click the button below the inline SVG via screen coordinates -> click_at hits button
+        let screen_row = ov.last_content_rect.y + btn_line.saturating_sub(ov.last_scroll_y);
+        let screen_col = ov.last_content_rect.x + btn_col;
+        assert!(
+            ov.handle_mouse_click(screen_row, screen_col),
+            "click_at at ({btn_line}, {btn_col}) must hit <button> below inline SVG"
+        );
+
+        let (screen1, _) = render_overlay_text(&mut ov, &app, &mut ui, 90, 32);
+        assert!(
+            screen1.contains("Clicked: 1"),
+            "expected button onclick to fire after clicking below SVG:\n{screen1}"
+        );
+    }
+
+    #[tokio::test]
+    async fn html_preview_inline_svg_pixel_protocol_queues_pending_graphic_and_skips_cells() {
+        let (app, mut ui, _rx) = make_test_app_and_ui();
+        ui.graphics_caps = TerminalGraphicsCaps {
+            protocol: TerminalImageProtocol::Sixel,
+            cell_px: (8, 16),
+            cell_px_exact: true,
+        };
+
+        let html = r##"
+            <h1>Pixel SVG</h1>
+            <svg width="120" height="60"><rect width="120" height="60" fill="#16a34a"/></svg>
+            <p>Caption below</p>
+        "##;
+        let mut ov = HtmlPreviewOverlay::new("Pixel SVG", html);
+
+        let mut hitmap = HitMap::new();
+        let backend = TestBackend::new(90, 28);
+        let mut terminal = Terminal::new(backend).unwrap();
+        ui.pending_pixel_graphics.clear();
+        let mut all_cells_skipped = false;
+        terminal
+            .draw(|f| {
+                ov.draw(f, f.area(), &app, &mut ui, &mut hitmap);
+                if let Some(pg) = ui.pending_pixel_graphics.first() {
+                    let buf = f.buffer_mut();
+                    all_cells_skipped = true;
+                    for y in pg.rect.top()..pg.rect.bottom() {
+                        for x in pg.rect.left()..pg.rect.right() {
+                            if !buf[(x, y)].skip {
+                                all_cells_skipped = false;
+                            }
+                        }
+                    }
+                }
+            })
+            .unwrap();
+
+        assert_eq!(
+            ui.pending_pixel_graphics.len(),
+            1,
+            "Sixel inline SVG should queue 1 pending pixel graphic"
+        );
+        let pg = &ui.pending_pixel_graphics[0];
+        assert!(pg.cache_key.starts_with("html:"));
+        assert_eq!(pg.protocol, TerminalImageProtocol::Sixel);
+        assert!(pg.payload.as_deref().is_some_and(|p| p.starts_with("\x1bP0;1;q\"1;1;")));
+        assert!(pg.rect.width > 0 && pg.rect.height > 0);
+        assert!(
+            all_cells_skipped,
+            "every pixel graphic cell in {:?} must be marked set_skip(true)",
+            pg.rect
+        );
     }
 }

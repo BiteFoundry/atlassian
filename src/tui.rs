@@ -276,12 +276,15 @@ impl PixelLayerTracker {
 }
 
 /// Overlay Z-order guard: blocks inline pixel graphics whenever any modal overlay is active,
-/// and blocks modal pixel graphics whenever another modal sits on top of `ImagePreview`.
+/// allows `ImagePreview` modal graphics when it is the topmost overlay, and allows `HtmlPreview`
+/// inline graphics (`html:*`) when `HtmlPreview` is the topmost overlay.
 fn pixel_graphics_allowed_for_overlays(overlays: &[Overlay], cache_key: &str) -> bool {
     if overlays.is_empty() {
         true
     } else if matches!(overlays.last(), Some(Overlay::ImagePreview(_))) {
-        !cache_key.starts_with("inline:")
+        !cache_key.starts_with("inline:") && !cache_key.starts_with("html:")
+    } else if matches!(overlays.last(), Some(Overlay::HtmlPreview(_))) {
+        cache_key.starts_with("html:")
     } else {
         false
     }
@@ -796,29 +799,42 @@ fn draw_frame(
         })?;
 
         let mut desired: Vec<ActivePixelGraphic> = Vec::new();
-        let mut desired_payload: Option<String> = None;
+        let mut desired_payloads: Vec<String> = Vec::new();
 
-        if let Some(pg) = current_pending_pixel_graphic(frame_area, app, ui) {
-            if pixel_graphics_allowed_for_overlays(&ui.overlays, &pg.cache_key) {
-                let safe_bottom = ui.term_height.saturating_sub(1);
-                if pg.rect.y < safe_bottom && pg.rect.x < ui.term_width {
-                    if let Some((payload, draw_cols, draw_rows)) =
-                        resolve_pixel_payload(&pg.cache_key, pixel_rt, app)
-                    {
-                        let clamped_w = draw_cols.min(ui.term_width.saturating_sub(pg.rect.x));
-                        let clamped_h = draw_rows.min(safe_bottom.saturating_sub(pg.rect.y));
-                        if clamped_w > 0 && clamped_h > 0 {
-                            desired.push(ActivePixelGraphic {
-                                cache_key: pg.cache_key,
-                                rect: Rect::new(pg.rect.x, pg.rect.y, clamped_w, clamped_h),
-                                protocol: pg.protocol,
-                                cols: clamped_w,
-                                rows: clamped_h,
-                                payload_len: payload.len(),
-                            });
-                            desired_payload = Some(payload.into_owned());
-                        }
-                    }
+        let pending_list: Vec<PendingPixelGraphic> = if !ui.pending_pixel_graphics.is_empty() {
+            ui.pending_pixel_graphics.clone()
+        } else if let Some(pg) = current_pending_pixel_graphic(frame_area, app, ui) {
+            vec![pg]
+        } else {
+            Vec::new()
+        };
+
+        let safe_bottom = ui.term_height.saturating_sub(1);
+        for pg in pending_list {
+            if !pixel_graphics_allowed_for_overlays(&ui.overlays, &pg.cache_key) {
+                continue;
+            }
+            if pg.rect.y >= safe_bottom || pg.rect.x >= ui.term_width {
+                continue;
+            }
+            let resolved = if let Some(inline_payload) = pg.payload {
+                Some((Cow::Owned(inline_payload), pg.rect.width, pg.rect.height))
+            } else {
+                resolve_pixel_payload(&pg.cache_key, pixel_rt, app)
+            };
+            if let Some((payload, draw_cols, draw_rows)) = resolved {
+                let clamped_w = draw_cols.min(ui.term_width.saturating_sub(pg.rect.x));
+                let clamped_h = draw_rows.min(safe_bottom.saturating_sub(pg.rect.y));
+                if clamped_w > 0 && clamped_h > 0 {
+                    desired.push(ActivePixelGraphic {
+                        cache_key: pg.cache_key,
+                        rect: Rect::new(pg.rect.x, pg.rect.y, clamped_w, clamped_h),
+                        protocol: pg.protocol,
+                        cols: clamped_w,
+                        rows: clamped_h,
+                        payload_len: payload.len(),
+                    });
+                    desired_payloads.push(payload.into_owned());
                 }
             }
         }
@@ -860,24 +876,44 @@ fn draw_frame(
         }
 
         if plan.emit_desired {
-            if let (Some(graphic), Some(payload)) = (desired.first(), desired_payload.as_deref()) {
-                if graphic.protocol == TerminalImageProtocol::Kitty {
+            if !desired.is_empty() {
+                let any_kitty = desired
+                    .iter()
+                    .any(|g| g.protocol == TerminalImageProtocol::Kitty);
+                if any_kitty {
                     terminal
                         .backend_mut()
-                        .write_all(img_preview::kitty_delete_preview_sequence().as_bytes())?;
+                        .write_all(img_preview::kitty_delete_all_sequence().as_bytes())?;
                     guard.kitty_used = true;
                     KITTY_USED_GLOBAL.store(true, Ordering::Relaxed);
                 }
-                queue!(
-                    terminal.backend_mut(),
-                    MoveTo(graphic.rect.x, graphic.rect.y)
-                )?;
-                terminal.backend_mut().write_all(payload.as_bytes())?;
+                for (idx, (graphic, payload)) in
+                    desired.iter().zip(desired_payloads.iter()).enumerate()
+                {
+                    queue!(
+                        terminal.backend_mut(),
+                        MoveTo(graphic.rect.x, graphic.rect.y)
+                    )?;
+                    if graphic.protocol == TerminalImageProtocol::Kitty && idx > 0 {
+                        let unique_id =
+                            img_preview::KITTY_PREVIEW_IMAGE_ID.saturating_add(idx as u32);
+                        let patched = payload.replacen(
+                            &format!(",i={},", img_preview::KITTY_PREVIEW_IMAGE_ID),
+                            &format!(",i={unique_id},"),
+                            1,
+                        );
+                        terminal.backend_mut().write_all(patched.as_bytes())?;
+                    } else {
+                        terminal.backend_mut().write_all(payload.as_bytes())?;
+                    }
+                }
                 terminal.backend_mut().flush()?;
-                pixel_rt.set_active_pixel_graphic(
-                    ui,
-                    Some((graphic.cache_key.clone(), graphic.rect, graphic.protocol)),
-                );
+                if let Some(first) = desired.first() {
+                    pixel_rt.set_active_pixel_graphic(
+                        ui,
+                        Some((first.cache_key.clone(), first.rect, first.protocol)),
+                    );
+                }
             } else {
                 pixel_rt.set_active_pixel_graphic(ui, None);
             }

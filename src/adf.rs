@@ -771,6 +771,8 @@ fn is_inline_xhtml_element(tag: &str, el: ElementRef<'_>) -> bool {
 fn parse_xhtml_block_element(el: ElementRef<'_>) -> Vec<DocBlock> {
     let tag = el.value().name().to_ascii_lowercase();
     match tag.as_str() {
+        "style" | "script" | "noscript" | "head" | "meta" | "title" | "xml" | "svg" | "canvas"
+        | "ac:parameter" => Vec::new(),
         "p" => {
             let mut spans = Vec::new();
             parse_xhtml_inlines_of(el, &InlineStyle::default(), &mut spans);
@@ -1009,17 +1011,19 @@ fn parse_xhtml_macro(el: ElementRef<'_>) -> Vec<DocBlock> {
                 Vec::new()
             }
         }
+        "html" => vec![DocBlock::Panel {
+            kind: PanelKind::Info,
+            title: Some("[◈ Embedded HTML · Press H]".to_string()),
+            blocks: Vec::new(),
+        }],
+        "mermaid" | "drawio" | "gliffy" | "plantuml" | "chart" => vec![DocBlock::Panel {
+            kind: PanelKind::Info,
+            title: Some(format!("[◈ Diagram ({macro_name}) · Press H/o]")),
+            blocks: Vec::new(),
+        }],
         _ => {
             if let Some(rich) = rich_body_el {
                 parse_xhtml_children(rich)
-            } else if let Some(plain) = plain_body {
-                if plain.trim().is_empty() {
-                    Vec::new()
-                } else {
-                    vec![DocBlock::Paragraph {
-                        spans: split_text_with_issue_refs(&plain, &InlineStyle::default()),
-                    }]
-                }
             } else {
                 Vec::new()
             }
@@ -1101,6 +1105,8 @@ fn parse_xhtml_inline_element(
 ) {
     let tag = el.value().name().to_ascii_lowercase();
     match tag.as_str() {
+        "style" | "script" | "noscript" | "head" | "meta" | "title" | "xml" | "svg" | "canvas"
+        | "ac:parameter" => {}
         "strong" | "b" => {
             let mut st = parent_style.clone();
             st.bold = true;
@@ -1185,8 +1191,25 @@ fn parse_xhtml_inline_element(
                         key: key.trim().to_string(),
                     });
                 }
+            } else if macro_name == "html" {
+                out.push(InlineNode::Text {
+                    text: "[◈ Embedded HTML · Press H]".to_string(),
+                    style: parent_style.clone(),
+                });
+            } else if matches!(
+                macro_name.as_str(),
+                "mermaid" | "drawio" | "gliffy" | "plantuml" | "chart"
+            ) {
+                out.push(InlineNode::Text {
+                    text: format!("[◈ Diagram ({macro_name}) · Press H/o]"),
+                    style: parent_style.clone(),
+                });
             } else {
-                parse_xhtml_inlines_of(el, parent_style, out);
+                for child in el.children().filter_map(ElementRef::wrap) {
+                    if child.value().name().eq_ignore_ascii_case("ac:rich-text-body") {
+                        parse_xhtml_inlines_of(child, parent_style, out);
+                    }
+                }
             }
         }
         "ac:link" => {
@@ -3755,5 +3778,69 @@ mod tests {
         assert!(back_wiki.contains("h1. Hi"));
         assert!(back_wiki.contains("{{code}}"));
         assert!(back_wiki.contains("[docs|https://a.b]"));
+    }
+
+    #[test]
+    fn test_storage_xhtml_blocks_style_script_cdata_and_ac_parameter_leaks() {
+        let xhtml = r#"
+            <style>.secret-css-leak { color: #ff00ff; }</style>
+            <script>const SECRET_JS_LEAK = "never-show";</script>
+            <noscript>SECRET_NOSCRIPT_LEAK</noscript>
+            <svg width="40" height="40"><desc>SECRET_SVG_DESC</desc><rect width="40" height="40"/></svg>
+            <canvas>SECRET_CANVAS_FALLBACK</canvas>
+            <ac:parameter ac:name="orphan">SECRET_AC_PARAMETER</ac:parameter>
+            <p>Clean intro <style>.inline-css{display:none}</style><script>alert("inline-js")</script><ac:parameter ac:name="inline">SECRET_INLINE_PARAM</ac:parameter> text.</p>
+            <ac:structured-macro ac:name="html">
+                <ac:parameter ac:name="sanitize">false</ac:parameter>
+                <ac:plain-text-body><![CDATA[<div class="raw-widget"><style>.widget-css{}</style><p>SECRET_HTML_CDATA</p></div>]]></ac:plain-text-body>
+            </ac:structured-macro>
+            <ac:structured-macro ac:name="mermaid">
+                <ac:parameter ac:name="theme">dark</ac:parameter>
+                <ac:plain-text-body><![CDATA[graph TD; SECRET_MERMAID_NODE --> B;]]></ac:plain-text-body>
+            </ac:structured-macro>
+            <ac:structured-macro ac:name="custom-unknown">
+                <ac:parameter ac:name="token">SECRET_UNKNOWN_PARAM</ac:parameter>
+                <ac:plain-text-body><![CDATA[SECRET_UNKNOWN_CDATA_DUMP]]></ac:plain-text-body>
+            </ac:structured-macro>
+        "#;
+
+        let blocks = parse_storage_xhtml(xhtml);
+        let md = blocks_to_markdown(&blocks);
+        let plain = blocks_to_plain_text(&blocks);
+
+        for rendered in [&md, &plain] {
+            assert!(rendered.contains("Clean intro"), "expected visible text:\n{rendered}");
+            assert!(
+                rendered.contains("[◈ Embedded HTML · Press H]"),
+                "expected HTML macro summary:\n{rendered}"
+            );
+            assert!(
+                rendered.contains("[◈ Diagram (mermaid) · Press H/o]"),
+                "expected Mermaid diagram panel:\n{rendered}"
+            );
+
+            for forbidden in [
+                "secret-css-leak",
+                "SECRET_JS_LEAK",
+                "SECRET_NOSCRIPT_LEAK",
+                "SECRET_SVG_DESC",
+                "SECRET_CANVAS_FALLBACK",
+                "SECRET_AC_PARAMETER",
+                "inline-css",
+                "inline-js",
+                "SECRET_INLINE_PARAM",
+                "SECRET_HTML_CDATA",
+                "widget-css",
+                "SECRET_MERMAID_NODE",
+                "SECRET_UNKNOWN_PARAM",
+                "SECRET_UNKNOWN_CDATA_DUMP",
+                "<ac:parameter",
+            ] {
+                assert!(
+                    !rendered.contains(forbidden),
+                    "leaked `{forbidden}` in output:\n{rendered}"
+                );
+            }
+        }
     }
 }

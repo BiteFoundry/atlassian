@@ -162,6 +162,7 @@ pub fn draw(frame: &mut Frame, app: &AppState, ui: &mut UiState) -> Option<(u16,
     ui.term_height = area.height;
     ui.hitmap.clear();
     ui.site_group_keys.clear();
+    ui.pending_pixel_graphics.clear();
 
     if area.width < 12 || area.height < 5 {
         return None;
@@ -395,6 +396,7 @@ pub fn draw(frame: &mut Frame, app: &AppState, ui: &mut UiState) -> Option<(u16,
     let mut overlays = std::mem::take(&mut ui.overlays);
     for overlay in &mut overlays {
         hitmap.clear();
+        ui.pending_pixel_graphics.clear();
         overlay.draw(frame, area, app, ui, &mut hitmap);
     }
     ui.overlays = overlays;

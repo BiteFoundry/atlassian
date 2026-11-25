@@ -293,7 +293,7 @@ impl Overlay {
         frame: &mut Frame,
         area: Rect,
         app: &AppState,
-        ui: &UiState,
+        ui: &mut UiState,
         hitmap: &mut HitMap,
     ) {
         match self {
@@ -304,7 +304,11 @@ impl Overlay {
             Overlay::Comment(o) => o.draw(frame, area, app, ui, hitmap),
             Overlay::CrossLink(o) => o.draw(frame, area, app, ui, hitmap),
             Overlay::Links(o) => o.draw(frame, area, app, ui, hitmap),
-            Overlay::ImagePreview(o) => o.draw(frame, area, app, ui, hitmap),
+            Overlay::ImagePreview(o) => {
+                if let Some(pg) = o.draw_with_pending(frame, area, app, ui, hitmap) {
+                    ui.pending_pixel_graphics.push(pg);
+                }
+            }
             Overlay::HtmlPreview(o) => o.draw(frame, area, app, ui, hitmap),
             Overlay::PathInput(o) => o.draw(frame, area, app, ui, hitmap),
             Overlay::FilePicker(o) => o.draw(frame, area, app, ui, hitmap),
