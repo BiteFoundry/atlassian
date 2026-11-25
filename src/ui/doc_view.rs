@@ -2,6 +2,10 @@
 
 use std::borrow::Cow;
 
+use bitefoundry_html::layout::{
+    pad_display_width, render_wrapped_table, wrap_styled_spans, TableAlign, TableBorder,
+    TableSpec, WrapPrefix,
+};
 use ratatui::{
     style::{Modifier, Style},
     text::{Line, Span},
@@ -114,7 +118,10 @@ pub fn render_blocks_with_options(
     inline_images: bool,
     show_hrefs: bool,
 ) -> Vec<Line<'static>> {
-    let w = (width as usize).max(16);
+    if width == 0 {
+        return Vec::new();
+    }
+    let w = width as usize;
     let mut out = Vec::new();
     render_block_list(
         blocks,
@@ -308,13 +315,13 @@ fn render_block_list(
     out: &mut Vec<Line<'static>>,
 ) {
     let prefix_w: usize = prefix.iter().map(|s| s.content.width()).sum();
-    let inner_w = width.saturating_sub(prefix_w).max(8);
+    let inner_w = width.saturating_sub(prefix_w);
 
     for (idx, block) in blocks.iter().enumerate() {
         match block {
             DocBlock::Paragraph { spans } => {
                 let styled = inline_nodes_to_spans_with_hrefs(spans, theme, show_hrefs);
-                let wrapped = wrap_spans_with_prefix(&styled, inner_w, prefix, prefix);
+                let wrapped = wrap_spans_with_prefix(&styled, width, prefix, prefix);
                 if wrapped.is_empty() {
                     out.push(Line::from(prefix.to_vec()));
                 } else {
@@ -331,7 +338,7 @@ fn render_block_list(
                     sp.style = sp.style.patch(style);
                     h_spans.push(sp);
                 }
-                out.extend(wrap_spans_with_prefix(&h_spans, inner_w, prefix, prefix));
+                out.extend(wrap_spans_with_prefix(&h_spans, width, prefix, prefix));
                 if *level <= 2 {
                     let rule_w = inner_w.min(48);
                     let mut r_spans = prefix.to_vec();
@@ -420,7 +427,7 @@ fn render_block_list(
                     }
                     out.extend(wrap_spans_with_prefix(
                         &spans,
-                        inner_w.saturating_sub(2).max(6),
+                        width,
                         &first_pfx,
                         &cont_pfx,
                     ));
@@ -464,17 +471,20 @@ fn render_block_list(
                     Style::default().fg(color).add_modifier(Modifier::BOLD)
                 };
                 let border_span = Span::styled("▌ ", accent);
-                let mut hdr = prefix.to_vec();
-                hdr.push(border_span.clone());
+                let mut panel_pfx = prefix.to_vec();
+                panel_pfx.push(border_span);
                 let title_text = title
                     .as_deref()
                     .filter(|t| !t.trim().is_empty())
                     .unwrap_or(default_lbl);
-                hdr.push(Span::styled(format!("{icon} {title_text}"), accent));
-                out.push(Line::from(hdr));
+                let title_spans = vec![Span::styled(format!("{icon} {title_text}"), accent)];
+                out.extend(wrap_spans_with_prefix(
+                    &title_spans,
+                    width,
+                    &panel_pfx,
+                    &panel_pfx,
+                ));
 
-                let mut panel_pfx = prefix.to_vec();
-                panel_pfx.push(border_span);
                 render_block_list(
                     inner,
                     width,
@@ -493,12 +503,18 @@ fn render_block_list(
                 title,
                 blocks: inner,
             } => {
-                let mut hdr = prefix.to_vec();
-                hdr.push(Span::styled(format!("▾ {title}"), theme.accent_style()));
-                out.push(Line::from(hdr));
-
+                let mut first_hdr_pfx = prefix.to_vec();
+                first_hdr_pfx.push(Span::styled("▾ ", theme.accent_style()));
                 let mut exp_pfx = prefix.to_vec();
                 exp_pfx.push(Span::styled("  ", theme.muted_style()));
+                let title_spans = vec![Span::styled(title.clone(), theme.accent_style())];
+                out.extend(wrap_spans_with_prefix(
+                    &title_spans,
+                    width,
+                    &first_hdr_pfx,
+                    &exp_pfx,
+                ));
+
                 render_block_list(
                     inner,
                     width,
@@ -514,7 +530,7 @@ fn render_block_list(
                 }
             }
             DocBlock::Table { headers, rows } => {
-                render_table(headers, rows, inner_w, theme, show_hrefs, prefix, out);
+                render_table(headers, rows, width, theme, show_hrefs, prefix, out);
                 if idx + 1 < blocks.len() {
                     out.push(Line::from(prefix.to_vec()));
                 }
@@ -548,12 +564,11 @@ fn render_block_list(
                         .fg(theme.chip_fg)
                         .add_modifier(Modifier::BOLD)
                 };
-                let mut sp = prefix.to_vec();
-                sp.push(Span::styled(
+                let media_spans = vec![Span::styled(
                     format!("[Image: {label} — press v to preview]"),
                     chip_style,
-                ));
-                out.push(Line::from(sp));
+                )];
+                out.extend(wrap_spans_with_prefix(&media_spans, width, prefix, prefix));
                 if idx + 1 < blocks.len() {
                     out.push(Line::from(prefix.to_vec()));
                 }
@@ -585,7 +600,7 @@ fn render_list_item(
     out: &mut Vec<Line<'static>>,
 ) {
     let mut sub_out = Vec::new();
-    let avail = inner_w.saturating_sub(marker.width()).max(8);
+    let avail = inner_w.saturating_sub(marker.width()).max(2);
     render_block_list(
         item_blocks,
         avail,
@@ -673,15 +688,21 @@ fn render_code_block(
     prefix: &[Span<'static>],
     out: &mut Vec<Line<'static>>,
 ) {
-    let box_w = inner_w.clamp(12, 96);
+    let box_w = inner_w.min(96);
+    if box_w < 6 {
+        let code_spans = vec![Span::styled(code.to_string(), theme.code_style())];
+        let total_w = prefix.iter().map(|s| s.content.width()).sum::<usize>() + inner_w;
+        out.extend(wrap_spans_with_prefix(&code_spans, total_w, prefix, prefix));
+        return;
+    }
     let lang_label = language
         .map(str::trim)
         .filter(|l| !l.is_empty())
         .unwrap_or("code");
-    let header_title = format!("─ {lang_label} ");
-    let top_fill = box_w
-        .saturating_sub(2 + header_title.width())
-        .max(1);
+    let max_lang_w = box_w.saturating_sub(5).max(1);
+    let fitted_lang = truncate_width(lang_label, max_lang_w);
+    let header_title = format!("─ {fitted_lang} ");
+    let top_fill = box_w.saturating_sub(2 + header_title.width());
     let border_st = theme.subtle_style();
     let mut top = prefix.to_vec();
     top.push(Span::styled(
@@ -690,11 +711,12 @@ fn render_code_block(
     ));
     out.push(Line::from(top));
 
-    let code_inner_w = box_w.saturating_sub(4).max(4);
+    let code_inner_w = box_w.saturating_sub(4).max(2);
     for raw_line in code.lines() {
-        let wrapped = wrap_plain_text(raw_line, code_inner_w);
+        let expanded = raw_line.replace('\t', "    ");
+        let wrapped = wrap_plain_text(&expanded, code_inner_w);
         for seg in wrapped {
-            let padded = pad_right_width(&seg, code_inner_w);
+            let padded = pad_display_width(&seg, code_inner_w, TableAlign::Left);
             let mut row = prefix.to_vec();
             row.push(Span::styled("│ ", border_st));
             row.push(Span::styled(padded, theme.code_style()));
@@ -721,97 +743,40 @@ fn render_code_block(
 fn render_table(
     headers: &[Vec<InlineNode>],
     rows: &[Vec<Vec<InlineNode>>],
-    inner_w: usize,
+    max_width: usize,
     theme: &Theme,
     show_hrefs: bool,
     prefix: &[Span<'static>],
     out: &mut Vec<Line<'static>>,
 ) {
-    let col_count = headers
-        .len()
-        .max(rows.iter().map(|r| r.len()).max().unwrap_or(0));
-    if col_count == 0 {
-        return;
-    }
-
-    let mut col_widths = vec![4usize; col_count];
-    for (c, cell) in headers.iter().enumerate() {
-        let txt = inline_nodes_plain_text_with_hrefs(cell, show_hrefs);
-        col_widths[c] = col_widths[c].max(txt.width());
-    }
-    for row in rows {
-        for (c, cell) in row.iter().enumerate() {
-            let txt = inline_nodes_plain_text_with_hrefs(cell, show_hrefs);
-            col_widths[c] = col_widths[c].max(txt.width());
-        }
-    }
-
-    let overhead = 1 + col_count * 3;
-    let avail = inner_w.saturating_sub(overhead).max(col_count * 3);
-    let total_req: usize = col_widths.iter().sum();
-    if total_req > avail {
-        let mut remaining = total_req - avail;
-        while remaining > 0 {
-            let Some((idx, _)) = col_widths.iter().enumerate().max_by_key(|(_, w)| *w) else {
-                break;
-            };
-            if col_widths[idx] <= 3 {
-                break;
-            }
-            col_widths[idx] -= 1;
-            remaining -= 1;
-        }
-    }
-
-    let border_style = theme.subtle_style();
-    let make_border = |left: &str, mid: &str, right: &str| -> Line<'static> {
-        let mut s = String::from(left);
-        for (i, w) in col_widths.iter().enumerate() {
-            s.push_str(&"─".repeat(w + 2));
-            if i + 1 < col_widths.len() {
-                s.push_str(mid);
-            }
-        }
-        s.push_str(right);
-        let mut sp = prefix.to_vec();
-        sp.push(Span::styled(s, border_style));
-        Line::from(sp)
+    let header_spans: Vec<Vec<Span<'static>>> = headers
+        .iter()
+        .map(|cell| inline_nodes_to_spans_with_hrefs(cell, theme, show_hrefs))
+        .collect();
+    let row_spans: Vec<Vec<Vec<Span<'static>>>> = rows
+        .iter()
+        .map(|row| {
+            row.iter()
+                .map(|cell| inline_nodes_to_spans_with_hrefs(cell, theme, show_hrefs))
+                .collect()
+        })
+        .collect();
+    let cell_style = if theme.no_color {
+        Style::default()
+    } else {
+        Style::default().fg(theme.fg_primary)
     };
-
-    out.push(make_border("┌", "┬", "┐"));
-
-    if !headers.is_empty() {
-        let mut line_spans = prefix.to_vec();
-        line_spans.push(Span::styled("│", border_style));
-        for (c, w) in col_widths.iter().enumerate() {
-            let txt = headers
-                .get(c)
-                .map(|n| inline_nodes_plain_text_with_hrefs(n, show_hrefs))
-                .unwrap_or_default();
-            let cell = pad_right_width(&truncate_width(&txt, *w), *w);
-            line_spans.push(Span::styled(format!(" {cell} "), theme.accent_style()));
-            line_spans.push(Span::styled("│", border_style));
-        }
-        out.push(Line::from(line_spans));
-        out.push(make_border("├", "┼", "┤"));
-    }
-
-    for row in rows {
-        let mut line_spans = prefix.to_vec();
-        line_spans.push(Span::styled("│", border_style));
-        for (c, w) in col_widths.iter().enumerate() {
-            let txt = row
-                .get(c)
-                .map(|n| inline_nodes_plain_text_with_hrefs(n, show_hrefs))
-                .unwrap_or_default();
-            let cell = pad_right_width(&truncate_width(&txt, *w), *w);
-            line_spans.push(Span::raw(format!(" {cell} ")));
-            line_spans.push(Span::styled("│", border_style));
-        }
-        out.push(Line::from(line_spans));
-    }
-
-    out.push(make_border("└", "┴", "┘"));
+    let spec = TableSpec {
+        headers: &header_spans,
+        rows: &row_spans,
+        alignments: &[],
+        border: TableBorder::Box,
+        prefix,
+        border_style: theme.subtle_style(),
+        header_style: theme.accent_style(),
+        cell_style,
+    };
+    out.extend(render_wrapped_table(&spec, max_width));
 }
 
 /// Wraps a sequence of styled spans into `Line<'static>`s fitting `width` display columns.
@@ -821,62 +786,14 @@ pub fn wrap_spans_with_prefix(
     first_prefix: &[Span<'static>],
     cont_prefix: &[Span<'static>],
 ) -> Vec<Line<'static>> {
-    let max_w = width.max(4);
-    let mut lines: Vec<Line<'static>> = Vec::new();
-    let mut cur_spans: Vec<Span<'static>> = first_prefix.to_vec();
-    let mut cur_w = 0usize;
-
-    let flush = |lines: &mut Vec<Line<'static>>, cur: &mut Vec<Span<'static>>, cur_w: &mut usize| {
-        lines.push(Line::from(std::mem::take(cur)));
-        *cur = cont_prefix.to_vec();
-        *cur_w = 0;
-    };
-
-    for span in spans {
-        let style = span.style;
-        let text = span.content.as_ref();
-        // Atomic chips/pills should not break mid-token if possible.
-        let is_chip = style.bg.is_some();
-
-        for (seg_idx, segment) in text.split('\n').enumerate() {
-            if seg_idx > 0 {
-                flush(&mut lines, &mut cur_spans, &mut cur_w);
-            }
-            if segment.is_empty() {
-                continue;
-            }
-            if is_chip {
-                let sw = segment.width();
-                if cur_w > 0 && cur_w + sw > max_w {
-                    flush(&mut lines, &mut cur_spans, &mut cur_w);
-                }
-                cur_spans.push(Span::styled(segment.to_string(), style));
-                cur_w += sw;
-                continue;
-            }
-
-            let mut buf = String::new();
-            for ch in segment.chars() {
-                let cw = ch.width().unwrap_or(0);
-                if cur_w + cw > max_w && (cur_w > 0 || !buf.is_empty()) {
-                    if !buf.is_empty() {
-                        cur_spans.push(Span::styled(std::mem::take(&mut buf), style));
-                    }
-                    flush(&mut lines, &mut cur_spans, &mut cur_w);
-                }
-                buf.push(ch);
-                cur_w += cw;
-            }
-            if !buf.is_empty() {
-                cur_spans.push(Span::styled(buf, style));
-            }
-        }
-    }
-
-    if cur_w > 0 || lines.is_empty() {
-        lines.push(Line::from(cur_spans));
-    }
-    lines
+    wrap_styled_spans(
+        spans,
+        width,
+        WrapPrefix {
+            first: first_prefix,
+            cont: cont_prefix,
+        },
+    )
 }
 
 #[cfg(test)]
@@ -1088,5 +1005,229 @@ mod tests {
         ))
         .join("\n");
         assert!(shown.contains("RFC-42 (https://acme.dev/rfc-42)"));
+    }
+
+    #[test]
+    fn narrow_drawer_wraps_bg_styled_code_wiki_mention_lozenge_and_blocks_losslessly() {
+        let theme = Theme::midnight_dark();
+        let code_45 = "very_long_inline_code_identifier_with_45_char";
+        assert_eq!(code_45.len(), 45);
+        let wiki_title = "긴 한글 문서 아키텍처 가이드";
+        let mention_name = "hong_gildong_platform_engineering";
+        let blocks = vec![
+            DocBlock::Paragraph {
+                spans: vec![
+                    InlineNode::Text {
+                        text: code_45.into(),
+                        style: InlineStyle {
+                            code: true,
+                            ..Default::default()
+                        },
+                    },
+                    InlineNode::Text {
+                        text: " ".into(),
+                        style: InlineStyle::default(),
+                    },
+                    InlineNode::PageRef {
+                        page_id: "100".into(),
+                        title: wiki_title.into(),
+                    },
+                    InlineNode::Text {
+                        text: " ".into(),
+                        style: InlineStyle::default(),
+                    },
+                    InlineNode::Mention {
+                        id: "u1".into(),
+                        display: mention_name.into(),
+                    },
+                    InlineNode::Text {
+                        text: " ".into(),
+                        style: InlineStyle::default(),
+                    },
+                    InlineNode::StatusLozenge {
+                        text: "WAITING FOR EXTERNAL REVIEW".into(),
+                        category: StatusCategory::InProgress,
+                    },
+                ],
+            },
+            DocBlock::Panel {
+                kind: PanelKind::Warning,
+                title: Some("긴 한글 경고 패널 제목이 26컬럼 드로어에서 안전하게 줄바꿈됩니다".into()),
+                blocks: vec![],
+            },
+            DocBlock::Expand {
+                title: "접기 펼치기 긴 제목 테스트 26컬럼 폭 불변식 검증".into(),
+                blocks: vec![],
+            },
+            DocBlock::Media {
+                id_or_filename: "architecture-overview-diagram-v2.png".into(),
+                alt: Some("아키텍처 다이어그램 미리보기".into()),
+                url: None,
+            },
+        ];
+
+        let rendered = render_blocks(&blocks, 26, &theme, None, false);
+        for (i, line) in rendered.iter().enumerate() {
+            assert!(
+                line.width() <= 26,
+                "line {i} exceeded width 26 (width={}): {:?}",
+                line.width(),
+                line
+            );
+        }
+
+        // Collapse whitespace and check lossless preservation of all bg-styled tokens & block titles.
+        let compact: String = lines_to_strings(&rendered)
+            .join("")
+            .chars()
+            .filter(|c| !c.is_whitespace() && *c != '▌' && *c != '▾')
+            .collect();
+        assert!(compact.contains(code_45), "45-char inline code lost:\n{compact}");
+        for tok in ["[Wiki:", "긴", "한글", "문서", "아키텍처", "가이드]"] {
+            assert!(compact.contains(tok), "wiki chip token `{tok}` lost:\n{compact}");
+        }
+        assert!(
+            compact.contains(&format!("@{mention_name}")),
+            "mention lost:\n{compact}"
+        );
+        assert!(
+            compact.contains("WAITINGFOREXTERNALREVIEW"),
+            "status lozenge lost:\n{compact}"
+        );
+        assert!(
+            compact.contains("26컬럼드로어에서안전하게줄바꿈됩니다"),
+            "panel title lost:\n{compact}"
+        );
+        assert!(
+            compact.contains("접기펼치기긴제목테스트"),
+            "expand title lost:\n{compact}"
+        );
+        assert!(
+            compact.contains("아키텍처다이어그램미리보기"),
+            "media chip lost:\n{compact}"
+        );
+    }
+
+    #[test]
+    fn table_preserves_hard_break_multiline_cells_and_fits_six_columns_in_40_cols() {
+        let theme = Theme::midnight_dark();
+
+        // 1. HardBreak splits cell content across distinct rendered lines while preserving style.
+        let hb_blocks = vec![DocBlock::Table {
+            headers: vec![
+                vec![InlineNode::Text {
+                    text: "항목".into(),
+                    style: InlineStyle::default(),
+                }],
+                vec![InlineNode::Text {
+                    text: "내용".into(),
+                    style: InlineStyle::default(),
+                }],
+            ],
+            rows: vec![vec![
+                vec![InlineNode::Text {
+                    text: "배포".into(),
+                    style: InlineStyle::default(),
+                }],
+                vec![
+                    InlineNode::Text {
+                        text: "ALPHA_LINE_1".into(),
+                        style: InlineStyle {
+                            bold: true,
+                            ..Default::default()
+                        },
+                    },
+                    InlineNode::HardBreak,
+                    InlineNode::Text {
+                        text: "BETA_LINE_2".into(),
+                        style: InlineStyle::default(),
+                    },
+                ],
+            ]],
+        }];
+        let hb_lines = render_blocks(&hb_blocks, 48, &theme, None, false);
+        assert!(hb_lines.iter().all(|l| l.width() <= 48));
+        let hb_strings = lines_to_strings(&hb_lines);
+        let row1 = hb_strings
+            .iter()
+            .position(|l| l.contains("ALPHA_LINE_1"))
+            .expect("ALPHA_LINE_1 present");
+        let row2 = hb_strings
+            .iter()
+            .position(|l| l.contains("BETA_LINE_2"))
+            .expect("BETA_LINE_2 present");
+        assert_ne!(
+            row1, row2,
+            "InlineNode::HardBreak must split onto separate lines:\n{}",
+            hb_strings.join("\n")
+        );
+        assert!(
+            hb_lines[row1]
+                .spans
+                .iter()
+                .any(|s| s.content.contains("ALPHA_LINE_1") && s.style.add_modifier.contains(Modifier::BOLD)),
+            "expected BOLD style preserved in table cell"
+        );
+
+        // 2. 6-column table fits strictly within width = 40 without losing any cell data.
+        let six_col_blocks = vec![DocBlock::Table {
+            headers: ["C1", "C2", "C3", "C4", "C5", "C6"]
+                .into_iter()
+                .map(|h| {
+                    vec![InlineNode::Text {
+                        text: h.into(),
+                        style: InlineStyle::default(),
+                    }]
+                })
+                .collect(),
+            rows: vec![vec![
+                vec![InlineNode::Text {
+                    text: "K1".into(),
+                    style: InlineStyle::default(),
+                }],
+                vec![InlineNode::Text {
+                    text: "한글".into(),
+                    style: InlineStyle::default(),
+                }],
+                vec![InlineNode::Text {
+                    text: "V3".into(),
+                    style: InlineStyle::default(),
+                }],
+                vec![InlineNode::Text {
+                    text: "V4".into(),
+                    style: InlineStyle::default(),
+                }],
+                vec![InlineNode::Text {
+                    text: "V5".into(),
+                    style: InlineStyle::default(),
+                }],
+                vec![InlineNode::Text {
+                    text: "LASTCOL".into(),
+                    style: InlineStyle::default(),
+                }],
+            ]],
+        }];
+        let rendered = render_blocks(&six_col_blocks, 40, &theme, None, false);
+        for (i, line) in rendered.iter().enumerate() {
+            assert!(
+                line.width() <= 40,
+                "6-col table line {i} exceeded 40 cols (width={}): {:?}",
+                line.width(),
+                line
+            );
+        }
+        let compact: String = lines_to_strings(&rendered)
+            .join("")
+            .chars()
+            .filter(|c| !c.is_whitespace() && !"┌┬┐├┼┤└┴┘│─:".contains(*c))
+            .collect();
+        for expected in ["C1", "C2", "C3", "C4", "C5", "C6", "K1", "한글", "V3", "V4", "V5", "LASTCOL"]
+        {
+            assert!(
+                compact.contains(expected),
+                "6-col table lost `{expected}` in:\n{}",
+                lines_to_strings(&rendered).join("\n")
+            );
+        }
     }
 }

@@ -1,10 +1,11 @@
 //! Tab 4 (`Ctrl+5`): Minimal-chrome Unified Local FTS5 + `Ctrl+R` Remote JQL & CQL Parallel Search.
 
+use bitefoundry_html::layout::windowed_single_line_input;
 use ratatui::{
     layout::{Constraint, Direction, Layout, Rect},
     style::{Modifier, Style},
     text::{Line, Span},
-    widgets::Paragraph,
+    widgets::{Paragraph, Wrap},
     Frame,
 };
 use unicode_width::UnicodeWidthStr;
@@ -93,47 +94,74 @@ pub fn draw_with_scope(
     ui.hitmap.add(rows[0], HitTarget::SearchBar);
 
     let prefix = format!(" Search [{mode_lbl}]> ");
-    let query_text = ui.search_ui.query.text.clone();
-    let mut bar_spans = vec![
-        Span::styled(prefix.clone(), theme.accent_style().patch(bar_surface)),
-        Span::styled(query_text.clone(), bar_surface),
-    ];
-    let mut cx = input_rect
-        .x
-        .saturating_add(prefix.width() as u16)
-        .saturating_add(query_text.width() as u16);
+    let prefix_w = prefix.width();
+    let total_w = input_rect.width as usize;
     let muted = theme.muted_style().patch(bar_surface);
-    if bar_focused {
-        let cursor = "▏";
-        bar_spans.push(Span::styled(cursor, theme.accent_style().patch(bar_surface)));
-        cx = cx.saturating_add(cursor.width() as u16);
-        let tail_segments: &[(&str, Option<ButtonId>)] = &[
-            ("   ", None),
+    let accent = theme.accent_style().patch(bar_surface);
+
+    let full_tail: &[(&str, Option<ButtonId>)] = if bar_focused {
+        &[
             ("[Ctrl+R] Remote", Some(ButtonId::RemoteSearch)),
             (" · ", None),
             ("[Ctrl+S] Site", Some(ButtonId::SiteSwitcher)),
-        ];
-        for &(seg, btn) in tail_segments {
-            let seg_w = seg.width() as u16;
-            if let Some(btn_id) = btn {
-                if cx < input_rect.right() {
-                    let clipped_w = seg_w.min(input_rect.right().saturating_sub(cx));
-                    ui.hitmap
-                        .add_line(cx, input_rect.y, clipped_w, HitTarget::Button(btn_id));
-                }
-            }
-            bar_spans.push(Span::styled(seg, muted));
-            cx = cx.saturating_add(seg_w);
-        }
+        ]
     } else {
-        let tail_segments: &[(&str, Option<ButtonId>)] = &[
-            ("   [/] Focus · ", None),
+        &[
+            ("[/] Focus · ", None),
             ("[Ctrl+R] Remote", Some(ButtonId::RemoteSearch)),
             (" · ", None),
             ("[Ctrl+S] Site", Some(ButtonId::SiteSwitcher)),
             (" · [Enter] Open", None),
-        ];
-        for &(seg, btn) in tail_segments {
+        ]
+    };
+    let tail_w: usize = full_tail.iter().map(|(s, _)| s.width()).sum();
+    let gap_w = 2usize;
+    let min_viewport = if bar_focused { 10usize } else { 8usize };
+    let show_tail = total_w >= prefix_w + min_viewport + gap_w + tail_w;
+    let reserved_right = if show_tail { gap_w + tail_w } else { 0 };
+    let viewport_w = total_w.saturating_sub(prefix_w + reserved_right);
+
+    let mut bar_spans = vec![Span::styled(prefix, accent)];
+    let mut rendered_w = 0usize;
+    if bar_focused {
+        let win = windowed_single_line_input(
+            &ui.search_ui.query.text,
+            ui.search_ui.query.cursor,
+            viewport_w,
+        );
+        if win.clipped_left {
+            bar_spans.push(Span::styled("‹", muted));
+            rendered_w += 1;
+        }
+        if !win.before_cursor.is_empty() {
+            rendered_w += win.before_cursor.width();
+            bar_spans.push(Span::styled(win.before_cursor, bar_surface));
+        }
+        if viewport_w > 0 {
+            bar_spans.push(Span::styled("▏", accent));
+            rendered_w += 1;
+        }
+        if !win.after_cursor.is_empty() {
+            rendered_w += win.after_cursor.width();
+            bar_spans.push(Span::styled(win.after_cursor, bar_surface));
+        }
+        if win.clipped_right {
+            bar_spans.push(Span::styled("›", muted));
+            rendered_w += 1;
+        }
+    } else {
+        let fitted = truncate_width(&ui.search_ui.query.text, viewport_w);
+        rendered_w += fitted.width();
+        bar_spans.push(Span::styled(fitted, bar_surface));
+    }
+
+    if show_tail {
+        let pad = total_w.saturating_sub(prefix_w + rendered_w + tail_w);
+        if pad > 0 {
+            bar_spans.push(Span::styled(" ".repeat(pad), bar_surface));
+        }
+        let mut cx = input_rect.right().saturating_sub(tail_w as u16);
+        for &(seg, btn) in full_tail {
             let seg_w = seg.width() as u16;
             if let Some(btn_id) = btn {
                 if cx < input_rect.right() {
@@ -209,7 +237,8 @@ pub fn draw_with_scope(
             Paragraph::new(Span::styled(
                 "  No search results. Press [/] to search locally or [Ctrl+R] for remote JQL+CQL search.",
                 theme.muted_style(),
-            )),
+            ))
+            .wrap(Wrap { trim: false }),
             list_inner,
         );
         return;
@@ -450,5 +479,34 @@ mod tests {
             .map(|c| c.symbol())
             .collect();
         assert!(single_text.contains("Scope: acme"));
+    }
+
+    #[tokio::test]
+    async fn search_bar_windows_100_char_query_with_tail_and_cursor_visible() {
+        let (app, mut ui) = test_app();
+        let query = format!("{}SEARCH_TAIL_88", "query_prefix_".repeat(7));
+        assert!(query.len() >= 100);
+        ui.focus = PaneFocus::SearchBar;
+        ui.search_ui.query.set_text(query);
+
+        let backend = TestBackend::new(72, 12);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal
+            .draw(|f| draw(f, f.area(), &app, &mut ui))
+            .unwrap();
+        let buf = terminal.backend().buffer();
+        let top_row: String = (0..72).map(|x| buf[(x, 0)].symbol()).collect();
+        assert!(
+            top_row.contains("SEARCH_TAIL_88"),
+            "expected tail of 100-char search query in top row:\n{top_row}"
+        );
+        assert!(
+            top_row.contains('▏'),
+            "expected cursor `▏` in top row:\n{top_row}"
+        );
+        assert!(
+            top_row.contains('‹'),
+            "expected left overflow marker `‹` in top row:\n{top_row}"
+        );
     }
 }

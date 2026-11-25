@@ -1,10 +1,11 @@
 //! Tab 3 (`Ctrl+4`): Minimal-chrome Confluence Space Selector, Page Tree, Wiki Reader & TOC Drawer.
 
+use bitefoundry_html::layout::{windowed_single_line_input, wrap_styled_spans, WrapPrefix};
 use ratatui::{
     layout::{Constraint, Direction, Layout, Rect},
     style::{Modifier, Style},
     text::{Line, Span},
-    widgets::Paragraph,
+    widgets::{Paragraph, Wrap},
     Frame,
 };
 use unicode_width::UnicodeWidthStr;
@@ -282,26 +283,64 @@ fn draw_spaces_pane(
             area.width,
             HitTarget::Button(ButtonId::FocusLocalFilter),
         );
-        let cursor = if ui.confluence_ui.space_filter_active {
-            "▏"
-        } else {
-            ""
-        };
+        let prefix = " / ";
+        let prefix_w = prefix.width();
         let count_str = format!("  {matched}/{}", app.spaces.len());
-        let mut filter_spans = vec![
-            Span::styled(" / ", theme.accent_style()),
-            Span::raw(ui.confluence_ui.space_filter.text.clone()),
-            Span::styled(cursor, theme.accent_style()),
-            Span::styled(count_str.clone(), theme.muted_style()),
-        ];
-        if ui.confluence_ui.space_filter_active {
-            let used_w = " / ".width()
-                + ui.confluence_ui.space_filter.text.width()
-                + cursor.width()
-                + count_str.width();
-            let esc_lbl = "(Esc)";
+        let esc_lbl = "(Esc)";
+        let total_w = area.width as usize;
+        let active = ui.confluence_ui.space_filter_active;
+
+        let full_suffix_w = count_str.width() + if active { 1 + esc_lbl.width() } else { 0 };
+        let (show_count, show_esc, suffix_w) = if total_w >= prefix_w + 4 + full_suffix_w {
+            (true, active, full_suffix_w)
+        } else if total_w >= prefix_w + 4 + count_str.width() {
+            (true, false, count_str.width())
+        } else {
+            (false, false, 0)
+        };
+        let viewport_w = total_w.saturating_sub(prefix_w + suffix_w);
+
+        let mut filter_spans = vec![Span::styled(prefix, theme.accent_style())];
+        let mut rendered_w = prefix_w;
+        if active {
+            let win = windowed_single_line_input(
+                &ui.confluence_ui.space_filter.text,
+                ui.confluence_ui.space_filter.cursor,
+                viewport_w,
+            );
+            if win.clipped_left {
+                filter_spans.push(Span::styled("‹", theme.muted_style()));
+                rendered_w += 1;
+            }
+            if !win.before_cursor.is_empty() {
+                rendered_w += win.before_cursor.width();
+                filter_spans.push(Span::raw(win.before_cursor));
+            }
+            if viewport_w > 0 {
+                filter_spans.push(Span::styled("▏", theme.accent_style()));
+                rendered_w += 1;
+            }
+            if !win.after_cursor.is_empty() {
+                rendered_w += win.after_cursor.width();
+                filter_spans.push(Span::raw(win.after_cursor));
+            }
+            if win.clipped_right {
+                filter_spans.push(Span::styled("›", theme.muted_style()));
+                rendered_w += 1;
+            }
+        } else {
+            let fitted = truncate_width(&ui.confluence_ui.space_filter.text, viewport_w);
+            rendered_w += fitted.width();
+            filter_spans.push(Span::raw(fitted));
+        }
+
+        if show_count {
+            rendered_w += count_str.width();
+            filter_spans.push(Span::styled(count_str, theme.muted_style()));
+        }
+        if show_esc {
             let esc_w = esc_lbl.width();
-            let esc_x = area.x.saturating_add((used_w + 1) as u16);
+            let esc_x = area.x.saturating_add((rendered_w + 1) as u16);
             if esc_x < area.right() {
                 let clipped_w = (esc_w as u16).min(area.right().saturating_sub(esc_x));
                 ui.hitmap.add_line(
@@ -443,7 +482,8 @@ fn draw_wiki_reader(frame: &mut Frame, area: Rect, app: &AppState, ui: &mut UiSt
                     "  Select a Confluence page from the tree or press [n] to create a new page.",
                     theme.muted_style(),
                 )),
-            ]),
+            ])
+            .wrap(Wrap { trim: false }),
             inner,
         );
         return;
@@ -567,10 +607,17 @@ fn build_wiki_reader_lines_with_hits(
     )));
 
     // 2. Title
-    lines.push(Line::from(Span::styled(
-        truncate_width(&format!(" {}", s.title), w),
-        Style::default().add_modifier(Modifier::BOLD),
-    )));
+    lines.extend(wrap_styled_spans(
+        &[Span::styled(
+            s.title.clone(),
+            Style::default().add_modifier(Modifier::BOLD),
+        )],
+        w,
+        WrapPrefix {
+            first: &[Span::raw(" ")],
+            cont: &[Span::raw(" ")],
+        },
+    ));
 
     // 3. Metadata: v{N} · Author · Updated · #labels
     let author = s.author_name.as_deref().unwrap_or("Unknown");
@@ -586,13 +633,17 @@ fn build_wiki_reader_lines_with_hits(
                 .join(" ")
         )
     };
-    lines.push(Line::from(Span::styled(
-        truncate_width(
-            &format!(" v{} · {author} · {}{labels}", s.version_number, s.updated_at),
-            w,
-        ),
-        theme.muted_style(),
-    )));
+    lines.extend(wrap_styled_spans(
+        &[Span::styled(
+            format!("v{} · {author} · {}{labels}", s.version_number, s.updated_at),
+            theme.muted_style(),
+        )],
+        w,
+        WrapPrefix {
+            first: &[Span::raw(" ")],
+            cont: &[Span::raw(" ")],
+        },
+    ));
 
     // 4. Action bar
     let action_row = lines.len();
@@ -661,20 +712,30 @@ fn build_wiki_reader_lines_with_hits(
         };
         for (idx, att) in page.attachments.iter().enumerate() {
             let kb = (att.size / 1024).max(1);
-            row_hits.push(WikiLineHit {
-                line_idx: lines.len(),
-                x_offset: 0,
-                width: None,
-                target: HitTarget::Attachment(idx),
-            });
-            lines.push(Line::from(vec![
-                Span::raw("  • "),
-                Span::styled(att.filename.clone(), file_style),
-                Span::styled(
-                    format!(" ({kb} KB · {})", att.mime_type),
-                    theme.muted_style(),
-                ),
-            ]));
+            let start_idx = lines.len();
+            let wrapped = wrap_styled_spans(
+                &[
+                    Span::styled(att.filename.clone(), file_style),
+                    Span::styled(
+                        format!(" ({kb} KB · {})", att.mime_type),
+                        theme.muted_style(),
+                    ),
+                ],
+                w,
+                WrapPrefix {
+                    first: &[Span::raw("  • ")],
+                    cont: &[Span::raw("    ")],
+                },
+            );
+            for offset in 0..wrapped.len() {
+                row_hits.push(WikiLineHit {
+                    line_idx: start_idx + offset,
+                    x_offset: 0,
+                    width: None,
+                    target: HitTarget::Attachment(idx),
+                });
+            }
+            lines.extend(wrapped);
         }
         if !is_compact {
             lines.push(Line::from(""));
@@ -684,16 +745,45 @@ fn build_wiki_reader_lines_with_hits(
     // 7. Footer comments
     let comment_hdr_prefix = format!(" ▾ Page Comments ({}) — ", page.comments.len());
     let comment_btn_lbl = "[c] Add Comment";
-    row_hits.push(WikiLineHit {
-        line_idx: lines.len(),
-        x_offset: comment_hdr_prefix.width() as u16,
-        width: Some(comment_btn_lbl.width() as u16),
-        target: HitTarget::Button(ButtonId::Comment),
-    });
-    lines.push(Line::from(Span::styled(
-        format!("{comment_hdr_prefix}{comment_btn_lbl}"),
-        teal_bold,
-    )));
+    if comment_hdr_prefix.width() + comment_btn_lbl.width() <= w {
+        row_hits.push(WikiLineHit {
+            line_idx: lines.len(),
+            x_offset: comment_hdr_prefix.width() as u16,
+            width: Some(comment_btn_lbl.width() as u16),
+            target: HitTarget::Button(ButtonId::Comment),
+        });
+        lines.push(Line::from(Span::styled(
+            format!("{comment_hdr_prefix}{comment_btn_lbl}"),
+            teal_bold,
+        )));
+    } else {
+        lines.extend(wrap_styled_spans(
+            &[Span::styled(
+                format!("▾ Page Comments ({})", page.comments.len()),
+                teal_bold,
+            )],
+            w,
+            WrapPrefix {
+                first: &[Span::raw(" ")],
+                cont: &[Span::raw("   ")],
+            },
+        ));
+        let btn_line_idx = lines.len();
+        row_hits.push(WikiLineHit {
+            line_idx: btn_line_idx,
+            x_offset: 3,
+            width: Some(comment_btn_lbl.width() as u16),
+            target: HitTarget::Button(ButtonId::Comment),
+        });
+        lines.extend(wrap_styled_spans(
+            &[Span::styled(comment_btn_lbl, teal_bold)],
+            w,
+            WrapPrefix {
+                first: &[Span::raw("   ")],
+                cont: &[Span::raw("   ")],
+            },
+        ));
+    }
     if page.comments.is_empty() {
         lines.push(Line::from(Span::styled(
             "  (no comments)",
@@ -1059,5 +1149,96 @@ mod tests {
         let visible = app.visible_space_indices(&ui);
         assert_eq!(visible.first(), Some(&40));
         assert_eq!(visible.len(), 40);
+    }
+
+    #[tokio::test]
+    async fn space_filter_windows_100_char_query_and_wiki_reader_wraps_title_meta_and_empty_state()
+    {
+        use crate::models::PageSummary;
+
+        let (mut app, mut ui) = single_site();
+        app.spaces = vec![
+            space("ENG", "Engineering"),
+            space("OPS", "Operations"),
+            space("DOCS", "Documentation"),
+        ];
+        let long_query = format!("{}TAIL_SPACE_99", "space_query_".repeat(8));
+        assert!(long_query.len() >= 100);
+        ui.confluence_ui.space_filter.set_text(long_query);
+        ui.confluence_ui.space_filter_active = true;
+
+        let rows = render_nav(&app, &mut ui, 40, 20);
+        let filter_row = rows
+            .iter()
+            .find(|r| r.contains(" / "))
+            .expect("filter row rendered");
+        assert!(
+            filter_row.contains("TAIL_SPACE_99"),
+            "expected tail of 100-char space filter query:\n{filter_row}"
+        );
+        assert!(
+            filter_row.contains('▏'),
+            "expected cursor `▏` in space filter row:\n{filter_row}"
+        );
+        assert!(
+            filter_row.contains("0/3"),
+            "expected match count in space filter row:\n{filter_row}"
+        );
+
+        // Wiki page title and metadata wrap cleanly without truncation at narrow width.
+        let page = PageDetail {
+            summary: PageSummary {
+                id: "p1".into(),
+                space_key: "ENG".into(),
+                title: "매우 긴 한글 컨플루언스 문서 제목이 좁은 화면에서도 잘리지 않고 줄바꿈됩니다"
+                    .into(),
+                version_number: 7,
+                author_name: Some("Hong Gildong".into()),
+                updated_at: "2026-11-25T09:00:00Z".into(),
+                ..Default::default()
+            },
+            labels: vec![
+                "architecture".into(),
+                "track-d".into(),
+                "lossless-wrap".into(),
+            ],
+            ..Default::default()
+        };
+        let (lines, _, _) = build_wiki_reader_lines_with_hits(&page, 32, &app, &ui);
+        let compact: String = lines
+            .iter()
+            .map(|l| l.spans.iter().map(|s| s.content.as_ref()).collect::<String>())
+            .collect::<String>()
+            .chars()
+            .filter(|c| !c.is_whitespace())
+            .collect();
+        assert!(compact.contains("매우긴한글컨플루언스문서제목이좁은화면에서도잘리지않고줄바꿈됩니다"));
+        assert!(compact.contains("v7·HongGildong·2026-11-25T09:00:00Z"));
+        assert!(compact.contains("#architecture#track-d#lossless-wrap"));
+        // Title & metadata lines (indices 1..action_row) must fit width <= 32.
+        for line in lines.iter().take(4) {
+            assert!(
+                line.width() <= 32,
+                "wiki header line exceeded 32 cols (width={}): {:?}",
+                line.width(),
+                line
+            );
+        }
+
+        // Empty-state prompt wraps cleanly in a narrow reader pane.
+        app.active_page = None;
+        let mut terminal = Terminal::new(TestBackend::new(32, 10)).unwrap();
+        terminal
+            .draw(|f| draw_wiki_reader(f, Rect::new(0, 0, 32, 10), &app, &mut ui))
+            .unwrap();
+        let buf = terminal.backend().buffer();
+        let full_text: String = (0..10)
+            .map(|y| (0..32).map(|x| buf[(x, y)].symbol()).collect::<String>())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            full_text.contains("new page."),
+            "expected wrapped empty-state prompt tail:\n{full_text}"
+        );
     }
 }

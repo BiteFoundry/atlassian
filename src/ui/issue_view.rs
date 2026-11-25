@@ -1,10 +1,11 @@
 //! Tab 1 (`Ctrl+2`): Minimal-chrome Jira Issue Explorer, JQL Navigator, and Native Issue Inspector.
 
+use bitefoundry_html::layout::{windowed_single_line_input, wrap_styled_spans, WrapPrefix};
 use ratatui::{
     layout::{Constraint, Direction, Layout, Rect},
     style::{Modifier, Style},
     text::{Line, Span},
-    widgets::Paragraph,
+    widgets::{Paragraph, Wrap},
     Frame,
 };
 use unicode_width::UnicodeWidthStr;
@@ -16,7 +17,6 @@ use crate::{
         app::{AppState, PaneFocus, UiState, WorkspaceTab},
         doc_view::{
             blocks_or_markdown, pad_right_width, render_blocks_with_options, truncate_width,
-            wrap_plain_text,
         },
         draw_horizontal_hairline, fill_surface,
         hitmap::{ButtonId, HitMap, HitTarget},
@@ -72,85 +72,166 @@ fn draw_jql_bar(frame: &mut Frame, area: Rect, _app: &AppState, ui: &mut UiState
     fill_surface(frame, input_rect, bar_surface);
     ui.hitmap.add(area, HitTarget::JqlBar);
 
+    let muted = theme.muted_style().patch(bar_surface);
+    let accent = theme.accent_style().patch(bar_surface);
+    let total_w = input_rect.width as usize;
+
     let line = if filter_focused {
         let prefix = " Filter / ";
-        let text = ui.issue_ui.local_filter.text.clone();
-        let cursor = "▏";
-        let sep = "   ";
+        let prefix_w = prefix.width();
         let close_lbl = "(Esc to close)";
-        let close_x = input_rect
-            .x
-            .saturating_add(prefix.width() as u16)
-            .saturating_add(text.width() as u16)
-            .saturating_add(cursor.width() as u16)
-            .saturating_add(sep.width() as u16);
-        let close_w = close_lbl.width() as u16;
-        if close_x < input_rect.right() {
-            let clipped_w = close_w.min(input_rect.right().saturating_sub(close_x));
+        let close_w = close_lbl.width();
+        let gap_w = 2usize;
+        let show_hint = total_w >= prefix_w + 6 + gap_w + close_w;
+        let reserved_right = if show_hint { gap_w + close_w } else { 0 };
+        let viewport_w = total_w.saturating_sub(prefix_w + reserved_right);
+
+        let win = windowed_single_line_input(
+            &ui.issue_ui.local_filter.text,
+            ui.issue_ui.local_filter.cursor,
+            viewport_w,
+        );
+        let mut spans = vec![Span::styled(prefix, accent)];
+        let mut rendered_w = 0usize;
+        if win.clipped_left {
+            spans.push(Span::styled("‹", muted));
+            rendered_w += 1;
+        }
+        if !win.before_cursor.is_empty() {
+            rendered_w += win.before_cursor.width();
+            spans.push(Span::styled(win.before_cursor, bar_surface));
+        }
+        if viewport_w > 0 {
+            spans.push(Span::styled("▏", accent));
+            rendered_w += 1;
+        }
+        if !win.after_cursor.is_empty() {
+            rendered_w += win.after_cursor.width();
+            spans.push(Span::styled(win.after_cursor, bar_surface));
+        }
+        if win.clipped_right {
+            spans.push(Span::styled("›", muted));
+            rendered_w += 1;
+        }
+        if show_hint {
+            let pad = total_w.saturating_sub(prefix_w + rendered_w + close_w);
+            if pad > 0 {
+                spans.push(Span::styled(" ".repeat(pad), bar_surface));
+            }
+            let close_x = input_rect.right().saturating_sub(close_w as u16);
             ui.hitmap.add_line(
                 close_x,
                 input_rect.y,
-                clipped_w,
+                close_w as u16,
                 HitTarget::Button(ButtonId::CloseLocalFilter),
             );
+            spans.push(Span::styled(close_lbl, muted));
         }
-        Line::from(vec![
-            Span::styled(prefix, theme.accent_style().patch(bar_surface)),
-            Span::styled(text, bar_surface),
-            Span::styled(cursor, theme.accent_style().patch(bar_surface)),
-            Span::styled(sep, theme.muted_style().patch(bar_surface)),
-            Span::styled(close_lbl, theme.muted_style().patch(bar_surface)),
-        ])
+        Line::from(spans)
     } else {
         let prefix = " JQL> ";
-        let mut spans = vec![
-            Span::styled(prefix, theme.accent_style().patch(bar_surface)),
-            Span::styled(ui.issue_ui.jql.text.clone(), bar_surface),
-        ];
-        let prefix_w = prefix.width() as u16;
-        if input_rect.x.saturating_add(prefix_w) <= input_rect.right() {
+        let prefix_w = prefix.width();
+        if input_rect.x.saturating_add(prefix_w as u16) <= input_rect.right() {
             ui.hitmap.add_line(
                 input_rect.x,
                 input_rect.y,
-                prefix_w,
+                prefix_w as u16,
                 HitTarget::Button(ButtonId::FocusJql),
             );
         }
-        let mut cx = input_rect
-            .x
-            .saturating_add(prefix_w)
-            .saturating_add(ui.issue_ui.jql.text.as_str().width() as u16);
-        let muted = theme.muted_style().patch(bar_surface);
-        if jql_focused {
-            let cursor = "▏";
-            spans.push(Span::styled(cursor, theme.accent_style().patch(bar_surface)));
-            cx = cx.saturating_add(cursor.width() as u16);
-            let sep = "   ";
-            let run_lbl = "[Enter] Run";
-            let run_x = cx.saturating_add(sep.width() as u16);
-            let run_w = run_lbl.width() as u16;
-            if run_x < input_rect.right() {
-                let clipped_w = run_w.min(input_rect.right().saturating_sub(run_x));
-                ui.hitmap.add_line(
-                    run_x,
-                    input_rect.y,
-                    clipped_w,
-                    HitTarget::Button(ButtonId::RunJql),
-                );
-            }
-            spans.push(Span::styled(sep, muted));
-            spans.push(Span::styled(run_lbl, muted));
-            cx = run_x.saturating_add(run_w);
+
+        let filter_badge = (!ui.issue_ui.local_filter.text.trim().is_empty())
+            .then(|| format!("[Filter: {}]", ui.issue_ui.local_filter.text));
+        let filter_st = if theme.no_color {
+            Style::default().add_modifier(Modifier::BOLD)
         } else {
-            let segments: &[(&str, Option<ButtonId>)] = &[
-                ("   ", None),
-                ("[J] Edit", Some(ButtonId::FocusJql)),
-                (" · ", None),
-                ("[Enter] Run", Some(ButtonId::RunJql)),
-                (" · ", None),
-                ("[/] Filter", Some(ButtonId::FocusLocalFilter)),
-            ];
-            for &(seg, btn) in segments {
+            bar_surface.fg(theme.warning)
+        };
+
+        let mut right_segments: Vec<(String, Style, Option<ButtonId>)> = Vec::new();
+        if jql_focused {
+            right_segments.push(("[Enter] Run".to_string(), muted, Some(ButtonId::RunJql)));
+        } else {
+            right_segments.push(("[J] Edit".to_string(), muted, Some(ButtonId::FocusJql)));
+            right_segments.push((" · ".to_string(), muted, None));
+            right_segments.push(("[Enter] Run".to_string(), muted, Some(ButtonId::RunJql)));
+            right_segments.push((" · ".to_string(), muted, None));
+            right_segments.push((
+                "[/] Filter".to_string(),
+                muted,
+                Some(ButtonId::FocusLocalFilter),
+            ));
+        }
+        if let Some(badge) = filter_badge {
+            right_segments.push(("  ".to_string(), muted, None));
+            right_segments.push((badge, filter_st, Some(ButtonId::FocusLocalFilter)));
+        }
+
+        let min_viewport = if jql_focused { 10usize } else { 8usize };
+        let gap_w = 2usize;
+        let full_right_w: usize = right_segments.iter().map(|(s, _, _)| s.width()).sum();
+        let active_right: Vec<(String, Style, Option<ButtonId>)> =
+            if total_w >= prefix_w + min_viewport + gap_w + full_right_w {
+                right_segments
+            } else if jql_focused {
+                let short = ("[Enter] Run".to_string(), muted, Some(ButtonId::RunJql));
+                if total_w >= prefix_w + min_viewport + gap_w + short.0.width() {
+                    vec![short]
+                } else {
+                    Vec::new()
+                }
+            } else {
+                Vec::new()
+            };
+        let active_right_w: usize = active_right.iter().map(|(s, _, _)| s.width()).sum();
+        let reserved_right = if active_right.is_empty() {
+            0
+        } else {
+            gap_w + active_right_w
+        };
+        let viewport_w = total_w.saturating_sub(prefix_w + reserved_right);
+
+        let mut spans = vec![Span::styled(prefix, accent)];
+        let mut rendered_w = 0usize;
+        if jql_focused {
+            let win = windowed_single_line_input(
+                &ui.issue_ui.jql.text,
+                ui.issue_ui.jql.cursor,
+                viewport_w,
+            );
+            if win.clipped_left {
+                spans.push(Span::styled("‹", muted));
+                rendered_w += 1;
+            }
+            if !win.before_cursor.is_empty() {
+                rendered_w += win.before_cursor.width();
+                spans.push(Span::styled(win.before_cursor, bar_surface));
+            }
+            if viewport_w > 0 {
+                spans.push(Span::styled("▏", accent));
+                rendered_w += 1;
+            }
+            if !win.after_cursor.is_empty() {
+                rendered_w += win.after_cursor.width();
+                spans.push(Span::styled(win.after_cursor, bar_surface));
+            }
+            if win.clipped_right {
+                spans.push(Span::styled("›", muted));
+                rendered_w += 1;
+            }
+        } else {
+            let fitted = truncate_width(&ui.issue_ui.jql.text, viewport_w);
+            rendered_w += fitted.width();
+            spans.push(Span::styled(fitted, bar_surface));
+        }
+
+        if !active_right.is_empty() {
+            let pad = total_w.saturating_sub(prefix_w + rendered_w + active_right_w);
+            if pad > 0 {
+                spans.push(Span::styled(" ".repeat(pad), bar_surface));
+            }
+            let mut cx = input_rect.right().saturating_sub(active_right_w as u16);
+            for (seg, st, btn) in active_right {
                 let seg_w = seg.width() as u16;
                 if let Some(btn_id) = btn {
                     if cx < input_rect.right() {
@@ -159,31 +240,9 @@ fn draw_jql_bar(frame: &mut Frame, area: Rect, _app: &AppState, ui: &mut UiState
                             .add_line(cx, input_rect.y, clipped_w, HitTarget::Button(btn_id));
                     }
                 }
-                spans.push(Span::styled(seg, muted));
+                spans.push(Span::styled(seg, st));
                 cx = cx.saturating_add(seg_w);
             }
-        }
-        if !ui.issue_ui.local_filter.text.trim().is_empty() {
-            let filter_st = if theme.no_color {
-                Style::default().add_modifier(Modifier::BOLD)
-            } else {
-                bar_surface.fg(theme.warning)
-            };
-            let sep = "   ";
-            let badge = format!("[Filter: {}]", ui.issue_ui.local_filter.text);
-            let badge_x = cx.saturating_add(sep.width() as u16);
-            let badge_w = badge.width() as u16;
-            if badge_x < input_rect.right() {
-                let clipped_w = badge_w.min(input_rect.right().saturating_sub(badge_x));
-                ui.hitmap.add_line(
-                    badge_x,
-                    input_rect.y,
-                    clipped_w,
-                    HitTarget::Button(ButtonId::FocusLocalFilter),
-                );
-            }
-            spans.push(Span::styled(sep, muted));
-            spans.push(Span::styled(badge, filter_st));
         }
         Line::from(spans)
     };
@@ -729,7 +788,12 @@ pub fn draw_issue_inspector_pane(
                 theme.muted_style(),
             )),
         ];
-        frame.render_widget(Paragraph::new(empty).style(pane_surface), inner);
+        frame.render_widget(
+            Paragraph::new(empty)
+                .style(pane_surface)
+                .wrap(Wrap { trim: false }),
+            inner,
+        );
         return;
     };
 
@@ -878,22 +942,33 @@ fn build_issue_inspector_lines_with_hits(
         .map(|p| format!("{p} / "))
         .unwrap_or_default();
     let (type_icon, type_color) = theme.issue_type_badge(&s.issue_type);
-    lines.push(Line::from(vec![
-        Span::raw(" "),
-        Span::styled(format!("{type_icon} "), Style::default().fg(type_color)),
-        Span::styled(
-            format!("{} / {}{}", s.project_key, parent_crumb, s.key),
-            theme.muted_style(),
-        ),
-    ]));
+    lines.extend(wrap_styled_spans(
+        &[
+            Span::styled(format!("{type_icon} "), Style::default().fg(type_color)),
+            Span::styled(
+                format!("{} / {}{}", s.project_key, parent_crumb, s.key),
+                theme.muted_style(),
+            ),
+        ],
+        w,
+        WrapPrefix {
+            first: &[Span::raw(" ")],
+            cont: &[Span::raw("   ")],
+        },
+    ));
 
     // 2. Bold Summary
-    for seg in wrap_plain_text(&s.summary, w.saturating_sub(2)) {
-        lines.push(Line::from(Span::styled(
-            format!(" {seg}"),
+    lines.extend(wrap_styled_spans(
+        &[Span::styled(
+            s.summary.clone(),
             Style::default().add_modifier(Modifier::BOLD),
-        )));
-    }
+        )],
+        w,
+        WrapPrefix {
+            first: &[Span::raw(" ")],
+            cont: &[Span::raw(" ")],
+        },
+    ));
 
     // 3. Action hint bar
     let action_row = lines.len();
@@ -952,51 +1027,106 @@ fn build_issue_inspector_lines_with_hits(
         .map(|p| format!("{p:.1}"))
         .unwrap_or_else(|| "-".to_string());
 
+    let push_wrapped_meta = |lines: &mut Vec<Line<'static>>,
+                             label: &str,
+                             label_style: Style,
+                             value_spans: Vec<Span<'static>>| {
+        let first_pfx = [Span::styled(label.to_string(), label_style)];
+        let cont_pfx = [Span::raw("  ")];
+        lines.extend(wrap_styled_spans(
+            &value_spans,
+            w,
+            WrapPrefix {
+                first: &first_pfx,
+                cont: &cont_pfx,
+            },
+        ));
+    };
+
+    let status_span = theme.status_lozenge_span(&s.status.name, s.status.category);
+    let prio_span = Span::styled(
+        format!("{prio_icon} {prio_name}"),
+        Style::default().fg(prio_color),
+    );
+    let stacked = w < 44;
+    let status_prio_w = " Status: ".width()
+        + status_span.content.width()
+        + "   Priority: ".width()
+        + prio_span.content.width();
+    if !stacked && status_prio_w <= w {
+        lines.push(Line::from(vec![
+            Span::styled(" Status: ", theme.muted_style()),
+            status_span,
+            Span::raw("   "),
+            Span::styled("Priority: ", theme.muted_style()),
+            prio_span,
+        ]));
+    } else {
+        push_wrapped_meta(&mut lines, " Status: ", theme.muted_style(), vec![status_span]);
+        push_wrapped_meta(&mut lines, " Priority: ", theme.muted_style(), vec![prio_span]);
+    }
+
     let col1_w = (w / 2).max(16);
-    lines.push(Line::from(vec![
-        Span::styled(" Status: ", theme.muted_style()),
-        theme.status_lozenge_span(&s.status.name, s.status.category),
-        Span::raw("   "),
-        Span::styled("Priority: ", theme.muted_style()),
-        Span::styled(
-            format!("{prio_icon} {prio_name}"),
-            Style::default().fg(prio_color),
-        ),
-    ]));
-    lines.push(Line::from(vec![
-        Span::raw(pad_right_width(
-            &truncate_width(&format!(" Assignee: {assignee}"), col1_w),
-            col1_w,
-        )),
-        Span::styled(
-            truncate_width(&format!("Reporter: {reporter}"), w.saturating_sub(col1_w)),
-            theme.muted_style(),
-        ),
-    ]));
-    lines.push(Line::from(vec![
-        Span::raw(pad_right_width(
-            &truncate_width(&format!(" Sprint: {sprint}"), col1_w),
-            col1_w,
-        )),
-        Span::raw(truncate_width(
-            &format!("Story Points: {pts}"),
-            w.saturating_sub(col1_w),
-        )),
-    ]));
-    lines.push(Line::from(vec![
-        Span::raw(pad_right_width(
-            &truncate_width(&format!(" Labels: {labels}"), col1_w),
-            col1_w,
-        )),
-        Span::styled(
-            truncate_width(&format!("Fix Versions: {fix_v}"), w.saturating_sub(col1_w)),
-            theme.muted_style(),
-        ),
-    ]));
-    lines.push(Line::from(Span::styled(
-        truncate_width(&format!(" Updated: {}", s.updated_at), w),
+    let col2_w = w.saturating_sub(col1_w);
+    let mut push_meta_pair = |l_label: &str,
+                              l_val: &str,
+                              l_style: Style,
+                              r_label: &str,
+                              r_val: &str,
+                              r_style: Style| {
+        let left_full = format!(" {l_label}{l_val}");
+        let right_full = format!("{r_label}{r_val}");
+        if !stacked && left_full.width() < col1_w && right_full.width() <= col2_w {
+            lines.push(Line::from(vec![
+                Span::styled(pad_right_width(&left_full, col1_w), l_style),
+                Span::styled(right_full, r_style),
+            ]));
+        } else {
+            push_wrapped_meta(
+                &mut lines,
+                &format!(" {l_label}"),
+                theme.muted_style(),
+                vec![Span::styled(l_val.to_string(), l_style)],
+            );
+            push_wrapped_meta(
+                &mut lines,
+                &format!(" {r_label}"),
+                theme.muted_style(),
+                vec![Span::styled(r_val.to_string(), r_style)],
+            );
+        }
+    };
+
+    push_meta_pair(
+        "Assignee: ",
+        assignee,
+        Style::default(),
+        "Reporter: ",
+        reporter,
         theme.muted_style(),
-    )));
+    );
+    push_meta_pair(
+        "Sprint: ",
+        sprint,
+        Style::default(),
+        "Story Points: ",
+        &pts,
+        Style::default(),
+    );
+    push_meta_pair(
+        "Labels: ",
+        &labels,
+        Style::default(),
+        "Fix Versions: ",
+        &fix_v,
+        theme.muted_style(),
+    );
+    push_wrapped_meta(
+        &mut lines,
+        " Updated: ",
+        theme.muted_style(),
+        vec![Span::styled(s.updated_at.clone(), theme.muted_style())],
+    );
     if !is_compact {
         lines.push(Line::from(""));
     }
@@ -1049,17 +1179,27 @@ fn build_issue_inspector_lines_with_hits(
             } else {
                 theme.fg_muted
             };
-            row_hits.push(IssueLineHit {
-                line_idx: lines.len(),
-                x_offset: 0,
-                width: None,
-                target: HitTarget::DetailSubtask(idx),
-            });
-            lines.push(Line::from(vec![
-                Span::styled(format!("  {chk} "), Style::default().fg(chk_col)),
-                Span::styled(format!("{} ", st.key), theme.accent_style()),
-                Span::raw(truncate_width(&st.summary, w.saturating_sub(18))),
-            ]));
+            let start_idx = lines.len();
+            let wrapped = wrap_styled_spans(
+                &[
+                    Span::styled(format!("{} ", st.key), theme.accent_style()),
+                    Span::raw(st.summary.clone()),
+                ],
+                w,
+                WrapPrefix {
+                    first: &[Span::styled(format!("  {chk} "), Style::default().fg(chk_col))],
+                    cont: &[Span::raw("    ")],
+                },
+            );
+            for offset in 0..wrapped.len() {
+                row_hits.push(IssueLineHit {
+                    line_idx: start_idx + offset,
+                    x_offset: 0,
+                    width: None,
+                    target: HitTarget::DetailSubtask(idx),
+                });
+            }
+            lines.extend(wrapped);
         }
         if !is_compact {
             lines.push(Line::from(""));
@@ -1075,38 +1215,64 @@ fn build_issue_inspector_lines_with_hits(
                 .fg(theme.confluence_teal)
                 .add_modifier(Modifier::BOLD)
         };
-        lines.push(Line::from(Span::styled(
-            " ▾ Linked Issues & Confluence Pages ([g] to jump)",
-            link_hdr_style,
-        )));
+        lines.extend(wrap_styled_spans(
+            &[Span::styled(
+                "▾ Linked Issues & Confluence Pages ([g] to jump)",
+                link_hdr_style,
+            )],
+            w,
+            WrapPrefix {
+                first: &[Span::raw(" ")],
+                cont: &[Span::raw("   ")],
+            },
+        ));
         for (idx, lp) in detail.linked_pages.iter().enumerate() {
-            row_hits.push(IssueLineHit {
-                line_idx: lines.len(),
-                x_offset: 0,
-                width: None,
-                target: HitTarget::DetailConfluenceLink(idx),
-            });
-            lines.push(Line::from(vec![
-                Span::styled("  [Confluence] ", link_hdr_style),
-                Span::raw(truncate_width(&lp.title, w.saturating_sub(18))),
-            ]));
+            let start_idx = lines.len();
+            let wrapped = wrap_styled_spans(
+                &[
+                    Span::styled("[Confluence] ", link_hdr_style),
+                    Span::raw(lp.title.clone()),
+                ],
+                w,
+                WrapPrefix {
+                    first: &[Span::raw("  ")],
+                    cont: &[Span::raw("    ")],
+                },
+            );
+            for offset in 0..wrapped.len() {
+                row_hits.push(IssueLineHit {
+                    line_idx: start_idx + offset,
+                    x_offset: 0,
+                    width: None,
+                    target: HitTarget::DetailConfluenceLink(idx),
+                });
+            }
+            lines.extend(wrapped);
         }
         for (idx, li) in detail.linked_issues.iter().enumerate() {
-            row_hits.push(IssueLineHit {
-                line_idx: lines.len(),
-                x_offset: 0,
-                width: None,
-                target: HitTarget::DetailIssueLink(idx),
-            });
-            lines.push(Line::from(vec![
-                Span::styled(format!("  ↳ {} ", li.relation_label), theme.muted_style()),
-                Span::styled(format!("{} ", li.key), theme.accent_style()),
-                theme.status_lozenge_span(&li.status.name, li.status.category),
-                Span::raw(format!(
-                    " {}",
-                    truncate_width(&li.summary, w.saturating_sub(36))
-                )),
-            ]));
+            let start_idx = lines.len();
+            let wrapped = wrap_styled_spans(
+                &[
+                    Span::styled(format!("↳ {} ", li.relation_label), theme.muted_style()),
+                    Span::styled(format!("{} ", li.key), theme.accent_style()),
+                    theme.status_lozenge_span(&li.status.name, li.status.category),
+                    Span::raw(format!(" {}", li.summary)),
+                ],
+                w,
+                WrapPrefix {
+                    first: &[Span::raw("  ")],
+                    cont: &[Span::raw("    ")],
+                },
+            );
+            for offset in 0..wrapped.len() {
+                row_hits.push(IssueLineHit {
+                    line_idx: start_idx + offset,
+                    x_offset: 0,
+                    width: None,
+                    target: HitTarget::DetailIssueLink(idx),
+                });
+            }
+            lines.extend(wrapped);
         }
         if !is_compact {
             lines.push(Line::from(""));
@@ -1115,13 +1281,20 @@ fn build_issue_inspector_lines_with_hits(
 
     // 8. Attachments
     if !detail.attachments.is_empty() {
-        lines.push(Line::from(Span::styled(
-            format!(
-                " ▾ Attachments ({}) — [d] Download · [v] Preview",
-                detail.attachments.len()
-            ),
-            theme.accent_style(),
-        )));
+        lines.extend(wrap_styled_spans(
+            &[Span::styled(
+                format!(
+                    "▾ Attachments ({}) — [d] Download · [v] Preview",
+                    detail.attachments.len()
+                ),
+                theme.accent_style(),
+            )],
+            w,
+            WrapPrefix {
+                first: &[Span::raw(" ")],
+                cont: &[Span::raw("   ")],
+            },
+        ));
         let file_style = if theme.no_color {
             Style::default().add_modifier(Modifier::BOLD)
         } else {
@@ -1129,20 +1302,30 @@ fn build_issue_inspector_lines_with_hits(
         };
         for (idx, att) in detail.attachments.iter().enumerate() {
             let kb = (att.size / 1024).max(1);
-            row_hits.push(IssueLineHit {
-                line_idx: lines.len(),
-                x_offset: 0,
-                width: None,
-                target: HitTarget::Attachment(idx),
-            });
-            lines.push(Line::from(vec![
-                Span::raw("  • "),
-                Span::styled(att.filename.clone(), file_style),
-                Span::styled(
-                    format!(" ({kb} KB · {})", att.mime_type),
-                    theme.muted_style(),
-                ),
-            ]));
+            let start_idx = lines.len();
+            let wrapped = wrap_styled_spans(
+                &[
+                    Span::styled(att.filename.clone(), file_style),
+                    Span::styled(
+                        format!(" ({kb} KB · {})", att.mime_type),
+                        theme.muted_style(),
+                    ),
+                ],
+                w,
+                WrapPrefix {
+                    first: &[Span::raw("  • ")],
+                    cont: &[Span::raw("    ")],
+                },
+            );
+            for offset in 0..wrapped.len() {
+                row_hits.push(IssueLineHit {
+                    line_idx: start_idx + offset,
+                    x_offset: 0,
+                    width: None,
+                    target: HitTarget::Attachment(idx),
+                });
+            }
+            lines.extend(wrapped);
         }
         if !is_compact {
             lines.push(Line::from(""));
@@ -1152,16 +1335,45 @@ fn build_issue_inspector_lines_with_hits(
     // 9. Comments Thread
     let comment_hdr_prefix = format!(" ▾ Comments ({}) — ", detail.comments.len());
     let comment_btn_lbl = "[c] Add Comment";
-    row_hits.push(IssueLineHit {
-        line_idx: lines.len(),
-        x_offset: comment_hdr_prefix.width() as u16,
-        width: Some(comment_btn_lbl.width() as u16),
-        target: HitTarget::Button(ButtonId::Comment),
-    });
-    lines.push(Line::from(Span::styled(
-        format!("{comment_hdr_prefix}{comment_btn_lbl}"),
-        theme.accent_style(),
-    )));
+    if comment_hdr_prefix.width() + comment_btn_lbl.width() <= w {
+        row_hits.push(IssueLineHit {
+            line_idx: lines.len(),
+            x_offset: comment_hdr_prefix.width() as u16,
+            width: Some(comment_btn_lbl.width() as u16),
+            target: HitTarget::Button(ButtonId::Comment),
+        });
+        lines.push(Line::from(Span::styled(
+            format!("{comment_hdr_prefix}{comment_btn_lbl}"),
+            theme.accent_style(),
+        )));
+    } else {
+        lines.extend(wrap_styled_spans(
+            &[Span::styled(
+                format!("▾ Comments ({})", detail.comments.len()),
+                theme.accent_style(),
+            )],
+            w,
+            WrapPrefix {
+                first: &[Span::raw(" ")],
+                cont: &[Span::raw("   ")],
+            },
+        ));
+        let btn_line_idx = lines.len();
+        row_hits.push(IssueLineHit {
+            line_idx: btn_line_idx,
+            x_offset: 3,
+            width: Some(comment_btn_lbl.width() as u16),
+            target: HitTarget::Button(ButtonId::Comment),
+        });
+        lines.extend(wrap_styled_spans(
+            &[Span::styled(comment_btn_lbl, theme.accent_style())],
+            w,
+            WrapPrefix {
+                first: &[Span::raw("   ")],
+                cont: &[Span::raw("   ")],
+            },
+        ));
+    }
     if detail.comments.is_empty() {
         lines.push(Line::from(Span::styled(
             "  (no comments)",
@@ -1199,4 +1411,222 @@ fn build_issue_inspector_lines_with_hits(
     }
 
     (lines, action_row, row_hits)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{
+        atlassian::AtlassianClient,
+        auth::AuthManager,
+        config::{AppConfig, Persona},
+        models::{
+            AttachmentItem, IssuePriority, IssueStatus, IssueSummary, IssueType, LinkedIssueItem,
+            UserSummary,
+        },
+        storage::Storage,
+        sync,
+    };
+    use ratatui::{backend::TestBackend, Terminal};
+    use tokio::sync::mpsc;
+
+    fn test_app_ui() -> (AppState, UiState) {
+        let cfg = AppConfig {
+            site_url: "https://acme.atlassian.net".into(),
+            ..Default::default()
+        };
+        let auth = AuthManager::new("test");
+        let client = AtlassianClient::new(cfg.clone(), auth.clone()).unwrap();
+        let storage = Storage::open_in_memory().unwrap();
+        let (core_tx, _) = mpsc::unbounded_channel();
+        let sync_ctrl =
+            sync::spawn_sync_engine(cfg.clone(), client.clone(), storage.clone(), core_tx);
+        let (ui_tx, _) = mpsc::unbounded_channel();
+        let app = AppState::new_with_persona(
+            cfg.clone(),
+            Persona::Jira,
+            auth,
+            client,
+            storage,
+            sync_ctrl,
+            ui_tx,
+        );
+        let ui = UiState::from_config_with_persona(&cfg, Persona::Jira);
+        (app, ui)
+    }
+
+    #[tokio::test]
+    async fn narrow_drawer_stacks_metadata_and_preserves_linked_issue_summary_and_attachments() {
+        let (app, ui) = test_app_ui();
+        let detail = IssueDetail {
+            summary: IssueSummary {
+                id: "1".into(),
+                key: "ENG-42".into(),
+                project_key: "ENG".into(),
+                summary: "Kanban narrow drawer wrapping invariant".into(),
+                status: IssueStatus {
+                    id: "3".into(),
+                    name: "In Progress".into(),
+                    category: StatusCategory::InProgress,
+                },
+                priority: Some(IssuePriority {
+                    id: "2".into(),
+                    name: "High".into(),
+                }),
+                issue_type: IssueType {
+                    id: "10001".into(),
+                    name: "Story".into(),
+                    subtask: false,
+                    epic: false,
+                },
+                assignee: Some(UserSummary {
+                    id: "u1".into(),
+                    display_name: "Kim Minseo".into(),
+                    ..Default::default()
+                }),
+                reporter: Some(UserSummary {
+                    id: "u2".into(),
+                    display_name: "Lee Jihun".into(),
+                    ..Default::default()
+                }),
+                labels: vec![
+                    "platform-core".into(),
+                    "unicode-wrapping".into(),
+                    "track-d".into(),
+                ],
+                story_points: Some(5.0),
+                sprint_name: Some("Sprint 42 — Core Layout Hardening".into()),
+                updated_at: "2026-11-25T10:00:00Z".into(),
+                ..Default::default()
+            },
+            fix_versions: vec!["v2.4.0-release-candidate".into(), "v2.5.0".into()],
+            linked_issues: vec![LinkedIssueItem {
+                link_type: "Blocks".into(),
+                direction: "outward".into(),
+                relation_label: "blocks".into(),
+                key: "ENG-99".into(),
+                summary: "핵심 연결 이슈 요약이 32컬럼 드로어에서도 완전히 보존되어야 합니다".into(),
+                status: IssueStatus {
+                    id: "2".into(),
+                    name: "To Do".into(),
+                    category: StatusCategory::Todo,
+                },
+            }],
+            attachments: vec![AttachmentItem {
+                id: "a1".into(),
+                filename: "very-long-architecture-specification-document-v3.pdf".into(),
+                mime_type: "application/pdf".into(),
+                size: 4096,
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+
+        let lines = build_issue_inspector_lines(&detail, 32, &app, &ui, true);
+        let rendered_rows: Vec<String> = lines
+            .iter()
+            .map(|l| l.spans.iter().map(|s| s.content.as_ref()).collect::<String>())
+            .collect();
+
+        // 1-col stacked metadata when w = 32 (< 44): Status and Priority on distinct lines.
+        let status_row = rendered_rows
+            .iter()
+            .position(|r| r.contains("Status:"))
+            .expect("Status row present");
+        let prio_row = rendered_rows
+            .iter()
+            .position(|r| r.contains("Priority:"))
+            .expect("Priority row present");
+        assert_ne!(
+            status_row, prio_row,
+            "Status and Priority must stack at w = 32:\n{}",
+            rendered_rows.join("\n")
+        );
+
+        let compact: String = rendered_rows
+            .join("")
+            .chars()
+            .filter(|c| !c.is_whitespace())
+            .collect();
+        for expected in [
+            "INPROGRESS",
+            "High",
+            "KimMinseo",
+            "LeeJihun",
+            "Sprint42—CoreLayoutHardening",
+            "5.0",
+            "platform-core,unicode-wrapping,track-d",
+            "v2.4.0-release-candidate,v2.5.0",
+            "ENG-99",
+            "핵심연결이슈요약이32컬럼드로어에서도완전히보존되어야합니다",
+            "very-long-architecture-specification-document-v3.pdf",
+        ] {
+            assert!(
+                compact.contains(expected),
+                "expected `{expected}` preserved at w=32:\n{}",
+                rendered_rows.join("\n")
+            );
+        }
+
+        // Width invariant for metadata, linked issues, and attachments (skipping divider & action bar).
+        for (i, line) in lines.iter().enumerate() {
+            assert!(
+                line.width() <= 32,
+                "issue inspector line {i} exceeded 32 cols (width={}): {:?}",
+                line.width(),
+                line
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn jql_and_local_filter_bars_window_100_char_queries_with_cursor_visible() {
+        let (app, mut ui) = test_app_ui();
+        let long_jql = format!("{}ORDER BY updated DESC END_TAIL_999", "project = ENG AND ".repeat(5));
+        assert!(long_jql.len() >= 100);
+
+        ui.focus = PaneFocus::JqlBar;
+        ui.issue_ui.local_filter_active = false;
+        ui.issue_ui.jql.set_text(long_jql);
+
+        let mut terminal = Terminal::new(TestBackend::new(64, 4)).unwrap();
+        terminal
+            .draw(|f| draw_jql_bar(f, Rect::new(0, 0, 64, 2), &app, &mut ui))
+            .unwrap();
+        let buf = terminal.backend().buffer();
+        let jql_row: String = (0..64).map(|x| buf[(x, 0)].symbol()).collect();
+        assert!(
+            jql_row.contains("END_TAIL_999"),
+            "expected JQL tail in row:\n{jql_row}"
+        );
+        assert!(jql_row.contains('▏'), "expected cursor `▏` in JQL row:\n{jql_row}");
+        assert!(
+            jql_row.contains('‹'),
+            "expected left clip indicator `‹` in JQL row:\n{jql_row}"
+        );
+        assert!(
+            jql_row.contains("[Enter] Run"),
+            "expected right-aligned hint in JQL row:\n{jql_row}"
+        );
+
+        // Local Filter input mode with 100+ char query
+        let long_filter = format!("{}FILTER_TAIL_777", "filter_term_".repeat(8));
+        assert!(long_filter.len() >= 100);
+        ui.issue_ui.local_filter_active = true;
+        ui.issue_ui.local_filter.set_text(long_filter);
+
+        terminal
+            .draw(|f| draw_jql_bar(f, Rect::new(0, 0, 64, 2), &app, &mut ui))
+            .unwrap();
+        let buf = terminal.backend().buffer();
+        let filter_row: String = (0..64).map(|x| buf[(x, 0)].symbol()).collect();
+        assert!(
+            filter_row.contains("FILTER_TAIL_777"),
+            "expected local filter tail in row:\n{filter_row}"
+        );
+        assert!(
+            filter_row.contains('▏'),
+            "expected cursor `▏` in local filter row:\n{filter_row}"
+        );
+    }
 }

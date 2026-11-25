@@ -20,7 +20,7 @@ use crate::{
         visible_window,
     },
 };
-use unicode_width::UnicodeWidthStr;
+use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 const MIN_COL_WIDTH: u16 = 26;
 
@@ -614,12 +614,21 @@ fn draw_kanban_column(
     // Register the entire Kanban column rect BEFORE individual cards.
     ui.hitmap.add(area, HitTarget::KanbanColumn(col_idx));
 
-    // Column header: status lozenge + count + subtle underline
+    // Column header: reserve ` ({count})` width first, then fit title so count never clips.
     let hdr_rect = Rect::new(area.x, area.y, area.width, 1);
+    let count_str = format!(" ({})", col.issues.len());
+    let overhead = 1 + 2 + count_str.width(); // leading " " + lozenge padding "  " + count
+    let title_budget = (area.width as usize).saturating_sub(overhead).max(1);
+    let raw_label = if col.title.trim().is_empty() {
+        col.category.badge_label()
+    } else {
+        col.title.trim()
+    };
+    let fitted_title = truncate_width(raw_label, title_budget);
     let hdr_line = Line::from(vec![
         Span::raw(" "),
-        theme.status_lozenge_span(&col.title, col.category),
-        Span::styled(format!(" ({})", col.issues.len()), theme.muted_style()),
+        theme.status_lozenge_span(&fitted_title, col.category),
+        Span::styled(count_str, theme.muted_style()),
     ]);
     frame.render_widget(Paragraph::new(hdr_line), hdr_rect);
     draw_horizontal_hairline(
@@ -809,11 +818,17 @@ fn draw_kanban_card(
             // Line 2-3: up to 2-line wrapped summary
             let wrapped = wrap_plain_text(&issue.summary, content_w);
             let max_sum_lines = area.height.saturating_sub(2).min(2) as usize;
-            for seg in wrapped.into_iter().take(max_sum_lines) {
+            let clipped = wrapped.len() > max_sum_lines && max_sum_lines > 0;
+            for (idx, seg) in wrapped.into_iter().take(max_sum_lines).enumerate() {
+                let display_seg = if clipped && idx + 1 == max_sum_lines {
+                    append_ellipsis_within(seg.trim_end(), content_w)
+                } else {
+                    truncate_width(&seg, content_w)
+                };
                 card_lines.push(Line::from(vec![
                     bar.clone(),
                     Span::styled(
-                        truncate_width(&seg, content_w),
+                        display_seg,
                         if selected {
                             card_surface.add_modifier(Modifier::BOLD)
                         } else {
@@ -846,4 +861,132 @@ fn draw_kanban_card(
     }
 
     frame.render_widget(Paragraph::new(card_lines).style(card_surface), area);
+}
+
+/// Appends `…` to `text` while keeping the total display width within `max_width`.
+fn append_ellipsis_within(text: &str, max_width: usize) -> String {
+    if max_width == 0 {
+        return String::new();
+    }
+    if max_width == 1 {
+        return "…".to_string();
+    }
+    let target = max_width - 1;
+    let mut out = String::new();
+    let mut used = 0usize;
+    for ch in text.chars() {
+        let w = ch.width().unwrap_or(0);
+        if used + w > target {
+            break;
+        }
+        out.push(ch);
+        used += w;
+    }
+    out.push('…');
+    out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{
+        atlassian::AtlassianClient,
+        auth::AuthManager,
+        config::{AppConfig, Persona},
+        models::{IssueStatus, IssueType, StatusCategory},
+        storage::Storage,
+        sync,
+    };
+    use ratatui::{backend::TestBackend, Terminal};
+    use tokio::sync::mpsc;
+
+    fn test_app_ui() -> (AppState, UiState) {
+        let cfg = AppConfig {
+            site_url: "https://acme.atlassian.net".into(),
+            ..Default::default()
+        };
+        let auth = AuthManager::new("test");
+        let client = AtlassianClient::new(cfg.clone(), auth.clone()).unwrap();
+        let storage = Storage::open_in_memory().unwrap();
+        let (core_tx, _) = mpsc::unbounded_channel();
+        let sync_ctrl =
+            sync::spawn_sync_engine(cfg.clone(), client.clone(), storage.clone(), core_tx);
+        let (ui_tx, _) = mpsc::unbounded_channel();
+        let app = AppState::new_with_persona(
+            cfg.clone(),
+            Persona::Jira,
+            auth,
+            client,
+            storage,
+            sync_ctrl,
+            ui_tx,
+        );
+        let ui = UiState::from_config_with_persona(&cfg, Persona::Jira);
+        (app, ui)
+    }
+
+    fn sample_issue(key: &str, summary: &str) -> IssueSummary {
+        IssueSummary {
+            id: key.into(),
+            key: key.into(),
+            project_key: "ENG".into(),
+            summary: summary.into(),
+            status: IssueStatus {
+                id: "1".into(),
+                name: "In Progress".into(),
+                category: StatusCategory::InProgress,
+            },
+            issue_type: IssueType {
+                id: "10001".into(),
+                name: "Task".into(),
+                subtask: false,
+                epic: false,
+            },
+            ..Default::default()
+        }
+    }
+
+    #[tokio::test]
+    async fn korean_column_header_preserves_issue_count_and_cozy_card_appends_ellipsis() {
+        let (app, mut ui) = test_app_ui();
+        let long_summary =
+            "한글과 영문이 섞인 아주 긴 이슈 요약 텍스트라서 Cozy 카드의 2줄 표시 영역을 반드시 초과하여 3줄 이상이 됩니다";
+        let issues: Vec<IssueSummary> = (0..12)
+            .map(|i| sample_issue(&format!("ENG-{i}"), long_summary))
+            .collect();
+        let col = KanbanColumn {
+            title: "코드 리뷰 및 최종 품질 검증 대기중".into(),
+            category: StatusCategory::InProgress,
+            issues,
+        };
+
+        let width = 26u16;
+        let height = 14u16;
+        let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+        terminal
+            .draw(|f| draw_kanban_column(f, Rect::new(0, 0, width, height), 0, &col, true, &app, &mut ui))
+            .unwrap();
+        let buf = terminal.backend().buffer();
+        let rows: Vec<String> = (0..height)
+            .map(|y| (0..width).map(|x| buf[(x, y)].symbol()).collect())
+            .collect();
+
+        // Header row keeps `(12)` even on a long Korean status title.
+        assert!(
+            rows[0].contains("(12)"),
+            "expected `(12)` preserved in Korean column header:\n{}",
+            rows[0]
+        );
+
+        // First Cozy card starts at y = 2:
+        // y = 2: type/key/priority
+        // y = 3: summary line 1
+        // y = 4: summary line 2 (final visible summary line -> must end with `…`)
+        let second_summary_line = rows[4].trim_end();
+        assert!(
+            second_summary_line.ends_with('…'),
+            "expected Cozy card 3+ line summary to end with `…`, got:\n{}",
+            rows[2..6].join("\n")
+        );
+    }
 }
