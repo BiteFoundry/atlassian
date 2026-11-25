@@ -19,9 +19,12 @@ use crate::{
     ui::{
         app::{AppState, UiState, WorkspaceTab},
         doc_view::truncate_width,
-        hitmap::{HitMap, HitTarget},
+        hitmap::{ButtonId, HitMap, HitTarget},
         keymap::Action,
-        overlays::{centered_rect, modal_block, OverlayOutcome},
+        overlays::{
+            centered_rect, modal_block, modal_pill_primary, modal_pill_secondary,
+            register_modal_chrome, render_button_bar, OverlayOutcome,
+        },
     },
 };
 
@@ -117,7 +120,11 @@ impl LinksOverlay {
                 }
                 OverlayOutcome::Handled
             }
-            Action::Activate | Action::Submit | Action::Input('o') | Action::Input('O') => {
+            Action::Activate
+            | Action::Submit
+            | Action::Input('o')
+            | Action::Input('O')
+            | Action::OpenInBrowser => {
                 if let Some(link) = self.selected_link() {
                     self.pending_command = Some(LinkCommand::Open(link.url.clone()));
                     OverlayOutcome::Close
@@ -152,6 +159,7 @@ impl LinksOverlay {
         );
         let inner = block.inner(rect);
         frame.render_widget(block, rect);
+        register_modal_chrome(rect, frame, theme, hitmap, true);
         if inner.width == 0 || inner.height < 2 {
             return;
         }
@@ -256,15 +264,16 @@ impl LinksOverlay {
         frame.render_widget(Paragraph::new(lines), list_area);
 
         let footer_area = Rect::new(inner.x, inner.y + inner.height - 1, inner.width, 1);
-        frame.render_widget(
-            Paragraph::new(Line::from(Span::styled(
-                truncate_width(
-                    " ↑/↓/j/k navigate · Enter open in browser · y copy URL · Esc close",
-                    footer_area.width as usize,
-                ),
-                Style::default().fg(theme.muted).add_modifier(Modifier::DIM),
-            ))),
+        render_button_bar(
+            frame,
             footer_area,
+            &[
+                ("[y] Copy URL", ButtonId::OverlayCopyUrl, modal_pill_primary(theme)),
+                ("[o] Browser", ButtonId::OpenBrowser, modal_pill_secondary(theme)),
+            ],
+            Some("· ↑/↓ navigate · Enter open · Esc close"),
+            theme,
+            hitmap,
         );
     }
 }

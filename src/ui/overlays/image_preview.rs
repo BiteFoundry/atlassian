@@ -23,9 +23,12 @@ use crate::{
     ui::{
         app::{AppState, UiState},
         doc_view::truncate_width,
-        hitmap::{HitMap, HitTarget},
+        hitmap::{ButtonId, HitMap, HitTarget},
         keymap::Action,
-        overlays::{centered_rect, OverlayOutcome},
+        overlays::{
+            centered_rect, modal_pill_secondary, register_modal_chrome, render_button_bar,
+            OverlayOutcome,
+        },
     },
 };
 
@@ -421,6 +424,15 @@ impl ImagePreviewOverlay {
                 self.scroll_y = self.scroll_y.saturating_add(3);
                 OverlayOutcome::Handled
             }
+            Action::MouseScrollHoriz { delta, .. } => {
+                let step = (delta.unsigned_abs() as u16).saturating_mul(4).max(4);
+                if *delta < 0 {
+                    self.scroll_x = self.scroll_x.saturating_sub(step);
+                } else if *delta > 0 {
+                    self.scroll_x = self.scroll_x.saturating_add(step);
+                }
+                OverlayOutcome::Handled
+            }
             Action::GoTop | Action::CursorHome | Action::Input('g') => {
                 self.scroll_y = 0;
                 self.scroll_x = 0;
@@ -462,7 +474,7 @@ impl ImagePreviewOverlay {
                 self.toggle_zoom_fit();
                 OverlayOutcome::Dispatch(Action::LoadPreviewImage)
             }
-            Action::Input('p') | Action::Input('P') => {
+            Action::Input('p') | Action::Input('P') | Action::CycleImageProtocol => {
                 self.cycle_protocol();
                 OverlayOutcome::Dispatch(Action::LoadPreviewImage)
             }
@@ -500,12 +512,10 @@ impl ImagePreviewOverlay {
         let theme = &ui.theme;
         let rect = Self::modal_rect(area);
         frame.render_widget(Clear, rect);
-        hitmap.add(rect, HitTarget::OverlayBody);
 
         let modal_style = Style::default().bg(theme.card_bg).fg(theme.fg);
-        let close_label = "[✕ Esc]";
-        let close_w = close_label.width() as u16;
-        let show_close_pill = rect.width > close_w + 4;
+        let close_w = "[✕ Esc]".width() as u16;
+        let show_close_pill = rect.width >= 16;
         let title_budget = rect
             .width
             .saturating_sub(2 + if show_close_pill { close_w + 2 } else { 0 })
@@ -522,14 +532,7 @@ impl ImagePreviewOverlay {
                 Paragraph::new("No image attachments to display").block(block),
                 rect,
             );
-            if show_close_pill {
-                let close_x = rect.right().saturating_sub(close_w + 1);
-                frame.render_widget(
-                    Paragraph::new(Span::styled(close_label, modal_style)),
-                    Rect::new(close_x, rect.y, close_w, 1),
-                );
-                hitmap.add_line(close_x, rect.y, close_w, HitTarget::OverlayClose);
-            }
+            register_modal_chrome(rect, frame, theme, hitmap, true);
             return None;
         };
 
@@ -566,15 +569,7 @@ impl ImagePreviewOverlay {
             .border_style(theme.border_style(true));
         let inner = block.inner(rect);
         frame.render_widget(block, rect);
-
-        if show_close_pill {
-            let close_x = rect.right().saturating_sub(close_w + 1);
-            frame.render_widget(
-                Paragraph::new(Span::styled(close_label, modal_style)),
-                Rect::new(close_x, rect.y, close_w, 1),
-            );
-            hitmap.add_line(close_x, rect.y, close_w, HitTarget::OverlayClose);
-        }
+        register_modal_chrome(rect, frame, theme, hitmap, true);
 
         if inner.width == 0 || inner.height < 2 {
             return None;
@@ -583,42 +578,72 @@ impl ImagePreviewOverlay {
         let (header_area, img_area, footer_area) = Self::content_areas(area);
 
         if let Some(hdr) = header_area {
-            let mut spans = vec![
-                Span::styled(
-                    format!(" {} ", cur.filename),
-                    Style::default()
-                        .fg(theme.accent)
-                        .add_modifier(Modifier::BOLD),
-                ),
-            ];
+            let mut spans = Vec::new();
+            let mut cx = hdr.x;
+            let push_span = |spans: &mut Vec<Span<'static>>, cx: &mut u16, text: String, style: Style| {
+                let w = text.width() as u16;
+                spans.push(Span::styled(text, style));
+                *cx = cx.saturating_add(w);
+            };
+
+            push_span(
+                &mut spans,
+                &mut cx,
+                format!(" {} ", cur.filename),
+                Style::default()
+                    .fg(theme.accent)
+                    .add_modifier(Modifier::BOLD),
+            );
             if let Some((_, img)) = cached_entry {
-                spans.push(Span::styled(
+                push_span(
+                    &mut spans,
+                    &mut cx,
                     format!("{}x{} {} ", img.width_px, img.height_px, img.format_label),
                     theme.muted_style(),
-                ));
+                );
             } else if !cur.mime_type.trim().is_empty() {
-                spans.push(Span::styled(
+                push_span(
+                    &mut spans,
+                    &mut cx,
                     format!("{} ", cur.mime_type.trim()),
                     theme.muted_style(),
-                ));
+                );
             }
             if cur.size > 0 {
-                spans.push(Span::styled(
+                push_span(
+                    &mut spans,
+                    &mut cx,
                     format!("· {} ", format_file_size(cur.size)),
                     theme.muted_style(),
-                ));
+                );
             }
-            spans.push(Span::styled(
+            push_span(
+                &mut spans,
+                &mut cx,
                 format!("· {} ", zoom_label),
                 theme.muted_style(),
-            ));
-            spans.push(Span::styled(
-                format!(" [{proto_label}] "),
+            );
+            let proto_text = format!(" [{proto_label}] ");
+            let proto_w = proto_text.width() as u16;
+            let proto_x = cx;
+            if proto_x < hdr.right() {
+                let hit_w = proto_w.min(hdr.right().saturating_sub(proto_x));
+                hitmap.add_line(
+                    proto_x,
+                    hdr.y,
+                    hit_w,
+                    HitTarget::Button(ButtonId::OverlayImageProtocol),
+                );
+            }
+            push_span(
+                &mut spans,
+                &mut cx,
+                proto_text,
                 Style::default()
                     .bg(theme.chip_bg)
                     .fg(theme.chip_fg)
                     .add_modifier(Modifier::BOLD),
-            ));
+            );
             frame.render_widget(
                 Paragraph::new(Line::from(spans)).style(modal_style),
                 hdr,
@@ -717,15 +742,22 @@ impl ImagePreviewOverlay {
             );
         }
 
-        let footer =
-            " j/k/Wheel: Scroll   [/]: Prev/Next   +/- (0/f): Zoom/Fit   p: Protocol   d: Download   o: Browser   Esc/q/v: Close ";
-        frame.render_widget(
-            Paragraph::new(Span::styled(
-                truncate_width(footer, footer_area.width as usize),
-                theme.muted_style(),
-            ))
-            .style(modal_style),
+        let pill = modal_pill_secondary(theme);
+        render_button_bar(
+            frame,
             footer_area,
+            &[
+                ("[←]", ButtonId::OverlayImagePrev, pill),
+                ("[→]", ButtonId::OverlayImageNext, pill),
+                ("[-]", ButtonId::OverlayImageZoomOut, pill),
+                ("[+]", ButtonId::OverlayImageZoomIn, pill),
+                ("[Fit]", ButtonId::OverlayImageFit, pill),
+                ("[d] Download", ButtonId::DownloadAttachment, pill),
+                ("[o] Browser", ButtonId::OpenBrowser, pill),
+            ],
+            Some("· Wheel scroll · p protocol · Esc close"),
+            theme,
+            hitmap,
         );
 
         pending

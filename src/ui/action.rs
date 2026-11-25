@@ -1,5 +1,9 @@
 //! Action dispatcher for keyboard, mouse, overlays, and workspace tabs.
 
+use std::time::{Duration, Instant};
+
+use ratatui::layout::Rect;
+
 use crate::{
     config::{self, ImageProtocolPreference as ConfigImageProtocol},
     models::{CrossRefTarget, SearchHitKind},
@@ -40,22 +44,65 @@ pub fn dispatch(action: Action, app: &mut AppState, ui: &mut UiState) -> bool {
     if !ui.overlays.is_empty() {
         match action {
             Action::MouseClick { row, col } => {
-                match ui.hitmap.hit(row, col) {
+                let hit = ui.hitmap.hit(row, col);
+                let is_double_click = hit.is_some_and(|t| record_click(ui, t));
+                match hit {
                     Some(HitTarget::OverlayItem(idx)) => {
+                        if let Some(Overlay::FilePicker(fp)) = ui.overlays.last_mut() {
+                            let was_selected = fp.selected == idx;
+                            fp.select(idx);
+                            if fp.is_selected_directory() || is_double_click || was_selected {
+                                return dispatch_active_overlay(Action::Activate, app, ui);
+                            }
+                            return false;
+                        }
                         return handle_overlay_item_click(idx, app, ui);
                     }
+                    Some(HitTarget::OverlayItemToggle(idx)) => {
+                        let outcome = ui.overlays.last_mut().map(|o| o.click_toggle(idx));
+                        if let Some(Overlay::SiteSwitcher(ov)) = ui.overlays.last_mut() {
+                            if let Some(cmd) = ov.take_pending_command() {
+                                if matches!(outcome, Some(OverlayOutcome::Close)) {
+                                    ui.pop_overlay();
+                                }
+                                app.apply_site_switcher_command(cmd, ui);
+                                return false;
+                            }
+                        }
+                        return false;
+                    }
+                    Some(HitTarget::OverlayField(idx)) => {
+                        if let Some(top) = ui.overlays.last_mut() {
+                            top.click_field(idx);
+                        }
+                        return false;
+                    }
                     Some(HitTarget::OverlayClose) => {
+                        if let Some(top) = ui.overlays.last_mut() {
+                            top.force_close_if_editing();
+                        }
                         close_top_overlay_and_save_draft(app, ui);
                         return false;
                     }
                     Some(HitTarget::Button(btn)) => {
+                        if btn == ButtonId::OverlayCancel {
+                            close_top_overlay_and_save_draft(app, ui);
+                            return false;
+                        }
+                        if btn == ButtonId::OverlayImageProtocol {
+                            apply_settings_command(SettingsCommand::CycleImageProtocol, app, ui);
+                            if matches!(ui.overlays.last(), Some(Overlay::ImagePreview(_))) {
+                                app.request_load_preview_image(ui);
+                            }
+                            return false;
+                        }
                         return dispatch_active_overlay(
                             crate::ui::event::button_to_action(btn),
                             app,
                             ui,
                         );
                     }
-                    Some(HitTarget::OverlayBody) => {
+                    Some(HitTarget::OverlayBody | HitTarget::OverlayScrollArea) => {
                         let cmds = if let Some(Overlay::HtmlPreview(ov)) = ui.overlays.last_mut() {
                             ov.handle_mouse_click(row, col);
                             ov.take_pending_commands()
@@ -67,17 +114,8 @@ pub fn dispatch(action: Action, app: &mut AppState, ui: &mut UiState) -> bool {
                     }
                     _ => {}
                 }
-                if matches!(
-                    ui.overlays.last(),
-                    Some(
-                        Overlay::ContextMenu(_)
-                            | Overlay::ImagePreview(_)
-                            | Overlay::HtmlPreview(_)
-                            | Overlay::Help
-                    )
-                ) {
-                    ui.pop_overlay();
-                }
+                // Backdrop click outside any modal closes it (saving drafts if applicable).
+                close_top_overlay_and_save_draft(app, ui);
                 return false;
             }
             Action::MouseRightClick { row, col } => {
@@ -85,6 +123,45 @@ pub fn dispatch(action: Action, app: &mut AppState, ui: &mut UiState) -> bool {
                     ui.pop_overlay();
                     return handle_mouse_right_click(row, col, app, ui);
                 }
+                return false;
+            }
+            Action::MouseScroll { delta, .. }
+                if matches!(ui.overlays.last(), Some(Overlay::Help)) =>
+            {
+                let max = overlays::help_max_scroll_for(Rect::new(
+                    0,
+                    0,
+                    ui.term_width,
+                    ui.term_height,
+                ));
+                ui.help_max_scroll = max;
+                ui.help_scroll = apply_scroll_clamped(ui.help_scroll, delta, max);
+                return false;
+            }
+            Action::ScrollUp | Action::PageUp
+                if matches!(ui.overlays.last(), Some(Overlay::Help)) =>
+            {
+                let max = overlays::help_max_scroll_for(Rect::new(
+                    0,
+                    0,
+                    ui.term_width,
+                    ui.term_height,
+                ));
+                ui.help_max_scroll = max;
+                ui.help_scroll = apply_scroll_clamped(ui.help_scroll, -4, max);
+                return false;
+            }
+            Action::ScrollDown | Action::PageDown
+                if matches!(ui.overlays.last(), Some(Overlay::Help)) =>
+            {
+                let max = overlays::help_max_scroll_for(Rect::new(
+                    0,
+                    0,
+                    ui.term_width,
+                    ui.term_height,
+                ));
+                ui.help_max_scroll = max;
+                ui.help_scroll = apply_scroll_clamped(ui.help_scroll, 4, max);
                 return false;
             }
             Action::PasteClipboard => {
@@ -180,13 +257,12 @@ pub fn dispatch(action: Action, app: &mut AppState, ui: &mut UiState) -> bool {
             open_attachments(app, ui, None);
         }
         Action::OpenHelp => {
+            ui.help_scroll = 0;
             ui.push_overlay(Overlay::Help);
         }
         Action::SyncAll => {
             app.request_multi_site_sync(ui);
-            if ui.active_tab == WorkspaceTab::MyWork {
-                app.request_my_work_refresh(ui);
-            }
+            app.refresh_active_context(ui);
         }
         Action::CheckUpdate => {
             app.request_check_update(ui);
@@ -293,8 +369,7 @@ pub fn dispatch(action: Action, app: &mut AppState, ui: &mut UiState) -> bool {
                 ui.focus = PaneFocus::SearchBar;
             }
             _ => {
-                ui.active_tab = WorkspaceTab::Search;
-                ui.focus = PaneFocus::SearchBar;
+                switch_tab(WorkspaceTab::Search, app, ui);
             }
         },
         Action::RemoteSearch => {
@@ -323,6 +398,15 @@ pub fn dispatch(action: Action, app: &mut AppState, ui: &mut UiState) -> bool {
         Action::ScrollUp | Action::PageUp => scroll_active_pane(app, ui, -6),
         Action::ScrollDown | Action::PageDown => scroll_active_pane(app, ui, 6),
         Action::MouseScroll { delta, row, col } => handle_mouse_scroll(delta, row, col, app, ui),
+        Action::MouseScrollHoriz { delta, .. } => {
+            if ui.active_tab == WorkspaceTab::Board {
+                let dx = if delta < 0 { -1 } else { 1 };
+                let prev_focus = ui.focus;
+                ui.focus = PaneFocus::Main;
+                move_direction(app, ui, 0, dx);
+                ui.focus = prev_focus;
+            }
+        }
         Action::GoTop => scroll_active_pane(app, ui, -10000),
         Action::GoBottom => scroll_active_pane(app, ui, 10000),
         Action::Activate => activate_selection(app, ui),
@@ -365,12 +449,11 @@ fn switch_tab(tab: WorkspaceTab, app: &mut AppState, ui: &mut UiState) {
     match tab {
         WorkspaceTab::MyWork => {
             ui.focus = PaneFocus::Main;
-            if app.my_issues.is_empty() && app.my_pages.is_empty() {
-                app.request_my_work_refresh(ui);
-            }
+            app.maybe_refresh_my_work_on_tab_switch(ui);
         }
         WorkspaceTab::Search => {
             ui.focus = PaneFocus::SearchBar;
+            ui.search_ui.is_remote = false;
             app.refresh_local_search(&ui.search_ui.query.text);
         }
         WorkspaceTab::Confluence => {
@@ -497,8 +580,10 @@ fn handle_inline_text_action(action: Action, app: &mut AppState, ui: &mut UiStat
                 }
                 Action::Delete => {
                     buf.delete();
+                    ui.search_ui.is_remote = false;
                     let q = buf.text.clone();
                     app.refresh_local_search(&q);
+                    ui.search_ui.selected_hit = 0;
                 }
                 Action::CursorLeft => buf.move_left(),
                 Action::CursorRight => buf.move_right(),
@@ -506,8 +591,10 @@ fn handle_inline_text_action(action: Action, app: &mut AppState, ui: &mut UiStat
                 Action::CursorEnd => buf.move_end(),
                 Action::Paste(s) => {
                     buf.insert_str(&s);
+                    ui.search_ui.is_remote = false;
                     let q = buf.text.clone();
                     app.refresh_local_search(&q);
+                    ui.search_ui.selected_hit = 0;
                 }
                 Action::RemoteSearch => {
                     let q = buf.text.clone();
@@ -1000,6 +1087,19 @@ fn handle_overlay_item_click(idx: usize, app: &mut AppState, ui: &mut UiState) -
     dispatch_active_overlay(Action::Activate, app, ui)
 }
 
+fn record_click(ui: &mut UiState, target: HitTarget) -> bool {
+    const DOUBLE_CLICK_WINDOW: Duration = Duration::from_millis(450);
+    let now = Instant::now();
+    if let Some((prev_time, prev_target)) = ui.last_click {
+        if prev_target == target && now.duration_since(prev_time) <= DOUBLE_CLICK_WINDOW {
+            ui.last_click = None;
+            return true;
+        }
+    }
+    ui.last_click = Some((now, target));
+    false
+}
+
 fn handle_mouse_right_click(row: u16, col: u16, app: &mut AppState, ui: &mut UiState) -> bool {
     if let Some(target) = ui.hitmap.hit(row, col) {
         match target {
@@ -1011,6 +1111,21 @@ fn handle_mouse_right_click(row: u16, col: u16, app: &mut AppState, ui: &mut UiS
                 if let Some(issue) = app.selected_board_issue(ui) {
                     app.request_issue_detail_for_site(ui, site_id.as_deref(), &issue.key);
                 }
+            }
+            HitTarget::BoardItem(idx) => {
+                ui.focus = PaneFocus::Nav;
+                ui.board_ui.nav_section = 0;
+                ui.board_ui.selected_board = idx;
+            }
+            HitTarget::SprintItem(idx) => {
+                ui.focus = PaneFocus::Nav;
+                ui.board_ui.nav_section = 1;
+                ui.board_ui.selected_sprint = idx;
+            }
+            HitTarget::FilterItem(idx) => {
+                ui.focus = PaneFocus::Nav;
+                ui.issue_ui.nav_section = 0;
+                ui.issue_ui.selected_filter = idx;
             }
             HitTarget::IssueRow(idx) => {
                 ui.focus = PaneFocus::Nav;
@@ -1029,7 +1144,12 @@ fn handle_mouse_right_click(row: u16, col: u16, app: &mut AppState, ui: &mut UiS
                 ui.my_work_ui.active_column = 1;
                 ui.my_work_ui.selected_page = idx;
             }
-            HitTarget::TreeRow(idx) => {
+            HitTarget::SpaceItem(idx) => {
+                ui.focus = PaneFocus::Nav;
+                ui.confluence_ui.nav_section = 0;
+                ui.confluence_ui.selected_space = idx;
+            }
+            HitTarget::TreeRow(idx) | HitTarget::TreeChevron(idx) => {
                 ui.focus = PaneFocus::Nav;
                 ui.confluence_ui.nav_section = 1;
                 ui.confluence_ui.selected_tree_row = idx;
@@ -1039,6 +1159,25 @@ fn handle_mouse_right_click(row: u16, col: u16, app: &mut AppState, ui: &mut UiS
                     let page_id = row_item.page.id.clone();
                     app.request_page_detail_for_site(ui, site_id.as_deref(), &page_id);
                 }
+            }
+            HitTarget::SearchHit(idx) => {
+                ui.focus = PaneFocus::Main;
+                ui.search_ui.selected_hit = idx;
+            }
+            HitTarget::DirectoryProject(idx) => {
+                ui.directory_ui.section = 0;
+                ui.directory_ui.selected_project = idx;
+            }
+            HitTarget::DirectorySpace(idx) => {
+                ui.directory_ui.section = 1;
+                ui.directory_ui.selected_space = idx;
+            }
+            HitTarget::DetailPane => {
+                ui.focus = if ui.active_tab == WorkspaceTab::Board {
+                    PaneFocus::Detail
+                } else {
+                    PaneFocus::Main
+                };
             }
             _ => {}
         }
@@ -1063,20 +1202,38 @@ fn open_attachments(app: &mut AppState, ui: &mut UiState, preferred_idx: Option<
 
 fn handle_mouse_click(row: u16, col: u16, app: &mut AppState, ui: &mut UiState) -> bool {
     let Some(target) = ui.hitmap.hit(row, col) else {
+        ui.issue_ui.local_filter_active = false;
+        ui.confluence_ui.space_filter_active = false;
         return false;
     };
+    let is_double_click = record_click(ui, target);
     if !matches!(
         target,
-        HitTarget::SpaceItem(_) | HitTarget::SiteGroupHeader(_)
+        HitTarget::SpaceItem(_)
+            | HitTarget::SiteGroupHeader(_)
+            | HitTarget::Button(ButtonId::FocusLocalFilter)
     ) {
         ui.confluence_ui.space_filter_active = false;
     }
+    if !matches!(target, HitTarget::Button(ButtonId::FocusLocalFilter)) {
+        ui.issue_ui.local_filter_active = false;
+    }
     match target {
         HitTarget::Tab(idx) => switch_tab(WorkspaceTab::from_index(idx), app, ui),
+        HitTarget::BoardNavBoards => {
+            ui.focus = PaneFocus::Nav;
+            ui.board_ui.nav_section = 0;
+        }
+        HitTarget::BoardNavSprints => {
+            ui.focus = PaneFocus::Nav;
+            ui.board_ui.nav_section = 1;
+        }
         HitTarget::BoardItem(idx) => {
             ui.focus = PaneFocus::Nav;
             ui.board_ui.nav_section = 0;
             ui.board_ui.selected_board = idx;
+            ui.board_ui.selected_sprint = 0;
+            ui.board_ui.col_scroll = 0;
             ui.board_ui.user_moved_board = true;
             app.request_board_load(ui, idx, None);
         }
@@ -1088,6 +1245,11 @@ fn handle_mouse_click(row: u16, col: u16, app: &mut AppState, ui: &mut UiState) 
                 app.request_board_load(ui, ui.board_ui.selected_board, Some(sp.id));
             }
         }
+        HitTarget::KanbanColumn(c) => {
+            ui.focus = PaneFocus::Main;
+            ui.board_ui.selected_col = c;
+            app.clamp_selections(ui);
+        }
         HitTarget::KanbanCard { col: c, row: r } => {
             ui.focus = PaneFocus::Main;
             ui.board_ui.selected_col = c;
@@ -1095,8 +1257,26 @@ fn handle_mouse_click(row: u16, col: u16, app: &mut AppState, ui: &mut UiState) 
             ui.board_ui.drawer_open = true;
             let site_id = app.active_board_site_id(ui).map(str::to_string);
             if let Some(issue) = app.selected_board_issue(ui) {
-                app.request_issue_detail_for_site(ui, site_id.as_deref(), &issue.key);
+                if is_double_click {
+                    let key = issue.key.clone();
+                    let label = Some(issue.summary.clone());
+                    app.jump_to_cross_ref_for_site(
+                        ui,
+                        site_id.as_deref(),
+                        CrossRefTarget::JiraIssue { key, label },
+                    );
+                } else {
+                    app.request_issue_detail_for_site(ui, site_id.as_deref(), &issue.key);
+                }
             }
+        }
+        HitTarget::IssueNavFilters => {
+            ui.focus = PaneFocus::Nav;
+            ui.issue_ui.nav_section = 0;
+        }
+        HitTarget::IssueNavIssues => {
+            ui.focus = PaneFocus::Nav;
+            ui.issue_ui.nav_section = 1;
         }
         HitTarget::FilterItem(idx) => {
             ui.focus = PaneFocus::Nav;
@@ -1115,6 +1295,14 @@ fn handle_mouse_click(row: u16, col: u16, app: &mut AppState, ui: &mut UiState) 
             if let Some((sid, it)) = list.get(idx) {
                 app.request_issue_detail_for_site(ui, Some(sid.as_str()), &it.key);
             }
+        }
+        HitTarget::MyWorkIssuesPane => {
+            ui.focus = PaneFocus::Main;
+            ui.my_work_ui.active_column = 0;
+        }
+        HitTarget::MyWorkPagesPane => {
+            ui.focus = PaneFocus::Main;
+            ui.my_work_ui.active_column = 1;
         }
         HitTarget::MyWorkIssue(idx) => {
             ui.my_work_ui.active_column = 0;
@@ -1146,6 +1334,14 @@ fn handle_mouse_click(row: u16, col: u16, app: &mut AppState, ui: &mut UiState) 
                 );
             }
         }
+        HitTarget::WikiNavSpaces => {
+            ui.focus = PaneFocus::Nav;
+            ui.confluence_ui.nav_section = 0;
+        }
+        HitTarget::WikiNavTree => {
+            ui.focus = PaneFocus::Nav;
+            ui.confluence_ui.nav_section = 1;
+        }
         HitTarget::SpaceItem(idx) => {
             ui.focus = PaneFocus::Nav;
             ui.confluence_ui.nav_section = 0;
@@ -1157,6 +1353,12 @@ fn handle_mouse_click(row: u16, col: u16, app: &mut AppState, ui: &mut UiState) 
                 app.request_space_root_pages_for_site(ui, site_id.as_deref(), &sp.key);
             }
         }
+        HitTarget::TreeChevron(idx) => {
+            ui.focus = PaneFocus::Nav;
+            ui.confluence_ui.nav_section = 1;
+            ui.confluence_ui.selected_tree_row = idx;
+            app.toggle_page_expand_only(ui, idx);
+        }
         HitTarget::TreeRow(idx) => {
             ui.focus = PaneFocus::Nav;
             ui.confluence_ui.nav_section = 1;
@@ -1165,31 +1367,155 @@ fn handle_mouse_click(row: u16, col: u16, app: &mut AppState, ui: &mut UiState) 
             let tree = app.current_confluence_tree(ui);
             if let Some(row) = tree.get(idx) {
                 let page = row.page.clone();
+                let has_children = row.has_children;
                 app.request_page_detail_for_site(ui, site_id.as_deref(), &page.id);
-                if row.has_children {
+                if is_double_click && has_children {
                     app.toggle_expand_page(ui, &page);
                 }
             }
         }
+        HitTarget::TocPane => {
+            ui.focus = PaneFocus::Detail;
+        }
         HitTarget::TocItem(idx) => {
+            ui.focus = PaneFocus::Detail;
             ui.confluence_ui.selected_toc = idx;
             if let Some(page) = &app.active_page {
                 if let Some(entry) = page.toc.iter().filter(|t| t.level <= 4).nth(idx) {
-                    ui.confluence_ui.reader_scroll = entry.line_hint as u16;
+                    let max = ui.confluence_ui.reader_max_scroll;
+                    let target_line = entry.line_hint as u16;
+                    ui.confluence_ui.reader_scroll =
+                        if max > 0 { target_line.min(max) } else { target_line };
                 }
             }
         }
+        HitTarget::SearchResultsPane => {
+            ui.focus = PaneFocus::Main;
+        }
         HitTarget::SearchHit(idx) => {
+            ui.focus = PaneFocus::Main;
             ui.search_ui.selected_hit = idx;
             activate_selection(app, ui);
         }
+        HitTarget::DirectoryProjectsPane => {
+            ui.focus = PaneFocus::Main;
+            ui.directory_ui.section = 0;
+        }
+        HitTarget::DirectorySpacesPane => {
+            ui.focus = PaneFocus::Main;
+            ui.directory_ui.section = 1;
+        }
+        HitTarget::DirectorySitesPane => {
+            ui.focus = PaneFocus::Main;
+        }
+        HitTarget::DirectorySiteRow(idx) => {
+            ui.focus = PaneFocus::Main;
+            ui.directory_ui.selected_site = idx;
+            if is_double_click {
+                let rows = app.build_connected_site_rows();
+                if let Some(site_row) = rows.get(idx) {
+                    app.apply_site_switcher_command(
+                        crate::ui::overlays::site_switcher::SiteSwitcherCommand::SelectSite(
+                            site_row.site_id.clone(),
+                        ),
+                        ui,
+                    );
+                }
+            }
+        }
         HitTarget::DirectoryProject(idx) => {
+            ui.focus = PaneFocus::Main;
             ui.directory_ui.section = 0;
             ui.directory_ui.selected_project = idx;
+            if is_double_click {
+                activate_selection(app, ui);
+            }
         }
         HitTarget::DirectorySpace(idx) => {
+            ui.focus = PaneFocus::Main;
             ui.directory_ui.section = 1;
             ui.directory_ui.selected_space = idx;
+            if is_double_click {
+                activate_selection(app, ui);
+            }
+        }
+        HitTarget::DetailSubtask(idx) => {
+            let site_id = app.active_issue_site_id.clone();
+            if let Some(sub) = app
+                .active_issue
+                .as_ref()
+                .and_then(|d| d.subtasks.get(idx))
+                .cloned()
+            {
+                app.jump_to_cross_ref_for_site(
+                    ui,
+                    site_id.as_deref(),
+                    CrossRefTarget::JiraIssue {
+                        key: sub.key,
+                        label: Some(sub.summary),
+                    },
+                );
+            }
+        }
+        HitTarget::DetailIssueLink(idx) => {
+            let site_id = app.active_issue_site_id.clone();
+            if let Some(link) = app
+                .active_issue
+                .as_ref()
+                .and_then(|d| d.linked_issues.get(idx))
+                .cloned()
+            {
+                app.jump_to_cross_ref_for_site(
+                    ui,
+                    site_id.as_deref(),
+                    CrossRefTarget::JiraIssue {
+                        key: link.key,
+                        label: Some(link.summary),
+                    },
+                );
+            }
+        }
+        HitTarget::DetailConfluenceLink(idx) => {
+            let site_id = app.active_issue_site_id.clone();
+            if let Some(link) = app
+                .active_issue
+                .as_ref()
+                .and_then(|d| d.linked_pages.get(idx))
+                .cloned()
+            {
+                if !link.page_id.trim().is_empty() {
+                    app.jump_to_cross_ref_for_site(
+                        ui,
+                        site_id.as_deref(),
+                        CrossRefTarget::ConfluencePage {
+                            page_id: link.page_id,
+                            title: Some(link.title),
+                        },
+                    );
+                } else if !link.web_url.trim().is_empty() {
+                    if let Err(err) = open::that(&link.web_url) {
+                        ui.error(format!("Failed to open browser: {err}"));
+                    }
+                }
+            }
+        }
+        HitTarget::WikiBreadcrumb(idx) => {
+            let site_id = app.active_page_site_id.clone();
+            if let Some(anc) = app
+                .active_page
+                .as_ref()
+                .and_then(|p| p.ancestors.get(idx))
+                .cloned()
+            {
+                app.jump_to_cross_ref_for_site(
+                    ui,
+                    site_id.as_deref(),
+                    CrossRefTarget::ConfluencePage {
+                        page_id: anc.id,
+                        title: Some(anc.title),
+                    },
+                );
+            }
         }
         HitTarget::JqlBar => {
             ui.focus = PaneFocus::JqlBar;
@@ -1199,7 +1525,11 @@ fn handle_mouse_click(row: u16, col: u16, app: &mut AppState, ui: &mut UiState) 
             ui.focus = PaneFocus::SearchBar;
         }
         HitTarget::DetailPane => {
-            ui.focus = PaneFocus::Main;
+            ui.focus = if ui.active_tab == WorkspaceTab::Board {
+                PaneFocus::Detail
+            } else {
+                PaneFocus::Main
+            };
         }
         HitTarget::NavPane => {
             ui.focus = PaneFocus::Nav;
@@ -1210,18 +1540,74 @@ fn handle_mouse_click(row: u16, col: u16, app: &mut AppState, ui: &mut UiState) 
                 if !ui.collapsed_site_groups.remove(&key) {
                     ui.collapsed_site_groups.insert(key);
                 }
+                app.clamp_selections(ui);
             }
         }
-        HitTarget::Button(btn) => {
-            if btn != ButtonId::FocusJql {
+        HitTarget::Button(btn) => match btn {
+            ButtonId::Quit => return true,
+            ButtonId::RunJql => {
                 ui.issue_ui.local_filter_active = false;
-                if matches!(ui.focus, PaneFocus::JqlBar | PaneFocus::SearchBar) {
-                    ui.focus = PaneFocus::Main;
+                let jql = ui.issue_ui.jql.text.trim().to_string();
+                if !jql.is_empty() {
+                    app.request_jql_search(ui, jql, "Custom JQL".to_string());
+                }
+                ui.focus = PaneFocus::Main;
+            }
+            ButtonId::FocusLocalFilter => match ui.active_tab {
+                WorkspaceTab::Issues => {
+                    ui.focus = PaneFocus::Nav;
+                    ui.issue_ui.local_filter_active = true;
+                }
+                WorkspaceTab::Confluence => {
+                    ui.focus = PaneFocus::Nav;
+                    ui.confluence_ui.nav_section = 0;
+                    ui.confluence_ui.space_filter_active = true;
+                }
+                _ => {
+                    switch_tab(WorkspaceTab::Search, app, ui);
+                }
+            },
+            ButtonId::CloseLocalFilter => {
+                if ui.active_tab == WorkspaceTab::Issues {
+                    ui.issue_ui.local_filter_active = false;
+                    ui.issue_ui.local_filter.clear();
+                    ui.focus = PaneFocus::Nav;
+                    app.clamp_selections(ui);
+                } else if ui.active_tab == WorkspaceTab::Confluence {
+                    ui.confluence_ui.space_filter_active = false;
+                    ui.confluence_ui.space_filter.clear();
+                    app.keep_space_selection_visible(ui);
                 }
             }
-            return dispatch(crate::ui::event::button_to_action(btn), app, ui);
-        }
-        HitTarget::OverlayItem(_) | HitTarget::OverlayBody | HitTarget::OverlayClose => {}
+            ButtonId::BoardColPrev => {
+                let prev_focus = ui.focus;
+                ui.focus = PaneFocus::Main;
+                move_direction(app, ui, 0, -1);
+                ui.focus = prev_focus;
+            }
+            ButtonId::BoardColNext => {
+                let prev_focus = ui.focus;
+                ui.focus = PaneFocus::Main;
+                move_direction(app, ui, 0, 1);
+                ui.focus = prev_focus;
+            }
+            other => {
+                if other != ButtonId::FocusJql {
+                    ui.issue_ui.local_filter_active = false;
+                    ui.confluence_ui.space_filter_active = false;
+                    if matches!(ui.focus, PaneFocus::JqlBar | PaneFocus::SearchBar) {
+                        ui.focus = PaneFocus::Main;
+                    }
+                }
+                return dispatch(crate::ui::event::button_to_action(other), app, ui);
+            }
+        },
+        HitTarget::OverlayItem(_)
+        | HitTarget::OverlayItemToggle(_)
+        | HitTarget::OverlayField(_)
+        | HitTarget::OverlayScrollArea
+        | HitTarget::OverlayBody
+        | HitTarget::OverlayClose => {}
     }
     false
 }
@@ -1245,8 +1631,11 @@ fn move_direction(app: &mut AppState, ui: &mut UiState, dy: i32, dx: i32) {
             }
             PaneFocus::Detail => {
                 if dy != 0 {
-                    ui.board_ui.detail_scroll =
-                        apply_scroll(ui.board_ui.detail_scroll, dy * 2);
+                    ui.board_ui.detail_scroll = apply_scroll_clamped(
+                        ui.board_ui.detail_scroll,
+                        dy * 2,
+                        ui.board_ui.detail_max_scroll,
+                    );
                 }
             }
             _ => {
@@ -1286,7 +1675,11 @@ fn move_direction(app: &mut AppState, ui: &mut UiState, dy: i32, dx: i32) {
             }
             _ => {
                 if dy != 0 {
-                    ui.issue_ui.detail_scroll = apply_scroll(ui.issue_ui.detail_scroll, dy * 2);
+                    ui.issue_ui.detail_scroll = apply_scroll_clamped(
+                        ui.issue_ui.detail_scroll,
+                        dy * 2,
+                        ui.issue_ui.detail_max_scroll,
+                    );
                 }
             }
         },
@@ -1330,8 +1723,11 @@ fn move_direction(app: &mut AppState, ui: &mut UiState, dy: i32, dx: i32) {
             }
             _ => {
                 if dy != 0 {
-                    ui.confluence_ui.reader_scroll =
-                        apply_scroll(ui.confluence_ui.reader_scroll, dy * 2);
+                    ui.confluence_ui.reader_scroll = apply_scroll_clamped(
+                        ui.confluence_ui.reader_scroll,
+                        dy * 2,
+                        ui.confluence_ui.reader_max_scroll,
+                    );
                 }
             }
         },
@@ -1363,39 +1759,108 @@ fn move_direction(app: &mut AppState, ui: &mut UiState, dy: i32, dx: i32) {
 fn handle_mouse_scroll(delta: i32, row: u16, col: u16, app: &mut AppState, ui: &mut UiState) {
     let step = if delta < 0 { -1 } else { 1 };
     match ui.hitmap.hit(row, col) {
-        // The wheel over the SPACES rows moves the space selection even while the
-        // page tree section has the keyboard.
-        Some(HitTarget::SpaceItem(_)) if ui.active_tab == WorkspaceTab::Confluence => {
+        // Hover-targeted left-nav scrolling for all 2-section navs.
+        Some(HitTarget::BoardNavBoards | HitTarget::BoardItem(_)) => {
+            let len = app.boards.len();
+            ui.board_ui.selected_board = step_index(ui.board_ui.selected_board, step, len);
+            ui.board_ui.user_moved_board = true;
+        }
+        Some(HitTarget::BoardNavSprints | HitTarget::SprintItem(_)) => {
+            let len = app.sprints.len();
+            ui.board_ui.selected_sprint = step_index(ui.board_ui.selected_sprint, step, len);
+        }
+        Some(HitTarget::IssueNavFilters | HitTarget::FilterItem(_)) => {
+            let len = app.saved_filters.len();
+            ui.issue_ui.selected_filter = step_index(ui.issue_ui.selected_filter, step, len);
+        }
+        Some(HitTarget::IssueNavIssues | HitTarget::IssueRow(_)) => {
+            let len = app.filtered_issues(ui).len();
+            ui.issue_ui.selected_issue = step_index(ui.issue_ui.selected_issue, step, len);
+        }
+        Some(HitTarget::WikiNavSpaces | HitTarget::SpaceItem(_)) => {
             step_space_selection(app, ui, step);
         }
-        Some(
-            HitTarget::NavPane
-            | HitTarget::BoardItem(_)
-            | HitTarget::SprintItem(_)
-            | HitTarget::FilterItem(_)
-            | HitTarget::IssueRow(_)
-            | HitTarget::SpaceItem(_)
-            | HitTarget::TreeRow(_)
-            | HitTarget::SiteGroupHeader(_),
-        ) => {
+        Some(HitTarget::WikiNavTree | HitTarget::TreeRow(_) | HitTarget::TreeChevron(_)) => {
+            let len = app.current_confluence_tree(ui).len();
+            ui.confluence_ui.selected_tree_row =
+                step_index(ui.confluence_ui.selected_tree_row, step, len);
+        }
+        Some(HitTarget::SiteGroupHeader(_)) => match ui.active_tab {
+            WorkspaceTab::Confluence => step_space_selection(app, ui, step),
+            WorkspaceTab::Board => {
+                let len = app.boards.len();
+                ui.board_ui.selected_board = step_index(ui.board_ui.selected_board, step, len);
+                ui.board_ui.user_moved_board = true;
+            }
+            WorkspaceTab::Issues => {
+                let len = app.filtered_issues(ui).len();
+                ui.issue_ui.selected_issue = step_index(ui.issue_ui.selected_issue, step, len);
+            }
+            _ => {}
+        },
+        Some(HitTarget::NavPane) => {
             let prev_focus = ui.focus;
             ui.focus = PaneFocus::Nav;
             move_direction(app, ui, step, 0);
             ui.focus = prev_focus;
         }
-        Some(HitTarget::TocItem(_)) => {
-            let prev_focus = ui.focus;
-            ui.focus = PaneFocus::Detail;
-            move_direction(app, ui, step, 0);
-            ui.focus = prev_focus;
+        // Hover-targeted Kanban column scrolling (scrolls the hovered column, never the drawer).
+        Some(HitTarget::KanbanColumn(c) | HitTarget::KanbanCard { col: c, .. }) => {
+            let cols = app.build_kanban_columns(ui);
+            if let Some(col_data) = cols.get(c) {
+                ui.board_ui.selected_col = c;
+                ui.board_ui.selected_row = step_index(
+                    ui.board_ui.selected_row.min(col_data.issues.len().saturating_sub(1)),
+                    step,
+                    col_data.issues.len(),
+                );
+            }
         }
-        Some(HitTarget::KanbanCard { .. }) => {
-            let prev_focus = ui.focus;
-            ui.focus = PaneFocus::Main;
-            move_direction(app, ui, step, 0);
-            ui.focus = prev_focus;
+        // Hover-targeted TOC drawer scrolling.
+        Some(HitTarget::TocPane | HitTarget::TocItem(_)) => {
+            if let Some(page) = &app.active_page {
+                let len = page.toc.iter().filter(|t| t.level <= 4).count();
+                ui.confluence_ui.selected_toc =
+                    step_index(ui.confluence_ui.selected_toc, step, len);
+            }
         }
-        Some(HitTarget::DetailPane) => {
+        // Hover-targeted My Work column scrolling.
+        Some(HitTarget::MyWorkIssuesPane | HitTarget::MyWorkIssue(_)) => {
+            let len = app.my_issues.len();
+            ui.my_work_ui.selected_issue = step_index(ui.my_work_ui.selected_issue, step, len);
+        }
+        Some(HitTarget::MyWorkPagesPane | HitTarget::MyWorkPage(_)) => {
+            let len = app.my_pages.len();
+            ui.my_work_ui.selected_page = step_index(ui.my_work_ui.selected_page, step, len);
+        }
+        // Hover-targeted Search results scrolling.
+        Some(HitTarget::SearchResultsPane | HitTarget::SearchHit(_)) => {
+            let len = app.search_hits.len();
+            ui.search_ui.selected_hit = step_index(ui.search_ui.selected_hit, step, len);
+        }
+        // Hover-targeted Directory section scrolling.
+        Some(HitTarget::DirectoryProjectsPane | HitTarget::DirectoryProject(_)) => {
+            let len = app.projects.len();
+            ui.directory_ui.selected_project =
+                step_index(ui.directory_ui.selected_project, step, len);
+        }
+        Some(HitTarget::DirectorySpacesPane | HitTarget::DirectorySpace(_)) => {
+            let len = app.spaces.len();
+            ui.directory_ui.selected_space = step_index(ui.directory_ui.selected_space, step, len);
+        }
+        Some(HitTarget::DirectorySitesPane | HitTarget::DirectorySiteRow(_)) => {
+            let len = app.build_connected_site_rows().len();
+            ui.directory_ui.selected_site = step_index(ui.directory_ui.selected_site, step, len);
+        }
+        // Detail / reader pane and clickable content inside it.
+        Some(
+            HitTarget::DetailPane
+            | HitTarget::Attachment(_)
+            | HitTarget::DetailSubtask(_)
+            | HitTarget::DetailIssueLink(_)
+            | HitTarget::DetailConfluenceLink(_)
+            | HitTarget::WikiBreadcrumb(_),
+        ) => {
             scroll_active_pane(app, ui, delta);
         }
         _ => {
@@ -1414,13 +1879,25 @@ fn handle_mouse_scroll(delta: i32, row: u16, col: u16, app: &mut AppState, ui: &
 fn scroll_active_pane(app: &mut AppState, ui: &mut UiState, delta: i32) {
     match ui.active_tab {
         WorkspaceTab::Board => {
-            ui.board_ui.detail_scroll = apply_scroll(ui.board_ui.detail_scroll, delta);
+            ui.board_ui.detail_scroll = apply_scroll_clamped(
+                ui.board_ui.detail_scroll,
+                delta,
+                ui.board_ui.detail_max_scroll,
+            );
         }
         WorkspaceTab::Issues => {
-            ui.issue_ui.detail_scroll = apply_scroll(ui.issue_ui.detail_scroll, delta);
+            ui.issue_ui.detail_scroll = apply_scroll_clamped(
+                ui.issue_ui.detail_scroll,
+                delta,
+                ui.issue_ui.detail_max_scroll,
+            );
         }
         WorkspaceTab::Confluence => {
-            ui.confluence_ui.reader_scroll = apply_scroll(ui.confluence_ui.reader_scroll, delta);
+            ui.confluence_ui.reader_scroll = apply_scroll_clamped(
+                ui.confluence_ui.reader_scroll,
+                delta,
+                ui.confluence_ui.reader_max_scroll,
+            );
         }
         WorkspaceTab::MyWork | WorkspaceTab::Search | WorkspaceTab::Directory => {
             let step = if delta < 0 { -1 } else { 1 };
@@ -1911,7 +2388,7 @@ fn toggle_pin(app: &mut AppState, ui: &mut UiState) {
         if ui.directory_ui.section == 0 {
             let row = ui.directory_ui.selected_project;
             let site_id = app.project_row_site(row);
-            if let Some(p) = app.projects.get_mut(row) {
+            let toggled_key = if let Some(p) = app.projects.get_mut(row) {
                 p.pinned = !p.pinned;
                 let _ = app.storage.set_project_pinned_for_site(&site_id, &p.key, p.pinned);
                 ui.info(format!(
@@ -1919,6 +2396,21 @@ fn toggle_pin(app: &mut AppState, ui: &mut UiState) {
                     p.key,
                     if p.pinned { "pinned" } else { "unpinned" }
                 ));
+                Some(p.key.clone())
+            } else {
+                None
+            };
+            if let Some(key) = toggled_key {
+                app.sort_directory_pinned();
+                if let Some(new_idx) = app
+                    .projects
+                    .iter()
+                    .enumerate()
+                    .position(|(i, p)| p.key == key && app.project_row_site(i) == site_id)
+                {
+                    ui.directory_ui.selected_project = new_idx;
+                }
+                app.clamp_selections(ui);
             }
         } else {
             let row = ui.directory_ui.selected_space;
@@ -1927,12 +2419,23 @@ fn toggle_pin(app: &mut AppState, ui: &mut UiState) {
                 return;
             };
             s.pinned = !s.pinned;
-            let _ = app.storage.set_space_pinned_for_site(&site_id, &s.key, s.pinned);
+            let key = s.key.clone();
+            let _ = app.storage.set_space_pinned_for_site(&site_id, &key, s.pinned);
             ui.info(format!(
                 "{} {}",
-                s.key,
+                key,
                 if s.pinned { "pinned" } else { "unpinned" }
             ));
+            app.sort_directory_pinned();
+            if let Some(new_idx) = app
+                .spaces
+                .iter()
+                .enumerate()
+                .position(|(i, sp)| sp.key == key && app.space_row_site(i) == site_id)
+            {
+                ui.directory_ui.selected_space = new_idx;
+            }
+            app.clamp_selections(ui);
         }
     }
 }
@@ -1953,6 +2456,15 @@ fn apply_scroll(cur: u16, delta: i32) -> u16 {
         cur.saturating_sub((-delta) as u16)
     } else {
         cur.saturating_add(delta as u16)
+    }
+}
+
+fn apply_scroll_clamped(cur: u16, delta: i32, max_scroll: u16) -> u16 {
+    let next = apply_scroll(cur, delta);
+    if max_scroll > 0 {
+        next.min(max_scroll)
+    } else {
+        next
     }
 }
 
@@ -2698,5 +3210,460 @@ mod tests {
             Some(false),
             "someone else's space"
         );
+    }
+
+    #[tokio::test]
+    async fn buttons_work_while_inline_text_input_is_active() {
+        use crossterm::event::{KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
+        let (mut app, mut ui, _dir) = test_app_and_ui();
+
+        // Tab 5 Search defaults to SearchBar (accepts_text_input() == true).
+        switch_tab(WorkspaceTab::Search, &mut app, &mut ui);
+        assert!(ui.accepts_text_input());
+        ui.hitmap.clear();
+        ui.hitmap
+            .add_line(10, 0, 12, HitTarget::Button(ButtonId::SiteSwitcher));
+
+        let ev = MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: 12,
+            row: 0,
+            modifiers: KeyModifiers::NONE,
+        };
+        let action = crate::ui::event::mouse_to_action(ev, &ui.hitmap).unwrap();
+        dispatch(action, &mut app, &mut ui);
+        assert!(
+            matches!(ui.overlays.last(), Some(Overlay::SiteSwitcher(_))),
+            "clicking SiteSwitcher button must work while SearchBar is focused"
+        );
+        ui.pop_overlay();
+
+        // Issues local filter active: clicking CommandPalette button must open it & clear filter mode.
+        switch_tab(WorkspaceTab::Issues, &mut app, &mut ui);
+        ui.issue_ui.local_filter_active = true;
+        assert!(ui.accepts_text_input());
+        ui.hitmap.clear();
+        ui.hitmap
+            .add_line(20, 0, 14, HitTarget::Button(ButtonId::CommandPalette));
+        let ev2 = MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: 22,
+            row: 0,
+            modifiers: KeyModifiers::NONE,
+        };
+        let action2 = crate::ui::event::mouse_to_action(ev2, &ui.hitmap).unwrap();
+        dispatch(action2, &mut app, &mut ui);
+        assert!(matches!(
+            ui.overlays.last(),
+            Some(Overlay::CommandPalette(_))
+        ));
+        assert!(!ui.issue_ui.local_filter_active);
+    }
+
+    #[tokio::test]
+    async fn board_detail_click_focuses_detail_and_local_filter_clears_on_click_away() {
+        let (mut app, mut ui, _dir) = test_app_and_ui();
+
+        // Board tab: clicking DetailPane must focus PaneFocus::Detail (not Main).
+        ui.active_tab = WorkspaceTab::Board;
+        ui.focus = PaneFocus::Main;
+        ui.board_ui.drawer_open = true;
+        ui.hitmap.clear();
+        ui.hitmap
+            .add(Rect::new(60, 2, 40, 20), HitTarget::DetailPane);
+        dispatch(Action::MouseClick { row: 5, col: 70 }, &mut app, &mut ui);
+        assert_eq!(ui.focus, PaneFocus::Detail);
+
+        // Issues tab: clicking an IssueRow while local_filter_active is true must clear it.
+        ui.active_tab = WorkspaceTab::Issues;
+        ui.issue_ui.local_filter_active = true;
+        ui.hitmap.clear();
+        ui.hitmap.add_line(2, 5, 30, HitTarget::IssueRow(0));
+        dispatch(Action::MouseClick { row: 5, col: 10 }, &mut app, &mut ui);
+        assert!(!ui.issue_ui.local_filter_active);
+        assert_eq!(ui.focus, PaneFocus::Nav);
+    }
+
+    #[tokio::test]
+    async fn hover_targeted_scroll_targets_hovered_pane_across_tabs() {
+        let (mut app, mut ui, _dir) = test_app_and_ui();
+
+        // Board: hover over KanbanColumn(1) while drawer is open and selected_col == 0.
+        app.board_issues = vec![
+            IssueSummary {
+                key: "ATL-1".into(),
+                summary: "Todo 1".into(),
+                status: crate::models::IssueStatus {
+                    id: "1".into(),
+                    name: "To Do".into(),
+                    category: crate::models::StatusCategory::Todo,
+                },
+                ..Default::default()
+            },
+            IssueSummary {
+                key: "ATL-2".into(),
+                summary: "Prog 1".into(),
+                status: crate::models::IssueStatus {
+                    id: "2".into(),
+                    name: "In Progress".into(),
+                    category: crate::models::StatusCategory::InProgress,
+                },
+                ..Default::default()
+            },
+            IssueSummary {
+                key: "ATL-3".into(),
+                summary: "Prog 2".into(),
+                status: crate::models::IssueStatus {
+                    id: "3".into(),
+                    name: "In Progress".into(),
+                    category: crate::models::StatusCategory::InProgress,
+                },
+                ..Default::default()
+            },
+        ];
+        ui.active_tab = WorkspaceTab::Board;
+        ui.board_ui.drawer_open = true;
+        ui.board_ui.selected_col = 0;
+        ui.board_ui.selected_row = 0;
+        ui.board_ui.detail_scroll = 0;
+        ui.hitmap.clear();
+        ui.hitmap
+            .add(Rect::new(30, 3, 25, 20), HitTarget::KanbanColumn(1));
+        dispatch(
+            Action::MouseScroll {
+                delta: 3,
+                row: 10,
+                col: 40,
+            },
+            &mut app,
+            &mut ui,
+        );
+        assert_eq!(ui.board_ui.selected_col, 1);
+        assert_eq!(ui.board_ui.selected_row, 1);
+        assert_eq!(
+            ui.board_ui.detail_scroll, 0,
+            "scrolling KanbanColumn gap must NOT scroll the detail drawer"
+        );
+
+        // My Work: active_column is 0, hovering MyWorkPagesPane scrolls selected_page.
+        app.my_pages = vec![
+            PageSummary {
+                id: "p1".into(),
+                title: "Page 1".into(),
+                ..Default::default()
+            },
+            PageSummary {
+                id: "p2".into(),
+                title: "Page 2".into(),
+                ..Default::default()
+            },
+        ];
+        ui.active_tab = WorkspaceTab::MyWork;
+        ui.my_work_ui.active_column = 0;
+        ui.my_work_ui.selected_page = 0;
+        ui.hitmap.clear();
+        ui.hitmap
+            .add(Rect::new(50, 3, 40, 20), HitTarget::MyWorkPagesPane);
+        dispatch(
+            Action::MouseScroll {
+                delta: 3,
+                row: 6,
+                col: 60,
+            },
+            &mut app,
+            &mut ui,
+        );
+        assert_eq!(ui.my_work_ui.selected_page, 1);
+        assert_eq!(ui.my_work_ui.selected_issue, 0);
+    }
+
+    #[tokio::test]
+    async fn right_click_context_menu_matches_my_work_page_and_wiki_tree() {
+        let (mut app, mut ui, _dir) = test_app_and_ui();
+        app.my_pages = vec![PageSummary {
+            id: "pg-42".into(),
+            title: "Runbook".into(),
+            web_url: "https://acme.atlassian.net/wiki/pages/42".into(),
+            ..Default::default()
+        }];
+        app.active_page = None;
+        ui.active_tab = WorkspaceTab::MyWork;
+        ui.hitmap.clear();
+        ui.hitmap.add_line(50, 6, 30, HitTarget::MyWorkPage(0));
+
+        dispatch(
+            Action::MouseRightClick { row: 6, col: 55 },
+            &mut app,
+            &mut ui,
+        );
+        match ui.overlays.last() {
+            Some(Overlay::ContextMenu(menu)) => {
+                assert!(
+                    matches!(
+                        &menu.context,
+                        crate::ui::overlays::context_menu::ContextTarget::ConfluencePage {
+                            page_id,
+                            ..
+                        } if page_id == "pg-42"
+                    ),
+                    "expected ConfluencePage menu for MyWorkPage, got {:?}",
+                    menu.context
+                );
+            }
+            other => panic!("expected ContextMenu, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn confirm_dialog_buttons_and_backdrop_close_and_context_menu_body() {
+        let (mut app, mut ui, _dir) = test_app_and_ui();
+
+        // ConfirmDialog: clicking OverlaySubmit dispatches on_confirm and closes.
+        ui.push_overlay(Overlay::confirm(
+            "Proceed?",
+            Some(Action::ToggleHrefDisplay),
+        ));
+        assert!(!ui.show_hrefs);
+        ui.hitmap.clear();
+        ui.hitmap.add(Rect::new(10, 5, 40, 8), HitTarget::OverlayBody);
+        ui.hitmap
+            .add_line(14, 10, 15, HitTarget::Button(ButtonId::OverlaySubmit));
+        dispatch(Action::MouseClick { row: 10, col: 16 }, &mut app, &mut ui);
+        assert!(ui.overlays.is_empty());
+        assert!(ui.show_hrefs);
+
+        // ContextMenu: clicking OverlayBody (border/title) must NOT dismiss it.
+        ui.push_overlay(Overlay::ContextMenu(ContextMenuOverlay::for_global((
+            10, 5,
+        ))));
+        ui.hitmap.clear();
+        ui.hitmap.add(Rect::new(10, 5, 30, 10), HitTarget::OverlayBody);
+        dispatch(Action::MouseClick { row: 5, col: 12 }, &mut app, &mut ui);
+        assert!(matches!(ui.overlays.last(), Some(Overlay::ContextMenu(_))));
+
+        // Clicking outside OverlayBody dismisses any overlay (including Settings).
+        ui.pop_overlay();
+        ui.push_overlay(Overlay::Settings(SettingsOverlay::from_config(&app, &ui)));
+        ui.hitmap.clear();
+        ui.hitmap.add(Rect::new(20, 5, 40, 15), HitTarget::OverlayBody);
+        dispatch(Action::MouseClick { row: 1, col: 1 }, &mut app, &mut ui);
+        assert!(ui.overlays.is_empty());
+    }
+
+    #[tokio::test]
+    async fn tree_chevron_toggles_without_opening_and_directory_double_click_opens() {
+        let (mut app, mut ui, _dir) = test_app_and_ui();
+
+        // Wiki tree: TreeChevron expands without loading page; TreeRow does not collapse.
+        spaces_section(&mut app, &mut ui);
+        let site = app.tree_site(&ui);
+        let parent = PageSummary {
+            id: "p-parent".into(),
+            space_key: "ENG".into(),
+            title: "Architecture".into(),
+            has_children: Some(true),
+            ..Default::default()
+        };
+        let child = PageSummary {
+            id: "p-child".into(),
+            space_key: "ENG".into(),
+            title: "Child Doc".into(),
+            parent_id: Some("p-parent".into()),
+            ..Default::default()
+        };
+        app.root_pages_by_space
+            .insert(SiteKey::new(&site, "ENG"), vec![parent]);
+        app.page_children_map
+            .insert(SiteKey::new(&site, "p-parent"), vec![child]);
+        ui.confluence_ui.nav_section = 1;
+        ui.hitmap.clear();
+        ui.hitmap.add_line(2, 6, 25, HitTarget::TreeRow(0));
+        ui.hitmap.add_line(2, 6, 3, HitTarget::TreeChevron(0));
+
+        // Click chevron -> expands!
+        dispatch(Action::MouseClick { row: 6, col: 2 }, &mut app, &mut ui);
+        assert!(app
+            .expanded_pages
+            .contains(&SiteKey::new(&site, "p-parent")));
+
+        // Single-click title -> stays expanded (does NOT accidentally collapse!).
+        dispatch(Action::MouseClick { row: 6, col: 10 }, &mut app, &mut ui);
+        assert!(app
+            .expanded_pages
+            .contains(&SiteKey::new(&site, "p-parent")));
+
+        // Directory: single-click selects project, double-click opens Issues with project JQL.
+        app.projects = vec![
+            crate::models::ProjectSummary {
+                id: "1".into(),
+                key: "AAA".into(),
+                name: "Alpha".into(),
+                ..Default::default()
+            },
+            crate::models::ProjectSummary {
+                id: "2".into(),
+                key: "BBB".into(),
+                name: "Beta".into(),
+                ..Default::default()
+            },
+        ];
+        app.project_site_ids = vec!["default".into(), "default".into()];
+        ui.active_tab = WorkspaceTab::Directory;
+        ui.last_click = None;
+        ui.hitmap.clear();
+        ui.hitmap.add_line(2, 10, 30, HitTarget::DirectoryProject(1));
+
+        dispatch(Action::MouseClick { row: 10, col: 5 }, &mut app, &mut ui);
+        assert_eq!(ui.active_tab, WorkspaceTab::Directory);
+        assert_eq!(ui.directory_ui.selected_project, 1);
+
+        dispatch(Action::MouseClick { row: 10, col: 5 }, &mut app, &mut ui);
+        assert_eq!(ui.active_tab, WorkspaceTab::Issues);
+        assert!(ui.issue_ui.jql.text.contains("project = BBB"));
+    }
+
+    #[tokio::test]
+    async fn custom_jql_protected_from_background_sync_and_seq_guards_drop_stale_loads() {
+        let (mut app, mut ui, _dir) = test_app_and_ui();
+
+        // Simulate active custom JQL results.
+        app.issues_custom_query = true;
+        app.issues = vec![IssueSummary {
+            key: "CUST-9".into(),
+            summary: "Custom Query Issue".into(),
+            ..Default::default()
+        }];
+        app.issue_site_ids = vec!["default".into()];
+
+        // 45s background IssuesUpdated arrives with my_open_issues -> must NOT clobber custom JQL!
+        let bg_issue = IssueSummary {
+            key: "BG-1".into(),
+            summary: "Background Issue".into(),
+            ..Default::default()
+        };
+        app.handle_core_event(
+            &mut ui,
+            crate::models::CoreEvent::IssuesUpdated {
+                site_id: "default".into(),
+                issues: vec![bg_issue],
+            },
+        );
+        assert_eq!(app.issues.len(), 1);
+        assert_eq!(app.issues[0].key, "CUST-9");
+
+        // Stale IssuesLoaded (seq < app.issues_req_seq) must be dropped.
+        app.issues_req_seq = 5;
+        app.handle_ui_msg(
+            &mut ui,
+            UiMsg::IssuesLoaded {
+                seq: 3,
+                site_id: "default".into(),
+                issues: vec![IssueSummary {
+                    key: "STALE-1".into(),
+                    summary: "Old response".into(),
+                    ..Default::default()
+                }],
+                label: "Old".into(),
+            },
+        );
+        assert_eq!(app.issues[0].key, "CUST-9");
+
+        // MultiSiteSyncFinished must NOT wipe active local search hits.
+        ui.search_ui.query.set_text("hello");
+        ui.search_ui.is_remote = false;
+        app.search_hits = vec![crate::models::UnifiedSearchHit {
+            kind: SearchHitKind::JiraIssue,
+            id_or_key: "ATL-1".into(),
+            title: "Hello world".into(),
+            container: "ATL".into(),
+            status_or_version: "Open".into(),
+            snippet: String::new(),
+            web_url: String::new(),
+            updated_at: String::new(),
+        }];
+        app.search_hit_site_ids = vec!["default".into()];
+        app.search_hit_site_labels = vec![None];
+        // Seed matching item in SQLite so re-running local search keeps hits populated.
+        let _ = app.storage.upsert_issues_for_site(
+            "default",
+            &[IssueSummary {
+                key: "ATL-1".into(),
+                summary: "Hello world".into(),
+                ..Default::default()
+            }],
+        );
+        app.handle_ui_msg(
+            &mut ui,
+            UiMsg::MultiSiteSyncFinished(crate::sync::MultiSiteSyncOutcome {
+                total_sites: 1,
+                succeeded_sites: 1,
+                per_site: Vec::new(),
+                summary: "ok".into(),
+            }),
+        );
+        assert!(
+            !app.search_hits.is_empty(),
+            "MultiSiteSyncFinished must not wipe active Search tab query with empty string"
+        );
+    }
+
+    #[tokio::test]
+    async fn all_sites_my_work_filters_per_site_me_id() {
+        let storage = Storage::open_in_memory().unwrap();
+        let make_issue = |key: &str, assignee_id: &str, cat: crate::models::StatusCategory| {
+            IssueSummary {
+                key: key.into(),
+                summary: format!("Issue {key}"),
+                assignee: Some(crate::models::UserSummary {
+                    id: assignee_id.into(),
+                    display_name: assignee_id.into(),
+                    ..Default::default()
+                }),
+                status: crate::models::IssueStatus {
+                    id: String::new(),
+                    name: if cat == crate::models::StatusCategory::Done {
+                        "Done".into()
+                    } else {
+                        "In Progress".into()
+                    },
+                    category: cat,
+                },
+                ..Default::default()
+            }
+        };
+        storage
+            .upsert_issues_for_site(
+                "site-a",
+                &[
+                    make_issue("A-1", "me-a", crate::models::StatusCategory::InProgress),
+                    make_issue("A-2", "other-user", crate::models::StatusCategory::InProgress),
+                    make_issue("A-3", "me-a", crate::models::StatusCategory::Done),
+                ],
+            )
+            .unwrap();
+        storage
+            .upsert_issues_for_site(
+                "site-b",
+                &[
+                    make_issue("B-1", "me-b", crate::models::StatusCategory::Todo),
+                    make_issue("B-2", "someone-else", crate::models::StatusCategory::Todo),
+                ],
+            )
+            .unwrap();
+
+        let mut me_ids = std::collections::HashMap::new();
+        me_ids.insert("site-a".to_string(), "me-a".to_string());
+        me_ids.insert("site-b".to_string(), "me-b".to_string());
+
+        let rows = storage
+            .list_my_work_all_sites_for_users(&me_ids, 40)
+            .unwrap();
+        let keys: Vec<String> = rows.into_iter().map(|(_, i)| i.key).collect();
+        assert_eq!(keys.len(), 2);
+        assert!(keys.contains(&"A-1".to_string()));
+        assert!(keys.contains(&"B-1".to_string()));
+        assert!(!keys.contains(&"A-2".to_string()));
+        assert!(!keys.contains(&"A-3".to_string()));
+        assert!(!keys.contains(&"B-2".to_string()));
     }
 }

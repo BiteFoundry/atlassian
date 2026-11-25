@@ -7,6 +7,7 @@ use ratatui::{
     widgets::Paragraph,
     Frame,
 };
+use unicode_width::UnicodeWidthStr;
 
 use crate::{
     config::DensityMode,
@@ -101,6 +102,9 @@ fn draw_space_and_tree(frame: &mut Frame, area: Rect, app: &AppState, ui: &mut U
 
     draw_spaces_pane(frame, rows[0], app, ui, multi_site);
 
+    // Register Page Tree container BEFORE tree item rows.
+    ui.hitmap.add(rows[1], HitTarget::WikiNavTree);
+
     // Expandable Hierarchical Page Tree
     let theme = &ui.theme;
     let tree = app.current_confluence_tree(ui);
@@ -149,12 +153,26 @@ fn draw_space_and_tree(frame: &mut Frame, area: Rect, app: &AppState, ui: &mut U
                 rows[1].width as usize,
             );
             t_lines.push(Line::from(Span::styled(text, style)));
+            let row_y = rows[1].y + 1 + vis_idx as u16;
             ui.hitmap.add_line(
                 rows[1].x,
-                rows[1].y + 1 + vis_idx as u16,
+                row_y,
                 rows[1].width,
                 HitTarget::TreeRow(abs_idx),
             );
+            if row.has_children {
+                let indent_w = indent.width() as u16;
+                let chev_x = rows[1].x.saturating_add(indent_w);
+                if chev_x < rows[1].right() {
+                    let chev_w = 3u16.min(rows[1].right().saturating_sub(chev_x));
+                    ui.hitmap.add_line(
+                        chev_x,
+                        row_y,
+                        chev_w,
+                        HitTarget::TreeChevron(abs_idx),
+                    );
+                }
+            }
         }
     }
     frame.render_widget(Paragraph::new(t_lines).style(sidebar_style), rows[1]);
@@ -174,6 +192,9 @@ fn draw_spaces_pane(
     ui: &mut UiState,
     multi_site: bool,
 ) {
+    // Register Spaces nav section container BEFORE header buttons & item rows.
+    ui.hitmap.add(area, HitTarget::WikiNavSpaces);
+
     let pane_rows = app.space_pane_rows(ui);
     let show_filter = space_filter_shown(ui);
     let selected = ui.confluence_ui.selected_space;
@@ -229,25 +250,71 @@ fn draw_spaces_pane(
             None => title.push_str(&format!(" {up}{down} {listed}")),
         }
     }
-    let mut lines = vec![Line::from(Span::styled(
-        truncate_width(&title, area.width as usize),
-        theme.muted_style(),
-    ))];
+    let filter_btn = "[/]";
+    let filter_btn_w = filter_btn.width();
+    let header_line = if (area.width as usize) > title.width() + filter_btn_w {
+        let pad = (area.width as usize).saturating_sub(title.width() + filter_btn_w);
+        let btn_x = area.right().saturating_sub(filter_btn_w as u16);
+        ui.hitmap.add_line(
+            btn_x,
+            area.y,
+            filter_btn_w as u16,
+            HitTarget::Button(ButtonId::FocusLocalFilter),
+        );
+        Line::from(vec![
+            Span::styled(title, theme.muted_style()),
+            Span::raw(" ".repeat(pad)),
+            Span::styled(filter_btn, theme.accent_style()),
+        ])
+    } else {
+        Line::from(Span::styled(
+            truncate_width(&title, area.width as usize),
+            theme.muted_style(),
+        ))
+    };
+    let mut lines = vec![header_line];
     if show_filter {
+        let filter_y = area.y + 1;
+        // Clicking the filter bar focuses the filter instead of falling through to NavPane.
+        ui.hitmap.add_line(
+            area.x,
+            filter_y,
+            area.width,
+            HitTarget::Button(ButtonId::FocusLocalFilter),
+        );
         let cursor = if ui.confluence_ui.space_filter_active {
             "▏"
         } else {
             ""
         };
-        lines.push(Line::from(vec![
+        let count_str = format!("  {matched}/{}", app.spaces.len());
+        let mut filter_spans = vec![
             Span::styled(" / ", theme.accent_style()),
             Span::raw(ui.confluence_ui.space_filter.text.clone()),
             Span::styled(cursor, theme.accent_style()),
-            Span::styled(
-                format!("  {matched}/{}", app.spaces.len()),
-                theme.muted_style(),
-            ),
-        ]));
+            Span::styled(count_str.clone(), theme.muted_style()),
+        ];
+        if ui.confluence_ui.space_filter_active {
+            let used_w = " / ".width()
+                + ui.confluence_ui.space_filter.text.width()
+                + cursor.width()
+                + count_str.width();
+            let esc_lbl = "(Esc)";
+            let esc_w = esc_lbl.width();
+            let esc_x = area.x.saturating_add((used_w + 1) as u16);
+            if esc_x < area.right() {
+                let clipped_w = (esc_w as u16).min(area.right().saturating_sub(esc_x));
+                ui.hitmap.add_line(
+                    esc_x,
+                    filter_y,
+                    clipped_w,
+                    HitTarget::Button(ButtonId::CloseLocalFilter),
+                );
+            }
+            filter_spans.push(Span::styled(" ", theme.muted_style()));
+            filter_spans.push(Span::styled(esc_lbl, theme.muted_style()));
+        }
+        lines.push(Line::from(filter_spans));
     }
 
     let list_y = area.y + 1 + u16::from(show_filter);
@@ -367,6 +434,8 @@ fn draw_wiki_reader(frame: &mut Frame, area: Rect, app: &AppState, ui: &mut UiSt
     }
 
     let Some(page) = &app.active_page else {
+        ui.confluence_ui.reader_max_scroll = 0;
+        ui.confluence_ui.reader_scroll = 0;
         frame.render_widget(
             Paragraph::new(vec![
                 Line::from(""),
@@ -380,50 +449,88 @@ fn draw_wiki_reader(frame: &mut Frame, area: Rect, app: &AppState, ui: &mut UiSt
         return;
     };
 
-    let lines = build_wiki_reader_lines(page, inner.width, app, ui);
-    if ui.confluence_ui.reader_scroll == 0 && inner.height > 3 {
-        register_wiki_action_buttons(inner.x, inner.y + 3, inner.width, &mut ui.hitmap);
+    let (lines, action_row, row_hits) = build_wiki_reader_lines_with_hits(page, inner.width, app, ui);
+    let max_scroll = lines.len().saturating_sub(inner.height as usize) as u16;
+    let clamped_scroll = ui.confluence_ui.reader_scroll.min(max_scroll);
+    ui.confluence_ui.reader_max_scroll = max_scroll;
+    ui.confluence_ui.reader_scroll = clamped_scroll;
+
+    // Register clickable action bar buttons whenever the action bar row is visible.
+    let action_row_u16 = action_row as u16;
+    if clamped_scroll <= action_row_u16 {
+        let vis_row = action_row_u16 - clamped_scroll;
+        if vis_row < inner.height {
+            register_wiki_action_buttons(inner.x, inner.y + vis_row, inner.width, &mut ui.hitmap);
+        }
     }
+
+    // Register visible breadcrumb segments, attachment rows, and [c] Add Comment prompt.
+    let scroll_usize = clamped_scroll as usize;
+    for hit in row_hits {
+        if hit.line_idx >= scroll_usize {
+            let vis_row = hit.line_idx - scroll_usize;
+            if vis_row < inner.height as usize {
+                let y = inner.y + vis_row as u16;
+                let x = inner.x.saturating_add(hit.x_offset);
+                if x < inner.right() {
+                    let max_w = inner.right().saturating_sub(x);
+                    let w = hit.width.map_or(max_w, |w| w.min(max_w));
+                    ui.hitmap.add_line(x, y, w, hit.target);
+                }
+            }
+        }
+    }
+
     frame.render_widget(
-        Paragraph::new(lines).scroll((ui.confluence_ui.reader_scroll, 0)),
+        Paragraph::new(lines).scroll((clamped_scroll, 0)),
         inner,
     );
 }
 
+const WIKI_ACTION_BUTTONS: &[(&str, ButtonId)] = &[
+    ("[e]Edit", ButtonId::Edit),
+    ("[n]Child Page", ButtonId::NewItem),
+    ("[c]Comment", ButtonId::Comment),
+    ("[t]TOC", ButtonId::ToggleToc),
+    ("[H: HTML]", ButtonId::HtmlPreview),
+    ("[Ctrl+F]Upload", ButtonId::UploadAttachment),
+    ("[d]Download", ButtonId::DownloadAttachment),
+    ("[v]Image", ButtonId::ImagePreview),
+    ("[g]Links", ButtonId::CrossLinks),
+    ("[o]Open", ButtonId::OpenBrowser),
+];
+
 fn register_wiki_action_buttons(x: u16, row: u16, width: u16, hitmap: &mut HitMap) {
-    let buttons = [
-        ("[e]Edit", ButtonId::Edit),
-        ("[n]Child Page", ButtonId::NewItem),
-        ("[c]Comment", ButtonId::Comment),
-        ("[t]TOC", ButtonId::ToggleToc),
-        ("[H: HTML]", ButtonId::HtmlPreview),
-        ("[u]Upload", ButtonId::UploadAttachment),
-        ("[d]Download", ButtonId::DownloadAttachment),
-        ("[v]Image", ButtonId::ImagePreview),
-        ("[g]Links", ButtonId::CrossLinks),
-        ("[o]Open", ButtonId::OpenBrowser),
-    ];
     let mut cx = x + 1;
-    for (label, btn) in buttons {
-        let w = unicode_width::UnicodeWidthStr::width(label) as u16;
-        if cx + w > x + width {
+    let max_x = x.saturating_add(width);
+    for &(label, btn) in WIKI_ACTION_BUTTONS {
+        let w = label.width() as u16;
+        if cx.saturating_add(w) > max_x {
             break;
         }
         hitmap.add_line(cx, row, w, HitTarget::Button(btn));
-        cx += w + 1;
+        cx = cx.saturating_add(w + 1);
     }
 }
 
-fn build_wiki_reader_lines(
+struct WikiLineHit {
+    line_idx: usize,
+    x_offset: u16,
+    width: Option<u16>,
+    target: HitTarget,
+}
+
+fn build_wiki_reader_lines_with_hits(
     page: &PageDetail,
     width: u16,
     app: &AppState,
     ui: &UiState,
-) -> Vec<Line<'static>> {
+) -> (Vec<Line<'static>>, usize, Vec<WikiLineHit>) {
     let theme = &ui.theme;
     let is_compact = app.config.density == DensityMode::Compact;
     let w = (width as usize).max(20);
     let mut lines = Vec::new();
+    let mut row_hits = Vec::new();
     let s = &page.summary;
 
     let teal_style = if theme.no_color {
@@ -434,8 +541,23 @@ fn build_wiki_reader_lines(
     let teal_bold = teal_style.add_modifier(Modifier::BOLD);
 
     // 1. Breadcrumb: SPACE > Ancestor > Title
+    let breadcrumb_line_idx = lines.len();
     let mut crumb_parts = vec![s.space_key.clone()];
-    for anc in &page.ancestors {
+    let mut cx = 1usize + s.space_key.width() + 3; // leading " " + space_key + " > "
+    for (idx, anc) in page.ancestors.iter().enumerate() {
+        let anc_w = anc.title.width();
+        if cx < w && anc_w > 0 {
+            let clipped_w = anc_w.min(w.saturating_sub(cx));
+            if clipped_w > 0 {
+                row_hits.push(WikiLineHit {
+                    line_idx: breadcrumb_line_idx,
+                    x_offset: cx as u16,
+                    width: Some(clipped_w as u16),
+                    target: HitTarget::WikiBreadcrumb(idx),
+                });
+            }
+        }
+        cx = cx.saturating_add(anc_w + 3);
         crumb_parts.push(anc.title.clone());
     }
     crumb_parts.push(s.title.clone());
@@ -473,16 +595,22 @@ fn build_wiki_reader_lines(
     )));
 
     // 4. Action bar
+    let action_row = lines.len();
     let action_style = if theme.no_color {
         Style::default().add_modifier(Modifier::DIM)
     } else {
         Style::default().fg(theme.accent)
     };
+    let action_bar = format!(
+        " {}",
+        WIKI_ACTION_BUTTONS
+            .iter()
+            .map(|(lbl, _)| *lbl)
+            .collect::<Vec<_>>()
+            .join(" ")
+    );
     lines.push(Line::from(Span::styled(
-        truncate_width(
-            " [e]Edit [n]Child Page [c]Comment [t]TOC [H: HTML] [u]Upload [d]Download [v]Image [g]Links [o]Open",
-            w,
-        ),
+        truncate_width(&action_bar, w),
         action_style,
     )));
     lines.push(Line::from(Span::styled(
@@ -531,8 +659,14 @@ fn build_wiki_reader_lines(
         } else {
             Style::default().fg(theme.chip_fg)
         };
-        for att in &page.attachments {
+        for (idx, att) in page.attachments.iter().enumerate() {
             let kb = (att.size / 1024).max(1);
+            row_hits.push(WikiLineHit {
+                line_idx: lines.len(),
+                x_offset: 0,
+                width: None,
+                target: HitTarget::Attachment(idx),
+            });
             lines.push(Line::from(vec![
                 Span::raw("  • "),
                 Span::styled(att.filename.clone(), file_style),
@@ -548,11 +682,16 @@ fn build_wiki_reader_lines(
     }
 
     // 7. Footer comments
+    let comment_hdr_prefix = format!(" ▾ Page Comments ({}) — ", page.comments.len());
+    let comment_btn_lbl = "[c] Add Comment";
+    row_hits.push(WikiLineHit {
+        line_idx: lines.len(),
+        x_offset: comment_hdr_prefix.width() as u16,
+        width: Some(comment_btn_lbl.width() as u16),
+        target: HitTarget::Button(ButtonId::Comment),
+    });
     lines.push(Line::from(Span::styled(
-        format!(
-            " ▾ Page Comments ({}) — [c] Add Comment",
-            page.comments.len()
-        ),
+        format!("{comment_hdr_prefix}{comment_btn_lbl}"),
         teal_bold,
     )));
     if page.comments.is_empty() {
@@ -591,7 +730,7 @@ fn build_wiki_reader_lines(
         }
     }
 
-    lines
+    (lines, action_row, row_hits)
 }
 
 fn draw_toc_drawer(frame: &mut Frame, area: Rect, app: &AppState, ui: &mut UiState) {
@@ -599,24 +738,47 @@ fn draw_toc_drawer(frame: &mut Frame, area: Rect, app: &AppState, ui: &mut UiSta
     let focused = ui.focus == PaneFocus::Detail;
     let sidebar_style = theme.surface_style(theme.bg_sidebar);
     fill_surface(frame, area, sidebar_style);
+    // Register TOC pane container BEFORE close pill & TOC items.
+    ui.hitmap.add(area, HitTarget::TocPane);
     if area.width < 4 || area.height < 3 {
         return;
     }
 
     let hdr_rect = Rect::new(area.x, area.y, area.width, 1);
     let focus_mark = if focused { "▸" } else { " " };
-    let hdr_text = truncate_width(
-        &format!("{focus_mark} Table of Contents [t]"),
-        area.width as usize,
-    );
-    let hdr_w = unicode_width::UnicodeWidthStr::width(hdr_text.as_str()) as u16;
-    ui.hitmap
-        .add_line(hdr_rect.x, hdr_rect.y, hdr_w, HitTarget::Button(ButtonId::ToggleToc));
-    frame.render_widget(
-        Paragraph::new(Line::from(Span::styled(hdr_text, theme.title(focused))))
+    let close_pill = "[✕]";
+    let close_w = close_pill.width() as u16;
+    if area.width > close_w + 3 {
+        let title_budget = (area.width as usize).saturating_sub(close_w as usize + 1);
+        let title_text = truncate_width(&format!("{focus_mark} Table of Contents"), title_budget);
+        let pad = (area.width as usize).saturating_sub(title_text.width() + close_w as usize);
+        let close_x = hdr_rect.right().saturating_sub(close_w);
+        ui.hitmap.add_line(
+            close_x,
+            hdr_rect.y,
+            close_w,
+            HitTarget::Button(ButtonId::ToggleToc),
+        );
+        frame.render_widget(
+            Paragraph::new(Line::from(vec![
+                Span::styled(title_text, theme.title(focused)),
+                Span::raw(" ".repeat(pad)),
+                Span::styled(close_pill, theme.muted_style()),
+            ]))
             .style(sidebar_style),
-        hdr_rect,
-    );
+            hdr_rect,
+        );
+    } else {
+        let hdr_text = truncate_width(
+            &format!("{focus_mark} TOC"),
+            area.width as usize,
+        );
+        frame.render_widget(
+            Paragraph::new(Line::from(Span::styled(hdr_text, theme.title(focused))))
+                .style(sidebar_style),
+            hdr_rect,
+        );
+    }
     draw_horizontal_hairline(
         frame,
         area.x,
@@ -640,10 +802,12 @@ fn draw_toc_drawer(frame: &mut Frame, area: Rect, app: &AppState, ui: &mut UiSta
     }
 
     let Some(page) = &app.active_page else {
+        ui.confluence_ui.toc_scroll = 0;
         return;
     };
     let toc: Vec<_> = page.toc.iter().filter(|t| t.level <= 4).collect();
     if toc.is_empty() {
+        ui.confluence_ui.toc_scroll = 0;
         frame.render_widget(
             Paragraph::new(Span::styled(" (no headings)", theme.muted_style()))
                 .style(sidebar_style),
@@ -652,8 +816,17 @@ fn draw_toc_drawer(frame: &mut Frame, area: Rect, app: &AppState, ui: &mut UiSta
         return;
     }
 
+    let (scroll, window) = visible_window(
+        ui.confluence_ui.selected_toc,
+        ui.confluence_ui.toc_scroll,
+        inner.height as usize,
+        toc.len(),
+    );
+    ui.confluence_ui.toc_scroll = scroll;
+
     let mut lines = Vec::new();
-    for (idx, entry) in toc.iter().enumerate().take(inner.height as usize) {
+    for (offset, idx) in window.enumerate() {
+        let entry = toc[idx];
         let is_sel = ui.confluence_ui.selected_toc == idx;
         let style = if focused && is_sel {
             theme.nav_selection()
@@ -669,7 +842,7 @@ fn draw_toc_drawer(frame: &mut Frame, area: Rect, app: &AppState, ui: &mut UiSta
         )));
         ui.hitmap.add_line(
             inner.x,
-            inner.y + idx as u16,
+            inner.y + offset as u16,
             inner.width,
             HitTarget::TocItem(idx),
         );

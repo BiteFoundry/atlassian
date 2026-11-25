@@ -1403,7 +1403,8 @@ async fn try_connect_tui_at(cfg: &AppConfig, paths: &DaemonPaths) -> Option<TuiD
                 maybe_cmd = cmd_rx.recv() => {
                     match maybe_cmd {
                         // Never shut down the shared background daemon when an attached TUI client exits.
-                        Some(SyncCommand::Shutdown) => continue,
+                        // `UpdateTargets` is an in-process sync controller command, never sent over IPC.
+                        Some(SyncCommand::Shutdown | SyncCommand::UpdateTargets(_)) => continue,
                         Some(cmd) => {
                             if write_json_line(&mut write_half, &ClientStreamCmd::Command(cmd))
                                 .await
@@ -1541,8 +1542,9 @@ async fn run_initial_bootstrap(
         Ok(summary) => {
             let site_id = client.site_id().to_string();
             let st_proj = storage.clone();
+            let sid_proj = site_id.clone();
             if let Ok(Ok(projects)) =
-                tokio::task::spawn_blocking(move || st_proj.list_projects()).await
+                tokio::task::spawn_blocking(move || st_proj.list_projects_for_site(&sid_proj)).await
             {
                 let _ = event_tx.send(CoreEvent::ProjectsUpdated {
                     site_id: site_id.clone(),
@@ -1550,8 +1552,10 @@ async fn run_initial_bootstrap(
                 });
             }
             let st_boards = storage.clone();
+            let sid_boards = site_id.clone();
             if let Ok(Ok(boards)) =
-                tokio::task::spawn_blocking(move || st_boards.list_boards(None)).await
+                tokio::task::spawn_blocking(move || st_boards.list_boards_for_site(&sid_boards, None))
+                    .await
             {
                 let _ = event_tx.send(CoreEvent::BoardsUpdated {
                     site_id: site_id.clone(),
@@ -1559,8 +1563,9 @@ async fn run_initial_bootstrap(
                 });
             }
             let st_spaces = storage.clone();
+            let sid_spaces = site_id.clone();
             if let Ok(Ok(spaces)) =
-                tokio::task::spawn_blocking(move || st_spaces.list_spaces()).await
+                tokio::task::spawn_blocking(move || st_spaces.list_spaces_for_site(&sid_spaces)).await
             {
                 let _ = event_tx.send(CoreEvent::SpacesUpdated {
                     site_id: site_id.clone(),
@@ -1853,7 +1858,7 @@ async fn handle_client_connection(
         ClientOp::Nudge { cmd } => {
             if let Some(c) = cmd {
                 match c {
-                    SyncCommand::Shutdown => {}
+                    SyncCommand::Shutdown | SyncCommand::UpdateTargets(_) => {}
                     SyncCommand::RefreshSite { ref site_id } if site_id.trim().is_empty() => {
                         write_json_line(
                             &mut write_half,
@@ -1912,7 +1917,7 @@ async fn handle_client_connection(
                             Ok(Some(raw)) => {
                                 match serde_json::from_str::<ClientStreamCmd>(&raw) {
                                     Ok(ClientStreamCmd::Command(cmd)) => match cmd {
-                                        SyncCommand::Shutdown => {}
+                                        SyncCommand::Shutdown | SyncCommand::UpdateTargets(_) => {}
                                         SyncCommand::RefreshSite { ref site_id }
                                             if site_id.trim().is_empty() => {}
                                         other => {

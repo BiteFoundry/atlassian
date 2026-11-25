@@ -15,7 +15,7 @@ use crate::{
         app::{AppState, UiState},
         doc_view::truncate_width,
         draw_horizontal_hairline, draw_vertical_hairline,
-        hitmap::HitTarget,
+        hitmap::{ButtonId, HitTarget},
         theme::Theme,
     },
 };
@@ -134,6 +134,7 @@ fn draw_my_issues(
 ) {
     let theme = &ui.theme;
     let active = ui.my_work_ui.active_column == 0;
+    ui.hitmap.add(area, HitTarget::MyWorkIssuesPane);
     if area.width < 6 || area.height < 3 {
         return;
     }
@@ -142,7 +143,16 @@ fn draw_my_issues(
     let mark = if active { "▸" } else { " " };
     let title_text = format!("{mark} Assigned Open Issues ({})", app.my_issues.len());
     let scope_badge = format_scope_badge(scope.active_site_label, theme);
-    let hdr_line = if (area.width as usize) > title_text.width() + scope_badge.width() + 2 {
+    let title_w = title_text.width();
+    let badge_w = scope_badge.width();
+    let hdr_line = if (area.width as usize) > title_w + badge_w + 2 {
+        let badge_x = hdr_rect.x.saturating_add((title_w + 2) as u16);
+        ui.hitmap.add_line(
+            badge_x,
+            hdr_rect.y,
+            badge_w as u16,
+            HitTarget::Button(ButtonId::SiteSwitcher),
+        );
         Line::from(vec![
             Span::styled(title_text, theme.title(active)),
             Span::raw("  "),
@@ -300,6 +310,7 @@ fn draw_recent_pages(
 ) {
     let theme = &ui.theme;
     let active = ui.my_work_ui.active_column == 1;
+    ui.hitmap.add(area, HitTarget::MyWorkPagesPane);
     if area.width < 6 || area.height < 3 {
         return;
     }
@@ -308,7 +319,16 @@ fn draw_recent_pages(
     let mark = if active { "▸" } else { " " };
     let title_text = format!("{mark} Recent Confluence Pages ({})", app.my_pages.len());
     let scope_badge = format_scope_badge(scope.active_site_label, theme);
-    let hdr_line = if (area.width as usize) > title_text.width() + scope_badge.width() + 2 {
+    let title_w = title_text.width();
+    let badge_w = scope_badge.width();
+    let hdr_line = if (area.width as usize) > title_w + badge_w + 2 {
+        let badge_x = hdr_rect.x.saturating_add((title_w + 2) as u16);
+        ui.hitmap.add_line(
+            badge_x,
+            hdr_rect.y,
+            badge_w as u16,
+            HitTarget::Button(ButtonId::SiteSwitcher),
+        );
         Line::from(vec![
             Span::styled(title_text, theme.title(active)),
             Span::raw("  "),

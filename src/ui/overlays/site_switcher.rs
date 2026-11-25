@@ -18,10 +18,11 @@ use crate::{
     ui::{
         app::{AppState, UiState},
         doc_view::truncate_width,
-        hitmap::{HitMap, HitTarget},
+        hitmap::{ButtonId, HitMap, HitTarget},
         keymap::Action,
         overlays::{
-            centered_rect, modal_block, read_clipboard_text, sanitize_single_line, OverlayOutcome,
+            centered_rect, modal_block, modal_pill_secondary, read_clipboard_text,
+            register_modal_chrome, render_button_bar, sanitize_single_line, OverlayOutcome,
         },
         text_edit::TextBuffer,
         theme::Theme,
@@ -255,6 +256,16 @@ impl SiteSwitcherOverlay {
         }
     }
 
+    /// Selects a visible row by index and toggles its enabled flag without closing.
+    pub fn toggle_item(&mut self, idx: usize) -> OverlayOutcome {
+        let len = self.visible_rows().len();
+        if idx < len {
+            self.selected = idx;
+            return self.toggle_selected_enabled();
+        }
+        OverlayOutcome::Handled
+    }
+
     fn toggle_selected_enabled(&mut self) -> OverlayOutcome {
         let rows = self.visible_rows();
         if let Some(SiteSwitcherRow::Site(idx)) = rows.get(self.selected) {
@@ -305,7 +316,7 @@ impl SiteSwitcherOverlay {
                 self.pending_command = Some(SiteSwitcherCommand::SyncAllSites);
                 OverlayOutcome::Close
             }
-            Action::DownloadAttachment => {
+            Action::DiscoverCloudSites | Action::DownloadAttachment => {
                 self.pending_command = Some(SiteSwitcherCommand::DiscoverCloudSites);
                 OverlayOutcome::Close
             }
@@ -382,6 +393,7 @@ impl SiteSwitcherOverlay {
         let block = modal_block(" Switch Site (Ctrl+S) ", theme, true);
         let inner = block.inner(rect);
         frame.render_widget(block, rect);
+        register_modal_chrome(rect, frame, theme, hitmap, true);
         if inner.width == 0 || inner.height < 4 {
             return;
         }
@@ -461,25 +473,36 @@ impl SiteSwitcherOverlay {
                     }
                 };
                 lines.push(line);
+                let row_y = chunks[1].y + vis_idx as u16;
                 hitmap.add_line(
                     chunks[1].x,
-                    chunks[1].y + vis_idx as u16,
+                    row_y,
                     chunks[1].width,
                     HitTarget::OverlayItem(abs_idx),
                 );
+                if matches!(row, SiteSwitcherRow::Site(_)) {
+                    let toggle_w = 6u16.min(chunks[1].width);
+                    hitmap.add_line(
+                        chunks[1].x,
+                        row_y,
+                        toggle_w,
+                        HitTarget::OverlayItemToggle(abs_idx),
+                    );
+                }
             }
         }
         frame.render_widget(Paragraph::new(lines), chunks[1]);
 
-        frame.render_widget(
-            Paragraph::new(Span::styled(
-                truncate_width(
-                    " Enter select · Space toggle enabled · d discover Cloud sites · r sync all · Esc close",
-                    chunks[2].width as usize,
-                ),
-                Style::default().fg(theme.muted).add_modifier(Modifier::DIM),
-            )),
+        render_button_bar(
+            frame,
             chunks[2],
+            &[
+                ("[d] Discover", ButtonId::OverlayDiscoverSites, modal_pill_secondary(theme)),
+                ("[r] Sync All", ButtonId::SyncAll, modal_pill_secondary(theme)),
+            ],
+            Some("· Enter select · Space toggle enabled · Esc close"),
+            theme,
+            hitmap,
         );
     }
 }
@@ -950,7 +973,13 @@ mod tests {
             text.contains("Enter select") && text.contains("Space toggle enabled"),
             "missing footer actions:\n{text}"
         );
-        assert_eq!(hitmap.len(), 4);
+        assert!(hitmap.region_of(HitTarget::OverlayBody).is_some());
+        assert!(hitmap.region_of(HitTarget::OverlayClose).is_some());
+        assert!(hitmap.region_of(HitTarget::OverlayItem(0)).is_some());
+        assert!(hitmap.region_of(HitTarget::OverlayItem(3)).is_some());
+        assert!(hitmap.region_of(HitTarget::OverlayItemToggle(1)).is_some());
+        assert!(hitmap.region_of(HitTarget::Button(ButtonId::OverlayDiscoverSites)).is_some());
+        assert!(hitmap.region_of(HitTarget::Button(ButtonId::SyncAll)).is_some());
 
         // Narrow viewport + NoColor preset should render cleanly without panic
         ui.theme = Theme::detect(ThemePreset::NoColor);

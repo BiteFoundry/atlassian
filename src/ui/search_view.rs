@@ -16,7 +16,7 @@ use crate::{
         app::{AppState, PaneFocus, UiState},
         doc_view::truncate_width,
         draw_horizontal_hairline, fill_surface,
-        hitmap::HitTarget,
+        hitmap::{ButtonId, HitTarget},
         my_work_view::format_site_pill,
         theme::Theme,
     },
@@ -92,20 +92,59 @@ pub fn draw_with_scope(
     fill_surface(frame, input_rect, bar_surface);
     ui.hitmap.add(rows[0], HitTarget::SearchBar);
 
+    let prefix = format!(" Search [{mode_lbl}]> ");
+    let query_text = ui.search_ui.query.text.clone();
     let mut bar_spans = vec![
-        Span::styled(
-            format!(" Search [{mode_lbl}]> "),
-            theme.accent_style().patch(bar_surface),
-        ),
-        Span::styled(ui.search_ui.query.text.clone(), bar_surface),
+        Span::styled(prefix.clone(), theme.accent_style().patch(bar_surface)),
+        Span::styled(query_text.clone(), bar_surface),
     ];
+    let mut cx = input_rect
+        .x
+        .saturating_add(prefix.width() as u16)
+        .saturating_add(query_text.width() as u16);
+    let muted = theme.muted_style().patch(bar_surface);
     if bar_focused {
-        bar_spans.push(Span::styled("▏", theme.accent_style().patch(bar_surface)));
+        let cursor = "▏";
+        bar_spans.push(Span::styled(cursor, theme.accent_style().patch(bar_surface)));
+        cx = cx.saturating_add(cursor.width() as u16);
+        let tail_segments: &[(&str, Option<ButtonId>)] = &[
+            ("   ", None),
+            ("[Ctrl+R] Remote", Some(ButtonId::RemoteSearch)),
+            (" · ", None),
+            ("[Ctrl+S] Site", Some(ButtonId::SiteSwitcher)),
+        ];
+        for &(seg, btn) in tail_segments {
+            let seg_w = seg.width() as u16;
+            if let Some(btn_id) = btn {
+                if cx < input_rect.right() {
+                    let clipped_w = seg_w.min(input_rect.right().saturating_sub(cx));
+                    ui.hitmap
+                        .add_line(cx, input_rect.y, clipped_w, HitTarget::Button(btn_id));
+                }
+            }
+            bar_spans.push(Span::styled(seg, muted));
+            cx = cx.saturating_add(seg_w);
+        }
     } else {
-        bar_spans.push(Span::styled(
-            "   [/] Focus · [Ctrl+R] Remote · [Ctrl+S] Site · [Enter] Open",
-            theme.muted_style().patch(bar_surface),
-        ));
+        let tail_segments: &[(&str, Option<ButtonId>)] = &[
+            ("   [/] Focus · ", None),
+            ("[Ctrl+R] Remote", Some(ButtonId::RemoteSearch)),
+            (" · ", None),
+            ("[Ctrl+S] Site", Some(ButtonId::SiteSwitcher)),
+            (" · [Enter] Open", None),
+        ];
+        for &(seg, btn) in tail_segments {
+            let seg_w = seg.width() as u16;
+            if let Some(btn_id) = btn {
+                if cx < input_rect.right() {
+                    let clipped_w = seg_w.min(input_rect.right().saturating_sub(cx));
+                    ui.hitmap
+                        .add_line(cx, input_rect.y, clipped_w, HitTarget::Button(btn_id));
+                }
+            }
+            bar_spans.push(Span::styled(seg, muted));
+            cx = cx.saturating_add(seg_w);
+        }
     }
     frame.render_widget(
         Paragraph::new(Line::from(bar_spans)).style(bar_surface),
@@ -123,13 +162,25 @@ pub fn draw_with_scope(
         },
     );
 
+    // Register Results container BEFORE scope pill & SearchHit rows so clicking below unfocuses SearchBar.
+    ui.hitmap.add(rows[1], HitTarget::SearchResultsPane);
+
     // Results header + active scope indicator
     let list_focused = ui.focus == PaneFocus::Main;
     let hdr_rect = Rect::new(rows[1].x, rows[1].y, rows[1].width, 1);
     let mark = if list_focused { "▸" } else { " " };
     let results_title = format!("{mark} Results ({})", app.search_hits.len());
     let scope_span = format_search_scope(scope.active_site_label, theme);
-    let hdr_line = if (hdr_rect.width as usize) > results_title.width() + scope_span.width() + 2 {
+    let title_w = results_title.width();
+    let scope_w = scope_span.width();
+    let hdr_line = if (hdr_rect.width as usize) > title_w + scope_w + 2 {
+        let badge_x = hdr_rect.x.saturating_add((title_w + 2) as u16);
+        ui.hitmap.add_line(
+            badge_x,
+            hdr_rect.y,
+            scope_w as u16,
+            HitTarget::Button(ButtonId::SiteSwitcher),
+        );
         Line::from(vec![
             Span::styled(results_title, theme.title(list_focused)),
             Span::raw("  "),

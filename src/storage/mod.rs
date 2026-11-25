@@ -5,6 +5,7 @@ pub mod db;
 pub mod jira;
 
 use std::{
+    collections::HashMap,
     path::{Path, PathBuf},
     sync::{Arc, Mutex},
 };
@@ -205,6 +206,25 @@ impl Storage {
             )
             .optional()?;
         Ok(user_json.and_then(|raw| serde_json::from_str(&raw).ok()))
+    }
+
+    /// All cached per-site signed-in identities, keyed by `site_id`.
+    pub fn list_identities(&self) -> Result<HashMap<String, UserSummary>> {
+        let conn = self.lock_conn()?;
+        let mut stmt = conn.prepare("SELECT site_id, user_json FROM site_identities")?;
+        let mut out = HashMap::new();
+        let rows = stmt.query_map([], |row| {
+            let sid: String = row.get(0)?;
+            let raw: String = row.get(1)?;
+            Ok((sid, raw))
+        })?;
+        for row in rows {
+            let (sid, raw) = row?;
+            if let Ok(user) = serde_json::from_str::<UserSummary>(&raw) {
+                out.insert(sid, user);
+            }
+        }
+        Ok(out)
     }
 
     pub fn cache_counts(&self) -> Result<CacheCounts> {

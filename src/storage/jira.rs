@@ -1,6 +1,6 @@
 //! Jira projects, boards, sprints, issues, details, filters, and `issues_fts` persistence (multi-site aware).
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 use anyhow::{Context, Result};
 use rusqlite::{params, Connection, OptionalExtension, Row, ToSql};
@@ -731,7 +731,17 @@ impl Storage {
                     "UPDATE issues SET detail_json = ?1, comment_count = ?2 WHERE site_id = ?3 AND key = ?4",
                     params![updated_json, comment_count as i64, site_id, key],
                 )?;
+            } else {
+                tx.execute(
+                    "UPDATE issues SET comment_count = ?1 WHERE site_id = ?2 AND key = ?3",
+                    params![comment_count as i64, site_id, key],
+                )?;
             }
+        } else {
+            tx.execute(
+                "UPDATE issues SET comment_count = ?1 WHERE site_id = ?2 AND key = ?3",
+                params![comment_count as i64, site_id, key],
+            )?;
         }
         tx.commit()?;
         Ok(())
@@ -763,10 +773,217 @@ impl Storage {
                     "UPDATE issues SET detail_json = ?1, attachment_count = ?2 WHERE site_id = ?3 AND key = ?4",
                     params![updated_json, attachments.len() as i64, site_id, key],
                 )?;
+            } else {
+                tx.execute(
+                    "UPDATE issues SET attachment_count = ?1 WHERE site_id = ?2 AND key = ?3",
+                    params![attachments.len() as i64, site_id, key],
+                )?;
             }
+        } else {
+            tx.execute(
+                "UPDATE issues SET attachment_count = ?1 WHERE site_id = ?2 AND key = ?3",
+                params![attachments.len() as i64, site_id, key],
+            )?;
         }
         tx.commit()?;
         Ok(())
+    }
+
+    /// Immediately persists an issue status change (e.g. after a successful transition) to both
+    /// `status_json` and cached `detail_json` so offline/reloaded views never regress.
+    pub fn update_issue_status_for_site(
+        &self,
+        site_id: &str,
+        key: &str,
+        status: &IssueStatus,
+    ) -> Result<()> {
+        let status_json = serde_json::to_string(status)?;
+        let mut conn = self.lock_conn()?;
+        let tx = conn.transaction()?;
+        if let Some(raw) = tx
+            .query_row(
+                "SELECT detail_json FROM issues WHERE site_id = ?1 AND key = ?2",
+                params![site_id, key],
+                |row| row.get::<_, Option<String>>(0),
+            )
+            .optional()?
+            .flatten()
+        {
+            if let Ok(mut detail) = serde_json::from_str::<IssueDetail>(&raw) {
+                detail.summary.status = status.clone();
+                let updated_json = serde_json::to_string(&detail)?;
+                tx.execute(
+                    "UPDATE issues SET status_json = ?1, detail_json = ?2 WHERE site_id = ?3 AND key = ?4",
+                    params![status_json, updated_json, site_id, key],
+                )?;
+            } else {
+                tx.execute(
+                    "UPDATE issues SET status_json = ?1 WHERE site_id = ?2 AND key = ?3",
+                    params![status_json, site_id, key],
+                )?;
+            }
+        } else {
+            tx.execute(
+                "UPDATE issues SET status_json = ?1 WHERE site_id = ?2 AND key = ?3",
+                params![status_json, site_id, key],
+            )?;
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Immediately persists an issue assignee change to both `assignee_json` and cached `detail_json`.
+    pub fn update_issue_assignee_for_site(
+        &self,
+        site_id: &str,
+        key: &str,
+        assignee: Option<&UserSummary>,
+    ) -> Result<()> {
+        let assignee_json = assignee.map(serde_json::to_string).transpose()?;
+        let mut conn = self.lock_conn()?;
+        let tx = conn.transaction()?;
+        if let Some(raw) = tx
+            .query_row(
+                "SELECT detail_json FROM issues WHERE site_id = ?1 AND key = ?2",
+                params![site_id, key],
+                |row| row.get::<_, Option<String>>(0),
+            )
+            .optional()?
+            .flatten()
+        {
+            if let Ok(mut detail) = serde_json::from_str::<IssueDetail>(&raw) {
+                detail.summary.assignee = assignee.cloned();
+                let updated_json = serde_json::to_string(&detail)?;
+                tx.execute(
+                    "UPDATE issues SET assignee_json = ?1, detail_json = ?2 WHERE site_id = ?3 AND key = ?4",
+                    params![assignee_json, updated_json, site_id, key],
+                )?;
+            } else {
+                tx.execute(
+                    "UPDATE issues SET assignee_json = ?1 WHERE site_id = ?2 AND key = ?3",
+                    params![assignee_json, site_id, key],
+                )?;
+            }
+        } else {
+            tx.execute(
+                "UPDATE issues SET assignee_json = ?1 WHERE site_id = ?2 AND key = ?3",
+                params![assignee_json, site_id, key],
+            )?;
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Appends a newly created Jira comment into cached `detail_json` (if present) and bumps
+    /// `comment_count`, returning the resulting `comment_count`.
+    pub fn append_issue_comment_for_site(
+        &self,
+        site_id: &str,
+        key: &str,
+        comment: &IssueComment,
+    ) -> Result<usize> {
+        let mut conn = self.lock_conn()?;
+        let tx = conn.transaction()?;
+        let row_opt: Option<(i64, Option<String>)> = tx
+            .query_row(
+                "SELECT comment_count, detail_json FROM issues WHERE site_id = ?1 AND key = ?2",
+                params![site_id, key],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()?;
+        let mut new_count = 1usize;
+        if let Some((prev_count, raw_opt)) = row_opt {
+            let prev = prev_count.max(0) as usize;
+            if let Some(raw) = raw_opt.as_deref().filter(|s| !s.trim().is_empty()) {
+                if let Ok(mut detail) = serde_json::from_str::<IssueDetail>(raw) {
+                    let already_exists =
+                        !comment.id.is_empty() && detail.comments.iter().any(|c| c.id == comment.id);
+                    if !already_exists {
+                        detail.comments.push(comment.clone());
+                        new_count = prev.saturating_add(1).max(detail.comments.len());
+                    } else {
+                        new_count = prev.max(detail.comments.len());
+                    }
+                    detail.summary.comment_count = new_count;
+                    let updated_json = serde_json::to_string(&detail)?;
+                    tx.execute(
+                        "UPDATE issues SET detail_json = ?1, comment_count = ?2 WHERE site_id = ?3 AND key = ?4",
+                        params![updated_json, new_count as i64, site_id, key],
+                    )?;
+                } else {
+                    new_count = prev.saturating_add(1);
+                    tx.execute(
+                        "UPDATE issues SET comment_count = ?1 WHERE site_id = ?2 AND key = ?3",
+                        params![new_count as i64, site_id, key],
+                    )?;
+                }
+            } else {
+                new_count = prev.saturating_add(1);
+                tx.execute(
+                    "UPDATE issues SET comment_count = ?1 WHERE site_id = ?2 AND key = ?3",
+                    params![new_count as i64, site_id, key],
+                )?;
+            }
+        }
+        tx.commit()?;
+        Ok(new_count)
+    }
+
+    /// Appends newly uploaded Jira attachments into cached `detail_json` (if present) and bumps
+    /// `attachment_count`, returning the resulting `attachment_count`.
+    pub fn append_issue_attachments_for_site(
+        &self,
+        site_id: &str,
+        key: &str,
+        new_atts: &[AttachmentItem],
+    ) -> Result<usize> {
+        let mut conn = self.lock_conn()?;
+        let tx = conn.transaction()?;
+        let row_opt: Option<(i64, Option<String>)> = tx
+            .query_row(
+                "SELECT attachment_count, detail_json FROM issues WHERE site_id = ?1 AND key = ?2",
+                params![site_id, key],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()?;
+        let mut new_count = new_atts.len();
+        if let Some((prev_count, raw_opt)) = row_opt {
+            let prev = prev_count.max(0) as usize;
+            if let Some(raw) = raw_opt.as_deref().filter(|s| !s.trim().is_empty()) {
+                if let Ok(mut detail) = serde_json::from_str::<IssueDetail>(raw) {
+                    let mut added = 0usize;
+                    for att in new_atts {
+                        let exists = !att.id.is_empty()
+                            && detail.attachments.iter().any(|existing| existing.id == att.id);
+                        if !exists {
+                            detail.attachments.push(att.clone());
+                            added += 1;
+                        }
+                    }
+                    new_count = prev.saturating_add(added).max(detail.attachments.len());
+                    detail.summary.attachment_count = new_count;
+                    let updated_json = serde_json::to_string(&detail)?;
+                    tx.execute(
+                        "UPDATE issues SET detail_json = ?1, attachment_count = ?2 WHERE site_id = ?3 AND key = ?4",
+                        params![updated_json, new_count as i64, site_id, key],
+                    )?;
+                } else {
+                    new_count = prev.saturating_add(new_atts.len());
+                    tx.execute(
+                        "UPDATE issues SET attachment_count = ?1 WHERE site_id = ?2 AND key = ?3",
+                        params![new_count as i64, site_id, key],
+                    )?;
+                }
+            } else {
+                new_count = prev.saturating_add(new_atts.len());
+                tx.execute(
+                    "UPDATE issues SET attachment_count = ?1 WHERE site_id = ?2 AND key = ?3",
+                    params![new_count as i64, site_id, key],
+                )?;
+            }
+        }
+        tx.commit()?;
+        Ok(new_count)
     }
 
     /// Detaches cached issues of `(site_id, board_id, sprint_id)` that are absent from a complete
@@ -1037,6 +1254,68 @@ impl Storage {
     /// ordered most-recently-updated first.
     pub fn list_my_work_all_sites(&self, limit: usize) -> Result<Vec<(String, IssueSummary)>> {
         self.query_my_work(None, None, limit)
+    }
+
+    /// Federated "My Work" feed across all enabled sites with per-site assignee filtering:
+    /// whenever `me_ids` contains an account ID for a site (case-insensitive site key),
+    /// only open issues assigned to that account are returned for that site.
+    pub fn list_my_work_all_sites_for_users(
+        &self,
+        me_ids: &HashMap<String, String>,
+        limit: usize,
+    ) -> Result<Vec<(String, IssueSummary)>> {
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
+        let normalized: HashMap<String, &str> = me_ids
+            .iter()
+            .filter_map(|(sid, uid)| {
+                let s = sid.trim().to_ascii_lowercase();
+                let u = uid.trim();
+                (!s.is_empty() && !u.is_empty()).then_some((s, u))
+            })
+            .collect();
+        if normalized.is_empty() {
+            return self.query_my_work(None, None, limit);
+        }
+        let conn = self.lock_conn()?;
+        let mut stmt = conn.prepare(
+            "
+            SELECT
+                i.site_id,
+                i.id, i.key, i.project_key, i.summary, i.status_json, i.priority_json,
+                i.issue_type_json, i.assignee_json, i.reporter_json, i.parent_key,
+                i.parent_summary, i.labels_json, i.story_points, i.sprint_id,
+                i.sprint_name, i.comment_count, i.attachment_count, i.created_at,
+                i.updated_at, i.web_url
+            FROM issues i
+            WHERE COALESCE(json_extract(i.status_json, '$.category'), '') != 'done'
+              AND NOT EXISTS (
+                  SELECT 1 FROM sites s WHERE s.site_id = i.site_id AND s.enabled = 0
+              )
+            ORDER BY i.updated_at DESC, i.site_id ASC, i.key ASC
+            ",
+        )?;
+        let mut rows = stmt.query([])?;
+        let mut out = Vec::new();
+        while let Some(row) = rows.next()? {
+            let site_id: String = row.get(0)?;
+            let issue = map_issue_summary_row(row, 1)?;
+            let allowed = match normalized.get(&site_id.trim().to_ascii_lowercase()) {
+                Some(&me_id) => issue
+                    .assignee
+                    .as_ref()
+                    .is_some_and(|u| u.id.eq_ignore_ascii_case(me_id)),
+                None => true,
+            };
+            if allowed {
+                out.push((site_id, issue));
+                if out.len() == limit {
+                    break;
+                }
+            }
+        }
+        Ok(out)
     }
 
     /// Open (non-Done) issues of one site for the My Work seed. With `me_id`

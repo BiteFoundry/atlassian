@@ -10,9 +10,12 @@ use ratatui::{
 
 use crate::ui::{
     app::{AppState, UiState},
-    hitmap::HitMap,
+    hitmap::{ButtonId, HitMap},
     keymap::Action,
-    overlays::{centered_rect, modal_block, OverlayOutcome},
+    overlays::{
+        centered_rect, modal_block, modal_pill_muted, modal_pill_primary, register_modal_chrome,
+        render_button_bar, OverlayOutcome,
+    },
 };
 
 #[derive(Debug, Clone)]
@@ -31,12 +34,14 @@ impl ConfirmDialog {
 
     pub fn handle(&mut self, action: &Action) -> OverlayOutcome {
         match action {
-            Action::ConfirmYes | Action::Activate | Action::Input('y') | Action::Input('Y') => {
-                match self.on_confirm.clone() {
-                    Some(act) => OverlayOutcome::CloseAndDispatch(act),
-                    None => OverlayOutcome::Close,
-                }
-            }
+            Action::Submit
+            | Action::ConfirmYes
+            | Action::Activate
+            | Action::Input('y')
+            | Action::Input('Y') => match self.on_confirm.clone() {
+                Some(act) => OverlayOutcome::CloseAndDispatch(act),
+                None => OverlayOutcome::Close,
+            },
             Action::ConfirmNo
             | Action::CloseOverlay
             | Action::Input('n')
@@ -52,7 +57,7 @@ impl ConfirmDialog {
         area: Rect,
         _app: &AppState,
         ui: &UiState,
-        _hitmap: &mut HitMap,
+        hitmap: &mut HitMap,
     ) {
         let theme = &ui.theme;
         let rect = centered_rect(area, 56.min(area.width.saturating_sub(4)).max(26), 8);
@@ -61,6 +66,7 @@ impl ConfirmDialog {
         let block = modal_block(" Confirm ", theme, true);
         let inner = block.inner(rect);
         frame.render_widget(block, rect);
+        register_modal_chrome(rect, frame, theme, hitmap, true);
         if inner.width == 0 || inner.height == 0 {
             return;
         }
@@ -81,14 +87,17 @@ impl ConfirmDialog {
         );
 
         let btn_y = inner.y + inner.height.saturating_sub(1);
-        let buttons = Line::from(vec![
-            Span::styled(" [Enter] Confirm ", theme.selection()),
-            Span::raw("   "),
-            Span::styled(" [Esc] Cancel ", theme.muted_style()),
-        ]);
-        frame.render_widget(
-            Paragraph::new(buttons),
-            Rect::new(inner.x, btn_y, inner.width, 1),
+        let btn_area = Rect::new(inner.x, btn_y, inner.width, 1);
+        render_button_bar(
+            frame,
+            btn_area,
+            &[
+                ("[Enter] Confirm", ButtonId::OverlaySubmit, modal_pill_primary(theme)),
+                ("[Esc] Cancel", ButtonId::OverlayCancel, modal_pill_muted(theme)),
+            ],
+            None,
+            theme,
+            hitmap,
         );
     }
 }

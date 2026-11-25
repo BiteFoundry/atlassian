@@ -4,7 +4,10 @@ use ratatui::{
     layout::{Constraint, Direction, Layout, Rect},
     style::{Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, BorderType, Borders, Clear, Paragraph},
+    widgets::{
+        Block, BorderType, Borders, Clear, Paragraph, Scrollbar, ScrollbarOrientation,
+        ScrollbarState,
+    },
     Frame,
 };
 use serde::{Deserialize, Serialize};
@@ -13,11 +16,13 @@ use crate::{
     models::{IssueDetail, IssueUpdate},
     ui::{
         app::{AppState, ExternalEditorTarget, UiState},
-        doc_view::{truncate_width, wrap_plain_text},
-        hitmap::HitMap,
+        doc_view::truncate_width,
+        hitmap::{ButtonId, HitMap, HitTarget},
         keymap::Action,
         overlays::{
-            centered_rect, modal_block, read_clipboard_text, sanitize_single_line, OverlayOutcome,
+            centered_rect, modal_block, modal_pill_muted, modal_pill_primary,
+            modal_pill_secondary, read_clipboard_text, register_modal_chrome, render_button_bar,
+            sanitize_single_line, wrap_text_with_cursor_line, OverlayOutcome,
         },
         text_edit::TextBuffer,
     },
@@ -86,6 +91,9 @@ pub struct IssueFormOverlay {
     pub priority: TextBuffer,
     pub labels: TextBuffer,
     pub description: TextBuffer,
+    pub body_scroll: u16,
+    body_max_scroll: Option<u16>,
+    follow_cursor: bool,
     pub initial_summary: String,
     pub initial_priority: String,
     pub initial_labels: Vec<String>,
@@ -105,6 +113,9 @@ impl IssueFormOverlay {
             priority: TextBuffer::from_text("Medium"),
             labels: TextBuffer::new(),
             description: TextBuffer::new(),
+            body_scroll: 0,
+            body_max_scroll: None,
+            follow_cursor: true,
             initial_summary: String::new(),
             initial_priority: String::new(),
             initial_labels: Vec::new(),
@@ -135,12 +146,47 @@ impl IssueFormOverlay {
             priority: TextBuffer::from_text(initial_priority.clone()),
             labels: TextBuffer::from_text(initial_labels.join(", ")),
             description: TextBuffer::from_text(detail.description_markdown.clone()),
+            body_scroll: 0,
+            body_max_scroll: None,
+            follow_cursor: true,
             initial_summary: detail.summary.summary.clone(),
             initial_priority,
             initial_labels,
             initial_description: detail.description_markdown.clone(),
             field: IssueFormField::Summary,
             error: None,
+        }
+    }
+
+    /// Focuses field `0..=5` on click; clicking `Type` (1) while creating also cycles issue type.
+    pub fn click_field(&mut self, field_idx: usize) {
+        let is_edit = self.edit_key.is_some();
+        match field_idx {
+            0 if !is_edit => self.field = IssueFormField::Project,
+            1 if !is_edit => {
+                self.field = IssueFormField::IssueType;
+                self.cycle_issue_type();
+            }
+            2 => self.field = IssueFormField::Summary,
+            3 => self.field = IssueFormField::Priority,
+            4 => self.field = IssueFormField::Labels,
+            5 => {
+                self.field = IssueFormField::Description;
+                self.follow_cursor = true;
+            }
+            _ => {}
+        }
+    }
+
+    fn scroll_body(&mut self, delta: i32) {
+        self.follow_cursor = false;
+        let cap = self
+            .body_max_scroll
+            .unwrap_or_else(|| self.description.text.lines().count().saturating_sub(1) as u16);
+        if delta < 0 {
+            self.body_scroll = self.body_scroll.saturating_sub(delta.unsigned_abs() as u16);
+        } else if delta > 0 {
+            self.body_scroll = self.body_scroll.saturating_add(delta as u16).min(cap);
         }
     }
 
@@ -236,6 +282,7 @@ impl IssueFormOverlay {
     fn paste_text(&mut self, text: &str) {
         if self.field == IssueFormField::Description {
             self.description.insert_str(text);
+            self.follow_cursor = true;
         } else {
             let cleaned = sanitize_single_line(text);
             self.active_buffer_mut().insert_str(&cleaned);
@@ -288,9 +335,22 @@ impl IssueFormOverlay {
                 OverlayOutcome::Handled
             }
             Action::ExternalEditor => OverlayOutcome::Dispatch(Action::ExternalEditor),
+            Action::ScrollUp => {
+                self.scroll_body(-3);
+                OverlayOutcome::Handled
+            }
+            Action::ScrollDown => {
+                self.scroll_body(3);
+                OverlayOutcome::Handled
+            }
+            Action::MouseScroll { delta, .. } => {
+                self.scroll_body(*delta);
+                OverlayOutcome::Handled
+            }
             Action::InsertNewline => {
                 if self.field == IssueFormField::Description {
                     self.description.insert_char('\n');
+                    self.follow_cursor = true;
                 }
                 OverlayOutcome::Handled
             }
@@ -308,23 +368,39 @@ impl IssueFormOverlay {
                 OverlayOutcome::Dispatch(Action::Submit)
             }
             Action::Input(ch) => {
+                let is_desc = self.field == IssueFormField::Description;
                 self.active_buffer_mut().insert_char(*ch);
+                if is_desc {
+                    self.follow_cursor = true;
+                }
                 self.error = None;
                 OverlayOutcome::Handled
             }
             Action::Backspace => {
+                let is_desc = self.field == IssueFormField::Description;
                 self.active_buffer_mut().backspace();
+                if is_desc {
+                    self.follow_cursor = true;
+                }
                 OverlayOutcome::Handled
             }
             Action::Delete => {
+                let is_desc = self.field == IssueFormField::Description;
                 self.active_buffer_mut().delete();
+                if is_desc {
+                    self.follow_cursor = true;
+                }
                 OverlayOutcome::Handled
             }
             Action::CursorLeft => {
                 if self.field == IssueFormField::IssueType && !is_edit {
                     self.cycle_issue_type();
                 } else {
+                    let is_desc = self.field == IssueFormField::Description;
                     self.active_buffer_mut().move_left();
+                    if is_desc {
+                        self.follow_cursor = true;
+                    }
                 }
                 OverlayOutcome::Handled
             }
@@ -332,21 +408,34 @@ impl IssueFormOverlay {
                 if self.field == IssueFormField::IssueType && !is_edit {
                     self.cycle_issue_type();
                 } else {
+                    let is_desc = self.field == IssueFormField::Description;
                     self.active_buffer_mut().move_right();
+                    if is_desc {
+                        self.follow_cursor = true;
+                    }
                 }
                 OverlayOutcome::Handled
             }
             Action::CursorHome => {
+                let is_desc = self.field == IssueFormField::Description;
                 self.active_buffer_mut().move_home();
+                if is_desc {
+                    self.follow_cursor = true;
+                }
                 OverlayOutcome::Handled
             }
             Action::CursorEnd => {
+                let is_desc = self.field == IssueFormField::Description;
                 self.active_buffer_mut().move_end();
+                if is_desc {
+                    self.follow_cursor = true;
+                }
                 OverlayOutcome::Handled
             }
             Action::CursorUp => {
                 if self.field == IssueFormField::Description {
                     self.description.move_up();
+                    self.follow_cursor = true;
                 } else {
                     self.field = self.field.prev(is_edit);
                 }
@@ -355,6 +444,7 @@ impl IssueFormOverlay {
             Action::CursorDown => {
                 if self.field == IssueFormField::Description {
                     self.description.move_down();
+                    self.follow_cursor = true;
                 } else {
                     self.field = self.field.next(is_edit);
                 }
@@ -376,12 +466,12 @@ impl IssueFormOverlay {
     }
 
     pub fn draw(
-        &self,
+        &mut self,
         frame: &mut Frame,
         area: Rect,
         _app: &AppState,
         ui: &UiState,
-        _hitmap: &mut HitMap,
+        hitmap: &mut HitMap,
     ) {
         let theme = &ui.theme;
         let rect = centered_rect(
@@ -398,17 +488,28 @@ impl IssueFormOverlay {
         let block = modal_block(title, theme, true);
         let inner = block.inner(rect);
         frame.render_widget(block, rect);
+        register_modal_chrome(rect, frame, theme, hitmap, true);
         if inner.width == 0 || inner.height < 8 {
             return;
         }
 
+        let has_err = self.error.is_some() && inner.height >= 10;
         let chunks = Layout::default()
             .direction(Direction::Vertical)
-            .constraints([
-                Constraint::Length(5),
-                Constraint::Min(3),
-                Constraint::Length(1),
-            ])
+            .constraints(if has_err {
+                vec![
+                    Constraint::Length(5),
+                    Constraint::Min(3),
+                    Constraint::Length(1),
+                    Constraint::Length(1),
+                ]
+            } else {
+                vec![
+                    Constraint::Length(5),
+                    Constraint::Min(3),
+                    Constraint::Length(1),
+                ]
+            })
             .split(inner);
 
         let field_line = |f: IssueFormField, label: &str, val: &str, locked: bool| -> Line<'static> {
@@ -436,19 +537,27 @@ impl IssueFormOverlay {
         };
 
         let is_edit = self.edit_key.is_some();
+        let type_display = if is_edit {
+            self.issue_type.text.clone()
+        } else {
+            format!("◀ {} ▶", self.issue_type.text)
+        };
         let top_lines = vec![
             field_line(IssueFormField::Project, "Project", &self.project.text, is_edit),
-            field_line(
-                IssueFormField::IssueType,
-                "Type (←/→)",
-                &self.issue_type.text,
-                is_edit,
-            ),
+            field_line(IssueFormField::IssueType, "Type (←/→)", &type_display, is_edit),
             field_line(IssueFormField::Summary, "Summary", &self.summary.text, false),
             field_line(IssueFormField::Priority, "Priority", &self.priority.text, false),
             field_line(IssueFormField::Labels, "Labels (,)", &self.labels.text, false),
         ];
         frame.render_widget(Paragraph::new(top_lines), chunks[0]);
+        for idx in 0..5usize {
+            hitmap.add_line(
+                chunks[0].x,
+                chunks[0].y + idx as u16,
+                chunks[0].width,
+                HitTarget::OverlayField(idx),
+            );
+        }
 
         let desc_active = self.field == IssueFormField::Description;
         let desc_block = Block::default()
@@ -461,30 +570,99 @@ impl IssueFormOverlay {
             )))
             .border_style(theme.border_style(desc_active));
         let desc_inner = desc_block.inner(chunks[1]);
-        let wrapped = wrap_plain_text(&self.description.text, desc_inner.width.max(4) as usize);
-        let mut desc_lines: Vec<Line<'static>> = wrapped.into_iter().map(Line::from).collect();
-        if desc_active {
-            if let Some(last) = desc_lines.last_mut() {
-                last.spans.push(Span::styled("▏", theme.accent_style()));
+        frame.render_widget(desc_block, chunks[1]);
+        hitmap.add(chunks[1], HitTarget::OverlayScrollArea);
+        hitmap.add(chunks[1], HitTarget::OverlayField(5));
+
+        if desc_inner.width > 0 && desc_inner.height > 0 {
+            let view_h = desc_inner.height as usize;
+            let initial_w = desc_inner.width.max(4) as usize;
+            let (wrapped_check, _) =
+                wrap_text_with_cursor_line(&self.description.text, self.description.cursor, initial_w);
+            let show_scrollbar = wrapped_check.len() > view_h && desc_inner.width > 2;
+            let text_w = if show_scrollbar {
+                desc_inner.width.saturating_sub(1).max(4) as usize
+            } else {
+                initial_w
+            };
+            let (wrapped, cursor_line) =
+                wrap_text_with_cursor_line(&self.description.text, self.description.cursor, text_w);
+            let max_scroll = wrapped.len().saturating_sub(view_h) as u16;
+            self.body_max_scroll = Some(max_scroll);
+
+            if desc_active && self.follow_cursor {
+                if cursor_line < self.body_scroll {
+                    self.body_scroll = cursor_line;
+                } else if view_h > 0 && cursor_line >= self.body_scroll.saturating_add(view_h as u16) {
+                    self.body_scroll = cursor_line.saturating_sub(view_h as u16 - 1);
+                }
+                self.follow_cursor = false;
+            }
+            self.body_scroll = self.body_scroll.min(max_scroll);
+
+            let mut desc_lines: Vec<Line<'static>> = wrapped.into_iter().map(Line::from).collect();
+            if desc_active {
+                if let Some(last) = desc_lines.last_mut() {
+                    last.spans.push(Span::styled("▏", theme.accent_style()));
+                }
+            }
+            let text_area = if show_scrollbar {
+                Rect::new(
+                    desc_inner.x,
+                    desc_inner.y,
+                    desc_inner.width.saturating_sub(1),
+                    desc_inner.height,
+                )
+            } else {
+                desc_inner
+            };
+            frame.render_widget(
+                Paragraph::new(desc_lines).scroll((self.body_scroll, 0)),
+                text_area,
+            );
+            if show_scrollbar {
+                let sb_area = Rect::new(
+                    desc_inner.right().saturating_sub(1),
+                    desc_inner.y,
+                    1,
+                    desc_inner.height,
+                );
+                let mut sb_state = ScrollbarState::new(max_scroll.saturating_add(1) as usize)
+                    .position(self.body_scroll as usize);
+                let scrollbar = Scrollbar::new(ScrollbarOrientation::VerticalRight)
+                    .thumb_style(Style::default().fg(theme.accent))
+                    .track_style(theme.muted_style());
+                frame.render_stateful_widget(scrollbar, sb_area, &mut sb_state);
             }
         }
-        frame.render_widget(Paragraph::new(desc_lines).block(desc_block), chunks[1]);
 
-        let footer = if let Some(err) = &self.error {
-            Line::from(Span::styled(
-                format!(" Error: {err}"),
-                Style::default().fg(theme.error),
-            ))
+        let btn_area = if has_err {
+            if let Some(err) = &self.error {
+                frame.render_widget(
+                    Paragraph::new(Line::from(Span::styled(
+                        truncate_width(&format!(" Error: {err}"), chunks[2].width as usize),
+                        Style::default().fg(theme.error),
+                    ))),
+                    chunks[2],
+                );
+            }
+            chunks[3]
         } else {
-            Line::from(Span::styled(
-                truncate_width(
-                    " Tab next · Ctrl+V paste · Ctrl+E $EDITOR · Enter confirm · Esc cancel",
-                    chunks[2].width as usize,
-                ),
-                Style::default().fg(theme.muted).add_modifier(Modifier::DIM),
-            ))
+            chunks[2]
         };
-        frame.render_widget(Paragraph::new(footer), chunks[2]);
+
+        render_button_bar(
+            frame,
+            btn_area,
+            &[
+                ("[Ctrl+S] Submit", ButtonId::OverlaySubmit, modal_pill_primary(theme)),
+                ("[Ctrl+E] $EDITOR", ButtonId::OverlayExternalEditor, modal_pill_secondary(theme)),
+                ("[Esc] Cancel", ButtonId::OverlayCancel, modal_pill_muted(theme)),
+            ],
+            Some("· Tab next · Ctrl+V paste"),
+            theme,
+            hitmap,
+        );
     }
 }
 

@@ -553,6 +553,82 @@ impl Storage {
         Ok(())
     }
 
+    /// Appends a newly posted Confluence comment into cached `detail_json` (if present).
+    pub fn append_page_comment_for_site(
+        &self,
+        site_id: &str,
+        page_id: &str,
+        comment: &ConfluenceComment,
+    ) -> Result<()> {
+        let mut conn = self.lock_conn()?;
+        let tx = conn.transaction()?;
+        if let Some(raw) = tx
+            .query_row(
+                "SELECT detail_json FROM pages WHERE site_id = ?1 AND id = ?2",
+                params![site_id, page_id],
+                |row| row.get::<_, Option<String>>(0),
+            )
+            .optional()?
+            .flatten()
+        {
+            if let Ok(mut detail) = serde_json::from_str::<PageDetail>(&raw) {
+                let exists = !comment.id.is_empty()
+                    && detail.comments.iter().any(|existing| existing.id == comment.id);
+                if !exists {
+                    detail.comments.push(comment.clone());
+                    let updated_json = serde_json::to_string(&detail)?;
+                    tx.execute(
+                        "UPDATE pages SET detail_json = ?1 WHERE site_id = ?2 AND id = ?3",
+                        params![updated_json, site_id, page_id],
+                    )?;
+                }
+            }
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Appends newly uploaded Confluence attachments into cached `detail_json` (if present).
+    pub fn append_page_attachments_for_site(
+        &self,
+        site_id: &str,
+        page_id: &str,
+        new_atts: &[AttachmentItem],
+    ) -> Result<()> {
+        let mut conn = self.lock_conn()?;
+        let tx = conn.transaction()?;
+        if let Some(raw) = tx
+            .query_row(
+                "SELECT detail_json FROM pages WHERE site_id = ?1 AND id = ?2",
+                params![site_id, page_id],
+                |row| row.get::<_, Option<String>>(0),
+            )
+            .optional()?
+            .flatten()
+        {
+            if let Ok(mut detail) = serde_json::from_str::<PageDetail>(&raw) {
+                let mut changed = false;
+                for att in new_atts {
+                    let exists = !att.id.is_empty()
+                        && detail.attachments.iter().any(|existing| existing.id == att.id);
+                    if !exists {
+                        detail.attachments.push(att.clone());
+                        changed = true;
+                    }
+                }
+                if changed {
+                    let updated_json = serde_json::to_string(&detail)?;
+                    tx.execute(
+                        "UPDATE pages SET detail_json = ?1 WHERE site_id = ?2 AND id = ?3",
+                        params![updated_json, site_id, page_id],
+                    )?;
+                }
+            }
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
     /// Removes cached root pages in `(site_id, space_key)` that are absent from a complete
     /// root-page listing snapshot, together with every page cached below them, and returns the
     /// number of page rows removed. The space key is matched case-insensitively. Pages in

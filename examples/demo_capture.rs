@@ -645,6 +645,7 @@ fn build_demo_state() -> (AppState, UiState) {
 
     app.active_issue = Some(IssueDetail {
         summary: issues[0].clone(),
+        custom_fields: Default::default(),
         description_raw: String::new(),
         description_markdown:
             "Roll out weighted DNS cutover across `eu-central-1` with automated rollback triggers."

@@ -4,7 +4,10 @@ use ratatui::{
     layout::{Constraint, Direction, Layout, Rect},
     style::{Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, BorderType, Borders, Clear, Paragraph},
+    widgets::{
+        Block, BorderType, Borders, Clear, Paragraph, Scrollbar, ScrollbarOrientation,
+        ScrollbarState,
+    },
     Frame,
 };
 use serde::{Deserialize, Serialize};
@@ -13,12 +16,14 @@ use crate::{
     models::PageDetail,
     ui::{
         app::{AppState, ExternalEditorTarget, UiState},
-        doc_view::{truncate_width, wrap_plain_text},
+        doc_view::truncate_width,
         filter::is_personal_space_key,
-        hitmap::HitMap,
+        hitmap::{ButtonId, HitMap, HitTarget},
         keymap::Action,
         overlays::{
-            centered_rect, modal_block, read_clipboard_text, sanitize_single_line, OverlayOutcome,
+            centered_rect, modal_block, modal_pill_muted, modal_pill_primary,
+            modal_pill_secondary, read_clipboard_text, register_modal_chrome, render_button_bar,
+            sanitize_single_line, wrap_text_with_cursor_line, OverlayOutcome,
         },
         text_edit::TextBuffer,
         theme::Theme,
@@ -62,6 +67,9 @@ pub struct PageFormOverlay {
     pub parent_id: Option<String>,
     pub title: TextBuffer,
     pub body: TextBuffer,
+    pub body_scroll: u16,
+    body_max_scroll: Option<u16>,
+    follow_cursor: bool,
     pub initial_title: String,
     pub initial_body: String,
     pub initial_body_raw: Option<String>,
@@ -85,6 +93,9 @@ impl PageFormOverlay {
             parent_id,
             title: TextBuffer::new(),
             body: TextBuffer::new(),
+            body_scroll: 0,
+            body_max_scroll: None,
+            follow_cursor: true,
             initial_title: String::new(),
             initial_body: String::new(),
             initial_body_raw: None,
@@ -107,6 +118,9 @@ impl PageFormOverlay {
             parent_id: detail.summary.parent_id.clone(),
             title: TextBuffer::from_text(detail.summary.title.clone()),
             body: TextBuffer::from_text(detail.body_markdown.clone()),
+            body_scroll: 0,
+            body_max_scroll: None,
+            follow_cursor: true,
             initial_title: detail.summary.title.clone(),
             initial_body: detail.body_markdown.clone(),
             initial_body_raw: (detail.body_representation == "storage"
@@ -116,6 +130,30 @@ impl PageFormOverlay {
                 .then(|| detail.body_representation.clone()),
             field: PageFormField::Body,
             error: None,
+        }
+    }
+
+    /// Focuses field `0` (Title) or `1` (Body) on mouse click.
+    pub fn click_field(&mut self, field_idx: usize) {
+        match field_idx {
+            0 => self.field = PageFormField::Title,
+            1 => {
+                self.field = PageFormField::Body;
+                self.follow_cursor = true;
+            }
+            _ => {}
+        }
+    }
+
+    fn scroll_body(&mut self, delta: i32) {
+        self.follow_cursor = false;
+        let cap = self
+            .body_max_scroll
+            .unwrap_or_else(|| self.body.text.lines().count().saturating_sub(1) as u16);
+        if delta < 0 {
+            self.body_scroll = self.body_scroll.saturating_sub(delta.unsigned_abs() as u16);
+        } else if delta > 0 {
+            self.body_scroll = self.body_scroll.saturating_add(delta as u16).min(cap);
         }
     }
 
@@ -224,6 +262,7 @@ impl PageFormOverlay {
     fn paste_text(&mut self, text: &str) {
         if self.field == PageFormField::Body {
             self.body.insert_str(text);
+            self.follow_cursor = true;
         } else {
             let cleaned = sanitize_single_line(text);
             self.title.insert_str(&cleaned);
@@ -253,9 +292,22 @@ impl PageFormOverlay {
                 OverlayOutcome::Handled
             }
             Action::ExternalEditor => OverlayOutcome::Dispatch(Action::ExternalEditor),
+            Action::ScrollUp => {
+                self.scroll_body(-3);
+                OverlayOutcome::Handled
+            }
+            Action::ScrollDown => {
+                self.scroll_body(3);
+                OverlayOutcome::Handled
+            }
+            Action::MouseScroll { delta, .. } => {
+                self.scroll_body(*delta);
+                OverlayOutcome::Handled
+            }
             Action::InsertNewline => {
                 if self.field == PageFormField::Body {
                     self.body.insert_char('\n');
+                    self.follow_cursor = true;
                 }
                 OverlayOutcome::Handled
             }
@@ -272,37 +324,66 @@ impl PageFormOverlay {
                 OverlayOutcome::Dispatch(Action::Submit)
             }
             Action::Input(ch) => {
+                let is_body = self.field == PageFormField::Body;
                 self.active_buffer_mut().insert_char(*ch);
+                if is_body {
+                    self.follow_cursor = true;
+                }
                 self.error = None;
                 OverlayOutcome::Handled
             }
             Action::Backspace => {
+                let is_body = self.field == PageFormField::Body;
                 self.active_buffer_mut().backspace();
+                if is_body {
+                    self.follow_cursor = true;
+                }
                 OverlayOutcome::Handled
             }
             Action::Delete => {
+                let is_body = self.field == PageFormField::Body;
                 self.active_buffer_mut().delete();
+                if is_body {
+                    self.follow_cursor = true;
+                }
                 OverlayOutcome::Handled
             }
             Action::CursorLeft => {
+                let is_body = self.field == PageFormField::Body;
                 self.active_buffer_mut().move_left();
+                if is_body {
+                    self.follow_cursor = true;
+                }
                 OverlayOutcome::Handled
             }
             Action::CursorRight => {
+                let is_body = self.field == PageFormField::Body;
                 self.active_buffer_mut().move_right();
+                if is_body {
+                    self.follow_cursor = true;
+                }
                 OverlayOutcome::Handled
             }
             Action::CursorHome => {
+                let is_body = self.field == PageFormField::Body;
                 self.active_buffer_mut().move_home();
+                if is_body {
+                    self.follow_cursor = true;
+                }
                 OverlayOutcome::Handled
             }
             Action::CursorEnd => {
+                let is_body = self.field == PageFormField::Body;
                 self.active_buffer_mut().move_end();
+                if is_body {
+                    self.follow_cursor = true;
+                }
                 OverlayOutcome::Handled
             }
             Action::CursorUp => {
                 if self.field == PageFormField::Body {
                     self.body.move_up();
+                    self.follow_cursor = true;
                 } else {
                     self.field = PageFormField::Title;
                 }
@@ -311,6 +392,7 @@ impl PageFormOverlay {
             Action::CursorDown => {
                 if self.field == PageFormField::Body {
                     self.body.move_down();
+                    self.follow_cursor = true;
                 } else {
                     self.field = PageFormField::Body;
                 }
@@ -325,17 +407,17 @@ impl PageFormOverlay {
     }
 
     pub fn draw(
-        &self,
+        &mut self,
         frame: &mut Frame,
         area: Rect,
         _app: &AppState,
         ui: &UiState,
-        _hitmap: &mut HitMap,
+        hitmap: &mut HitMap,
     ) {
-        self.render(frame, area, &ui.theme);
+        self.render(frame, area, &ui.theme, hitmap);
     }
 
-    fn render(&self, frame: &mut Frame, area: Rect, theme: &Theme) {
+    fn render(&mut self, frame: &mut Frame, area: Rect, theme: &Theme, hitmap: &mut HitMap) {
         let rect = centered_rect(
             area,
             82.min(area.width.saturating_sub(4)).max(34),
@@ -357,20 +439,33 @@ impl PageFormOverlay {
         let block = modal_block(modal_title, theme, true);
         let inner = block.inner(rect);
         frame.render_widget(block, rect);
+        register_modal_chrome(rect, frame, theme, hitmap, true);
         let banner = self.personal_space_banner();
         let banner_h = u16::from(banner.is_some());
         if inner.width == 0 || inner.height < 6 + banner_h {
             return;
         }
 
+        let has_notice = (self.error.is_some() || self.foreign_space_confirm_pending)
+            && inner.height >= 7 + banner_h;
         let rows = Layout::default()
             .direction(Direction::Vertical)
-            .constraints([
-                Constraint::Length(banner_h),
-                Constraint::Length(2),
-                Constraint::Min(3),
-                Constraint::Length(1),
-            ])
+            .constraints(if has_notice {
+                vec![
+                    Constraint::Length(banner_h),
+                    Constraint::Length(2),
+                    Constraint::Min(3),
+                    Constraint::Length(1),
+                    Constraint::Length(1),
+                ]
+            } else {
+                vec![
+                    Constraint::Length(banner_h),
+                    Constraint::Length(2),
+                    Constraint::Min(3),
+                    Constraint::Length(1),
+                ]
+            })
             .split(inner);
         let chunks = &rows[1..];
 
@@ -421,6 +516,7 @@ impl PageFormOverlay {
             ]),
             chunks[0],
         );
+        hitmap.add_line(chunks[0].x, chunks[0].y, chunks[0].width, HitTarget::OverlayField(0));
 
         let body_active = self.field == PageFormField::Body;
         let body_block = Block::default()
@@ -433,40 +529,107 @@ impl PageFormOverlay {
             )))
             .border_style(theme.border_style(body_active));
         let body_inner = body_block.inner(chunks[1]);
-        let wrapped = wrap_plain_text(&self.body.text, body_inner.width.max(4) as usize);
-        let mut body_lines: Vec<Line<'static>> = wrapped.into_iter().map(Line::from).collect();
-        if body_active {
-            if let Some(last) = body_lines.last_mut() {
-                last.spans.push(Span::styled("▏", theme.accent_style()));
+        frame.render_widget(body_block, chunks[1]);
+        hitmap.add(chunks[1], HitTarget::OverlayScrollArea);
+        hitmap.add(chunks[1], HitTarget::OverlayField(1));
+
+        if body_inner.width > 0 && body_inner.height > 0 {
+            let view_h = body_inner.height as usize;
+            let initial_w = body_inner.width.max(4) as usize;
+            let (wrapped_check, _) =
+                wrap_text_with_cursor_line(&self.body.text, self.body.cursor, initial_w);
+            let show_scrollbar = wrapped_check.len() > view_h && body_inner.width > 2;
+            let text_w = if show_scrollbar {
+                body_inner.width.saturating_sub(1).max(4) as usize
+            } else {
+                initial_w
+            };
+            let (wrapped, cursor_line) =
+                wrap_text_with_cursor_line(&self.body.text, self.body.cursor, text_w);
+            let max_scroll = wrapped.len().saturating_sub(view_h) as u16;
+            self.body_max_scroll = Some(max_scroll);
+
+            if body_active && self.follow_cursor {
+                if cursor_line < self.body_scroll {
+                    self.body_scroll = cursor_line;
+                } else if view_h > 0 && cursor_line >= self.body_scroll.saturating_add(view_h as u16) {
+                    self.body_scroll = cursor_line.saturating_sub(view_h as u16 - 1);
+                }
+                self.follow_cursor = false;
+            }
+            self.body_scroll = self.body_scroll.min(max_scroll);
+
+            let mut body_lines: Vec<Line<'static>> = wrapped.into_iter().map(Line::from).collect();
+            if body_active {
+                if let Some(last) = body_lines.last_mut() {
+                    last.spans.push(Span::styled("▏", theme.accent_style()));
+                }
+            }
+            let text_area = if show_scrollbar {
+                Rect::new(
+                    body_inner.x,
+                    body_inner.y,
+                    body_inner.width.saturating_sub(1),
+                    body_inner.height,
+                )
+            } else {
+                body_inner
+            };
+            frame.render_widget(
+                Paragraph::new(body_lines).scroll((self.body_scroll, 0)),
+                text_area,
+            );
+            if show_scrollbar {
+                let sb_area = Rect::new(
+                    body_inner.right().saturating_sub(1),
+                    body_inner.y,
+                    1,
+                    body_inner.height,
+                );
+                let mut sb_state = ScrollbarState::new(max_scroll.saturating_add(1) as usize)
+                    .position(self.body_scroll as usize);
+                let scrollbar = Scrollbar::new(ScrollbarOrientation::VerticalRight)
+                    .thumb_style(Style::default().fg(theme.accent))
+                    .track_style(theme.muted_style());
+                frame.render_stateful_widget(scrollbar, sb_area, &mut sb_state);
             }
         }
-        frame.render_widget(Paragraph::new(body_lines).block(body_block), chunks[1]);
 
-        let footer = if let Some(err) = &self.error {
-            Line::from(Span::styled(
-                format!(" Error: {err}"),
-                Style::default().fg(theme.error),
-            ))
-        } else if self.foreign_space_confirm_pending {
-            Line::from(Span::styled(
-                truncate_width(
-                    &format!(" {FOREIGN_SPACE_CONFIRM}"),
-                    chunks[2].width as usize,
-                ),
-                Style::default()
-                    .fg(theme.warning)
-                    .add_modifier(Modifier::BOLD),
-            ))
+        let btn_area = if has_notice {
+            let notice_line = if let Some(err) = &self.error {
+                Line::from(Span::styled(
+                    truncate_width(&format!(" Error: {err}"), chunks[2].width as usize),
+                    Style::default().fg(theme.error),
+                ))
+            } else {
+                Line::from(Span::styled(
+                    truncate_width(
+                        &format!(" {FOREIGN_SPACE_CONFIRM}"),
+                        chunks[2].width as usize,
+                    ),
+                    Style::default()
+                        .fg(theme.warning)
+                        .add_modifier(Modifier::BOLD),
+                ))
+            };
+            frame.render_widget(Paragraph::new(notice_line), chunks[2]);
+            chunks[3]
         } else {
-            Line::from(Span::styled(
-                truncate_width(
-                    " Tab title/body · Ctrl+V paste · Ctrl+E $EDITOR · Enter confirm · Esc cancel",
-                    chunks[2].width as usize,
-                ),
-                Style::default().fg(theme.muted).add_modifier(Modifier::DIM),
-            ))
+            chunks[2]
         };
-        frame.render_widget(Paragraph::new(footer), chunks[2]);
+
+        render_button_bar(
+            frame,
+            btn_area,
+            &[
+                ("[Ctrl+S] Submit", ButtonId::OverlaySubmit, modal_pill_primary(theme)),
+                ("[Ctrl+E] $EDITOR", ButtonId::OverlayExternalEditor, modal_pill_secondary(theme)),
+                ("[Esc] Cancel", ButtonId::OverlayCancel, modal_pill_muted(theme)),
+            ],
+            Some("· Tab title/body · Ctrl+V paste"),
+            theme,
+            hitmap,
+        );
     }
 }
 
@@ -537,7 +700,11 @@ mod tests {
         use ratatui::{backend::TestBackend, Terminal};
         let mut terminal = Terminal::new(TestBackend::new(100, 30)).unwrap();
         let theme = Theme::midnight_dark();
-        terminal.draw(|f| form.render(f, f.area(), &theme)).unwrap();
+        let mut form = form.clone();
+        let mut hitmap = HitMap::new();
+        terminal
+            .draw(|f| form.render(f, f.area(), &theme, &mut hitmap))
+            .unwrap();
         let buf = terminal.backend().buffer();
         let mut out = String::new();
         for y in 0..buf.area.height {

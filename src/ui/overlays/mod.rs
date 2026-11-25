@@ -27,14 +27,18 @@ use ratatui::{
     layout::{Constraint, Direction, Layout, Rect},
     style::{Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, BorderType, Borders, Clear, Paragraph, Wrap},
+    widgets::{
+        Block, BorderType, Borders, Clear, Paragraph, Scrollbar, ScrollbarOrientation,
+        ScrollbarState, Wrap,
+    },
     Frame,
 };
+use unicode_width::UnicodeWidthStr;
 
 use crate::ui::{
     app::{AppState, UiState},
-    doc_view::truncate_width,
-    hitmap::HitMap,
+    doc_view::{truncate_width, wrap_plain_text},
+    hitmap::{ButtonId, HitMap, HitTarget},
     keymap::Action,
     overlays::{
         assignee::AssigneeOverlay, attachments::AttachmentsOverlay,
@@ -218,6 +222,32 @@ impl Overlay {
         }
     }
 
+    /// Focuses a form field by index (and cycles IssueType on click in `IssueForm`).
+    pub fn click_field(&mut self, field_idx: usize) {
+        match self {
+            Overlay::IssueForm(o) => o.click_field(field_idx),
+            Overlay::PageForm(o) => o.click_field(field_idx),
+            Overlay::Comment(o) => o.click_field(field_idx),
+            Overlay::PathInput(o) => o.click_field(field_idx),
+            _ => {}
+        }
+    }
+
+    /// Triggers an overlay item's secondary toggle (e.g. `SiteSwitcherOverlay` enabled dot).
+    pub fn click_toggle(&mut self, idx: usize) -> OverlayOutcome {
+        match self {
+            Overlay::SiteSwitcher(o) => o.toggle_item(idx),
+            _ => OverlayOutcome::Handled,
+        }
+    }
+
+    /// Exits any active nested text-input edit mode so `[✕ Esc]` closes the modal immediately.
+    pub fn force_close_if_editing(&mut self) {
+        if let Overlay::HtmlPreview(o) = self {
+            o.force_close_if_editing();
+        }
+    }
+
     pub fn handle(&mut self, action: &Action) -> OverlayOutcome {
         let scroll_as_move = match action {
             Action::ScrollUp => Some(Action::MoveUp),
@@ -234,9 +264,9 @@ impl Overlay {
         match self {
             Overlay::Transition(o) => o.handle(scroll_as_move.as_ref().unwrap_or(action)),
             Overlay::Assignee(o) => o.handle(scroll_as_move.as_ref().unwrap_or(action)),
-            Overlay::IssueForm(o) => o.handle(action),
-            Overlay::PageForm(o) => o.handle(action),
-            Overlay::Comment(o) => o.handle(action),
+            Overlay::IssueForm(o) => o.handle(wheel_as_scroll.as_ref().unwrap_or(action)),
+            Overlay::PageForm(o) => o.handle(wheel_as_scroll.as_ref().unwrap_or(action)),
+            Overlay::Comment(o) => o.handle(wheel_as_scroll.as_ref().unwrap_or(action)),
             Overlay::CrossLink(o) => o.handle(scroll_as_move.as_ref().unwrap_or(action)),
             Overlay::Links(o) => o.handle(scroll_as_move.as_ref().unwrap_or(action)),
             Overlay::ImagePreview(o) => o.handle(wheel_as_scroll.as_ref().unwrap_or(action)),
@@ -297,6 +327,136 @@ pub fn modal_block<'a>(title: impl Into<String>, theme: &Theme, focused: bool) -
         .style(Style::default().bg(theme.card_bg).fg(theme.fg))
         .title(Line::from(Span::styled(title.into(), theme.title(focused))))
         .border_style(theme.border_style(focused))
+}
+
+/// Registers `HitTarget::OverlayBody` on `popup` and optionally renders a clickable
+/// `[✕ Esc]` close pill on the top-right border row (`HitTarget::OverlayClose`).
+///
+/// Call AFTER rendering the modal's outer `Block` and BEFORE registering any inner
+/// interactive controls (items, fields, buttons) so inner controls win hit-testing.
+pub fn register_modal_chrome(
+    popup: Rect,
+    frame: &mut Frame,
+    theme: &Theme,
+    hitmap: &mut HitMap,
+    show_close_pill: bool,
+) {
+    hitmap.add(popup, HitTarget::OverlayBody);
+    if !show_close_pill || popup.width < 16 || popup.height == 0 {
+        return;
+    }
+    let close_label = "[✕ Esc]";
+    let close_w = close_label.width() as u16;
+    if popup.width <= close_w + 2 {
+        return;
+    }
+    let close_x = popup.right().saturating_sub(close_w + 1);
+    let close_style = if theme.no_color {
+        Style::default().add_modifier(Modifier::BOLD)
+    } else {
+        Style::default().bg(theme.card_bg).fg(theme.fg)
+    };
+    frame.render_widget(
+        Paragraph::new(Span::styled(close_label, close_style)),
+        Rect::new(close_x, popup.y, close_w, 1),
+    );
+    hitmap.add_line(close_x, popup.y, close_w, HitTarget::OverlayClose);
+}
+
+/// Primary action pill style for modal footer buttons (e.g. `[Ctrl+S] Submit`, `[Enter] Confirm`).
+pub fn modal_pill_primary(theme: &Theme) -> Style {
+    if theme.no_color {
+        Style::default().add_modifier(Modifier::REVERSED | Modifier::BOLD)
+    } else {
+        Style::default()
+            .bg(theme.chip_bg)
+            .fg(theme.chip_fg)
+            .add_modifier(Modifier::BOLD)
+    }
+}
+
+/// Secondary action pill style for modal footer/header buttons.
+pub fn modal_pill_secondary(theme: &Theme) -> Style {
+    if theme.no_color {
+        Style::default().add_modifier(Modifier::BOLD)
+    } else {
+        Style::default().bg(theme.bg_elevated).fg(theme.fg)
+    }
+}
+
+/// Muted cancel/secondary pill style for modal footer buttons.
+pub fn modal_pill_muted(theme: &Theme) -> Style {
+    if theme.no_color {
+        Style::default().add_modifier(Modifier::DIM)
+    } else {
+        Style::default().bg(theme.bg_elevated).fg(theme.muted)
+    }
+}
+
+/// Renders a horizontal row of clickable pill buttons (and optional trailing hint text)
+/// inside `area`, registering each button's exact rendered span in `hitmap`.
+pub fn render_button_bar(
+    frame: &mut Frame,
+    area: Rect,
+    buttons: &[(&str, ButtonId, Style)],
+    trailing_hint: Option<&str>,
+    theme: &Theme,
+    hitmap: &mut HitMap,
+) {
+    if area.width == 0 || area.height == 0 {
+        return;
+    }
+    let surface = if theme.no_color {
+        Style::default()
+    } else {
+        Style::default().bg(theme.card_bg).fg(theme.fg)
+    };
+    let mut spans: Vec<Span<'static>> = Vec::new();
+    let mut cx = area.x;
+
+    if cx < area.right() {
+        spans.push(Span::styled(" ", surface));
+        cx = cx.saturating_add(1);
+    }
+
+    for (label, btn_id, style) in buttons {
+        let w = label.width() as u16;
+        if w == 0 || cx.saturating_add(w) > area.right() {
+            continue;
+        }
+        spans.push(Span::styled((*label).to_string(), *style));
+        hitmap.add_line(cx, area.y, w, HitTarget::Button(*btn_id));
+        cx = cx.saturating_add(w);
+        if cx < area.right() {
+            spans.push(Span::styled(" ", surface));
+            cx = cx.saturating_add(1);
+        }
+    }
+
+    if let Some(hint) = trailing_hint {
+        let rem = area.right().saturating_sub(cx) as usize;
+        if rem > 1 {
+            spans.push(Span::styled(
+                truncate_width(hint, rem),
+                Style::default().fg(theme.muted).add_modifier(Modifier::DIM),
+            ));
+        }
+    }
+
+    frame.render_widget(Paragraph::new(Line::from(spans)).style(surface), area);
+}
+
+/// Wraps multiline form text to `width` and returns `(wrapped_lines, cursor_visual_line)`.
+pub fn wrap_text_with_cursor_line(text: &str, cursor: usize, width: usize) -> (Vec<String>, u16) {
+    let w = width.max(4);
+    let wrapped = wrap_plain_text(text, w);
+    let mut cur = cursor.min(text.len());
+    while cur > 0 && !text.is_char_boundary(cur) {
+        cur -= 1;
+    }
+    let before_wrapped = wrap_plain_text(&text[..cur], w);
+    let cursor_line = before_wrapped.len().saturating_sub(1) as u16;
+    (wrapped, cursor_line)
 }
 
 pub fn centered_rect(area: Rect, width: u16, height: u16) -> Rect {
@@ -441,8 +601,7 @@ const HELP_SECTIONS: [(&str, &[(&str, &str)]); 4] = [
     ),
 ];
 
-fn draw_help_overlay(frame: &mut Frame, area: Rect, ui: &UiState, hitmap: &mut HitMap) {
-    let theme = &ui.theme;
+fn help_modal_rect(area: Rect) -> (Rect, bool) {
     let wide = area.width >= 92;
     let rect = centered_rect(
         area,
@@ -453,12 +612,62 @@ fn draw_help_overlay(frame: &mut Frame, area: Rect, ui: &UiState, hitmap: &mut H
         },
         area.height.saturating_sub(2).min(if wide { 22 } else { 28 }).max(12),
     );
+    (rect, wide)
+}
+
+fn build_help_section_lines(idx: usize, title: &str, entries: &[(&str, &str)], bracketed: bool, theme: &Theme) -> Vec<Line<'static>> {
+    let mut lines = Vec::with_capacity(entries.len() + 1);
+    let header = if bracketed {
+        format!(" [{title}]")
+    } else {
+        format!(" {title}")
+    };
+    lines.push(Line::from(Span::styled(
+        header,
+        Style::default()
+            .fg(section_color(idx, theme))
+            .add_modifier(Modifier::BOLD),
+    )));
+    for (k, desc) in entries {
+        lines.push(Line::from(vec![
+            Span::styled(format!("  {k:<18}"), theme.accent_style()),
+            Span::raw((*desc).to_string()),
+        ]));
+    }
+    lines
+}
+
+/// Computes the maximum vertical scroll offset for `Overlay::Help` at the given terminal area.
+pub fn help_max_scroll_for(area: Rect) -> u16 {
+    let (rect, wide) = help_modal_rect(area);
+    let inner_h = rect.height.saturating_sub(2);
+    let body_h = inner_h.saturating_sub(1) as usize;
+    if body_h == 0 {
+        return 0;
+    }
+    let total_lines = if wide {
+        let left = (HELP_SECTIONS[0].1.len() + 1) + 1 + (HELP_SECTIONS[2].1.len() + 1);
+        let right = (HELP_SECTIONS[1].1.len() + 1) + 1 + (HELP_SECTIONS[3].1.len() + 1);
+        left.max(right)
+    } else {
+        HELP_SECTIONS
+            .iter()
+            .enumerate()
+            .map(|(i, (_, entries))| entries.len() + 1 + usize::from(i > 0))
+            .sum()
+    };
+    total_lines.saturating_sub(body_h) as u16
+}
+
+fn draw_help_overlay(frame: &mut Frame, area: Rect, ui: &UiState, hitmap: &mut HitMap) {
+    let theme = &ui.theme;
+    let (rect, wide) = help_modal_rect(area);
     frame.render_widget(Clear, rect);
-    hitmap.add(rect, crate::ui::hitmap::HitTarget::OverlayBody);
 
     let block = modal_block(" Atlassian TUI Keyboard Shortcuts (?) ", theme, true);
     let inner = block.inner(rect);
     frame.render_widget(block, rect);
+    register_modal_chrome(rect, frame, theme, hitmap, true);
     if inner.width == 0 || inner.height < 3 {
         return;
     }
@@ -470,40 +679,51 @@ fn draw_help_overlay(frame: &mut Frame, area: Rect, ui: &UiState, hitmap: &mut H
         inner.height.saturating_sub(1),
     );
     let footer_area = Rect::new(inner.x, inner.y + inner.height - 1, inner.width, 1);
+    hitmap.add(body_area, HitTarget::OverlayScrollArea);
+
+    let max_scroll = help_max_scroll_for(area);
+    let scroll = ui.help_scroll.min(max_scroll);
+    let show_scrollbar = max_scroll > 0 && body_area.width > 2;
+    let content_area = if show_scrollbar {
+        Rect::new(
+            body_area.x,
+            body_area.y,
+            body_area.width.saturating_sub(1),
+            body_area.height,
+        )
+    } else {
+        body_area
+    };
 
     if wide {
         let cols = Layout::default()
             .direction(Direction::Horizontal)
             .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
-            .split(body_area);
-        let half_h = (body_area.height / 2).max(1);
+            .split(content_area);
 
-        for (idx, (title, entries)) in HELP_SECTIONS.iter().enumerate() {
-            let target = cols[idx % 2];
-            if target.width == 0 {
-                continue;
-            }
-            let y_off = if idx < 2 { 0 } else { half_h };
-            let sub = Rect::new(
-                target.x,
-                target.y + y_off,
-                target.width,
-                target.height.saturating_sub(y_off),
+        let mut left_lines = build_help_section_lines(0, HELP_SECTIONS[0].0, HELP_SECTIONS[0].1, false, theme);
+        left_lines.push(Line::from(""));
+        left_lines.extend(build_help_section_lines(2, HELP_SECTIONS[2].0, HELP_SECTIONS[2].1, false, theme));
+
+        let mut right_lines = build_help_section_lines(1, HELP_SECTIONS[1].0, HELP_SECTIONS[1].1, false, theme);
+        right_lines.push(Line::from(""));
+        right_lines.extend(build_help_section_lines(3, HELP_SECTIONS[3].0, HELP_SECTIONS[3].1, false, theme));
+
+        if cols[0].width > 0 {
+            frame.render_widget(
+                Paragraph::new(left_lines)
+                    .wrap(Wrap { trim: false })
+                    .scroll((scroll, 0)),
+                cols[0],
             );
-            let mut lines = Vec::with_capacity(entries.len() + 1);
-            lines.push(Line::from(Span::styled(
-                format!(" {title}"),
-                Style::default()
-                    .fg(section_color(idx, theme))
-                    .add_modifier(Modifier::BOLD),
-            )));
-            for (k, desc) in *entries {
-                lines.push(Line::from(vec![
-                    Span::styled(format!("  {k:<18}"), theme.accent_style()),
-                    Span::raw(desc.to_string()),
-                ]));
-            }
-            frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), sub);
+        }
+        if cols[1].width > 0 {
+            frame.render_widget(
+                Paragraph::new(right_lines)
+                    .wrap(Wrap { trim: false })
+                    .scroll((scroll, 0)),
+                cols[1],
+            );
         }
     } else {
         let mut lines = Vec::new();
@@ -511,25 +731,39 @@ fn draw_help_overlay(frame: &mut Frame, area: Rect, ui: &UiState, hitmap: &mut H
             if idx > 0 {
                 lines.push(Line::from(""));
             }
-            lines.push(Line::from(Span::styled(
-                format!(" [{title}]"),
-                Style::default()
-                    .fg(section_color(idx, theme))
-                    .add_modifier(Modifier::BOLD),
-            )));
-            for (k, desc) in *entries {
-                lines.push(Line::from(vec![
-                    Span::styled(format!("  {k:<18}"), theme.accent_style()),
-                    Span::raw(desc.to_string()),
-                ]));
-            }
+            lines.extend(build_help_section_lines(idx, title, entries, true, theme));
         }
-        frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), body_area);
+        frame.render_widget(
+            Paragraph::new(lines)
+                .wrap(Wrap { trim: false })
+                .scroll((scroll, 0)),
+            content_area,
+        );
     }
 
+    if show_scrollbar {
+        let sb_area = Rect::new(
+            body_area.right().saturating_sub(1),
+            body_area.y,
+            1,
+            body_area.height,
+        );
+        let mut sb_state = ScrollbarState::new(max_scroll.saturating_add(1) as usize)
+            .position(scroll as usize);
+        let scrollbar = Scrollbar::new(ScrollbarOrientation::VerticalRight)
+            .thumb_style(Style::default().fg(theme.accent))
+            .track_style(theme.muted_style());
+        frame.render_stateful_widget(scrollbar, sb_area, &mut sb_state);
+    }
+
+    let hint = if max_scroll > 0 {
+        " Wheel/↑↓ scroll · Enter / Esc / ? close help"
+    } else {
+        " Enter / Esc / ? close help"
+    };
     frame.render_widget(
         Paragraph::new(Span::styled(
-            truncate_width(" Enter / Esc / ? close help", footer_area.width as usize),
+            truncate_width(hint, footer_area.width as usize),
             Style::default().fg(theme.muted).add_modifier(Modifier::DIM),
         )),
         footer_area,

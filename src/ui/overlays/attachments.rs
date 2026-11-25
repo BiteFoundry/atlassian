@@ -15,9 +15,12 @@ use crate::{
     ui::{
         app::{AppState, UiState},
         doc_view::truncate_width,
-        hitmap::{HitMap, HitTarget},
+        hitmap::{ButtonId, HitMap, HitTarget},
         keymap::Action,
-        overlays::{centered_rect, html_preview, modal_block, OverlayOutcome},
+        overlays::{
+            centered_rect, html_preview, modal_block, modal_pill_primary, modal_pill_secondary,
+            register_modal_chrome, render_button_bar, OverlayOutcome,
+        },
     },
 };
 
@@ -291,6 +294,7 @@ impl AttachmentsOverlay {
         let block = modal_block(title, theme, true);
         let inner = block.inner(rect);
         frame.render_widget(block, rect);
+        register_modal_chrome(rect, frame, theme, hitmap, true);
         if inner.width == 0 || inner.height < 3 {
             return;
         }
@@ -402,15 +406,17 @@ impl AttachmentsOverlay {
         }
 
         let hint_y = inner.y + inner.height.saturating_sub(1);
-        frame.render_widget(
-            Paragraph::new(Span::styled(
-                truncate_width(
-                    " Enter/v preview · d download · u upload · Esc cancel",
-                    inner.width as usize,
-                ),
-                Style::default().fg(theme.muted).add_modifier(Modifier::DIM),
-            )),
+        render_button_bar(
+            frame,
             Rect::new(inner.x, hint_y, inner.width, 1),
+            &[
+                ("[d] Download", ButtonId::DownloadAttachment, modal_pill_primary(theme)),
+                ("[u] Upload", ButtonId::UploadAttachment, modal_pill_secondary(theme)),
+                ("[o] Browser", ButtonId::OpenBrowser, modal_pill_secondary(theme)),
+            ],
+            Some("· Enter/v preview · Esc close"),
+            theme,
+            hitmap,
         );
     }
 }

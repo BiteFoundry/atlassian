@@ -4,7 +4,7 @@ use std::path::{Path, PathBuf};
 
 use ratatui::{
     layout::Rect,
-    style::{Modifier, Style},
+    style::Style,
     text::{Line, Span},
     widgets::{Clear, Paragraph},
     Frame,
@@ -13,10 +13,11 @@ use ratatui::{
 use crate::ui::{
     app::{AppState, UiState},
     doc_view::truncate_width,
-    hitmap::HitMap,
+    hitmap::{ButtonId, HitMap, HitTarget},
     keymap::Action,
     overlays::{
-        centered_rect, modal_block, read_clipboard_text, sanitize_single_line, OverlayOutcome,
+        centered_rect, modal_block, modal_pill_muted, modal_pill_primary, read_clipboard_text,
+        register_modal_chrome, render_button_bar, sanitize_single_line, OverlayOutcome,
     },
     text_edit::TextBuffer,
 };
@@ -74,6 +75,8 @@ impl PathInputOverlay {
     pub fn resolved_path(&self) -> PathBuf {
         expand_path(&self.path.text)
     }
+
+    pub fn click_field(&mut self, _field_idx: usize) {}
 
     /// Pastes a file path from the system clipboard (`Ctrl+V`).
     pub fn paste_from_clipboard(&mut self) -> bool {
@@ -159,7 +162,7 @@ impl PathInputOverlay {
         area: Rect,
         _app: &AppState,
         ui: &UiState,
-        _hitmap: &mut HitMap,
+        hitmap: &mut HitMap,
     ) {
         let theme = &ui.theme;
         let rect = centered_rect(area, 72.min(area.width.saturating_sub(4)).max(30), 8);
@@ -172,6 +175,7 @@ impl PathInputOverlay {
         let block = modal_block(format!(" Upload Attachment — {target_label} "), theme, true);
         let inner = block.inner(rect);
         frame.render_widget(block, rect);
+        register_modal_chrome(rect, frame, theme, hitmap, true);
         if inner.width == 0 || inner.height < 4 {
             return;
         }
@@ -186,23 +190,33 @@ impl PathInputOverlay {
                 Span::raw(&self.path.text),
                 Span::styled("▏", theme.accent_style()),
             ]),
-            Line::from(""),
+            Line::from(Span::styled(
+                "─".repeat(inner.width as usize),
+                Style::default().fg(theme.border),
+            )),
         ];
         if let Some(err) = &self.error {
             lines.push(Line::from(Span::styled(
                 truncate_width(&format!(" Error: {err}"), inner.width as usize),
                 Style::default().fg(theme.error),
             )));
-        } else {
-            lines.push(Line::from(Span::styled(
-                truncate_width(
-                    " Enter confirm · Ctrl+V paste · Esc cancel",
-                    inner.width as usize,
-                ),
-                Style::default().fg(theme.muted).add_modifier(Modifier::DIM),
-            )));
         }
-        frame.render_widget(Paragraph::new(lines), inner);
+        let body_area = Rect::new(inner.x, inner.y, inner.width, inner.height.saturating_sub(1));
+        frame.render_widget(Paragraph::new(lines), body_area);
+        hitmap.add_line(inner.x, inner.y + 1, inner.width, HitTarget::OverlayField(0));
+
+        let footer_area = Rect::new(inner.x, inner.y + inner.height - 1, inner.width, 1);
+        render_button_bar(
+            frame,
+            footer_area,
+            &[
+                ("[Ctrl+S] Submit", ButtonId::OverlaySubmit, modal_pill_primary(theme)),
+                ("[Esc] Cancel", ButtonId::OverlayCancel, modal_pill_muted(theme)),
+            ],
+            Some("· Ctrl+V paste"),
+            theme,
+            hitmap,
+        );
     }
 }
 

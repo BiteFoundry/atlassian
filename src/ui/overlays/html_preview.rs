@@ -24,9 +24,12 @@ use crate::{
     ui::{
         app::{AppState, UiState},
         doc_view::truncate_width,
-        hitmap::{HitMap, HitTarget},
+        hitmap::HitMap,
         keymap::Action,
-        overlays::{centered_rect, read_clipboard_text, sanitize_single_line, OverlayOutcome},
+        overlays::{
+            centered_rect, read_clipboard_text, register_modal_chrome, sanitize_single_line,
+            OverlayOutcome,
+        },
         theme::Theme,
     },
 };
@@ -168,6 +171,18 @@ impl HtmlPreviewOverlay {
         self.session
             .as_ref()
             .is_some_and(|s| s.editing_input.is_some())
+    }
+
+    /// Exits active `<input>`/`<textarea>` editing so clicking `[✕ Esc]` closes the modal immediately.
+    pub fn force_close_if_editing(&mut self) {
+        if self.is_editing_input() {
+            let effects = self
+                .session
+                .as_mut()
+                .map(HtmlViewSession::finish_editing)
+                .unwrap_or_default();
+            self.apply_effects(effects);
+        }
     }
 
     pub fn is_raw_mode(&self) -> bool {
@@ -484,7 +499,6 @@ impl HtmlPreviewOverlay {
         let theme = &ui.theme;
         let rect = Self::modal_rect(area);
         frame.render_widget(Clear, rect);
-        hitmap.add(rect, HitTarget::OverlayBody);
 
         self.last_content_rect = Rect::default();
         self.last_mode_pill_rect = Rect::default();
@@ -495,9 +509,8 @@ impl HtmlPreviewOverlay {
         } else {
             Style::default().bg(theme.card_bg).fg(theme.fg)
         };
-        let close_label = "[✕ Esc]";
-        let close_w = close_label.width() as u16;
-        let show_close_pill = rect.width > close_w + 4;
+        let close_w = "[✕ Esc]".width() as u16;
+        let show_close_pill = rect.width >= 16;
         let title_budget = rect
             .width
             .saturating_sub(2 + if show_close_pill { close_w + 2 } else { 0 })
@@ -522,15 +535,7 @@ impl HtmlPreviewOverlay {
             .border_style(theme.border_style(true));
         let inner = block.inner(rect);
         frame.render_widget(block, rect);
-
-        if show_close_pill {
-            let close_x = rect.right().saturating_sub(close_w + 1);
-            frame.render_widget(
-                Paragraph::new(Span::styled(close_label, modal_style)),
-                Rect::new(close_x, rect.y, close_w, 1),
-            );
-            hitmap.add_line(close_x, rect.y, close_w, HitTarget::OverlayClose);
-        }
+        register_modal_chrome(rect, frame, theme, hitmap, true);
 
         if inner.width == 0 || inner.height < 2 {
             return;

@@ -16,7 +16,8 @@ use crate::{
         hitmap::{HitMap, HitTarget},
         keymap::Action,
         overlays::{
-            centered_rect, modal_block, read_clipboard_text, sanitize_single_line, OverlayOutcome,
+            centered_rect, modal_block, read_clipboard_text, register_modal_chrome,
+            sanitize_single_line, OverlayOutcome,
         },
         text_edit::TextBuffer,
     },
@@ -174,6 +175,7 @@ impl AssigneeOverlay {
         let block = modal_block(format!(" Assign Issue — {} ", self.issue_key), theme, true);
         let inner = block.inner(rect);
         frame.render_widget(block, rect);
+        register_modal_chrome(rect, frame, theme, hitmap, true);
         if inner.width == 0 || inner.height < 4 {
             return;
         }

@@ -14,7 +14,7 @@ use crate::ui::{
     doc_view::truncate_width,
     hitmap::{HitMap, HitTarget},
     keymap::Action,
-    overlays::{anchored_rect, modal_block, OverlayOutcome},
+    overlays::{anchored_rect, modal_block, register_modal_chrome, OverlayOutcome},
 };
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -250,16 +250,97 @@ impl ContextMenuOverlay {
 
     /// Builds a context menu inferred from the active workspace tab and current selection.
     pub fn for_active_context(anchor: (u16, u16), app: &AppState, ui: &UiState) -> Self {
-        if ui.active_tab == WorkspaceTab::Confluence
-            || (ui.active_tab == WorkspaceTab::MyWork && ui.my_work_ui.active_column == 1)
-        {
-            if let Some(page) = &app.active_page {
-                return Self::for_confluence_page(
-                    page.summary.id.clone(),
-                    page.summary.title.clone(),
-                    page.summary.web_url.clone(),
-                    anchor,
-                );
+        match ui.active_tab {
+            WorkspaceTab::MyWork => {
+                if ui.my_work_ui.active_column == 1 {
+                    if let Some(page) = app.my_pages.get(ui.my_work_ui.selected_page) {
+                        return Self::for_confluence_page(
+                            page.id.clone(),
+                            page.title.clone(),
+                            page.web_url.clone(),
+                            anchor,
+                        );
+                    }
+                    return Self::for_global(anchor);
+                }
+                if let Some(issue) = app.my_issues.get(ui.my_work_ui.selected_issue) {
+                    let url = if !issue.web_url.is_empty() {
+                        issue.web_url.clone()
+                    } else {
+                        let base = app.config.jira_base_url();
+                        if base.is_empty() {
+                            String::new()
+                        } else {
+                            format!("{base}/browse/{}", issue.key)
+                        }
+                    };
+                    return Self::for_jira_issue(issue.key.clone(), url, anchor);
+                }
+                return Self::for_global(anchor);
+            }
+            WorkspaceTab::Confluence => {
+                if ui.focus == crate::ui::app::PaneFocus::Nav {
+                    if ui.confluence_ui.nav_section == 0 {
+                        return Self::for_global(anchor);
+                    }
+                    let tree = app.current_confluence_tree(ui);
+                    if let Some(row) = tree.get(ui.confluence_ui.selected_tree_row) {
+                        return Self::for_confluence_page(
+                            row.page.id.clone(),
+                            row.page.title.clone(),
+                            row.page.web_url.clone(),
+                            anchor,
+                        );
+                    }
+                }
+                if let Some(page) = &app.active_page {
+                    return Self::for_confluence_page(
+                        page.summary.id.clone(),
+                        page.summary.title.clone(),
+                        page.summary.web_url.clone(),
+                        anchor,
+                    );
+                }
+                return Self::for_global(anchor);
+            }
+            WorkspaceTab::Search => {
+                if let Some(hit) = app.search_hits.get(ui.search_ui.selected_hit) {
+                    return match hit.kind {
+                        crate::models::SearchHitKind::JiraIssue => {
+                            let url = if !hit.web_url.is_empty() {
+                                hit.web_url.clone()
+                            } else {
+                                let base = app.config.jira_base_url();
+                                if base.is_empty() {
+                                    String::new()
+                                } else {
+                                    format!("{base}/browse/{}", hit.id_or_key)
+                                }
+                            };
+                            Self::for_jira_issue(hit.id_or_key.clone(), url, anchor)
+                        }
+                        crate::models::SearchHitKind::ConfluencePage => Self::for_confluence_page(
+                            hit.id_or_key.clone(),
+                            hit.title.clone(),
+                            hit.web_url.clone(),
+                            anchor,
+                        ),
+                    };
+                }
+                return Self::for_global(anchor);
+            }
+            WorkspaceTab::Directory => {
+                return Self::for_global(anchor);
+            }
+            WorkspaceTab::Board => {
+                if ui.focus == crate::ui::app::PaneFocus::Nav {
+                    return Self::for_global(anchor);
+                }
+            }
+            WorkspaceTab::Issues => {
+                if ui.focus == crate::ui::app::PaneFocus::Nav && ui.issue_ui.nav_section == 0 {
+                    return Self::for_global(anchor);
+                }
             }
         }
         if let Some(key) = app.selected_issue_key(ui) {
@@ -373,14 +454,23 @@ impl ContextMenuOverlay {
         let block = modal_block(title, theme, true);
         let inner = block.inner(rect);
         frame.render_widget(block, rect);
+        register_modal_chrome(rect, frame, theme, hitmap, false);
         if inner.width == 0 || inner.height == 0 {
             return;
         }
 
         let max_rows = inner.height.saturating_sub(1) as usize;
-        for (index, item) in self.items.iter().take(max_rows).enumerate() {
-            let row = inner.y + index as u16;
-            let selected = index == self.selected;
+        let total = self.items.len();
+        let sel = self.selected.min(total.saturating_sub(1));
+        let start = if max_rows > 0 && sel >= max_rows {
+            sel - max_rows + 1
+        } else {
+            0
+        };
+        for (vis_idx, item) in self.items.iter().skip(start).take(max_rows).enumerate() {
+            let actual_idx = start + vis_idx;
+            let row = inner.y + vis_idx as u16;
+            let selected = actual_idx == sel;
             let prefix = if selected { "▸ " } else { "  " };
             let label_style = if selected {
                 theme.selection().remove_modifier(Modifier::BOLD)
@@ -413,14 +503,19 @@ impl ContextMenuOverlay {
                 Paragraph::new(line),
                 Rect::new(inner.x, row, inner.width, 1),
             );
-            hitmap.add_line(inner.x, row, inner.width, HitTarget::OverlayItem(index));
+            hitmap.add_line(inner.x, row, inner.width, HitTarget::OverlayItem(actual_idx));
         }
 
         if inner.height > 1 {
             let footer_y = inner.y + inner.height - 1;
+            let footer_text = if total > max_rows && max_rows > 0 {
+                format!(" {}/{total} · Enter confirm · Esc", sel + 1)
+            } else {
+                " Enter confirm · Esc cancel".to_string()
+            };
             frame.render_widget(
                 Paragraph::new(Span::styled(
-                    truncate_width(" Enter confirm · Esc cancel", inner.width as usize),
+                    truncate_width(&footer_text, inner.width as usize),
                     Style::default().fg(theme.muted).add_modifier(Modifier::DIM),
                 )),
                 Rect::new(inner.x, footer_y, inner.width, 1),

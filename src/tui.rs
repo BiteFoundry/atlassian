@@ -910,13 +910,29 @@ fn draw_frame(
     draw_res
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TermEventOutcome {
+    Continue,
+    /// Layout, tab, overlay, or mouse-click target changed; redraw immediately so
+    /// `ui.hitmap` is rebuilt before any subsequent queued mouse event is processed.
+    RedrawNow,
+    Quit,
+}
+
 fn handle_terminal_event(
     ev: CrosstermEvent,
     app: &mut AppState,
     ui: &mut UiState,
     pixel_rt: &mut PixelPreviewRuntime,
     dirty: &mut bool,
-) -> bool {
+) -> TermEventOutcome {
+    let prev_tab = ui.active_tab;
+    let prev_overlays = ui.overlays.len();
+    let prev_nav_rail = ui.show_nav_rail;
+    let prev_drawer = ui.board_ui.drawer_open;
+    let prev_toc = ui.confluence_ui.toc_open;
+    let mut force_redraw = false;
+
     match ev {
         CrosstermEvent::Key(key) => {
             if let Some(act) = event::key_to_action(
@@ -929,16 +945,22 @@ fn handle_terminal_event(
             ) {
                 *dirty = true;
                 if action::dispatch(act, app, ui) {
-                    return true;
+                    return TermEventOutcome::Quit;
                 }
                 pixel_rt.sync_overlay_state(app, ui);
             }
         }
         CrosstermEvent::Mouse(mouse) => {
             if let Some(act) = event::mouse_to_action(mouse, &ui.hitmap) {
+                if matches!(
+                    act,
+                    Action::MouseClick { .. } | Action::MouseRightClick { .. }
+                ) {
+                    force_redraw = true;
+                }
                 *dirty = true;
                 if action::dispatch(act, app, ui) {
-                    return true;
+                    return TermEventOutcome::Quit;
                 }
                 pixel_rt.sync_overlay_state(app, ui);
             }
@@ -946,7 +968,7 @@ fn handle_terminal_event(
         CrosstermEvent::Paste(text) => {
             *dirty = true;
             if action::dispatch(Action::Paste(text), app, ui) {
-                return true;
+                return TermEventOutcome::Quit;
             }
             pixel_rt.sync_overlay_state(app, ui);
         }
@@ -955,6 +977,7 @@ fn handle_terminal_event(
             ui.term_height = h;
             pixel_rt.on_resize();
             *dirty = true;
+            force_redraw = true;
             if matches!(ui.overlays.last(), Some(Overlay::ImagePreview(_))) {
                 let _ = action::dispatch(Action::LoadPreviewImage, app, ui);
                 pixel_rt.sync_overlay_state(app, ui);
@@ -965,7 +988,17 @@ fn handle_terminal_event(
         }
         _ => {}
     }
-    false
+
+    let layout_changed = ui.active_tab != prev_tab
+        || ui.overlays.len() != prev_overlays
+        || ui.show_nav_rail != prev_nav_rail
+        || ui.board_ui.drawer_open != prev_drawer
+        || ui.confluence_ui.toc_open != prev_toc;
+    if force_redraw || layout_changed {
+        TermEventOutcome::RedrawNow
+    } else {
+        TermEventOutcome::Continue
+    }
 }
 
 pub async fn run(
@@ -1059,6 +1092,7 @@ pub async fn run_with_persona(
         }
 
         let mut should_quit = false;
+        let mut needs_immediate_redraw = false;
         tokio::select! {
             _ = tick.tick() => {
                 let before = ui.toasts.len();
@@ -1090,11 +1124,11 @@ pub async fn run_with_persona(
             }
             maybe_ev = events.next() => {
                 match maybe_ev {
-                    Some(Ok(ev)) => {
-                        if handle_terminal_event(ev, &mut app, &mut ui, &mut pixel_rt, &mut dirty) {
-                            should_quit = true;
-                        }
-                    }
+                    Some(Ok(ev)) => match handle_terminal_event(ev, &mut app, &mut ui, &mut pixel_rt, &mut dirty) {
+                        TermEventOutcome::Quit => should_quit = true,
+                        TermEventOutcome::RedrawNow => needs_immediate_redraw = true,
+                        TermEventOutcome::Continue => {}
+                    },
                     Some(Err(_)) | None => should_quit = true,
                 }
             }
@@ -1103,9 +1137,14 @@ pub async fn run_with_persona(
             break;
         }
 
-        // Coalesce burst events before redrawing to avoid flickering pixel overlays.
+        // Coalesce burst events before redrawing to avoid flickering pixel overlays,
+        // but stop immediately after any mouse click or tab/overlay/layout change so
+        // the next mouse event never queries a stale hitmap.
         let mut drained = 0usize;
-        while drained < MAX_COALESCED_EVENTS && ui.editor_request.is_none() {
+        while drained < MAX_COALESCED_EVENTS
+            && ui.editor_request.is_none()
+            && !needs_immediate_redraw
+        {
             let mut progressed = false;
             while drained < MAX_COALESCED_EVENTS {
                 match core_rx.try_recv() {
@@ -1147,14 +1186,24 @@ pub async fn run_with_persona(
                     Err(_) => break,
                 }
             }
-            while drained < MAX_COALESCED_EVENTS && ui.editor_request.is_none() {
+            while drained < MAX_COALESCED_EVENTS
+                && ui.editor_request.is_none()
+                && !needs_immediate_redraw
+            {
                 match events.next().now_or_never() {
                     Some(Some(Ok(ev))) => {
                         drained += 1;
                         progressed = true;
-                        if handle_terminal_event(ev, &mut app, &mut ui, &mut pixel_rt, &mut dirty) {
-                            should_quit = true;
-                            break;
+                        match handle_terminal_event(ev, &mut app, &mut ui, &mut pixel_rt, &mut dirty) {
+                            TermEventOutcome::Quit => {
+                                should_quit = true;
+                                break;
+                            }
+                            TermEventOutcome::RedrawNow => {
+                                needs_immediate_redraw = true;
+                                break;
+                            }
+                            TermEventOutcome::Continue => {}
                         }
                     }
                     Some(Some(Err(_))) | Some(None) => {
@@ -1164,7 +1213,7 @@ pub async fn run_with_persona(
                     None => break,
                 }
             }
-            if should_quit || !progressed {
+            if should_quit || needs_immediate_redraw || !progressed {
                 break;
             }
         }

@@ -18,11 +18,12 @@ use ratatui::{
 use crate::ui::{
     app::{AppState, UiState},
     doc_view::truncate_width,
-    hitmap::{HitMap, HitTarget},
+    hitmap::{ButtonId, HitMap, HitTarget},
     keymap::Action,
     overlays::{
-        centered_rect, modal_block, path_input::UploadTarget, read_clipboard_text,
-        sanitize_single_line, OverlayOutcome,
+        centered_rect, modal_block, modal_pill_secondary, path_input::UploadTarget,
+        read_clipboard_text, register_modal_chrome, render_button_bar, sanitize_single_line,
+        OverlayOutcome,
     },
 };
 
@@ -197,6 +198,17 @@ impl FilePickerOverlay {
         }
     }
 
+    /// Returns `true` when the currently selected entry is a directory (or zoxide jump target).
+    pub fn is_selected_directory(&self) -> bool {
+        match self.mode {
+            FilePickerMode::Zoxide => !self.visible_zoxide_dirs().is_empty(),
+            FilePickerMode::Browse => self
+                .visible_entries()
+                .get(self.selected)
+                .is_some_and(|entry| entry.is_dir),
+        }
+    }
+
     pub fn paste_from_clipboard(&mut self) -> bool {
         let Some(text) = read_clipboard_text() else {
             return false;
@@ -251,6 +263,17 @@ impl FilePickerOverlay {
                 let len = self.visible_len();
                 if len > 0 {
                     self.selected = (self.selected + 8).min(len - 1);
+                }
+                OverlayOutcome::Handled
+            }
+            Action::CollapseNode => {
+                if self.mode == FilePickerMode::Zoxide {
+                    self.mode = FilePickerMode::Browse;
+                    self.filter.clear();
+                    self.selected = 0;
+                    self.status_msg = None;
+                } else {
+                    self.go_parent();
                 }
                 OverlayOutcome::Handled
             }
@@ -351,6 +374,7 @@ impl FilePickerOverlay {
         let block = modal_block(format!(" {mode_tag} — Upload to {target_label} "), theme, true);
         let inner = block.inner(rect);
         frame.render_widget(block, rect);
+        register_modal_chrome(rect, frame, theme, hitmap, true);
         if inner.width == 0 || inner.height < 5 {
             return;
         }
@@ -507,25 +531,23 @@ impl FilePickerOverlay {
         }
         frame.render_widget(Paragraph::new(lines), chunks[1]);
 
-        let footer_text = if let Some(msg) = &self.status_msg {
-            format!(" {msg}")
+        let trailing = if let Some(msg) = &self.status_msg {
+            format!("· {msg}")
         } else if self.mode == FilePickerMode::Zoxide {
-            " ↑/↓ select · Enter jump · type filter · Backspace/Esc back".to_string()
+            "· Enter jump · Esc browse".to_string()
         } else {
-            " ↑/↓ nav · Enter open/upload · Backspace parent · type filter · z zoxide · Esc close"
-                .to_string()
+            "· Enter open/upload · Backspace parent · Esc close".to_string()
         };
-        let footer_style = if self.status_msg.is_some() {
-            Style::default().fg(theme.warning)
-        } else {
-            Style::default().fg(theme.muted).add_modifier(Modifier::DIM)
-        };
-        frame.render_widget(
-            Paragraph::new(Span::styled(
-                truncate_width(&footer_text, chunks[2].width as usize),
-                footer_style,
-            )),
+        render_button_bar(
+            frame,
             chunks[2],
+            &[
+                ("[..] Parent", ButtonId::OverlayFileParent, modal_pill_secondary(theme)),
+                ("[z] Zoxide", ButtonId::OverlayFileZoxide, modal_pill_secondary(theme)),
+            ],
+            Some(&trailing),
+            theme,
+            hitmap,
         );
     }
 }

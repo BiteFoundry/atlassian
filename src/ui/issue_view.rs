@@ -7,18 +7,20 @@ use ratatui::{
     widgets::Paragraph,
     Frame,
 };
+use unicode_width::UnicodeWidthStr;
 
 use crate::{
     config::DensityMode,
     models::{IssueDetail, StatusCategory},
     ui::{
-        app::{AppState, PaneFocus, UiState},
+        app::{AppState, PaneFocus, UiState, WorkspaceTab},
         doc_view::{
             blocks_or_markdown, pad_right_width, render_blocks_with_options, truncate_width,
             wrap_plain_text,
         },
         draw_horizontal_hairline, fill_surface,
         hitmap::{ButtonId, HitMap, HitTarget},
+        visible_window,
     },
 };
 
@@ -71,11 +73,33 @@ fn draw_jql_bar(frame: &mut Frame, area: Rect, _app: &AppState, ui: &mut UiState
     ui.hitmap.add(area, HitTarget::JqlBar);
 
     let line = if filter_focused {
+        let prefix = " Filter / ";
+        let text = ui.issue_ui.local_filter.text.clone();
+        let cursor = "▏";
+        let sep = "   ";
+        let close_lbl = "(Esc to close)";
+        let close_x = input_rect
+            .x
+            .saturating_add(prefix.width() as u16)
+            .saturating_add(text.width() as u16)
+            .saturating_add(cursor.width() as u16)
+            .saturating_add(sep.width() as u16);
+        let close_w = close_lbl.width() as u16;
+        if close_x < input_rect.right() {
+            let clipped_w = close_w.min(input_rect.right().saturating_sub(close_x));
+            ui.hitmap.add_line(
+                close_x,
+                input_rect.y,
+                clipped_w,
+                HitTarget::Button(ButtonId::CloseLocalFilter),
+            );
+        }
         Line::from(vec![
-            Span::styled(" Filter / ", theme.accent_style().patch(bar_surface)),
-            Span::styled(ui.issue_ui.local_filter.text.clone(), bar_surface),
-            Span::styled("▏", theme.accent_style().patch(bar_surface)),
-            Span::styled("   (Esc to close)", theme.muted_style().patch(bar_surface)),
+            Span::styled(prefix, theme.accent_style().patch(bar_surface)),
+            Span::styled(text, bar_surface),
+            Span::styled(cursor, theme.accent_style().patch(bar_surface)),
+            Span::styled(sep, theme.muted_style().patch(bar_surface)),
+            Span::styled(close_lbl, theme.muted_style().patch(bar_surface)),
         ])
     } else {
         let prefix = " JQL> ";
@@ -83,10 +107,7 @@ fn draw_jql_bar(frame: &mut Frame, area: Rect, _app: &AppState, ui: &mut UiState
             Span::styled(prefix, theme.accent_style().patch(bar_surface)),
             Span::styled(ui.issue_ui.jql.text.clone(), bar_surface),
         ];
-        let mut cx = input_rect
-            .x
-            .saturating_add(unicode_width::UnicodeWidthStr::width(prefix) as u16);
-        let prefix_w = unicode_width::UnicodeWidthStr::width(prefix) as u16;
+        let prefix_w = prefix.width() as u16;
         if input_rect.x.saturating_add(prefix_w) <= input_rect.right() {
             ui.hitmap.add_line(
                 input_rect.x,
@@ -95,27 +116,52 @@ fn draw_jql_bar(frame: &mut Frame, area: Rect, _app: &AppState, ui: &mut UiState
                 HitTarget::Button(ButtonId::FocusJql),
             );
         }
-        cx = cx.saturating_add(unicode_width::UnicodeWidthStr::width(ui.issue_ui.jql.text.as_str()) as u16);
+        let mut cx = input_rect
+            .x
+            .saturating_add(prefix_w)
+            .saturating_add(ui.issue_ui.jql.text.as_str().width() as u16);
+        let muted = theme.muted_style().patch(bar_surface);
         if jql_focused {
-            spans.push(Span::styled("▏", theme.accent_style().patch(bar_surface)));
-        } else {
+            let cursor = "▏";
+            spans.push(Span::styled(cursor, theme.accent_style().patch(bar_surface)));
+            cx = cx.saturating_add(cursor.width() as u16);
             let sep = "   ";
-            let edit_lbl = "[J] Edit";
-            let tail = " · [Enter] Run · [/] Filter";
-            let edit_x = cx.saturating_add(sep.len() as u16);
-            let edit_w = edit_lbl.len() as u16;
-            if edit_x.saturating_add(edit_w) <= input_rect.right() {
+            let run_lbl = "[Enter] Run";
+            let run_x = cx.saturating_add(sep.width() as u16);
+            let run_w = run_lbl.width() as u16;
+            if run_x < input_rect.right() {
+                let clipped_w = run_w.min(input_rect.right().saturating_sub(run_x));
                 ui.hitmap.add_line(
-                    edit_x,
+                    run_x,
                     input_rect.y,
-                    edit_w,
-                    HitTarget::Button(ButtonId::FocusJql),
+                    clipped_w,
+                    HitTarget::Button(ButtonId::RunJql),
                 );
             }
-            spans.push(Span::styled(
-                format!("{sep}{edit_lbl}{tail}"),
-                theme.muted_style().patch(bar_surface),
-            ));
+            spans.push(Span::styled(sep, muted));
+            spans.push(Span::styled(run_lbl, muted));
+            cx = run_x.saturating_add(run_w);
+        } else {
+            let segments: &[(&str, Option<ButtonId>)] = &[
+                ("   ", None),
+                ("[J] Edit", Some(ButtonId::FocusJql)),
+                (" · ", None),
+                ("[Enter] Run", Some(ButtonId::RunJql)),
+                (" · ", None),
+                ("[/] Filter", Some(ButtonId::FocusLocalFilter)),
+            ];
+            for &(seg, btn) in segments {
+                let seg_w = seg.width() as u16;
+                if let Some(btn_id) = btn {
+                    if cx < input_rect.right() {
+                        let clipped_w = seg_w.min(input_rect.right().saturating_sub(cx));
+                        ui.hitmap
+                            .add_line(cx, input_rect.y, clipped_w, HitTarget::Button(btn_id));
+                    }
+                }
+                spans.push(Span::styled(seg, muted));
+                cx = cx.saturating_add(seg_w);
+            }
         }
         if !ui.issue_ui.local_filter.text.trim().is_empty() {
             let filter_st = if theme.no_color {
@@ -123,10 +169,21 @@ fn draw_jql_bar(frame: &mut Frame, area: Rect, _app: &AppState, ui: &mut UiState
             } else {
                 bar_surface.fg(theme.warning)
             };
-            spans.push(Span::styled(
-                format!("   [Filter: {}]", ui.issue_ui.local_filter.text),
-                filter_st,
-            ));
+            let sep = "   ";
+            let badge = format!("[Filter: {}]", ui.issue_ui.local_filter.text);
+            let badge_x = cx.saturating_add(sep.width() as u16);
+            let badge_w = badge.width() as u16;
+            if badge_x < input_rect.right() {
+                let clipped_w = badge_w.min(input_rect.right().saturating_sub(badge_x));
+                ui.hitmap.add_line(
+                    badge_x,
+                    input_rect.y,
+                    clipped_w,
+                    HitTarget::Button(ButtonId::FocusLocalFilter),
+                );
+            }
+            spans.push(Span::styled(sep, muted));
+            spans.push(Span::styled(badge, filter_st));
         }
         Line::from(spans)
     };
@@ -199,17 +256,35 @@ fn draw_issue_nav(frame: &mut Frame, area: Rect, app: &AppState, ui: &mut UiStat
         .constraints([Constraint::Length(filter_h), Constraint::Min(2)])
         .split(inner);
 
-    // Saved filters
+    // Register nav section containers BEFORE item rows for hover-scroll & fallback clicks.
+    ui.hitmap.add(rows[0], HitTarget::IssueNavFilters);
+    ui.hitmap.add(rows[1], HitTarget::IssueNavIssues);
+
+    // Saved filters (viewport scrolled)
+    let filter_list_h = rows[0].height.saturating_sub(1) as usize;
+    let (f_scroll, f_window) = visible_window(
+        ui.issue_ui.selected_filter,
+        ui.issue_ui.filter_scroll,
+        filter_list_h,
+        app.saved_filters.len(),
+    );
+    ui.issue_ui.filter_scroll = f_scroll;
+    let mut filter_title = " SAVED FILTERS".to_string();
+    if f_window.start > 0 || f_window.end < app.saved_filters.len() {
+        let up = if f_window.start > 0 { "▲" } else { "" };
+        let down = if f_window.end < app.saved_filters.len() {
+            "▼"
+        } else {
+            ""
+        };
+        filter_title.push_str(&format!(" {up}{down}"));
+    }
     let mut f_lines = vec![Line::from(Span::styled(
-        " SAVED FILTERS",
+        truncate_width(&filter_title, rows[0].width as usize),
         theme.muted_style(),
     ))];
-    for (idx, f) in app
-        .saved_filters
-        .iter()
-        .enumerate()
-        .take(rows[0].height.saturating_sub(1) as usize)
-    {
+    for (offset, idx) in f_window.enumerate() {
+        let f = &app.saved_filters[idx];
         let is_sel = ui.issue_ui.selected_filter == idx;
         let is_active_focus = focused && ui.issue_ui.nav_section == 0 && is_sel;
         let style = if is_active_focus {
@@ -227,7 +302,7 @@ fn draw_issue_nav(frame: &mut Frame, area: Rect, app: &AppState, ui: &mut UiStat
         )));
         ui.hitmap.add_line(
             rows[0].x,
-            rows[0].y + 1 + idx as u16,
+            rows[0].y + 1 + offset as u16,
             rows[0].width,
             HitTarget::FilterItem(idx),
         );
@@ -235,19 +310,30 @@ fn draw_issue_nav(frame: &mut Frame, area: Rect, app: &AppState, ui: &mut UiStat
     frame.render_widget(Paragraph::new(f_lines).style(sidebar_style), rows[0]);
 
     // Issue list (density-aware: Cozy = 2 lines per issue, Compact = 1 line per issue)
-    // In multi-site All Sites mode, renders collapsible site group headers.
+    // In multi-site All Sites mode, renders collapsible site group headers with viewport scroll.
     let issues_with_sites = app.filtered_issues_with_sites(ui);
     let list_h = rows[1].height.saturating_sub(1) as usize;
-    let mut i_lines = vec![Line::from(Span::styled(
-        format!(" ISSUES ({})", issues_with_sites.len()),
-        theme.muted_style(),
-    ))];
+    let mut i_lines = Vec::new();
     if issues_with_sites.is_empty() {
+        ui.issue_ui.issue_scroll = 0;
+        i_lines.push(Line::from(Span::styled(
+            " ISSUES (0)",
+            theme.muted_style(),
+        )));
         i_lines.push(Line::from(Span::styled(
             "  No issues to display",
             theme.muted_style(),
         )));
     } else if list_h > 0 && app.is_multi_site_all_mode() {
+        enum IssueNavRow {
+            SiteHeader {
+                site_id: String,
+                count: usize,
+                collapsed: bool,
+            },
+            Issue(usize),
+        }
+
         let row_lines = match app.config.density {
             DensityMode::Cozy => 2usize,
             DensityMode::Compact => 1usize,
@@ -257,8 +343,6 @@ fn draw_issue_nav(frame: &mut Frame, area: Rect, app: &AppState, ui: &mut UiStat
             .selected_issue
             .min(issues_with_sites.len().saturating_sub(1));
         let w = rows[1].width as usize;
-        let max_y = rows[1].bottom();
-        let mut cursor_y = rows[1].y + 1;
 
         let mut site_order: Vec<String> = Vec::new();
         for site in app.config.enabled_sites() {
@@ -272,6 +356,7 @@ fn draw_issue_nav(frame: &mut Frame, area: Rect, app: &AppState, ui: &mut UiStat
             }
         }
 
+        let mut nav_rows: Vec<IssueNavRow> = Vec::new();
         for site_id in site_order {
             let group_indices: Vec<usize> = issues_with_sites
                 .iter()
@@ -279,95 +364,170 @@ fn draw_issue_nav(frame: &mut Frame, area: Rect, app: &AppState, ui: &mut UiStat
                 .filter(|(_, (sid, _))| sid.eq_ignore_ascii_case(&site_id))
                 .map(|(i, _)| i)
                 .collect();
-            if group_indices.is_empty() || cursor_y >= max_y {
+            if group_indices.is_empty() {
                 continue;
             }
             let collapse_key = format!("issues:{site_id}");
             let collapsed = ui.collapsed_site_groups.contains(&collapse_key);
-            let group_idx = ui.site_group_keys.len();
-            ui.site_group_keys.push(collapse_key);
-            let chevron = if collapsed { "▸" } else { "▾" };
-            let site_label = app.site_display_label(&site_id);
-            i_lines.push(Line::from(Span::styled(
-                truncate_width(
-                    &format!(" {chevron} {site_label} ({})", group_indices.len()),
-                    w,
-                ),
-                theme.accent_style().patch(sidebar_style),
-            )));
-            ui.hitmap.add_line(
-                rows[1].x,
-                cursor_y,
-                rows[1].width,
-                HitTarget::SiteGroupHeader(group_idx),
-            );
-            cursor_y += 1;
-
-            if collapsed {
-                continue;
-            }
-            for abs_idx in group_indices {
-                if cursor_y >= max_y {
-                    break;
+            nav_rows.push(IssueNavRow::SiteHeader {
+                site_id,
+                count: group_indices.len(),
+                collapsed,
+            });
+            if !collapsed {
+                for abs_idx in group_indices {
+                    nav_rows.push(IssueNavRow::Issue(abs_idx));
                 }
-                let issue = &issues_with_sites[abs_idx].1;
-                let is_sel = abs_idx == sel;
-                let (icon, icon_color) = theme.issue_type_badge(&issue.issue_type);
-                let row_style = if is_sel && focused && ui.issue_ui.nav_section == 1 {
-                    theme.nav_selection()
-                } else if is_sel {
-                    theme.selection().add_modifier(Modifier::BOLD)
-                } else {
-                    sidebar_style
-                };
-                if row_lines == 2 && cursor_y + 1 < max_y {
-                    let status_txt = truncate_width(
-                        &issue.status.name,
-                        w.saturating_sub(issue.key.len() + 8),
-                    );
-                    i_lines.push(Line::from(vec![
-                        Span::styled(if is_sel { "  ▸ " } else { "    " }, row_style),
-                        Span::styled(format!("{icon} "), Style::default().fg(icon_color)),
-                        Span::styled(
-                            format!("{} ", issue.key),
-                            theme.accent_style().patch(row_style),
-                        ),
-                        Span::styled(status_txt, theme.muted_style().patch(row_style)),
-                    ]));
-                    let summary_line = truncate_width(&format!("      {}", issue.summary), w);
-                    i_lines.push(Line::from(Span::styled(summary_line, row_style)));
+            }
+        }
+
+        let row_height = |r: &IssueNavRow| -> usize {
+            match r {
+                IssueNavRow::SiteHeader { .. } => 1,
+                IssueNavRow::Issue(_) => row_lines,
+            }
+        };
+        let sel_row = nav_rows
+            .iter()
+            .position(|r| matches!(r, IssueNavRow::Issue(i) if *i == sel));
+
+        let mut scroll = ui
+            .issue_ui
+            .issue_scroll
+            .min(nav_rows.len().saturating_sub(1));
+        if let Some(sr) = sel_row {
+            if sr < scroll {
+                scroll = sr;
+            } else {
+                while scroll < sr {
+                    let used: usize = nav_rows[scroll..=sr].iter().map(row_height).sum();
+                    if used <= list_h {
+                        break;
+                    }
+                    scroll += 1;
+                }
+            }
+            if sr == scroll
+                && scroll > 0
+                && matches!(nav_rows[scroll - 1], IssueNavRow::SiteHeader { .. })
+                && row_lines < list_h
+            {
+                scroll -= 1;
+            }
+        }
+        while scroll > 0 {
+            let used: usize = nav_rows[(scroll - 1)..].iter().map(row_height).sum();
+            if used <= list_h {
+                scroll -= 1;
+            } else {
+                break;
+            }
+        }
+        ui.issue_ui.issue_scroll = scroll;
+
+        let total_from_scroll: usize = nav_rows[scroll..].iter().map(row_height).sum();
+        let mut issues_title = format!(" ISSUES ({})", issues_with_sites.len());
+        if scroll > 0 || total_from_scroll > list_h {
+            let up = if scroll > 0 { "▲" } else { "" };
+            let down = if total_from_scroll > list_h { "▼" } else { "" };
+            issues_title.push_str(&format!(" {up}{down}"));
+        }
+        i_lines.push(Line::from(Span::styled(
+            truncate_width(&issues_title, w),
+            theme.muted_style(),
+        )));
+
+        let max_y = rows[1].bottom();
+        let mut cursor_y = rows[1].y + 1;
+        for row in &nav_rows[scroll..] {
+            if cursor_y >= max_y {
+                break;
+            }
+            match row {
+                IssueNavRow::SiteHeader {
+                    site_id,
+                    count,
+                    collapsed,
+                } => {
+                    let collapse_key = format!("issues:{site_id}");
+                    let group_idx = ui.site_group_keys.len();
+                    ui.site_group_keys.push(collapse_key);
+                    let chevron = if *collapsed { "▸" } else { "▾" };
+                    let site_label = app.site_display_label(site_id);
+                    i_lines.push(Line::from(Span::styled(
+                        truncate_width(&format!(" {chevron} {site_label} ({count})"), w),
+                        theme.accent_style().patch(sidebar_style),
+                    )));
                     ui.hitmap.add_line(
                         rows[1].x,
                         cursor_y,
                         rows[1].width,
-                        HitTarget::IssueRow(abs_idx),
-                    );
-                    ui.hitmap.add_line(
-                        rows[1].x,
-                        cursor_y + 1,
-                        rows[1].width,
-                        HitTarget::IssueRow(abs_idx),
-                    );
-                    cursor_y += 2;
-                } else {
-                    let title_budget = w.saturating_sub(issue.key.len() + 8);
-                    let summary = truncate_width(&issue.summary, title_budget);
-                    i_lines.push(Line::from(vec![
-                        Span::styled(if is_sel { "  ▸ " } else { "    " }, row_style),
-                        Span::styled(format!("{icon} "), Style::default().fg(icon_color)),
-                        Span::styled(
-                            format!("{} ", issue.key),
-                            theme.accent_style().patch(row_style),
-                        ),
-                        Span::styled(summary, row_style),
-                    ]));
-                    ui.hitmap.add_line(
-                        rows[1].x,
-                        cursor_y,
-                        rows[1].width,
-                        HitTarget::IssueRow(abs_idx),
+                        HitTarget::SiteGroupHeader(group_idx),
                     );
                     cursor_y += 1;
+                }
+                IssueNavRow::Issue(abs_idx) => {
+                    let abs_idx = *abs_idx;
+                    let issue = &issues_with_sites[abs_idx].1;
+                    let is_sel = abs_idx == sel;
+                    let (icon, icon_color) = theme.issue_type_badge(&issue.issue_type);
+                    let row_style = if is_sel && focused && ui.issue_ui.nav_section == 1 {
+                        theme.nav_selection()
+                    } else if is_sel {
+                        theme.selection().add_modifier(Modifier::BOLD)
+                    } else {
+                        sidebar_style
+                    };
+                    if row_lines == 2 && cursor_y + 1 < max_y {
+                        let status_txt = truncate_width(
+                            &issue.status.name,
+                            w.saturating_sub(issue.key.len() + 8),
+                        );
+                        i_lines.push(Line::from(vec![
+                            Span::styled(if is_sel { "  ▸ " } else { "    " }, row_style),
+                            Span::styled(format!("{icon} "), Style::default().fg(icon_color)),
+                            Span::styled(
+                                format!("{} ", issue.key),
+                                theme.accent_style().patch(row_style),
+                            ),
+                            Span::styled(status_txt, theme.muted_style().patch(row_style)),
+                        ]));
+                        let summary_line =
+                            truncate_width(&format!("      {}", issue.summary), w);
+                        i_lines.push(Line::from(Span::styled(summary_line, row_style)));
+                        ui.hitmap.add_line(
+                            rows[1].x,
+                            cursor_y,
+                            rows[1].width,
+                            HitTarget::IssueRow(abs_idx),
+                        );
+                        ui.hitmap.add_line(
+                            rows[1].x,
+                            cursor_y + 1,
+                            rows[1].width,
+                            HitTarget::IssueRow(abs_idx),
+                        );
+                        cursor_y += 2;
+                    } else {
+                        let title_budget = w.saturating_sub(issue.key.len() + 8);
+                        let summary = truncate_width(&issue.summary, title_budget);
+                        i_lines.push(Line::from(vec![
+                            Span::styled(if is_sel { "  ▸ " } else { "    " }, row_style),
+                            Span::styled(format!("{icon} "), Style::default().fg(icon_color)),
+                            Span::styled(
+                                format!("{} ", issue.key),
+                                theme.accent_style().patch(row_style),
+                            ),
+                            Span::styled(summary, row_style),
+                        ]));
+                        ui.hitmap.add_line(
+                            rows[1].x,
+                            cursor_y,
+                            rows[1].width,
+                            HitTarget::IssueRow(abs_idx),
+                        );
+                        cursor_y += 1;
+                    }
                 }
             }
         }
@@ -382,14 +542,24 @@ fn draw_issue_nav(frame: &mut Frame, area: Rect, app: &AppState, ui: &mut UiStat
             .issue_ui
             .selected_issue
             .min(issues.len().saturating_sub(1));
-        let start = if sel >= visible_items {
-            sel - visible_items + 1
-        } else {
-            0
-        };
+        let (scroll, window) =
+            visible_window(sel, ui.issue_ui.issue_scroll, visible_items, issues.len());
+        ui.issue_ui.issue_scroll = scroll;
+
+        let mut issues_title = format!(" ISSUES ({})", issues.len());
+        if window.start > 0 || window.end < issues.len() {
+            let up = if window.start > 0 { "▲" } else { "" };
+            let down = if window.end < issues.len() { "▼" } else { "" };
+            issues_title.push_str(&format!(" {up}{down}"));
+        }
+        i_lines.push(Line::from(Span::styled(
+            truncate_width(&issues_title, rows[1].width as usize),
+            theme.muted_style(),
+        )));
+
         let mut cursor_y = rows[1].y + 1;
-        for (vis_idx, issue) in issues.iter().skip(start).take(visible_items).enumerate() {
-            let abs_idx = start + vis_idx;
+        for abs_idx in window {
+            let issue = &issues[abs_idx];
             let is_sel = abs_idx == sel;
             let (icon, icon_color) = theme.issue_type_badge(&issue.issue_type);
             let row_style = if is_sel && focused && ui.issue_ui.nav_section == 1 {
@@ -415,13 +585,14 @@ fn draw_issue_nav(frame: &mut Frame, area: Rect, app: &AppState, ui: &mut UiStat
                     ),
                     Span::styled(status_txt, theme.muted_style().patch(row_style)),
                 ]));
-                let summary_line = truncate_width(
-                    &format!("    {}", issue.summary),
-                    w,
-                );
+                let summary_line = truncate_width(&format!("    {}", issue.summary), w);
                 i_lines.push(Line::from(Span::styled(summary_line, row_style)));
-                ui.hitmap
-                    .add_line(rows[1].x, cursor_y, rows[1].width, HitTarget::IssueRow(abs_idx));
+                ui.hitmap.add_line(
+                    rows[1].x,
+                    cursor_y,
+                    rows[1].width,
+                    HitTarget::IssueRow(abs_idx),
+                );
                 ui.hitmap.add_line(
                     rows[1].x,
                     cursor_y + 1,
@@ -441,11 +612,20 @@ fn draw_issue_nav(frame: &mut Frame, area: Rect, app: &AppState, ui: &mut UiStat
                     ),
                     Span::styled(summary, row_style),
                 ]));
-                ui.hitmap
-                    .add_line(rows[1].x, cursor_y, rows[1].width, HitTarget::IssueRow(abs_idx));
+                ui.hitmap.add_line(
+                    rows[1].x,
+                    cursor_y,
+                    rows[1].width,
+                    HitTarget::IssueRow(abs_idx),
+                );
                 cursor_y += 1;
             }
         }
+    } else {
+        i_lines.push(Line::from(Span::styled(
+            format!(" ISSUES ({})", issues_with_sites.len()),
+            theme.muted_style(),
+        )));
     }
     frame.render_widget(Paragraph::new(i_lines).style(sidebar_style), rows[1]);
 }
@@ -479,14 +659,39 @@ pub fn draw_issue_inspector_pane(
     };
     let hdr_rect = Rect::new(area.x, area.y, area.width, 1);
     let focus_mark = if focused { "▸" } else { " " };
-    frame.render_widget(
-        Paragraph::new(Line::from(Span::styled(
-            truncate_width(&format!("{focus_mark}{title}"), area.width as usize),
-            theme.title(focused),
-        )))
-        .style(pane_surface),
-        hdr_rect,
-    );
+    if compact_drawer && area.width >= 10 {
+        let close_pill = "[✕]";
+        let close_w = close_pill.width() as u16;
+        let title_budget = (area.width as usize).saturating_sub(close_w as usize + 1);
+        let fitted_title = truncate_width(&format!("{focus_mark}{title}"), title_budget);
+        let pad = (area.width as usize)
+            .saturating_sub(fitted_title.width() + close_w as usize);
+        let close_x = hdr_rect.right().saturating_sub(close_w);
+        ui.hitmap.add_line(
+            close_x,
+            hdr_rect.y,
+            close_w,
+            HitTarget::Button(ButtonId::ToggleDrawer),
+        );
+        frame.render_widget(
+            Paragraph::new(Line::from(vec![
+                Span::styled(fitted_title, theme.title(focused)),
+                Span::raw(" ".repeat(pad)),
+                Span::styled(close_pill, theme.muted_style()),
+            ]))
+            .style(pane_surface),
+            hdr_rect,
+        );
+    } else {
+        frame.render_widget(
+            Paragraph::new(Line::from(Span::styled(
+                truncate_width(&format!("{focus_mark}{title}"), area.width as usize),
+                theme.title(focused),
+            )))
+            .style(pane_surface),
+            hdr_rect,
+        );
+    }
     draw_horizontal_hairline(
         frame,
         area.x,
@@ -510,6 +715,13 @@ pub fn draw_issue_inspector_pane(
     }
 
     let Some(detail) = &app.active_issue else {
+        if ui.active_tab == WorkspaceTab::Board {
+            ui.board_ui.detail_max_scroll = 0;
+            ui.board_ui.detail_scroll = 0;
+        } else {
+            ui.issue_ui.detail_max_scroll = 0;
+            ui.issue_ui.detail_scroll = 0;
+        }
         let empty = vec![
             Line::from(""),
             Line::from(Span::styled(
@@ -521,29 +733,91 @@ pub fn draw_issue_inspector_pane(
         return;
     };
 
-    let lines = build_issue_inspector_lines(detail, inner.width, app, ui, compact_drawer);
+    let (lines, action_row, row_hits) =
+        build_issue_inspector_lines_with_hits(detail, inner.width, app, ui, compact_drawer);
 
-    // Register clickable action bar buttons when visible and unscrolled.
-    // Breadcrumb = 0, Summary lines = sum_count, Action bar = 1 + sum_count.
-    let w = (inner.width as usize).max(20);
-    let sum_lines = wrap_plain_text(&detail.summary.summary, w.saturating_sub(2)).len() as u16;
-    let action_row = 1 + sum_lines;
-    if scroll == 0 && inner.height > action_row {
-        register_issue_action_buttons(
-            inner.x,
-            inner.y + action_row,
-            inner.width,
-            compact_drawer,
-            &mut ui.hitmap,
-        );
+    let max_scroll = lines.len().saturating_sub(inner.height as usize) as u16;
+    let clamped_scroll = scroll.min(max_scroll);
+    if ui.active_tab == WorkspaceTab::Board {
+        ui.board_ui.detail_max_scroll = max_scroll;
+        ui.board_ui.detail_scroll = clamped_scroll;
+    } else {
+        ui.issue_ui.detail_max_scroll = max_scroll;
+        ui.issue_ui.detail_scroll = clamped_scroll;
+    }
+
+    // Register clickable action bar buttons whenever the action bar row is visible.
+    let action_row_u16 = action_row as u16;
+    if clamped_scroll <= action_row_u16 {
+        let vis_row = action_row_u16 - clamped_scroll;
+        if vis_row < inner.height {
+            register_issue_action_buttons(
+                inner.x,
+                inner.y + vis_row,
+                inner.width,
+                compact_drawer,
+                &mut ui.hitmap,
+            );
+        }
+    }
+
+    // Register clickable subtasks, linked issues/pages, attachments, and Add Comment prompt.
+    let scroll_usize = clamped_scroll as usize;
+    for hit in row_hits {
+        if hit.line_idx >= scroll_usize {
+            let vis_row = hit.line_idx - scroll_usize;
+            if vis_row < inner.height as usize {
+                let y = inner.y + vis_row as u16;
+                let x = inner.x.saturating_add(hit.x_offset);
+                if x < inner.right() {
+                    let max_w = inner.right().saturating_sub(x);
+                    let w = hit.width.map_or(max_w, |w| w.min(max_w));
+                    ui.hitmap.add_line(x, y, w, hit.target);
+                }
+            }
+        }
     }
 
     frame.render_widget(
         Paragraph::new(lines)
             .style(pane_surface)
-            .scroll((scroll, 0)),
+            .scroll((clamped_scroll, 0)),
         inner,
     );
+}
+
+const COMPACT_ISSUE_ACTION_BUTTONS: &[(&str, ButtonId)] = &[
+    ("[m]Move", ButtonId::Transition),
+    ("[i]Me", ButtonId::AssignToMe),
+    ("[a]Assign", ButtonId::Assignee),
+    ("[c]Comment", ButtonId::Comment),
+    ("[e]Edit", ButtonId::Edit),
+    ("[H: HTML]", ButtonId::HtmlPreview),
+    ("[g]Links", ButtonId::CrossLinks),
+    ("[v]Img", ButtonId::ImagePreview),
+    ("[o]Open", ButtonId::OpenBrowser),
+];
+
+const FULL_ISSUE_ACTION_BUTTONS: &[(&str, ButtonId)] = &[
+    ("[m]Transition", ButtonId::Transition),
+    ("[i]Assign Me", ButtonId::AssignToMe),
+    ("[a]Assignee", ButtonId::Assignee),
+    ("[c]Comment", ButtonId::Comment),
+    ("[e]Edit", ButtonId::Edit),
+    ("[n]New", ButtonId::NewItem),
+    ("[H: HTML]", ButtonId::HtmlPreview),
+    ("[Ctrl+F]Attach", ButtonId::UploadAttachment),
+    ("[v]Image", ButtonId::ImagePreview),
+    ("[g]Links", ButtonId::CrossLinks),
+    ("[o]Open", ButtonId::OpenBrowser),
+];
+
+fn issue_action_buttons(compact: bool) -> &'static [(&'static str, ButtonId)] {
+    if compact {
+        COMPACT_ISSUE_ACTION_BUTTONS
+    } else {
+        FULL_ISSUE_ACTION_BUTTONS
+    }
 }
 
 fn register_issue_action_buttons(
@@ -553,42 +827,24 @@ fn register_issue_action_buttons(
     compact: bool,
     hitmap: &mut HitMap,
 ) {
-    let buttons: &[(&str, ButtonId)] = if compact {
-        &[
-            ("[m]Move", ButtonId::Transition),
-            ("[i]Me", ButtonId::AssignToMe),
-            ("[a]Assign", ButtonId::Assignee),
-            ("[c]Comment", ButtonId::Comment),
-            ("[e]Edit", ButtonId::Edit),
-            ("[H: HTML]", ButtonId::HtmlPreview),
-            ("[g]Links", ButtonId::CrossLinks),
-            ("[v]Img", ButtonId::ImagePreview),
-            ("[o]Open", ButtonId::OpenBrowser),
-        ]
-    } else {
-        &[
-            ("[m]Transition", ButtonId::Transition),
-            ("[i]Assign Me", ButtonId::AssignToMe),
-            ("[a]Assignee", ButtonId::Assignee),
-            ("[c]Comment", ButtonId::Comment),
-            ("[e]Edit", ButtonId::Edit),
-            ("[n]New", ButtonId::NewItem),
-            ("[H: HTML]", ButtonId::HtmlPreview),
-            ("[u]Attach", ButtonId::UploadAttachment),
-            ("[v]Image", ButtonId::ImagePreview),
-            ("[g]Links", ButtonId::CrossLinks),
-            ("[o]Open", ButtonId::OpenBrowser),
-        ]
-    };
+    let buttons = issue_action_buttons(compact);
     let mut cx = x + 1;
+    let max_x = x.saturating_add(width);
     for &(label, btn) in buttons {
-        let w = unicode_width::UnicodeWidthStr::width(label) as u16;
-        if cx + w > x + width {
+        let w = label.width() as u16;
+        if cx.saturating_add(w) > max_x {
             break;
         }
         hitmap.add_line(cx, row, w, HitTarget::Button(btn));
-        cx += w + 1;
+        cx = cx.saturating_add(w + 1);
     }
+}
+
+struct IssueLineHit {
+    line_idx: usize,
+    x_offset: u16,
+    width: Option<u16>,
+    target: HitTarget,
 }
 
 pub fn build_issue_inspector_lines(
@@ -598,10 +854,21 @@ pub fn build_issue_inspector_lines(
     ui: &UiState,
     compact: bool,
 ) -> Vec<Line<'static>> {
+    build_issue_inspector_lines_with_hits(detail, width, app, ui, compact).0
+}
+
+fn build_issue_inspector_lines_with_hits(
+    detail: &IssueDetail,
+    width: u16,
+    app: &AppState,
+    ui: &UiState,
+    compact: bool,
+) -> (Vec<Line<'static>>, usize, Vec<IssueLineHit>) {
     let theme = &ui.theme;
     let is_compact = compact || app.config.density == DensityMode::Compact;
     let w = (width as usize).max(20);
     let mut lines = Vec::new();
+    let mut row_hits = Vec::new();
     let s = &detail.summary;
 
     // 1. Breadcrumb
@@ -629,18 +896,22 @@ pub fn build_issue_inspector_lines(
     }
 
     // 3. Action hint bar
-    let action_bar = if compact {
-        " [m]Move [i]Me [a]Assign [c]Comment [e]Edit [H: HTML] [g]Links [v]Img [o]Open"
-    } else {
-        " [m]Transition [i]Assign Me [a]Assignee [c]Comment [e]Edit [n]New [H: HTML] [u]Attach [v]Image [g]Links [o]Open"
-    };
+    let action_row = lines.len();
+    let action_bar = format!(
+        " {}",
+        issue_action_buttons(compact)
+            .iter()
+            .map(|(lbl, _)| *lbl)
+            .collect::<Vec<_>>()
+            .join(" ")
+    );
     let action_style = if theme.no_color {
         Style::default().add_modifier(Modifier::DIM)
     } else {
         Style::default().fg(theme.accent_soft)
     };
     lines.push(Line::from(Span::styled(
-        truncate_width(action_bar, w),
+        truncate_width(&action_bar, w),
         action_style,
     )));
     lines.push(Line::from(Span::styled(
@@ -768,7 +1039,7 @@ pub fn build_issue_inspector_lines(
             format!(" ▾ Subtasks ({})", detail.subtasks.len()),
             theme.accent_style(),
         )));
-        for st in &detail.subtasks {
+        for (idx, st) in detail.subtasks.iter().enumerate() {
             let done = st.status.category == StatusCategory::Done;
             let chk = if done { "☑" } else { "☐" };
             let chk_col = if theme.no_color {
@@ -778,6 +1049,12 @@ pub fn build_issue_inspector_lines(
             } else {
                 theme.fg_muted
             };
+            row_hits.push(IssueLineHit {
+                line_idx: lines.len(),
+                x_offset: 0,
+                width: None,
+                target: HitTarget::DetailSubtask(idx),
+            });
             lines.push(Line::from(vec![
                 Span::styled(format!("  {chk} "), Style::default().fg(chk_col)),
                 Span::styled(format!("{} ", st.key), theme.accent_style()),
@@ -802,13 +1079,25 @@ pub fn build_issue_inspector_lines(
             " ▾ Linked Issues & Confluence Pages ([g] to jump)",
             link_hdr_style,
         )));
-        for lp in &detail.linked_pages {
+        for (idx, lp) in detail.linked_pages.iter().enumerate() {
+            row_hits.push(IssueLineHit {
+                line_idx: lines.len(),
+                x_offset: 0,
+                width: None,
+                target: HitTarget::DetailConfluenceLink(idx),
+            });
             lines.push(Line::from(vec![
                 Span::styled("  [Confluence] ", link_hdr_style),
                 Span::raw(truncate_width(&lp.title, w.saturating_sub(18))),
             ]));
         }
-        for li in &detail.linked_issues {
+        for (idx, li) in detail.linked_issues.iter().enumerate() {
+            row_hits.push(IssueLineHit {
+                line_idx: lines.len(),
+                x_offset: 0,
+                width: None,
+                target: HitTarget::DetailIssueLink(idx),
+            });
             lines.push(Line::from(vec![
                 Span::styled(format!("  ↳ {} ", li.relation_label), theme.muted_style()),
                 Span::styled(format!("{} ", li.key), theme.accent_style()),
@@ -838,8 +1127,14 @@ pub fn build_issue_inspector_lines(
         } else {
             Style::default().fg(theme.chip_fg)
         };
-        for att in &detail.attachments {
+        for (idx, att) in detail.attachments.iter().enumerate() {
             let kb = (att.size / 1024).max(1);
+            row_hits.push(IssueLineHit {
+                line_idx: lines.len(),
+                x_offset: 0,
+                width: None,
+                target: HitTarget::Attachment(idx),
+            });
             lines.push(Line::from(vec![
                 Span::raw("  • "),
                 Span::styled(att.filename.clone(), file_style),
@@ -855,8 +1150,16 @@ pub fn build_issue_inspector_lines(
     }
 
     // 9. Comments Thread
+    let comment_hdr_prefix = format!(" ▾ Comments ({}) — ", detail.comments.len());
+    let comment_btn_lbl = "[c] Add Comment";
+    row_hits.push(IssueLineHit {
+        line_idx: lines.len(),
+        x_offset: comment_hdr_prefix.width() as u16,
+        width: Some(comment_btn_lbl.width() as u16),
+        target: HitTarget::Button(ButtonId::Comment),
+    });
     lines.push(Line::from(Span::styled(
-        format!(" ▾ Comments ({}) — [c] Add Comment", detail.comments.len()),
+        format!("{comment_hdr_prefix}{comment_btn_lbl}"),
         theme.accent_style(),
     )));
     if detail.comments.is_empty() {
@@ -895,5 +1198,5 @@ pub fn build_issue_inspector_lines(
         }
     }
 
-    lines
+    (lines, action_row, row_hits)
 }

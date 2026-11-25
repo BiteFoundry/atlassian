@@ -193,23 +193,46 @@ pub fn draw(frame: &mut Frame, app: &AppState, ui: &mut UiState) -> Option<(u16,
     );
     let show_nav = tab_supports_nav && (ui.show_nav_rail || mode == LayoutMode::Narrow);
     let has_drawer = match ui.active_tab {
-        WorkspaceTab::Board => ui.board_ui.drawer_open && mode == LayoutMode::Wide,
+        WorkspaceTab::Board => ui.board_ui.drawer_open,
         WorkspaceTab::Confluence => ui.confluence_ui.toc_open && mode == LayoutMode::Wide,
         _ => false,
     };
 
     let (nav_rect, main_rect, drawer_rect) = if !show_nav {
-        if has_drawer && mode == LayoutMode::Wide {
-            let drawer_w = (body.width * 34 / 100).clamp(34, 54);
-            let cols = Layout::default()
-                .direction(Direction::Horizontal)
-                .constraints([
-                    Constraint::Min(30),
-                    Constraint::Length(1),
-                    Constraint::Length(drawer_w),
-                ])
-                .split(body);
-            (None, cols[0], Some(cols[2]))
+        if has_drawer {
+            match mode {
+                LayoutMode::Wide => {
+                    let drawer_w = (body.width * 34 / 100).clamp(34, 54);
+                    let cols = Layout::default()
+                        .direction(Direction::Horizontal)
+                        .constraints([
+                            Constraint::Min(30),
+                            Constraint::Length(1),
+                            Constraint::Length(drawer_w),
+                        ])
+                        .split(body);
+                    (None, cols[0], Some(cols[2]))
+                }
+                LayoutMode::Medium => {
+                    let drawer_w = (body.width * 45 / 100)
+                        .clamp(28, 52)
+                        .min(body.width.saturating_sub(28));
+                    if drawer_w >= 24 {
+                        let cols = Layout::default()
+                            .direction(Direction::Horizontal)
+                            .constraints([
+                                Constraint::Min(26),
+                                Constraint::Length(1),
+                                Constraint::Length(drawer_w),
+                            ])
+                            .split(body);
+                        (None, cols[0], Some(cols[2]))
+                    } else {
+                        (None, Rect::default(), Some(body))
+                    }
+                }
+                LayoutMode::Narrow => (None, Rect::default(), Some(body)),
+            }
         } else {
             (None, body, None)
         }
@@ -241,19 +264,53 @@ pub fn draw(frame: &mut Frame, app: &AppState, ui: &mut UiState) -> Option<(u16,
                 )
             }
             LayoutMode::Medium => {
-                let nav_w = 24u16;
-                let cols = Layout::default()
-                    .direction(Direction::Horizontal)
-                    .constraints([
-                        Constraint::Length(nav_w),
-                        Constraint::Length(1),
-                        Constraint::Min(28),
-                    ])
-                    .split(body);
-                (Some(cols[0]), cols[2], None)
+                if has_drawer {
+                    let nav_w = 20u16;
+                    let avail = body.width.saturating_sub(nav_w + 2);
+                    let drawer_w = (avail * 45 / 100)
+                        .clamp(26, 48)
+                        .min(avail.saturating_sub(26));
+                    if drawer_w >= 24 {
+                        let cols = Layout::default()
+                            .direction(Direction::Horizontal)
+                            .constraints([
+                                Constraint::Length(nav_w),
+                                Constraint::Length(1),
+                                Constraint::Min(26),
+                                Constraint::Length(1),
+                                Constraint::Length(drawer_w),
+                            ])
+                            .split(body);
+                        (Some(cols[0]), cols[2], Some(cols[4]))
+                    } else {
+                        let cols = Layout::default()
+                            .direction(Direction::Horizontal)
+                            .constraints([
+                                Constraint::Length(24),
+                                Constraint::Length(1),
+                                Constraint::Min(28),
+                            ])
+                            .split(body);
+                        (Some(cols[0]), Rect::default(), Some(cols[2]))
+                    }
+                } else {
+                    let nav_w = 24u16;
+                    let cols = Layout::default()
+                        .direction(Direction::Horizontal)
+                        .constraints([
+                            Constraint::Length(nav_w),
+                            Constraint::Length(1),
+                            Constraint::Min(28),
+                        ])
+                        .split(body);
+                    (Some(cols[0]), cols[2], None)
+                }
             }
             LayoutMode::Narrow => match ui.focus {
                 PaneFocus::Nav => (Some(body), Rect::default(), None),
+                _ if has_drawer && ui.active_tab == WorkspaceTab::Board => {
+                    (None, Rect::default(), Some(body))
+                }
                 PaneFocus::Detail if has_drawer => (None, Rect::default(), Some(body)),
                 _ => (None, body, None),
             },
@@ -489,10 +546,16 @@ fn draw_status_bar(frame: &mut Frame, area: Rect, app: &AppState, ui: &mut UiSta
     let show_right = total_w > right_w + 16;
     let left_budget = if show_right { total_w - right_w } else { total_w };
 
+    let muted_style = if theme.no_color {
+        Style::default().add_modifier(Modifier::DIM)
+    } else {
+        Style::default().bg(bg).fg(theme.fg_muted)
+    };
+
     let mut left_spans: Vec<Span<'static>> = Vec::new();
     let mut left_used_w = 0usize;
 
-    if let Some(toast) = ui.toasts.current() {
+    let transient_msg: Option<(String, Style)> = if let Some(toast) = ui.toasts.current() {
         let fg = if theme.no_color {
             Color::Reset
         } else {
@@ -502,40 +565,99 @@ fn draw_status_bar(frame: &mut Frame, area: Rect, app: &AppState, ui: &mut UiSta
                 ToastKind::Error => theme.error,
             }
         };
-        let style = Style::default().bg(bg).fg(fg).add_modifier(Modifier::BOLD);
-        let fitted = truncate_width(&format!(" {} ", toast.message), left_budget);
-        left_used_w = fitted.width();
-        left_spans.push(Span::styled(fitted, style));
+        Some((
+            format!(" {} ", toast.message),
+            Style::default().bg(bg).fg(fg).add_modifier(Modifier::BOLD),
+        ))
     } else if let Some(task) = ui.tasks.first_running() {
         let style = Style::default().bg(bg).fg(if theme.no_color {
             Color::Reset
         } else {
             theme.accent_soft
         });
-        let fitted = truncate_width(
-            &format!(" {} {} ", spinner_glyph(), task.display()),
-            left_budget,
-        );
-        left_used_w = fitted.width();
-        left_spans.push(Span::styled(fitted, style));
+        Some((format!(" {} {} ", spinner_glyph(), task.display()), style))
     } else if app.syncing {
         let style = Style::default().bg(bg).fg(if theme.no_color {
             Color::Reset
         } else {
             theme.accent_soft
         });
-        let fitted = truncate_width(
-            &format!(" {} Syncing workspace… ", spinner_glyph()),
-            left_budget,
-        );
-        left_used_w = fitted.width();
-        left_spans.push(Span::styled(fitted, style));
+        Some((format!(" {} Syncing workspace… ", spinner_glyph()), style))
     } else {
-        let muted_style = if theme.no_color {
-            Style::default().add_modifier(Modifier::DIM)
-        } else {
-            Style::default().bg(bg).fg(theme.fg_muted)
+        None
+    };
+
+    if let Some((msg_text, msg_style)) = transient_msg {
+        // Keep right-side utility pills visible & clickable even during transient toasts/sync.
+        let mut util_groups: Vec<Vec<(String, Option<ButtonId>)>> = Vec::new();
+        if !app.nav_history.is_empty() {
+            util_groups.push(vec![(
+                format!("[Backspace] Back ({})", app.nav_history.len()),
+                Some(ButtonId::BackHistory),
+            )]);
+        }
+        util_groups.push(vec![(
+            "[Ctrl+P] Palette".to_string(),
+            Some(ButtonId::CommandPalette),
+        )]);
+        util_groups.push(vec![("[?] Help".to_string(), Some(ButtonId::Help))]);
+        util_groups.push(vec![("[q] Quit".to_string(), Some(ButtonId::Quit))]);
+
+        let build_util = |groups: &[Vec<(String, Option<ButtonId>)>]| -> Vec<(String, Option<ButtonId>)> {
+            let mut out = Vec::new();
+            for (idx, grp) in groups.iter().enumerate() {
+                if idx > 0 {
+                    out.push((" · ".to_string(), None));
+                }
+                out.extend(grp.iter().cloned());
+            }
+            if !out.is_empty() {
+                out.push((" ".to_string(), None));
+            }
+            out
         };
+
+        let min_msg_w = 16usize;
+        let mut chosen_util: Vec<(String, Option<ButtonId>)> = Vec::new();
+        // Keep Back/Palette/Help/Quit in priority order as space permits.
+        let mut kept_groups = util_groups;
+        while !kept_groups.is_empty() {
+            let candidate = build_util(&kept_groups);
+            let cand_w: usize = candidate.iter().map(|(s, _)| s.width()).sum();
+            if left_budget >= cand_w + min_msg_w {
+                chosen_util = candidate;
+                break;
+            }
+            kept_groups.pop();
+        }
+        let util_w: usize = chosen_util.iter().map(|(s, _)| s.width()).sum();
+        let msg_budget = left_budget.saturating_sub(util_w);
+        let fitted = truncate_width(&msg_text, msg_budget);
+        let fw = fitted.width();
+        left_spans.push(Span::styled(fitted, msg_style));
+        left_used_w += fw;
+
+        if !chosen_util.is_empty() {
+            let gap = msg_budget.saturating_sub(fw);
+            if gap > 0 {
+                left_spans.push(Span::styled(" ".repeat(gap), bar_style));
+                left_used_w += gap;
+            }
+            for (seg, btn) in chosen_util {
+                let seg_w = seg.width();
+                if let Some(btn_id) = btn {
+                    ui.hitmap.add_line(
+                        area.x.saturating_add(left_used_w as u16),
+                        area.y,
+                        seg_w as u16,
+                        HitTarget::Button(btn_id),
+                    );
+                }
+                left_used_w += seg_w;
+                left_spans.push(Span::styled(seg, muted_style));
+            }
+        }
+    } else {
         let mut segments: Vec<(String, Option<ButtonId>)> = vec![(format!(" {focus_badge} "), None)];
         if !app.nav_history.is_empty() {
             segments.push((
@@ -545,13 +667,19 @@ fn draw_status_bar(frame: &mut Frame, area: Rect, app: &AppState, ui: &mut UiSta
             segments.push((" · ".to_string(), None));
         }
         if !ui.show_nav_rail {
-            segments.push(("Nav Hidden · ".to_string(), None));
+            segments.push(("Nav Hidden".to_string(), Some(ButtonId::ToggleNavRail)));
+            segments.push((" · ".to_string(), None));
+        } else {
+            segments.push(("[Ctrl+B] Nav".to_string(), Some(ButtonId::ToggleNavRail)));
+            segments.push((" · ".to_string(), None));
         }
         segments.push(("[Tab] Pane · [1-6] Tabs · ".to_string(), None));
         segments.push(("[Ctrl+P] Palette".to_string(), Some(ButtonId::CommandPalette)));
         segments.push((" · ".to_string(), None));
         segments.push(("[?] Help".to_string(), Some(ButtonId::Help)));
-        segments.push((" · [q] Quit ".to_string(), None));
+        segments.push((" · ".to_string(), None));
+        segments.push(("[q] Quit".to_string(), Some(ButtonId::Quit)));
+        segments.push((" ".to_string(), None));
 
         for (seg, btn) in segments {
             let rem = left_budget.saturating_sub(left_used_w);
@@ -595,6 +723,12 @@ fn draw_status_bar(frame: &mut Frame, area: Rect, app: &AppState, ui: &mut UiSta
         left_spans.push(Span::styled(" ".repeat(pad), bar_style));
     }
     if show_right {
+        ui.hitmap.add_line(
+            area.x.saturating_add(left_budget as u16),
+            area.y,
+            right_w as u16,
+            HitTarget::Button(ButtonId::ToggleDensity),
+        );
         let right_style = if theme.no_color {
             Style::default().add_modifier(Modifier::DIM)
         } else {

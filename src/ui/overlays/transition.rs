@@ -15,7 +15,7 @@ use crate::{
         doc_view::truncate_width,
         hitmap::{HitMap, HitTarget},
         keymap::Action,
-        overlays::{centered_rect, modal_block, OverlayOutcome},
+        overlays::{centered_rect, modal_block, register_modal_chrome, OverlayOutcome},
     },
 };
 
@@ -111,6 +111,7 @@ impl TransitionOverlay {
         let block = modal_block(format!(" Transition Status — {} ", self.issue_key), theme, true);
         let inner = block.inner(rect);
         frame.render_widget(block, rect);
+        register_modal_chrome(rect, frame, theme, hitmap, true);
         if inner.width == 0 || inner.height < 2 {
             return;
         }

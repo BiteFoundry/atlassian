@@ -17,6 +17,7 @@ use crate::{
         draw_horizontal_hairline, draw_vertical_hairline, fill_surface,
         hitmap::{ButtonId, HitTarget},
         issue_view::draw_issue_inspector_pane,
+        visible_window,
     },
 };
 use unicode_width::UnicodeWidthStr;
@@ -117,16 +118,30 @@ fn draw_board_nav(frame: &mut Frame, area: Rect, app: &AppState, ui: &mut UiStat
         .constraints([Constraint::Length(split_h), Constraint::Min(2)])
         .split(inner);
 
+    // Register nav section containers BEFORE item rows for hover-scroll & click fallback.
+    ui.hitmap.add(rows[0], HitTarget::BoardNavBoards);
+    ui.hitmap.add(rows[1], HitTarget::BoardNavSprints);
+
     // Boards section (grouped by site with collapsible headers in multi-site All Sites mode)
-    let mut b_lines = vec![Line::from(Span::styled(
-        " AGILE BOARDS",
-        theme.muted_style(),
-    ))];
+    let board_list_h = rows[0].height.saturating_sub(1) as usize;
+    let mut b_lines = Vec::new();
     if app.boards.is_empty() {
+        b_lines.push(Line::from(Span::styled(
+            " AGILE BOARDS",
+            theme.muted_style(),
+        )));
         b_lines.push(Line::from(Span::styled("  (no boards)", theme.muted_style())));
+        ui.board_ui.board_scroll = 0;
     } else if multi_site {
-        let mut cursor_y = rows[0].y + 1;
-        let max_y = rows[0].bottom();
+        enum BoardNavRow {
+            SiteHeader {
+                site_id: String,
+                count: usize,
+                collapsed: bool,
+            },
+            Board(usize),
+        }
+
         let mut site_order: Vec<String> = Vec::new();
         for site in app.config.enabled_sites() {
             if !site_order.iter().any(|s| s.eq_ignore_ascii_case(&site.id)) {
@@ -138,6 +153,8 @@ fn draw_board_nav(frame: &mut Frame, area: Rect, app: &AppState, ui: &mut UiStat
                 site_order.push(sid.clone());
             }
         }
+
+        let mut nav_rows: Vec<BoardNavRow> = Vec::new();
         for site_id in site_order {
             let group_indices: Vec<usize> = app
                 .boards
@@ -151,72 +168,129 @@ fn draw_board_nav(frame: &mut Frame, area: Rect, app: &AppState, ui: &mut UiStat
                 })
                 .map(|(i, _)| i)
                 .collect();
-            if group_indices.is_empty() || cursor_y >= max_y {
+            if group_indices.is_empty() {
                 continue;
             }
             let collapse_key = format!("board:{site_id}");
             let collapsed = ui.collapsed_site_groups.contains(&collapse_key);
-            let group_idx = ui.site_group_keys.len();
-            ui.site_group_keys.push(collapse_key);
-            let chevron = if collapsed { "▸" } else { "▾" };
-            let site_label = app.site_display_label(&site_id);
-            b_lines.push(Line::from(Span::styled(
-                truncate_width(
-                    &format!(" {chevron} {site_label} ({})", group_indices.len()),
-                    rows[0].width as usize,
-                ),
-                theme.accent_style().patch(sidebar_style),
-            )));
-            ui.hitmap.add_line(
-                rows[0].x,
-                cursor_y,
-                rows[0].width,
-                HitTarget::SiteGroupHeader(group_idx),
-            );
-            cursor_y += 1;
-
-            if collapsed {
-                continue;
-            }
-            for idx in group_indices {
-                if cursor_y >= max_y {
-                    break;
+            nav_rows.push(BoardNavRow::SiteHeader {
+                site_id,
+                count: group_indices.len(),
+                collapsed,
+            });
+            if !collapsed {
+                for idx in group_indices {
+                    nav_rows.push(BoardNavRow::Board(idx));
                 }
-                let b = &app.boards[idx];
-                let is_sel = ui.board_ui.selected_board == idx;
-                let style = if focused && ui.board_ui.nav_section == 0 && is_sel {
-                    theme.nav_selection()
-                } else if is_sel {
-                    theme.accent_style()
-                } else {
-                    sidebar_style
-                };
-                let pfx = if is_sel { "  ▸ " } else { "    " };
-                let tag = if b.board_type.eq_ignore_ascii_case("scrum") {
-                    "S"
-                } else {
-                    "K"
-                };
-                b_lines.push(Line::from(Span::styled(
-                    truncate_width(&format!("{pfx}[{tag}] {}", b.name), rows[0].width as usize),
-                    style,
-                )));
-                ui.hitmap.add_line(
-                    rows[0].x,
-                    cursor_y,
-                    rows[0].width,
-                    HitTarget::BoardItem(idx),
-                );
-                cursor_y += 1;
+            }
+        }
+
+        let sel_row = nav_rows
+            .iter()
+            .position(|r| matches!(r, BoardNavRow::Board(i) if *i == ui.board_ui.selected_board));
+        let (mut scroll, mut window) = visible_window(
+            sel_row.unwrap_or(ui.board_ui.board_scroll),
+            ui.board_ui.board_scroll,
+            board_list_h,
+            nav_rows.len(),
+        );
+        if let Some(r) = sel_row.filter(|&r| r == scroll && r > 0 && board_list_h > 1) {
+            if matches!(nav_rows[r - 1], BoardNavRow::SiteHeader { .. }) {
+                scroll = r - 1;
+                window = scroll..(scroll + board_list_h).min(nav_rows.len());
+            }
+        }
+        ui.board_ui.board_scroll = scroll;
+
+        let mut title = " AGILE BOARDS".to_string();
+        if window.start > 0 || window.end < nav_rows.len() {
+            let up = if window.start > 0 { "▲" } else { "" };
+            let down = if window.end < nav_rows.len() { "▼" } else { "" };
+            title.push_str(&format!(" {up}{down}"));
+        }
+        b_lines.push(Line::from(Span::styled(
+            truncate_width(&title, rows[0].width as usize),
+            theme.muted_style(),
+        )));
+
+        for (offset, row) in nav_rows[window].iter().enumerate() {
+            let y = rows[0].y + 1 + offset as u16;
+            match row {
+                BoardNavRow::SiteHeader {
+                    site_id,
+                    count,
+                    collapsed,
+                } => {
+                    let collapse_key = format!("board:{site_id}");
+                    let group_idx = ui.site_group_keys.len();
+                    ui.site_group_keys.push(collapse_key);
+                    let chevron = if *collapsed { "▸" } else { "▾" };
+                    let site_label = app.site_display_label(site_id);
+                    b_lines.push(Line::from(Span::styled(
+                        truncate_width(
+                            &format!(" {chevron} {site_label} ({count})"),
+                            rows[0].width as usize,
+                        ),
+                        theme.accent_style().patch(sidebar_style),
+                    )));
+                    ui.hitmap.add_line(
+                        rows[0].x,
+                        y,
+                        rows[0].width,
+                        HitTarget::SiteGroupHeader(group_idx),
+                    );
+                }
+                BoardNavRow::Board(idx) => {
+                    let b = &app.boards[*idx];
+                    let is_sel = ui.board_ui.selected_board == *idx;
+                    let style = if focused && ui.board_ui.nav_section == 0 && is_sel {
+                        theme.nav_selection()
+                    } else if is_sel {
+                        theme.accent_style()
+                    } else {
+                        sidebar_style
+                    };
+                    let pfx = if is_sel { "  ▸ " } else { "    " };
+                    let tag = if b.board_type.eq_ignore_ascii_case("scrum") {
+                        "S"
+                    } else {
+                        "K"
+                    };
+                    b_lines.push(Line::from(Span::styled(
+                        truncate_width(&format!("{pfx}[{tag}] {}", b.name), rows[0].width as usize),
+                        style,
+                    )));
+                    ui.hitmap.add_line(
+                        rows[0].x,
+                        y,
+                        rows[0].width,
+                        HitTarget::BoardItem(*idx),
+                    );
+                }
             }
         }
     } else {
-        for (idx, b) in app
-            .boards
-            .iter()
-            .enumerate()
-            .take(rows[0].height.saturating_sub(1) as usize)
-        {
+        let (scroll, window) = visible_window(
+            ui.board_ui.selected_board,
+            ui.board_ui.board_scroll,
+            board_list_h,
+            app.boards.len(),
+        );
+        ui.board_ui.board_scroll = scroll;
+
+        let mut title = " AGILE BOARDS".to_string();
+        if window.start > 0 || window.end < app.boards.len() {
+            let up = if window.start > 0 { "▲" } else { "" };
+            let down = if window.end < app.boards.len() { "▼" } else { "" };
+            title.push_str(&format!(" {up}{down}"));
+        }
+        b_lines.push(Line::from(Span::styled(
+            truncate_width(&title, rows[0].width as usize),
+            theme.muted_style(),
+        )));
+
+        for (offset, idx) in window.enumerate() {
+            let b = &app.boards[idx];
             let is_sel = ui.board_ui.selected_board == idx;
             let style = if focused && ui.board_ui.nav_section == 0 && is_sel {
                 theme.nav_selection()
@@ -237,7 +311,7 @@ fn draw_board_nav(frame: &mut Frame, area: Rect, app: &AppState, ui: &mut UiStat
             )));
             ui.hitmap.add_line(
                 rows[0].x,
-                rows[0].y + 1 + idx as u16,
+                rows[0].y + 1 + offset as u16,
                 rows[0].width,
                 HitTarget::BoardItem(idx),
             );
@@ -246,19 +320,37 @@ fn draw_board_nav(frame: &mut Frame, area: Rect, app: &AppState, ui: &mut UiStat
     frame.render_widget(Paragraph::new(b_lines).style(sidebar_style), rows[0]);
 
     // Sprints section
-    let mut s_lines = vec![Line::from(Span::styled(" SPRINTS", theme.muted_style()))];
+    let sprint_list_h = rows[1].height.saturating_sub(1) as usize;
+    let mut s_lines = Vec::new();
     if app.sprints.is_empty() {
+        s_lines.push(Line::from(Span::styled(" SPRINTS", theme.muted_style())));
         s_lines.push(Line::from(Span::styled(
             "  (all board issues)",
             theme.muted_style(),
         )));
+        ui.board_ui.sprint_scroll = 0;
     } else {
-        for (idx, sp) in app
-            .sprints
-            .iter()
-            .enumerate()
-            .take(rows[1].height.saturating_sub(1) as usize)
-        {
+        let (scroll, window) = visible_window(
+            ui.board_ui.selected_sprint,
+            ui.board_ui.sprint_scroll,
+            sprint_list_h,
+            app.sprints.len(),
+        );
+        ui.board_ui.sprint_scroll = scroll;
+
+        let mut title = " SPRINTS".to_string();
+        if window.start > 0 || window.end < app.sprints.len() {
+            let up = if window.start > 0 { "▲" } else { "" };
+            let down = if window.end < app.sprints.len() { "▼" } else { "" };
+            title.push_str(&format!(" {up}{down}"));
+        }
+        s_lines.push(Line::from(Span::styled(
+            truncate_width(&title, rows[1].width as usize),
+            theme.muted_style(),
+        )));
+
+        for (offset, idx) in window.enumerate() {
+            let sp = &app.sprints[idx];
             let is_sel = ui.board_ui.selected_sprint == idx;
             let style = if focused && ui.board_ui.nav_section == 1 && is_sel {
                 theme.nav_selection()
@@ -282,7 +374,7 @@ fn draw_board_nav(frame: &mut Frame, area: Rect, app: &AppState, ui: &mut UiStat
             )));
             ui.hitmap.add_line(
                 rows[1].x,
-                rows[1].y + 1 + idx as u16,
+                rows[1].y + 1 + offset as u16,
                 rows[1].width,
                 HitTarget::SprintItem(idx),
             );
@@ -303,13 +395,71 @@ fn draw_kanban_canvas(frame: &mut Frame, area: Rect, app: &AppState, ui: &mut Ui
         return;
     }
 
+    let inner = Rect::new(
+        area.x,
+        area.y + 2,
+        area.width,
+        area.height.saturating_sub(2),
+    );
+    let columns = app.build_kanban_columns(ui);
+    let sel_col = ui
+        .board_ui
+        .selected_col
+        .min(columns.len().saturating_sub(1));
+    let visible_count = if columns.is_empty() {
+        0
+    } else {
+        ((inner.width / MIN_COL_WIDTH) as usize)
+            .max(1)
+            .min(columns.len())
+    };
+    let mut col_scroll = if visible_count == 0 {
+        0
+    } else {
+        ui.board_ui
+            .col_scroll
+            .min(columns.len().saturating_sub(visible_count))
+    };
+    if visible_count > 0 {
+        if sel_col < col_scroll {
+            col_scroll = sel_col;
+        } else if sel_col >= col_scroll + visible_count {
+            col_scroll = sel_col + 1 - visible_count;
+        }
+    }
+    ui.board_ui.col_scroll = col_scroll;
+
     // Minimal-chrome top board bar + hairline
     let header_area = Rect::new(area.x, area.y, area.width, 1);
-    let title_str = format!(" {board_name}");
+    let show_col_pager = columns.len() > visible_count && visible_count > 0;
+    let pager_parts = if show_col_pager {
+        let prev_lbl = " < ";
+        let range_lbl = format!(
+            "{}-{}/{}",
+            col_scroll + 1,
+            (col_scroll + visible_count).min(columns.len()),
+            columns.len()
+        );
+        let next_lbl = " > ";
+        let total_w = (prev_lbl.width() + range_lbl.width() + next_lbl.width()) as u16;
+        if header_area.width > total_w + 6 {
+            Some((prev_lbl, range_lbl, next_lbl, total_w))
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+
+    let left_max_x = match &pager_parts {
+        Some((_, _, _, pw)) => header_area.right().saturating_sub(*pw),
+        None => header_area.right(),
+    };
+    let title_budget = left_max_x.saturating_sub(header_area.x) as usize;
+    let title_str = truncate_width(&format!(" {board_name}"), title_budget);
     let title_w = title_str.width() as u16;
     let mut hdr_spans = vec![Span::styled(title_str, theme.title(focused))];
     let mut cx = header_area.x.saturating_add(title_w);
-    let max_x = header_area.right();
     let segments: &[(&str, Option<ButtonId>)] = &[
         (" [h/l] Col · [j/k] Card · ", None),
         ("[t] Drawer", Some(ButtonId::ToggleDrawer)),
@@ -321,10 +471,18 @@ fn draw_kanban_canvas(frame: &mut Frame, area: Rect, app: &AppState, ui: &mut Ui
     ];
     for &(seg, btn) in segments {
         let seg_w = seg.width() as u16;
-        if cx.saturating_add(seg_w) > max_x {
-            let rem = max_x.saturating_sub(cx) as usize;
+        if cx.saturating_add(seg_w) > left_max_x {
+            let rem = left_max_x.saturating_sub(cx) as usize;
             if rem > 0 {
-                hdr_spans.push(Span::styled(truncate_width(seg, rem), theme.muted_style()));
+                let fitted = truncate_width(seg, rem);
+                let fw = fitted.width() as u16;
+                if let Some(btn_id) = btn {
+                    if fw > 0 {
+                        ui.hitmap.add_line(cx, header_area.y, fw, HitTarget::Button(btn_id));
+                    }
+                }
+                hdr_spans.push(Span::styled(fitted, theme.muted_style()));
+                cx = cx.saturating_add(fw);
             }
             break;
         }
@@ -334,6 +492,51 @@ fn draw_kanban_canvas(frame: &mut Frame, area: Rect, app: &AppState, ui: &mut Ui
         hdr_spans.push(Span::styled(seg, theme.muted_style()));
         cx = cx.saturating_add(seg_w);
     }
+
+    if let Some((prev_lbl, range_lbl, next_lbl, _)) = pager_parts {
+        let pad = left_max_x.saturating_sub(cx) as usize;
+        if pad > 0 {
+            hdr_spans.push(Span::raw(" ".repeat(pad)));
+            cx = left_max_x;
+        }
+        let prev_w = prev_lbl.width() as u16;
+        let range_w = range_lbl.width() as u16;
+        let next_w = next_lbl.width() as u16;
+        let can_prev = col_scroll > 0;
+        let can_next = col_scroll + visible_count < columns.len();
+        ui.hitmap.add_line(
+            cx,
+            header_area.y,
+            prev_w,
+            HitTarget::Button(ButtonId::BoardColPrev),
+        );
+        hdr_spans.push(Span::styled(
+            prev_lbl,
+            if can_prev {
+                theme.accent_style()
+            } else {
+                theme.muted_style()
+            },
+        ));
+        cx = cx.saturating_add(prev_w);
+        hdr_spans.push(Span::styled(range_lbl, theme.muted_style()));
+        cx = cx.saturating_add(range_w);
+        ui.hitmap.add_line(
+            cx,
+            header_area.y,
+            next_w,
+            HitTarget::Button(ButtonId::BoardColNext),
+        );
+        hdr_spans.push(Span::styled(
+            next_lbl,
+            if can_next {
+                theme.accent_style()
+            } else {
+                theme.muted_style()
+            },
+        ));
+    }
+
     frame.render_widget(Paragraph::new(Line::from(hdr_spans)), header_area);
     draw_horizontal_hairline(
         frame,
@@ -347,40 +550,16 @@ fn draw_kanban_canvas(frame: &mut Frame, area: Rect, app: &AppState, ui: &mut Ui
         },
     );
 
-    let inner = Rect::new(
-        area.x,
-        area.y + 2,
-        area.width,
-        area.height.saturating_sub(2),
-    );
     if inner.width == 0 || inner.height < 3 {
         return;
     }
 
-    let columns = app.build_kanban_columns(ui);
     if columns.is_empty() {
         frame.render_widget(
             Paragraph::new(Span::styled("  No board columns", theme.muted_style())),
             inner,
         );
         return;
-    }
-
-    let sel_col = ui
-        .board_ui
-        .selected_col
-        .min(columns.len().saturating_sub(1));
-    let visible_count = ((inner.width / MIN_COL_WIDTH) as usize)
-        .max(1)
-        .min(columns.len());
-    let mut col_scroll = ui
-        .board_ui
-        .col_scroll
-        .min(columns.len().saturating_sub(visible_count));
-    if sel_col < col_scroll {
-        col_scroll = sel_col;
-    } else if sel_col >= col_scroll + visible_count {
-        col_scroll = sel_col + 1 - visible_count;
     }
 
     // Interleave 1px vertical hairline separators between Kanban columns
@@ -432,6 +611,8 @@ fn draw_kanban_column(
     if area.width < 6 || area.height < 3 {
         return;
     }
+    // Register the entire Kanban column rect BEFORE individual cards.
+    ui.hitmap.add(area, HitTarget::KanbanColumn(col_idx));
 
     // Column header: status lozenge + count + subtle underline
     let hdr_rect = Rect::new(area.x, area.y, area.width, 1);

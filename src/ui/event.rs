@@ -4,7 +4,7 @@ use crossterm::event::{KeyEvent, KeyEventKind, MouseButton, MouseEvent, MouseEve
 
 use crate::ui::{
     app::{PaneFocus, WorkspaceTab},
-    hitmap::{ButtonId, HitMap, HitTarget},
+    hitmap::{ButtonId, HitMap},
     keymap::{Action, Keymap},
 };
 
@@ -22,19 +22,12 @@ pub fn key_to_action(
     keymap.resolve(key, tab, focus, has_overlay, accepts_text)
 }
 
-pub fn mouse_to_action(mouse: MouseEvent, hitmap: &HitMap) -> Option<Action> {
+pub fn mouse_to_action(mouse: MouseEvent, _hitmap: &HitMap) -> Option<Action> {
     match mouse.kind {
-        MouseEventKind::Down(MouseButton::Left) => {
-            match hitmap.hit(mouse.row, mouse.column) {
-                Some(HitTarget::Button(btn)) => return Some(button_to_action(btn)),
-                Some(HitTarget::OverlayClose) => return Some(Action::CloseOverlay),
-                _ => {}
-            }
-            Some(Action::MouseClick {
-                row: mouse.row,
-                col: mouse.column,
-            })
-        }
+        MouseEventKind::Down(MouseButton::Left) => Some(Action::MouseClick {
+            row: mouse.row,
+            col: mouse.column,
+        }),
         MouseEventKind::Down(MouseButton::Right) => Some(Action::MouseRightClick {
             row: mouse.row,
             col: mouse.column,
@@ -46,6 +39,16 @@ pub fn mouse_to_action(mouse: MouseEvent, hitmap: &HitMap) -> Option<Action> {
         }),
         MouseEventKind::ScrollDown => Some(Action::MouseScroll {
             delta: 3,
+            row: mouse.row,
+            col: mouse.column,
+        }),
+        MouseEventKind::ScrollLeft => Some(Action::MouseScrollHoriz {
+            delta: -1,
+            row: mouse.row,
+            col: mouse.column,
+        }),
+        MouseEventKind::ScrollRight => Some(Action::MouseScrollHoriz {
+            delta: 1,
             row: mouse.row,
             col: mouse.column,
         }),
@@ -77,5 +80,29 @@ pub fn button_to_action(btn: ButtonId) -> Action {
         ButtonId::ToggleInlineImages => Action::ToggleInlineImages,
         ButtonId::ToggleDrawer => Action::ToggleDrawerOrToc,
         ButtonId::SiteSwitcher => Action::OpenSiteSwitcher,
+        ButtonId::ToggleNavRail => Action::ToggleNavRail,
+        ButtonId::ToggleDensity => Action::ToggleDensity,
+        ButtonId::CycleTheme => Action::CycleTheme,
+        ButtonId::TogglePin => Action::TogglePin,
+        ButtonId::Quit => Action::Quit,
+        ButtonId::RunJql => Action::Activate,
+        ButtonId::FocusLocalFilter => Action::FocusFilter,
+        ButtonId::CloseLocalFilter => Action::CloseOverlay,
+        ButtonId::RemoteSearch => Action::RemoteSearch,
+        ButtonId::BoardColPrev => Action::MoveLeft,
+        ButtonId::BoardColNext => Action::MoveRight,
+        ButtonId::OverlaySubmit => Action::Submit,
+        ButtonId::OverlayCancel => Action::CloseOverlay,
+        ButtonId::OverlayExternalEditor => Action::ExternalEditor,
+        ButtonId::OverlayDiscoverSites => Action::DiscoverCloudSites,
+        ButtonId::OverlayCopyUrl => Action::Input('y'),
+        ButtonId::OverlayFileParent => Action::CollapseNode,
+        ButtonId::OverlayFileZoxide => Action::Input('z'),
+        ButtonId::OverlayImagePrev => Action::MoveLeft,
+        ButtonId::OverlayImageNext => Action::MoveRight,
+        ButtonId::OverlayImageZoomIn => Action::Input('+'),
+        ButtonId::OverlayImageZoomOut => Action::Input('-'),
+        ButtonId::OverlayImageFit => Action::Input('0'),
+        ButtonId::OverlayImageProtocol => Action::CycleImageProtocol,
     }
 }

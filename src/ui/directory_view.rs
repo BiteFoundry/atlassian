@@ -12,13 +12,14 @@ use unicode_width::UnicodeWidthStr;
 use crate::{
     auth::StoredCredentials,
     config::{DensityMode, DeploymentKind},
+    models::SiteScope,
     ui::{
         app::{AppState, UiState},
         doc_view::truncate_width,
         draw_horizontal_hairline, draw_vertical_hairline, fill_surface,
         hitmap::{ButtonId, HitTarget},
         my_work_view::format_scope_badge,
-        site_display_english, spinner_glyph,
+        site_display_english, spinner_glyph, visible_window,
     },
 };
 
@@ -147,7 +148,7 @@ pub fn draw_with_sites(
             .split(main_area)
     };
 
-    draw_stats_and_controls(frame, rows[0], app, ui);
+    draw_stats_and_controls(frame, rows[0], app, ui, sites);
 
     let list_area = if sites_h > 0 {
         draw_connected_sites(frame, rows[1], ui, sites, active_scope_label);
@@ -198,11 +199,13 @@ pub fn draw_with_sites(
 fn draw_connected_sites(
     frame: &mut Frame,
     area: Rect,
-    ui: &UiState,
+    ui: &mut UiState,
     sites: &[ConnectedSiteRow],
     active_scope_label: Option<&str>,
 ) {
     let theme = &ui.theme;
+    // Register Connected Sites container BEFORE header buttons & site rows.
+    ui.hitmap.add(area, HitTarget::DirectorySitesPane);
     if area.width < 10 || area.height < 3 {
         return;
     }
@@ -226,12 +229,40 @@ fn draw_connected_sites(
 
     let w = content_rect.width as usize;
     let enabled_count = sites.iter().filter(|s| s.enabled).count();
+    let available_body = content_rect.height.saturating_sub(2) as usize;
+    let max_site_rows = if available_body >= 2 {
+        available_body.saturating_sub(1)
+    } else {
+        0
+    };
+    let (scroll, window) = visible_window(
+        ui.directory_ui.selected_site,
+        ui.directory_ui.site_scroll,
+        max_site_rows,
+        sites.len(),
+    );
+    ui.directory_ui.site_scroll = scroll;
+
     let mut lines = Vec::new();
 
-    // Section title + active scope badge
-    let title = format!(" Connected Sites & Accounts ({enabled_count}/{})", sites.len());
+    // Section title + scroll hint + clickable active scope badge
+    let mut title = format!(" Connected Sites & Accounts ({enabled_count}/{})", sites.len());
+    if max_site_rows > 0 && (window.start > 0 || window.end < sites.len()) {
+        let up = if window.start > 0 { "▲" } else { "" };
+        let down = if window.end < sites.len() { "▼" } else { "" };
+        title.push_str(&format!(" {up}{down}"));
+    }
     let scope_badge = format_scope_badge(active_scope_label, theme);
-    if w > title.width() + scope_badge.width() + 2 {
+    let title_w = title.width();
+    let badge_w = scope_badge.width();
+    if w > title_w + badge_w + 2 {
+        let badge_x = content_rect.x.saturating_add((title_w + 2) as u16);
+        ui.hitmap.add_line(
+            badge_x,
+            content_rect.y,
+            badge_w as u16,
+            HitTarget::Button(ButtonId::SiteSwitcher),
+        );
         lines.push(Line::from(vec![
             Span::styled(title, theme.title(true)),
             Span::raw("  "),
@@ -244,23 +275,26 @@ fn draw_connected_sites(
         )));
     }
 
-    let available_body = content_rect.height.saturating_sub(2) as usize;
     if available_body >= 2 {
         let cols = ConnectedSitesColumns::for_width(w);
         lines.push(cols.header_line(theme));
 
         if sites.is_empty() {
             lines.push(Line::from(Span::styled(
-                truncate_width(
-                    "  No connected sites configured yet.",
-                    w,
-                ),
+                truncate_width("  No connected sites configured yet.", w),
                 theme.muted_style(),
             )));
         } else {
-            let max_site_rows = available_body.saturating_sub(1);
-            for site in sites.iter().take(max_site_rows) {
+            for (offset, idx) in window.enumerate() {
+                let site = &sites[idx];
                 lines.push(cols.row_line(site, theme));
+                let row_y = content_rect.y + 2 + offset as u16;
+                ui.hitmap.add_line(
+                    content_rect.x,
+                    row_y,
+                    content_rect.width,
+                    HitTarget::DirectorySiteRow(idx),
+                );
             }
         }
     } else if available_body == 1 {
@@ -285,6 +319,17 @@ fn draw_connected_sites(
     frame.render_widget(Paragraph::new(lines), body_rect);
 
     let hint_y = content_rect.y + content_rect.height.saturating_sub(1);
+    let switch_lbl = "Ctrl+S switch site";
+    let switch_x = content_rect.x.saturating_add(1);
+    if switch_x < content_rect.right() {
+        let switch_w = (switch_lbl.width() as u16).min(content_rect.right().saturating_sub(switch_x));
+        ui.hitmap.add_line(
+            switch_x,
+            hint_y,
+            switch_w,
+            HitTarget::Button(ButtonId::SiteSwitcher),
+        );
+    }
     frame.render_widget(
         Paragraph::new(Span::styled(
             truncate_width(
@@ -462,7 +507,13 @@ fn pad_col(text: &str, width: usize) -> String {
     }
 }
 
-fn draw_stats_and_controls(frame: &mut Frame, area: Rect, app: &AppState, ui: &mut UiState) {
+fn draw_stats_and_controls(
+    frame: &mut Frame,
+    area: Rect,
+    app: &AppState,
+    ui: &mut UiState,
+    sites: &[ConnectedSiteRow],
+) {
     let theme = &ui.theme;
     let card_style = theme.surface_style(theme.bg_card);
     let content_rect = Rect::new(
@@ -485,11 +536,75 @@ fn draw_stats_and_controls(frame: &mut Frame, area: Rect, app: &AppState, ui: &m
     }
 
     let c = &app.cache_counts;
-    let auth_status = if app.auth.is_logged_in() {
-        "Authenticated"
-    } else {
-        "Not signed in"
+    let (site_label, deploy_label, auth_status) = match &app.site_scope {
+        SiteScope::Only(site_id) => {
+            if let Some(row) = sites.iter().find(|s| s.site_id.eq_ignore_ascii_case(site_id)) {
+                let url = row.display_url();
+                let lbl = if url.is_empty() || url.eq_ignore_ascii_case(&row.name) {
+                    row.name.clone()
+                } else {
+                    format!("{} · {url}", row.name)
+                };
+                (lbl, row.deployment_label.clone(), row.auth_label.clone())
+            } else if let Some(prof) = app.config.find_effective_site(site_id) {
+                (
+                    prof.display_name().to_string(),
+                    prof.deployment.as_str().to_string(),
+                    if app.auth.is_logged_in() {
+                        "Authenticated".to_string()
+                    } else {
+                        "Not signed in".to_string()
+                    },
+                )
+            } else {
+                (
+                    site_id.clone(),
+                    app.config.deployment.as_str().to_string(),
+                    if app.auth.is_logged_in() {
+                        "Authenticated".to_string()
+                    } else {
+                        "Not signed in".to_string()
+                    },
+                )
+            }
+        }
+        SiteScope::All => {
+            if sites.len() > 1 {
+                let enabled_n = sites.iter().filter(|s| s.enabled).count();
+                let signed_in = sites
+                    .iter()
+                    .filter(|s| {
+                        !s.auth_label.eq_ignore_ascii_case("Offline")
+                            && !s.auth_label.eq_ignore_ascii_case("Not signed in")
+                    })
+                    .count();
+                (
+                    format!("All Sites ({enabled_n} enabled)"),
+                    format!("{} configured", sites.len()),
+                    format!("{signed_in}/{} authenticated", sites.len()),
+                )
+            } else if let Some(only) = sites.first() {
+                let url = only.display_url();
+                let lbl = if url.is_empty() {
+                    only.name.clone()
+                } else {
+                    url.to_string()
+                };
+                (lbl, only.deployment_label.clone(), only.auth_label.clone())
+            } else {
+                (
+                    site_display_english(app),
+                    app.config.deployment.as_str().to_string(),
+                    if app.auth.is_logged_in() {
+                        "Authenticated".to_string()
+                    } else {
+                        "Not signed in".to_string()
+                    },
+                )
+            }
+        }
     };
+
     let sync_lbl = if app.syncing {
         format!("{} Syncing…", spinner_glyph())
     } else if app.sync_summary.is_empty() {
@@ -525,57 +640,96 @@ fn draw_stats_and_controls(frame: &mut Frame, area: Rect, app: &AppState, ui: &m
             .add_modifier(Modifier::BOLD)
     };
 
-    let images_pill = format!("Images: {}", if ui.inline_images { "ON" } else { "OFF" });
-    let drawer_pill = format!("Drawer: {}", if ui.auto_detail_drawer { "ON" } else { "OFF" });
+    // Row 1: clickable Site label opens SiteSwitcher
+    let site_prefix = " Site: ";
+    let site_x = content_rect.x.saturating_add(site_prefix.width() as u16);
+    if site_x < content_rect.right() {
+        let site_w = (site_label.width() as u16).min(content_rect.right().saturating_sub(site_x));
+        ui.hitmap.add_line(
+            site_x,
+            content_rect.y + 1,
+            site_w,
+            HitTarget::Button(ButtonId::SiteSwitcher),
+        );
+    }
+
+    // Row 3: Status | Version | Theme | Density | Images | Drawer (all 4 settings clickable)
     let status_prefix_1 = " Status: ";
     let status_prefix_2 = "  |  Version: ";
-    let status_prefix_3 = format!(
-        "  |  Theme: {}  Density: {}  ",
-        app.config.theme.label(),
-        app.config.density.label(),
-    );
+    let status_pipe = "  |  ";
+    let theme_pill = format!("Theme: {}", app.config.theme.label());
+    let density_pill = format!("Density: {}", app.config.density.label());
+    let images_pill = format!("Images: {}", if ui.inline_images { "ON" } else { "OFF" });
+    let drawer_pill = format!("Drawer: {}", if ui.auto_detail_drawer { "ON" } else { "OFF" });
     let status_sep = "  ";
     let status_row_y = content_rect.y + 3;
-    let img_x = content_rect.x
-        + (status_prefix_1.width()
-            + sync_lbl.width()
-            + status_prefix_2.width()
-            + update_lbl.width()
-            + status_prefix_3.width()) as u16;
-    let img_w = images_pill.width() as u16;
-    let drawer_x = img_x + img_w + status_sep.width() as u16;
-    let drawer_w = drawer_pill.width() as u16;
-    if img_x.saturating_add(img_w) <= content_rect.right() {
+
+    let mut cx = content_rect
+        .x
+        .saturating_add(status_prefix_1.width() as u16)
+        .saturating_add(sync_lbl.width() as u16)
+        .saturating_add(status_prefix_2.width() as u16)
+        .saturating_add(update_lbl.width() as u16)
+        .saturating_add(status_pipe.width() as u16);
+    let theme_w = theme_pill.width() as u16;
+    if cx < content_rect.right() {
+        let clipped = theme_w.min(content_rect.right().saturating_sub(cx));
         ui.hitmap.add_line(
-            img_x,
+            cx,
             status_row_y,
-            img_w,
+            clipped,
+            HitTarget::Button(ButtonId::CycleTheme),
+        );
+    }
+    cx = cx.saturating_add(theme_w).saturating_add(status_sep.width() as u16);
+
+    let density_w = density_pill.width() as u16;
+    if cx < content_rect.right() {
+        let clipped = density_w.min(content_rect.right().saturating_sub(cx));
+        ui.hitmap.add_line(
+            cx,
+            status_row_y,
+            clipped,
+            HitTarget::Button(ButtonId::ToggleDensity),
+        );
+    }
+    cx = cx.saturating_add(density_w).saturating_add(status_sep.width() as u16);
+
+    let img_w = images_pill.width() as u16;
+    if cx < content_rect.right() {
+        let clipped = img_w.min(content_rect.right().saturating_sub(cx));
+        ui.hitmap.add_line(
+            cx,
+            status_row_y,
+            clipped,
             HitTarget::Button(ButtonId::ToggleInlineImages),
         );
     }
-    if drawer_x.saturating_add(drawer_w) <= content_rect.right() {
+    cx = cx.saturating_add(img_w).saturating_add(status_sep.width() as u16);
+
+    let drawer_w = drawer_pill.width() as u16;
+    if cx < content_rect.right() {
+        let clipped = drawer_w.min(content_rect.right().saturating_sub(cx));
         ui.hitmap.add_line(
-            drawer_x,
+            cx,
             status_row_y,
-            drawer_w,
+            clipped,
             HitTarget::Button(ButtonId::ToggleDrawer),
         );
     }
 
     let sync_btn_text = " [r] Sync All ";
     let update_btn_text = " [U] Check Update ";
+    let pin_btn_text = " [p] Toggle Pin ";
     let lines = vec![
         Line::from(Span::styled(
             " Sync · Cache Stats · Settings",
             theme.title(true),
         )),
         Line::from(vec![
-            Span::styled(" Site: ", theme.muted_style()),
-            Span::styled(site_display_english(app), theme.accent_style()),
-            Span::styled(
-                format!(" ({})  |  Auth: ", app.config.deployment.as_str()),
-                theme.muted_style(),
-            ),
+            Span::styled(site_prefix, theme.muted_style()),
+            Span::styled(site_label, theme.accent_style()),
+            Span::styled(format!(" ({deploy_label})  |  Auth: "), theme.muted_style()),
             Span::raw(auth_status),
         ]),
         Line::from(vec![
@@ -590,7 +744,11 @@ fn draw_stats_and_controls(frame: &mut Frame, area: Rect, app: &AppState, ui: &m
             Span::raw(sync_lbl),
             Span::styled(status_prefix_2, theme.muted_style()),
             Span::raw(update_lbl),
-            Span::styled(status_prefix_3, theme.muted_style()),
+            Span::styled(status_pipe, theme.muted_style()),
+            Span::styled(theme_pill, theme.muted_style()),
+            Span::styled(status_sep, theme.muted_style()),
+            Span::styled(density_pill, theme.muted_style()),
+            Span::styled(status_sep, theme.muted_style()),
             Span::styled(images_pill, sync_btn_style),
             Span::styled(status_sep, theme.muted_style()),
             Span::styled(drawer_pill, update_btn_style),
@@ -600,7 +758,7 @@ fn draw_stats_and_controls(frame: &mut Frame, area: Rect, app: &AppState, ui: &m
             Span::raw(" "),
             Span::styled(update_btn_text, update_btn_style),
             Span::raw(" "),
-            Span::styled(" [p] Toggle Pin ", pin_btn_style),
+            Span::styled(pin_btn_text, pin_btn_style),
             Span::raw(" "),
             Span::styled(" [h/l] Switch List ", theme.muted_style()),
         ]),
@@ -610,22 +768,35 @@ fn draw_stats_and_controls(frame: &mut Frame, area: Rect, app: &AppState, ui: &m
     if content_rect.height >= 5 {
         let row = content_rect.y + 4;
         let sync_w = sync_btn_text.width() as u16;
-        let update_x = content_rect.x + sync_w + 1;
+        let update_x = content_rect.x.saturating_add(sync_w + 1);
         let update_w = update_btn_text.width() as u16;
-        if content_rect.x + sync_w <= content_rect.right() {
+        let pin_x = update_x.saturating_add(update_w + 1);
+        let pin_w = pin_btn_text.width() as u16;
+        if content_rect.x < content_rect.right() {
+            let clipped = sync_w.min(content_rect.right().saturating_sub(content_rect.x));
             ui.hitmap.add_line(
                 content_rect.x,
                 row,
-                sync_w,
+                clipped,
                 HitTarget::Button(ButtonId::SyncAll),
             );
         }
-        if update_x + update_w <= content_rect.right() {
+        if update_x < content_rect.right() {
+            let clipped = update_w.min(content_rect.right().saturating_sub(update_x));
             ui.hitmap.add_line(
                 update_x,
                 row,
-                update_w,
+                clipped,
                 HitTarget::Button(ButtonId::CheckUpdate),
+            );
+        }
+        if pin_x < content_rect.right() {
+            let clipped = pin_w.min(content_rect.right().saturating_sub(pin_x));
+            ui.hitmap.add_line(
+                pin_x,
+                row,
+                clipped,
+                HitTarget::Button(ButtonId::TogglePin),
             );
         }
     }
@@ -634,6 +805,7 @@ fn draw_stats_and_controls(frame: &mut Frame, area: Rect, app: &AppState, ui: &m
 fn draw_projects(frame: &mut Frame, area: Rect, app: &AppState, ui: &mut UiState) {
     let theme = &ui.theme;
     let active = ui.directory_ui.section == 0;
+    ui.hitmap.add(area, HitTarget::DirectoryProjectsPane);
     if area.width < 6 || area.height < 3 {
         return;
     }
@@ -764,6 +936,7 @@ fn draw_projects(frame: &mut Frame, area: Rect, app: &AppState, ui: &mut UiState
 fn draw_spaces(frame: &mut Frame, area: Rect, app: &AppState, ui: &mut UiState) {
     let theme = &ui.theme;
     let active = ui.directory_ui.section == 1;
+    ui.hitmap.add(area, HitTarget::DirectorySpacesPane);
     if area.width < 6 || area.height < 3 {
         return;
     }

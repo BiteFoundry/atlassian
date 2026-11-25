@@ -3,6 +3,7 @@
 use std::{
     collections::{HashMap, HashSet},
     path::PathBuf,
+    sync::atomic::{AtomicU64, Ordering},
     time::{Duration, Instant},
 };
 
@@ -148,6 +149,8 @@ pub struct TreeRow {
 pub struct BoardUiState {
     pub selected_board: usize,
     pub selected_sprint: usize,
+    pub board_scroll: usize,
+    pub sprint_scroll: usize,
     /// `0` = boards list, `1` = sprints list inside left nav.
     pub nav_section: usize,
     pub selected_col: usize,
@@ -155,6 +158,7 @@ pub struct BoardUiState {
     pub col_scroll: usize,
     pub drawer_open: bool,
     pub detail_scroll: u16,
+    pub detail_max_scroll: u16,
     /// Set once the user picks a board, so reloads keep their selection.
     pub user_moved_board: bool,
 }
@@ -166,9 +170,12 @@ pub struct IssueUiState {
     pub local_filter_active: bool,
     pub selected_filter: usize,
     pub selected_issue: usize,
+    pub filter_scroll: usize,
+    pub issue_scroll: usize,
     /// `0` = saved filters, `1` = issue list inside left nav.
     pub nav_section: usize,
     pub detail_scroll: u16,
+    pub detail_max_scroll: u16,
 }
 
 impl Default for IssueUiState {
@@ -179,8 +186,11 @@ impl Default for IssueUiState {
             local_filter_active: false,
             selected_filter: 0,
             selected_issue: 0,
+            filter_scroll: 0,
+            issue_scroll: 0,
             nav_section: 1,
             detail_scroll: 0,
+            detail_max_scroll: 0,
         }
     }
 }
@@ -209,7 +219,9 @@ pub struct ConfluenceUiState {
     pub nav_section: usize,
     pub toc_open: bool,
     pub selected_toc: usize,
+    pub toc_scroll: usize,
     pub reader_scroll: u16,
+    pub reader_max_scroll: u16,
 }
 
 /// One row of the SPACES pane, in display order.
@@ -243,6 +255,8 @@ pub struct DirectoryUiState {
     pub section: usize,
     pub selected_project: usize,
     pub selected_space: usize,
+    pub selected_site: usize,
+    pub site_scroll: usize,
     pub last_update: Option<UpdateCheckResult>,
 }
 
@@ -252,22 +266,28 @@ pub enum UiMsg {
     BootstrapFinished(Result<String, String>),
     BoardsLoaded(Result<Vec<BoardSummary>, String>),
     BoardDataLoaded {
+        seq: u64,
         site_id: String,
         board_id: i64,
+        requested_sprint_id: Option<i64>,
         columns: Vec<BoardColumn>,
         sprints: Vec<SprintSummary>,
         issues: Vec<IssueSummary>,
     },
     BoardLoadFailed {
+        seq: u64,
+        site_id: String,
         board_id: i64,
         error: String,
     },
     IssuesLoaded {
+        seq: u64,
         site_id: String,
         issues: Vec<IssueSummary>,
         label: String,
     },
     IssuesLoadFailed {
+        seq: u64,
         label: String,
         error: String,
     },
@@ -309,10 +329,14 @@ pub enum UiMsg {
         error: String,
     },
     TransitionsLoaded {
+        seq: u64,
+        site_id: String,
         issue_key: String,
         transitions: Result<Vec<IssueTransition>, String>,
     },
     AssignableUsersLoaded {
+        seq: u64,
+        site_id: String,
         query: String,
         users: Result<Vec<UserSummary>, String>,
     },
@@ -355,6 +379,7 @@ pub enum UiMsg {
         error: String,
     },
     MyWorkLoaded {
+        seq: u64,
         issues: Vec<IssueSummary>,
         issue_site_ids: Vec<String>,
         issue_site_labels: Vec<Option<String>>,
@@ -373,9 +398,11 @@ pub enum UiMsg {
         issue_key: Option<String>,
         page_id: Option<String>,
         issue_comments: Option<Result<Vec<IssueComment>, String>>,
+        issue_comment_total: Option<usize>,
         page_comments: Option<Result<Vec<ConfluenceComment>, String>>,
     },
     RemoteSearchLoaded {
+        seq: u64,
         query: String,
         hits: Result<(Vec<UnifiedSearchHit>, Vec<String>, Vec<Option<String>>), String>,
     },
@@ -439,6 +466,12 @@ pub struct UiState {
     pub collapsed_site_groups: HashSet<String>,
     /// Per-frame mapping from `HitTarget::SiteGroupHeader(idx)` to group collapse key.
     pub site_group_keys: Vec<String>,
+    /// Scroll offset for the Help overlay on short/narrow terminals.
+    pub help_scroll: u16,
+    /// Max scroll computed during the last Help overlay draw.
+    pub help_max_scroll: u16,
+    /// Last left-click timestamp & target for double-click detection.
+    pub last_click: Option<(Instant, crate::ui::hitmap::HitTarget)>,
 }
 
 impl UiState {
@@ -479,6 +512,9 @@ impl UiState {
             directory_ui: DirectoryUiState::default(),
             collapsed_site_groups: HashSet::new(),
             site_group_keys: Vec::new(),
+            help_scroll: 0,
+            help_max_scroll: 0,
+            last_click: None,
         }
     }
 
@@ -611,9 +647,24 @@ pub struct AppState {
     pub config_path_override: Option<PathBuf>,
     pub drafts_path_override: Option<PathBuf>,
 
-    /// Monotonic sequence counters guarding against out-of-order async detail responses.
+    /// Monotonic sequence counters guarding against out-of-order async responses.
     pub issue_detail_req_seq: u64,
     pub page_detail_req_seq: u64,
+    pub board_data_req_seq: u64,
+    pub issues_req_seq: u64,
+    pub my_work_req_seq: u64,
+    pub remote_search_req_seq: u64,
+    pub transitions_req_seq: AtomicU64,
+    pub assignable_users_req_seq: AtomicU64,
+    /// True when `self.issues` shows a user-selected custom JQL, saved filter, or project filter
+    /// so periodic 45s background `IssuesUpdated` events never overwrite it.
+    pub issues_custom_query: bool,
+    pub active_jql_label: Option<String>,
+    pub active_jql_site_id: Option<String>,
+    /// Sprint ID currently loaded into `self.board_issues` (guards against active-sprint overwrites).
+    active_board_sprint_id: Option<i64>,
+    /// Timestamp of the last live My Work fetch this session.
+    last_my_work_refresh_at: Option<Instant>,
     /// Site IDs for currently opened issue / page details.
     pub active_issue_site_id: Option<String>,
     pub active_page_site_id: Option<String>,
@@ -704,6 +755,17 @@ impl AppState {
             drafts_path_override: None,
             issue_detail_req_seq: 0,
             page_detail_req_seq: 0,
+            board_data_req_seq: 0,
+            issues_req_seq: 0,
+            my_work_req_seq: 0,
+            remote_search_req_seq: 0,
+            transitions_req_seq: AtomicU64::new(0),
+            assignable_users_req_seq: AtomicU64::new(0),
+            issues_custom_query: false,
+            active_jql_label: None,
+            active_jql_site_id: None,
+            active_board_sprint_id: None,
+            last_my_work_refresh_at: None,
             active_issue_site_id: None,
             active_page_site_id: None,
             active_issue_target: None,
@@ -921,8 +983,8 @@ impl AppState {
         }
     }
 
-    /// Rebuilds the shared `SiteClientPool` from `self.config` and updates `self.client`
-    /// when a specific site scope is active.
+    /// Rebuilds the shared `SiteClientPool` from `self.config`, updates `self.client`
+    /// when a specific site scope is active, and pushes updated polling targets to `sync_ctrl`.
     pub fn rebuild_site_pool(&mut self) {
         if let Ok(pool) = SiteClientPool::from_config(&self.config) {
             self.site_pool = pool;
@@ -936,6 +998,8 @@ impl AppState {
                 self.client = def_client;
             }
         }
+        let targets = sync::sync_targets(&self.site_pool);
+        let _ = self.sync_ctrl.update_targets(targets);
     }
 
     /// Resolves a human-friendly site label for `site_id` (site `name` or fallback `site_id`).
@@ -1112,6 +1176,17 @@ impl AppState {
     fn reset_active_view_for_site_switch(&mut self) {
         self.issue_detail_req_seq = self.issue_detail_req_seq.wrapping_add(1);
         self.page_detail_req_seq = self.page_detail_req_seq.wrapping_add(1);
+        self.board_data_req_seq = self.board_data_req_seq.wrapping_add(1);
+        self.issues_req_seq = self.issues_req_seq.wrapping_add(1);
+        self.my_work_req_seq = self.my_work_req_seq.wrapping_add(1);
+        self.remote_search_req_seq = self.remote_search_req_seq.wrapping_add(1);
+        self.transitions_req_seq.fetch_add(1, Ordering::AcqRel);
+        self.assignable_users_req_seq.fetch_add(1, Ordering::AcqRel);
+        self.issues_custom_query = false;
+        self.active_jql_label = None;
+        self.active_jql_site_id = None;
+        self.active_board_sprint_id = None;
+        self.last_my_work_refresh_at = None;
         self.in_flight_issue_detail = None;
         self.in_flight_page_detail = None;
         self.active_issue = None;
@@ -1128,6 +1203,31 @@ impl AppState {
         self.board_issue_site_id = None;
     }
 
+    fn reset_ui_for_site_switch(&self, ui: &mut UiState) {
+        ui.search_ui.is_remote = false;
+        ui.search_ui.selected_hit = 0;
+        ui.board_ui.selected_sprint = 0;
+        ui.board_ui.selected_col = 0;
+        ui.board_ui.selected_row = 0;
+        ui.board_ui.detail_scroll = 0;
+        ui.board_ui.user_moved_board = false;
+        ui.issue_ui.selected_filter = 0;
+        ui.issue_ui.selected_issue = 0;
+        ui.issue_ui.detail_scroll = 0;
+        ui.issue_ui.local_filter.clear();
+        ui.issue_ui.local_filter_active = false;
+        ui.my_work_ui.selected_issue = 0;
+        ui.my_work_ui.selected_page = 0;
+        ui.confluence_ui.selected_tree_row = 0;
+        ui.confluence_ui.selected_toc = 0;
+        ui.confluence_ui.reader_scroll = 0;
+        ui.confluence_ui.user_moved_space = false;
+        ui.confluence_ui.space_filter.clear();
+        ui.confluence_ui.space_filter_active = false;
+        ui.directory_ui.selected_project = 0;
+        ui.directory_ui.selected_space = 0;
+    }
+
     /// Applies a `SiteSwitcherCommand` emitted by `SiteSwitcherOverlay`, persisting
     /// `active_site` / `enabled` to `config.toml` and refreshing federated views.
     pub fn apply_site_switcher_command(&mut self, cmd: SiteSwitcherCommand, ui: &mut UiState) {
@@ -1137,15 +1237,14 @@ impl AppState {
                 self.config.active_site = None;
                 self.rebuild_site_pool();
                 self.reset_active_view_for_site_switch();
+                self.reset_ui_for_site_switch(ui);
                 if let Err(err) = self.save_config() {
                     ui.error(format!("Failed to save config.toml: {err}"));
                 }
                 self.load_cached_initial();
                 self.refresh_local_search(&ui.search_ui.query.text);
-                ui.issue_ui.selected_issue = 0;
-                ui.board_ui.user_moved_board = false;
-                ui.confluence_ui.user_moved_space = false;
                 self.apply_default_selection(ui);
+                self.clamp_selections(ui);
                 self.sync_open_item_watch(ui);
                 ui.success("Scope: All Sites (Federated)");
             }
@@ -1155,15 +1254,14 @@ impl AppState {
                 self.config.active_site = Some(site_id);
                 self.rebuild_site_pool();
                 self.reset_active_view_for_site_switch();
+                self.reset_ui_for_site_switch(ui);
                 if let Err(err) = self.save_config() {
                     ui.error(format!("Failed to save config.toml: {err}"));
                 }
                 self.load_cached_initial();
                 self.refresh_local_search(&ui.search_ui.query.text);
-                ui.issue_ui.selected_issue = 0;
-                ui.board_ui.user_moved_board = false;
-                ui.confluence_ui.user_moved_space = false;
                 self.apply_default_selection(ui);
+                self.clamp_selections(ui);
                 self.sync_open_item_watch(ui);
                 ui.success(format!("Active site: {label}"));
             }
@@ -1190,13 +1288,25 @@ impl AppState {
                         break;
                     }
                 }
+                let disabled_active_scope = now_enabled == Some(false)
+                    && self
+                        .site_scope
+                        .site_id()
+                        .is_some_and(|active_id| active_id.eq_ignore_ascii_case(&site_id));
+                if disabled_active_scope {
+                    self.site_scope = SiteScope::All;
+                    self.config.active_site = None;
+                }
                 self.rebuild_site_pool();
                 self.reset_active_view_for_site_switch();
+                self.reset_ui_for_site_switch(ui);
                 if let Err(err) = self.save_config() {
                     ui.error(format!("Failed to save config.toml: {err}"));
                 }
                 self.load_cached_initial();
                 self.refresh_local_search(&ui.search_ui.query.text);
+                self.apply_default_selection(ui);
+                self.clamp_selections(ui);
                 self.sync_open_item_watch(ui);
                 if let Some(enabled) = now_enabled {
                     ui.info(format!(
@@ -1335,8 +1445,350 @@ impl AppState {
         }
     }
 
-    pub fn load_cached_initial(&mut self) {
+    /// Returns all known per-site signed-in account IDs (lowercase `site_id -> user.id`)
+    /// from SQLite persisted identities, `site_pool` cached profiles, and primary `self.me`.
+    pub fn known_me_ids_by_site(&self) -> HashMap<String, String> {
+        let mut out = HashMap::new();
+        if let Ok(stored) = self.storage.list_identities() {
+            for (sid, user) in stored {
+                if !user.id.trim().is_empty() {
+                    out.insert(sid.trim().to_ascii_lowercase(), user.id);
+                }
+            }
+        }
+        for (site, client) in self.site_pool.all_clients() {
+            if let Some(me) = client.cached_me() {
+                if !me.id.trim().is_empty() {
+                    out.insert(site.id.trim().to_ascii_lowercase(), me.id);
+                }
+            }
+        }
+        if let Some(me) = self.me.clone().or_else(|| self.client.cached_me()) {
+            if !me.id.trim().is_empty() {
+                out.insert(
+                    self.client.site_id().trim().to_ascii_lowercase(),
+                    me.id,
+                );
+            }
+        }
+        out
+    }
+
+    /// Re-reads `cache_counts` scoped to the active site (or across all sites in federated mode).
+    pub fn refresh_scoped_cache_counts(&mut self) {
+        let counts = match self.site_scope.site_id() {
+            Some(sid) => self.storage.cache_counts_for_site(sid),
+            None => self.storage.cache_counts(),
+        };
+        if let Ok(c) = counts {
+            self.cache_counts = c;
+        }
+    }
+
+    /// Resets the Issues tab custom JQL / Saved Filter protection flag back to default view mode.
+    pub fn reset_issues_custom_query(&mut self) {
+        self.issues_custom_query = false;
+        self.active_jql_label = None;
+        self.active_jql_site_id = None;
+    }
+
+    /// Re-reads `my_issues` from SQLite respecting the active `site_scope`, per-site `me_id`,
+    /// enabled sites, and excluding `Done` issues.
+    fn reload_my_issues_from_storage(&mut self) {
         let show_pills = self.site_scope.is_all();
+        match self.site_scope.site_id().map(str::to_string) {
+            Some(ref site_id) => {
+                let (_, site_client) = self.site_id_and_client_for(Some(site_id));
+                let me_id = self.known_me_for_site(site_id, &site_client).map(|m| m.id);
+                self.my_issues = self
+                    .storage
+                    .list_my_work_for_site(site_id, me_id.as_deref(), 40)
+                    .unwrap_or_default();
+                self.my_issue_site_ids = vec![site_id.clone(); self.my_issues.len()];
+                self.my_issue_site_labels = vec![None; self.my_issues.len()];
+            }
+            None => {
+                let me_ids = self.known_me_ids_by_site();
+                let my_work_pairs: Vec<(String, IssueSummary)> = self
+                    .storage
+                    .list_my_work_all_sites_for_users(&me_ids, 40)
+                    .unwrap_or_default()
+                    .into_iter()
+                    .filter(|(sid, _)| self.site_is_enabled_in_config(sid))
+                    .collect();
+                let has_multi = self.config.enabled_sites().len() > 1
+                    || my_work_pairs.iter().any(|(s, _)| s != DEFAULT_SITE_ID);
+                self.my_issue_site_ids = my_work_pairs.iter().map(|(sid, _)| sid.clone()).collect();
+                self.my_issue_site_labels = my_work_pairs
+                    .iter()
+                    .map(|(sid, _)| {
+                        (show_pills && has_multi).then(|| self.site_display_label(sid))
+                    })
+                    .collect();
+                self.my_issues = my_work_pairs.into_iter().map(|(_, i)| i).collect();
+            }
+        }
+    }
+
+    /// Re-reads `my_pages` from SQLite respecting the active `site_scope` and enabled sites.
+    fn reload_my_pages_from_storage(&mut self) {
+        let show_pills = self.site_scope.is_all();
+        match self.site_scope.site_id().map(str::to_string) {
+            Some(ref site_id) => {
+                if let Ok(pages) = self.storage.list_recent_pages_for_site(site_id, 30) {
+                    self.my_pages = pages;
+                    self.my_page_site_ids = vec![site_id.clone(); self.my_pages.len()];
+                    self.my_page_site_labels = vec![None; self.my_pages.len()];
+                }
+            }
+            None => {
+                if let Ok(pages_all) = self.storage.list_recent_pages_all_sites(30) {
+                    let filtered: Vec<(String, PageSummary)> = pages_all
+                        .into_iter()
+                        .filter(|(sid, _)| self.site_is_enabled_in_config(sid))
+                        .collect();
+                    let has_multi = self.config.enabled_sites().len() > 1
+                        || filtered.iter().any(|(s, _)| s != DEFAULT_SITE_ID);
+                    self.my_page_site_ids = filtered.iter().map(|(sid, _)| sid.clone()).collect();
+                    self.my_page_site_labels = filtered
+                        .iter()
+                        .map(|(sid, _)| {
+                            (show_pills && has_multi).then(|| self.site_display_label(sid))
+                        })
+                        .collect();
+                    self.my_pages = filtered.into_iter().map(|(_, p)| p).collect();
+                }
+            }
+        }
+    }
+
+    /// Clamps every list/tree/column cursor index in `UiState` to current collection lengths.
+    pub fn clamp_selections(&self, ui: &mut UiState) {
+        let clamp = |idx: &mut usize, len: usize| {
+            if len == 0 {
+                *idx = 0;
+            } else if *idx >= len {
+                *idx = len - 1;
+            }
+        };
+        clamp(&mut ui.board_ui.selected_board, self.boards.len());
+        clamp(&mut ui.board_ui.selected_sprint, self.sprints.len());
+        let cols = self.build_kanban_columns(ui);
+        clamp(&mut ui.board_ui.selected_col, cols.len());
+        let col_len = cols
+            .get(ui.board_ui.selected_col)
+            .map(|c| c.issues.len())
+            .unwrap_or(0);
+        clamp(&mut ui.board_ui.selected_row, col_len);
+
+        clamp(&mut ui.issue_ui.selected_filter, self.saved_filters.len());
+        let filtered_len = self.filtered_issues(ui).len();
+        clamp(&mut ui.issue_ui.selected_issue, filtered_len);
+
+        clamp(&mut ui.my_work_ui.selected_issue, self.my_issues.len());
+        clamp(&mut ui.my_work_ui.selected_page, self.my_pages.len());
+
+        clamp(&mut ui.confluence_ui.selected_space, self.spaces.len());
+        let tree_len = self.current_confluence_tree(ui).len();
+        clamp(&mut ui.confluence_ui.selected_tree_row, tree_len);
+        let toc_len = self
+            .active_page
+            .as_ref()
+            .map(|p| p.toc.iter().filter(|t| t.level <= 4).count())
+            .unwrap_or(0);
+        clamp(&mut ui.confluence_ui.selected_toc, toc_len);
+
+        clamp(&mut ui.search_ui.selected_hit, self.search_hits.len());
+
+        clamp(&mut ui.directory_ui.selected_project, self.projects.len());
+        clamp(&mut ui.directory_ui.selected_space, self.spaces.len());
+        let site_count = self.config.effective_sites().len();
+        clamp(&mut ui.directory_ui.selected_site, site_count);
+    }
+
+    /// Re-sorts `projects` and `spaces` so pinned items float to the top (matching SQLite order),
+    /// keeping parallel `project_site_ids` and `space_site_ids` strictly aligned.
+    pub fn sort_directory_pinned(&mut self) {
+        let multi = self.is_multi_site_all_mode();
+
+        let mut proj_pairs: Vec<(String, ProjectSummary)> = self
+            .projects
+            .drain(..)
+            .enumerate()
+            .map(|(i, p)| {
+                let sid = self
+                    .project_site_ids
+                    .get(i)
+                    .cloned()
+                    .unwrap_or_else(|| DEFAULT_SITE_ID.to_string());
+                (sid, p)
+            })
+            .collect();
+        proj_pairs.sort_by(|(sa, a), (sb, b)| {
+            let site_ord = if multi {
+                sa.cmp(sb)
+            } else {
+                std::cmp::Ordering::Equal
+            };
+            site_ord
+                .then_with(|| b.pinned.cmp(&a.pinned))
+                .then_with(|| a.name.to_ascii_lowercase().cmp(&b.name.to_ascii_lowercase()))
+                .then_with(|| a.key.cmp(&b.key))
+        });
+        self.project_site_ids = proj_pairs.iter().map(|(s, _)| s.clone()).collect();
+        self.projects = proj_pairs.into_iter().map(|(_, p)| p).collect();
+
+        let mut space_pairs: Vec<(String, SpaceSummary)> = self
+            .spaces
+            .drain(..)
+            .enumerate()
+            .map(|(i, s)| {
+                let sid = self
+                    .space_site_ids
+                    .get(i)
+                    .cloned()
+                    .unwrap_or_else(|| DEFAULT_SITE_ID.to_string());
+                (sid, s)
+            })
+            .collect();
+        space_pairs.sort_by(|(sa, a), (sb, b)| {
+            let site_ord = if multi {
+                sa.cmp(sb)
+            } else {
+                std::cmp::Ordering::Equal
+            };
+            site_ord
+                .then_with(|| b.pinned.cmp(&a.pinned))
+                .then_with(|| a.name.to_ascii_lowercase().cmp(&b.name.to_ascii_lowercase()))
+                .then_with(|| a.key.cmp(&b.key))
+        });
+        self.space_site_ids = space_pairs.iter().map(|(s, _)| s.clone()).collect();
+        self.spaces = space_pairs.into_iter().map(|(_, s)| s).collect();
+    }
+
+    /// Reloads SQLite cache while preserving user-selected board/sprint, space, custom JQL
+    /// results, and active Search results (never wiping search with an empty query).
+    pub fn reload_cached_preserving_ui(&mut self, ui: &mut UiState) {
+        let prev_board: Option<(String, i64)> = if ui.board_ui.user_moved_board {
+            self.active_board_with_site(ui).map(|(sid, b)| (sid, b.id))
+        } else {
+            None
+        };
+        let prev_sprint_id = self
+            .active_board_sprint_id
+            .or_else(|| self.sprints.get(ui.board_ui.selected_sprint).map(|s| s.id));
+        let prev_space: Option<(String, String)> = if ui.confluence_ui.user_moved_space {
+            self.active_space(ui).map(|sp| (self.tree_site(ui), sp.key.clone()))
+        } else {
+            None
+        };
+        let preserved_custom_issues = if self.issues_custom_query {
+            Some((self.issues.clone(), self.issue_site_ids.clone()))
+        } else {
+            None
+        };
+
+        self.load_cached_initial();
+
+        if let Some((saved_issues, saved_site_ids)) = preserved_custom_issues {
+            self.issues = saved_issues;
+            self.issue_site_ids = saved_site_ids;
+        }
+
+        if let Some((prev_sid, prev_bid)) = prev_board {
+            if let Some(new_idx) = self
+                .boards
+                .iter()
+                .enumerate()
+                .position(|(idx, b)| {
+                    b.id == prev_bid
+                        && self
+                            .board_site_ids
+                            .get(idx)
+                            .is_some_and(|s| s.eq_ignore_ascii_case(&prev_sid))
+                })
+            {
+                ui.board_ui.selected_board = new_idx;
+                let board_sid = self
+                    .board_site_ids
+                    .get(new_idx)
+                    .cloned()
+                    .unwrap_or(prev_sid);
+                self.board_issue_site_id = Some(board_sid.clone());
+                if let Ok(sprints) = self.storage.list_sprints_for_site(&board_sid, prev_bid) {
+                    self.sprints = sprints;
+                }
+                let matched_sprint = prev_sprint_id.and_then(|sid| {
+                    self.sprints
+                        .iter()
+                        .position(|s| s.id == sid)
+                        .map(|idx| (idx, sid))
+                });
+                let effective_sprint = if let Some((sp_idx, sid)) = matched_sprint {
+                    ui.board_ui.selected_sprint = sp_idx;
+                    Some(sid)
+                } else {
+                    self.sprints
+                        .iter()
+                        .position(|s| s.state.eq_ignore_ascii_case("active"))
+                        .map(|idx| {
+                            ui.board_ui.selected_sprint = idx;
+                            self.sprints[idx].id
+                        })
+                };
+                self.active_board_sprint_id = effective_sprint;
+                if let Ok(bi) = self.storage.list_board_issues_for_site(
+                    &board_sid,
+                    prev_bid,
+                    effective_sprint,
+                    BOARD_ISSUE_VIEW_CAP,
+                ) {
+                    self.board_issues = bi;
+                }
+            }
+        }
+
+        if let Some((prev_sid, prev_key)) = prev_space {
+            if let Some(new_idx) = self
+                .spaces
+                .iter()
+                .enumerate()
+                .position(|(idx, sp)| {
+                    sp.key.eq_ignore_ascii_case(&prev_key)
+                        && self
+                            .space_site_ids
+                            .get(idx)
+                            .is_some_and(|s| s.eq_ignore_ascii_case(&prev_sid))
+                })
+            {
+                ui.confluence_ui.selected_space = new_idx;
+                let space_sid = self
+                    .space_site_ids
+                    .get(new_idx)
+                    .cloned()
+                    .unwrap_or(prev_sid);
+                let space_key = self.spaces[new_idx].key.clone();
+                if let Ok(roots) = self
+                    .storage
+                    .list_space_root_pages_for_site(&space_sid, &space_key)
+                {
+                    self.root_pages_by_space
+                        .insert(SiteKey::new(&space_sid, &space_key), roots);
+                }
+            }
+        }
+
+        self.apply_default_selection(ui);
+
+        if !ui.search_ui.is_remote && !ui.search_ui.query.text.trim().is_empty() {
+            let q = ui.search_ui.query.text.clone();
+            self.refresh_local_search(&q);
+        }
+
+        self.clamp_selections(ui);
+    }
+
+    pub fn load_cached_initial(&mut self) {
         match self.site_scope.site_id().map(str::to_string) {
             Some(ref site_id) => {
                 if let Ok(projs) = self.storage.list_projects_for_site(site_id) {
@@ -1353,6 +1805,11 @@ impl AppState {
                         if let Ok(sprints) = self.storage.list_sprints_for_site(site_id, bid) {
                             self.sprints = sprints;
                         }
+                        self.active_board_sprint_id = self
+                            .sprints
+                            .iter()
+                            .find(|s| s.state.eq_ignore_ascii_case("active"))
+                            .map(|s| s.id);
                         if let Ok(bi) =
                             self.storage
                                 .list_board_issues_for_site(site_id, bid, None, BOARD_ISSUE_VIEW_CAP)
@@ -1363,6 +1820,7 @@ impl AppState {
                         self.board_issue_site_id = None;
                         self.sprints.clear();
                         self.board_issues.clear();
+                        self.active_board_sprint_id = None;
                     }
                 }
                 if let Ok(mut filters) = self.storage.list_saved_filters_for_site(site_id) {
@@ -1373,23 +1831,13 @@ impl AppState {
                         }
                     }
                     self.saved_filters = combined;
+                } else {
+                    self.saved_filters = builtin_filters();
                 }
                 if let Ok(issues) = self.storage.list_issues_for_site(site_id, None, 200) {
                     self.issue_site_ids = vec![site_id.clone(); issues.len()];
                     self.issues = issues.clone();
-                    // Seed My Work with this site's open issues assigned to this site's
-                    // "me" (ATL-25); without a known identity show open issues only and
-                    // let the "Loading My Work" request replace the list.
-                    let (_, site_client) = self.site_id_and_client_for(Some(site_id));
-                    let me_id = self
-                        .known_me_for_site(site_id, &site_client)
-                        .map(|me| me.id);
-                    self.my_issues = self
-                        .storage
-                        .list_my_work_for_site(site_id, me_id.as_deref(), 40)
-                        .unwrap_or_default();
-                    self.my_issue_site_ids = vec![site_id.clone(); self.my_issues.len()];
-                    self.my_issue_site_labels = vec![None; self.my_issues.len()];
+                    self.reload_my_issues_from_storage();
                     let preserved_key = self
                         .active_issue
                         .as_ref()
@@ -1485,11 +1933,7 @@ impl AppState {
                         }
                     }
                 }
-                if let Ok(pages) = self.storage.list_recent_pages_for_site(site_id, 30) {
-                    self.my_pages = pages;
-                    self.my_page_site_ids = vec![site_id.clone(); self.my_pages.len()];
-                    self.my_page_site_labels = vec![None; self.my_pages.len()];
-                }
+                self.reload_my_pages_from_storage();
                 if let Ok(counts) = self.storage.cache_counts_for_site(site_id) {
                     self.cache_counts = counts;
                 }
@@ -1513,6 +1957,11 @@ impl AppState {
                         if let Ok(sprints) = self.storage.list_sprints_for_site(board_sid, bid) {
                             self.sprints = sprints;
                         }
+                        self.active_board_sprint_id = self
+                            .sprints
+                            .iter()
+                            .find(|s| s.state.eq_ignore_ascii_case("active"))
+                            .map(|s| s.id);
                         if let Ok(bi) = self.storage.list_board_issues_for_site(
                             board_sid,
                             bid,
@@ -1521,48 +1970,43 @@ impl AppState {
                         ) {
                             self.board_issues = bi;
                         }
+                    } else {
+                        self.board_issue_site_id = None;
+                        self.sprints.clear();
+                        self.board_issues.clear();
+                        self.active_board_sprint_id = None;
                     }
                 }
-                if let Ok(mut filters) = self.storage.list_saved_filters() {
-                    if !filters.is_empty() {
-                        let mut combined = builtin_filters();
-                        for f in filters.drain(..) {
+                {
+                    let mut combined = builtin_filters();
+                    let filter_site_id = self.client.site_id().to_string();
+                    if let Ok(filters) = self.storage.list_saved_filters_for_site(&filter_site_id) {
+                        for f in filters {
                             if !combined.iter().any(|b| b.id == f.id) {
                                 combined.push(f);
                             }
                         }
-                        self.saved_filters = combined;
                     }
+                    if !filter_site_id.eq_ignore_ascii_case(DEFAULT_SITE_ID) {
+                        if let Ok(filters) = self.storage.list_saved_filters() {
+                            for f in filters {
+                                if !combined.iter().any(|b| b.id == f.id) {
+                                    combined.push(f);
+                                }
+                            }
+                        }
+                    }
+                    self.saved_filters = combined;
                 }
                 if let Ok(issues_all) = self.storage.list_issues_all_sites(None, 200) {
                     let filtered: Vec<(String, IssueSummary)> = issues_all
                         .into_iter()
                         .filter(|(sid, _)| self.site_is_enabled_in_config(sid))
                         .collect();
-                    let has_multi = self.config.enabled_sites().len() > 1
-                        || filtered.iter().any(|(s, _)| s != DEFAULT_SITE_ID);
                     self.issue_site_ids = filtered.iter().map(|(s, _)| s.clone()).collect();
                     self.issues = filtered.iter().map(|(_, i)| i.clone()).collect();
 
-                    let my_work_pairs = self
-                        .storage
-                        .list_my_work_all_sites(40)
-                        .ok()
-                        .map(|rows| {
-                            rows.into_iter()
-                                .filter(|(sid, _)| self.site_is_enabled_in_config(sid))
-                                .collect::<Vec<_>>()
-                        })
-                        .filter(|v| !v.is_empty())
-                        .unwrap_or_else(|| filtered.iter().take(20).cloned().collect());
-                    self.my_issue_site_ids = my_work_pairs.iter().map(|(sid, _)| sid.clone()).collect();
-                    self.my_issue_site_labels = my_work_pairs
-                        .iter()
-                        .map(|(sid, _)| {
-                            (show_pills && has_multi).then(|| self.site_display_label(sid))
-                        })
-                        .collect();
-                    self.my_issues = my_work_pairs.into_iter().map(|(_, i)| i).collect();
+                    self.reload_my_issues_from_storage();
 
                     let preserved = self.active_issue.as_ref().and_then(|d| {
                         let existing_sid = self.active_issue_site_id.as_deref();
@@ -1645,65 +2089,142 @@ impl AppState {
                         }
                     }
                 }
-                if let Ok(pages_all) = self.storage.list_recent_pages_all_sites(30) {
-                    let filtered: Vec<(String, PageSummary)> = pages_all
-                        .into_iter()
-                        .filter(|(sid, _)| self.site_is_enabled_in_config(sid))
-                        .collect();
-                    let has_multi = self.config.enabled_sites().len() > 1
-                        || filtered.iter().any(|(s, _)| s != DEFAULT_SITE_ID);
-                    self.my_page_site_ids = filtered.iter().map(|(sid, _)| sid.clone()).collect();
-                    self.my_page_site_labels = filtered
-                        .iter()
-                        .map(|(sid, _)| {
-                            (show_pills && has_multi).then(|| self.site_display_label(sid))
-                        })
-                        .collect();
-                    self.my_pages = filtered.into_iter().map(|(_, p)| p).collect();
-                }
+                self.reload_my_pages_from_storage();
                 if let Ok(counts) = self.storage.cache_counts() {
                     self.cache_counts = counts;
                 }
             }
         }
-        self.refresh_local_search("");
     }
 
     pub fn spawn_bootstrap(&self, ui: &mut UiState) {
         if tokio::runtime::Handle::try_current().is_err() {
             return;
         }
-        if !self.auth.is_logged_in() || self.config.site_url.trim().is_empty() {
+        let mut targets: Vec<(String, String, AtlassianClient)> = self
+            .site_pool
+            .enabled_clients()
+            .into_iter()
+            .filter(|(site, client)| {
+                !site.site_url.trim().is_empty() && client.auth().is_logged_in()
+            })
+            .map(|(site, client)| {
+                (
+                    site.id.clone(),
+                    site.display_name().to_string(),
+                    client,
+                )
+            })
+            .collect();
+        if targets.is_empty()
+            && self.auth.is_logged_in()
+            && !self.config.site_url.trim().is_empty()
+        {
+            targets.push((
+                self.client.site_id().to_string(),
+                self.site_display_label(self.client.site_id()),
+                self.client.clone(),
+            ));
+        }
+        if targets.is_empty() {
             ui.info("Offline cache mode (run `atlassian login` to connect)");
             return;
         }
+
         ui.tasks.begin("Initial sync");
-        let client = self.client.clone();
+        let primary_site_id = self.client.site_id().to_string();
+        let active_scope = self.site_scope.clone();
         let storage = self.storage.clone();
         let tx = self.ui_tx.clone();
         tokio::spawn(async move {
-            match client.get_myself().await {
-                Ok(me) => {
-                    client.set_cached_me(me.clone());
-                    let _ = tx.send(UiMsg::MeLoaded(Ok(me)));
-                }
-                Err(e) => {
-                    let _ = tx.send(UiMsg::MeLoaded(Err(e.to_string())));
+            let mut primary_me_sent = false;
+            for (idx, (site_id, _site_name, client)) in targets.iter().enumerate() {
+                let is_primary =
+                    site_id.eq_ignore_ascii_case(&primary_site_id) || (targets.len() == 1 && idx == 0);
+                match client.get_myself().await {
+                    Ok(me) => {
+                        client.set_cached_me(me.clone());
+                        let _ = storage.save_identity_for_site(site_id, &me);
+                        if is_primary && !primary_me_sent {
+                            primary_me_sent = true;
+                            let _ = tx.send(UiMsg::MeLoaded(Ok(me)));
+                        }
+                    }
+                    Err(e) => {
+                        if is_primary && !primary_me_sent {
+                            primary_me_sent = true;
+                            let _ = tx.send(UiMsg::MeLoaded(Err(e.to_string())));
+                        }
+                    }
                 }
             }
-            let summary = sync::bootstrap_workspace(&client, &storage)
-                .await
-                .map_err(|e| e.to_string());
+
+            let summary = if targets.len() == 1 {
+                let (site_id, _, client) = &targets[0];
+                sync::bootstrap_workspace_for_site(site_id, client, &storage)
+                    .await
+                    .map_err(|e| e.to_string())
+            } else {
+                let sync_targets: Vec<SiteSyncTarget> = targets
+                    .iter()
+                    .map(|(site_id, site_name, client)| SiteSyncTarget {
+                        site_id: site_id.clone(),
+                        site_name: site_name.clone(),
+                        client: client.clone(),
+                    })
+                    .collect();
+                let mut breakers = sync::CircuitBreakerMap::new();
+                let outcome = sync::run_multi_site_sync(
+                    &sync_targets,
+                    &storage,
+                    &mut breakers,
+                    sync::DEFAULT_MULTI_SITE_CONCURRENCY,
+                    None,
+                )
+                .await;
+                if outcome.succeeded_sites > 0 {
+                    Ok(outcome.summary)
+                } else {
+                    let first_err = outcome
+                        .per_site
+                        .iter()
+                        .find_map(|r| r.error.clone())
+                        .unwrap_or(outcome.summary);
+                    Err(first_err)
+                }
+            };
             let _ = tx.send(UiMsg::BootstrapFinished(summary));
-            if let Ok(filters) = client.list_favourite_filters().await {
-                let _ = storage.upsert_saved_filters(&filters);
-                let _ = tx.send(UiMsg::SavedFiltersLoaded(filters));
+
+            let mut visible_filters = Vec::new();
+            for (site_id, _, client) in &targets {
+                if let Ok(filters) = client.list_favourite_filters().await {
+                    let _ = storage.upsert_saved_filters_for_site(site_id, &filters);
+                    if active_scope.matches(site_id) {
+                        for f in filters {
+                            if !visible_filters.iter().any(|existing: &SavedFilter| existing.id == f.id) {
+                                visible_filters.push(f);
+                            }
+                        }
+                    }
+                }
+            }
+            if !visible_filters.is_empty() {
+                let _ = tx.send(UiMsg::SavedFiltersLoaded(visible_filters));
             }
         });
     }
 
     pub fn active_board(&self, ui: &UiState) -> Option<&BoardSummary> {
         self.boards.get(ui.board_ui.selected_board)
+    }
+
+    pub fn active_board_with_site(&self, ui: &UiState) -> Option<(String, BoardSummary)> {
+        let board = self.active_board(ui)?.clone();
+        let site_id = self
+            .active_board_site_id(ui)
+            .map(str::to_string)
+            .unwrap_or_else(|| self.effective_site_id_and_client().0);
+        Some((site_id, board))
     }
 
     pub fn active_board_site_id(&self, ui: &UiState) -> Option<&str> {
@@ -2409,25 +2930,25 @@ impl AppState {
             CrossRefTarget::JiraIssue { key, .. } => {
                 ui.active_tab = WorkspaceTab::Issues;
                 ui.focus = PaneFocus::Main;
-                if let Some(pos) = self.issues.iter().position(|i| i.key == key) {
+                let find_in_filtered = |app: &Self, ui: &UiState| {
+                    let filtered = app.filtered_issues_with_sites(ui);
                     if let Some(sid) = site_id {
-                        if let Some(exact) = self
-                            .issues
+                        filtered
                             .iter()
-                            .enumerate()
-                            .position(|(idx, i)| {
-                                i.key == key
-                                    && self
-                                        .issue_site_ids
-                                        .get(idx)
-                                        .is_some_and(|s| s.eq_ignore_ascii_case(sid))
-                            })
-                        {
-                            ui.issue_ui.selected_issue = exact;
-                        } else {
-                            ui.issue_ui.selected_issue = pos;
-                        }
+                            .position(|(s, i)| i.key == key && s.eq_ignore_ascii_case(sid))
+                            .or_else(|| filtered.iter().position(|(_, i)| i.key == key))
                     } else {
+                        filtered.iter().position(|(_, i)| i.key == key)
+                    }
+                };
+                if let Some(pos) = find_in_filtered(self, ui) {
+                    ui.issue_ui.selected_issue = pos;
+                } else if self.issues.iter().any(|i| i.key == key)
+                    && !ui.issue_ui.local_filter.text.trim().is_empty()
+                {
+                    ui.issue_ui.local_filter.clear();
+                    ui.issue_ui.local_filter_active = false;
+                    if let Some(pos) = find_in_filtered(self, ui) {
                         ui.issue_ui.selected_issue = pos;
                     }
                 }
@@ -2476,15 +2997,17 @@ impl AppState {
     }
 
     /// Loads the board shown in BOARDS row `row` (and `sprint_id`, when given) from that row's site.
-    pub fn request_board_load(&self, ui: &mut UiState, row: usize, sprint_id: Option<i64>) {
+    pub fn request_board_load(&mut self, ui: &mut UiState, row: usize, sprint_id: Option<i64>) {
         if tokio::runtime::Handle::try_current().is_err() {
             return;
         }
         let Some((board_id, board_site)) = self.board_row_target(row) else {
             return;
         };
-        ui.tasks.begin(format!("Board #{board_id}"));
         let (site_id, client) = self.site_id_and_client_for(board_site);
+        self.board_data_req_seq = self.board_data_req_seq.wrapping_add(1);
+        let seq = self.board_data_req_seq;
+        ui.tasks.begin(format!("Board #{board_id}"));
         let storage = self.storage.clone();
         let tx = self.ui_tx.clone();
         tokio::spawn(async move {
@@ -2510,8 +3033,10 @@ impl AppState {
             {
                 Ok(issues) => {
                     let _ = tx.send(UiMsg::BoardDataLoaded {
+                        seq,
                         site_id,
                         board_id,
+                        requested_sprint_id: sprint_id,
                         columns,
                         sprints,
                         issues,
@@ -2519,6 +3044,8 @@ impl AppState {
                 }
                 Err(e) => {
                     let _ = tx.send(UiMsg::BoardLoadFailed {
+                        seq,
+                        site_id,
                         board_id,
                         error: e.to_string(),
                     });
@@ -2527,36 +3054,43 @@ impl AppState {
         });
     }
 
-    pub fn request_jql_search(&self, ui: &mut UiState, jql: String, label: String) {
+    pub fn request_jql_search(&mut self, ui: &mut UiState, jql: String, label: String) {
         self.request_jql_search_for_site(ui, None, jql, label);
     }
 
     pub fn request_jql_search_for_site(
-        &self,
+        &mut self,
         ui: &mut UiState,
         explicit_site: Option<&str>,
         jql: String,
         label: String,
     ) {
+        self.issues_custom_query = true;
+        self.active_jql_label = Some(label.clone());
+        self.active_jql_site_id = explicit_site.map(str::to_string);
         if tokio::runtime::Handle::try_current().is_err() {
             return;
         }
+        self.issues_req_seq = self.issues_req_seq.wrapping_add(1);
+        let seq = self.issues_req_seq;
         ui.tasks.begin(format!("JQL: {label}"));
         let (site_id, client) = self.site_id_and_client_for(explicit_site);
         let storage = self.storage.clone();
         let tx = self.ui_tx.clone();
         tokio::spawn(async move {
-            match client.search_issues_jql(&jql, 80, None, None).await {
-                Ok(page) => {
-                    let _ = storage.upsert_issues_for_site(&site_id, &page.issues);
+            match client.search_all_issues_jql(&jql, 200).await {
+                Ok(collected) => {
+                    let _ = storage.upsert_issues_for_site(&site_id, &collected.items);
                     let _ = tx.send(UiMsg::IssuesLoaded {
+                        seq,
                         site_id,
-                        issues: page.issues,
+                        issues: collected.items,
                         label,
                     });
                 }
                 Err(e) => {
                     let _ = tx.send(UiMsg::IssuesLoadFailed {
+                        seq,
                         label,
                         error: e.to_string(),
                     });
@@ -2745,12 +3279,18 @@ impl AppState {
         if tokio::runtime::Handle::try_current().is_err() {
             return;
         }
-        let (_, client) = self.site_id_and_client_for(site.as_deref());
+        let seq = self
+            .transitions_req_seq
+            .fetch_add(1, Ordering::AcqRel)
+            .wrapping_add(1);
+        let (resolved_site, client) = self.site_id_and_client_for(site.as_deref());
         let tx = self.ui_tx.clone();
         let key = issue_key.to_string();
         tokio::spawn(async move {
             let res = client.list_transitions(&key).await.map_err(|e| e.to_string());
             let _ = tx.send(UiMsg::TransitionsLoaded {
+                seq,
+                site_id: resolved_site,
                 issue_key: key,
                 transitions: res,
             });
@@ -2778,6 +3318,7 @@ impl AppState {
         let prev_status = self.current_issue_status(site.as_deref(), key);
         // 0ms optimistic local column update so Kanban card moves right away!
         self.apply_local_status_update(site.as_deref(), key, &tr.to_status);
+        self.clamp_selections(ui);
         if tokio::runtime::Handle::try_current().is_err() {
             ui.success(format!("{key} → {}", tr.to_status.name));
             return;
@@ -2790,6 +3331,11 @@ impl AppState {
         tokio::spawn(async move {
             match client.transition_issue(&key_owned, &tr.id, None).await {
                 Ok(_) => {
+                    let _ = storage.update_issue_status_for_site(
+                        &site_id,
+                        &key_owned,
+                        &tr.to_status,
+                    );
                     let _ = tx.send(UiMsg::IssueTransitioned {
                         site_id: site_id.clone(),
                         key: key_owned.clone(),
@@ -2931,16 +3477,19 @@ impl AppState {
     }
 
     /// Identity of the signed-in user on `site_id`: the target client's own
-    /// cached profile, or the primary profile only when the target *is* the
-    /// primary site. Account ids differ per site (ATL-25), so another site's
-    /// "me" must never be sent.
+    /// cached profile, the primary profile when the target *is* the primary site,
+    /// or the persisted identity stored in SQLite for `site_id`. Account ids
+    /// differ per site (ATL-25), so another site's "me" is never sent.
     fn known_me_for_site(&self, site_id: &str, client: &AtlassianClient) -> Option<UserSummary> {
-        client.cached_me().or_else(|| {
-            site_id
-                .eq_ignore_ascii_case(self.client.site_id())
-                .then(|| self.me.clone().or_else(|| self.client.cached_me()))
-                .flatten()
-        })
+        client
+            .cached_me()
+            .or_else(|| {
+                site_id
+                    .eq_ignore_ascii_case(self.client.site_id())
+                    .then(|| self.me.clone().or_else(|| self.client.cached_me()))
+                    .flatten()
+            })
+            .or_else(|| self.storage.identity_for_site(site_id).ok().flatten())
     }
 
     pub fn request_assign_to_me_for_site(
@@ -2974,7 +3523,11 @@ impl AppState {
             let me = match known_me {
                 Some(me) => me,
                 None => match client.get_myself().await {
-                    Ok(me) => me,
+                    Ok(me) => {
+                        client.set_cached_me(me.clone());
+                        let _ = storage.save_identity_for_site(&site_id, &me);
+                        me
+                    }
                     Err(e) => {
                         let _ = tx.send(UiMsg::IssueAssignFailed {
                             site_id,
@@ -2988,30 +3541,33 @@ impl AppState {
                 },
             };
             match client.assign_issue(&key_owned, Some(&me.id)).await {
-                Ok(()) => match client.get_issue_with_meta(&key_owned).await {
-                    Ok((mut detail, meta)) => {
-                        let _ = storage.upsert_issue_detail_for_site_merging(
-                            &site_id,
-                            &mut detail,
-                            !meta.remote_links_ok,
-                        );
-                        let _ = tx.send(UiMsg::IssueMutated {
-                            site_id,
-                            detail,
-                            toast: format!("Assigned {key_owned} to you"),
-                            clear_draft_key: None,
-                        });
+                Ok(()) => {
+                    let _ = storage.update_issue_assignee_for_site(&site_id, &key_owned, Some(&me));
+                    match client.get_issue_with_meta(&key_owned).await {
+                        Ok((mut detail, meta)) => {
+                            let _ = storage.upsert_issue_detail_for_site_merging(
+                                &site_id,
+                                &mut detail,
+                                !meta.remote_links_ok,
+                            );
+                            let _ = tx.send(UiMsg::IssueMutated {
+                                site_id,
+                                detail,
+                                toast: format!("Assigned {key_owned} to you"),
+                                clear_draft_key: None,
+                            });
+                        }
+                        Err(e) => {
+                            let _ = tx.send(UiMsg::IssueAssignFailed {
+                                site_id,
+                                key: key_owned,
+                                previous_assignee: None,
+                                task_label,
+                                error: format!("Assigned issue, but failed to reload detail: {e}"),
+                            });
+                        }
                     }
-                    Err(e) => {
-                        let _ = tx.send(UiMsg::IssueAssignFailed {
-                            site_id,
-                            key: key_owned,
-                            previous_assignee: None,
-                            task_label,
-                            error: format!("Assigned issue, but failed to reload detail: {e}"),
-                        });
-                    }
-                },
+                }
                 Err(e) => {
                     let _ = tx.send(UiMsg::IssueAssignFailed {
                         site_id,
@@ -3049,8 +3605,12 @@ impl AppState {
         if tokio::runtime::Handle::try_current().is_err() {
             return;
         }
+        let seq = self
+            .assignable_users_req_seq
+            .fetch_add(1, Ordering::AcqRel)
+            .wrapping_add(1);
         let site = self.issue_write_site(site_id);
-        let (_, client) = self.site_id_and_client_for(site.as_deref());
+        let (resolved_site, client) = self.site_id_and_client_for(site.as_deref());
         let tx = self.ui_tx.clone();
         let key = project_or_issue.to_string();
         let q = query.to_string();
@@ -3059,7 +3619,12 @@ impl AppState {
                 .search_assignable_users(&key, &q)
                 .await
                 .map_err(|e| e.to_string());
-            let _ = tx.send(UiMsg::AssignableUsersLoaded { query: q, users: res });
+            let _ = tx.send(UiMsg::AssignableUsersLoaded {
+                seq,
+                site_id: resolved_site,
+                query: q,
+                users: res,
+            });
         });
     }
 
@@ -3090,30 +3655,37 @@ impl AppState {
         tokio::spawn(async move {
             let id_ref = user.as_ref().map(|u| u.id.as_str());
             match client.assign_issue(&key_owned, id_ref).await {
-                Ok(()) => match client.get_issue_with_meta(&key_owned).await {
-                    Ok((mut detail, meta)) => {
-                        let _ = storage.upsert_issue_detail_for_site_merging(
-                            &site_id,
-                            &mut detail,
-                            !meta.remote_links_ok,
-                        );
-                        let _ = tx.send(UiMsg::IssueMutated {
-                            site_id,
-                            detail,
-                            toast: format!("{key_owned} assignee → {label}"),
-                            clear_draft_key: None,
-                        });
+                Ok(()) => {
+                    let _ = storage.update_issue_assignee_for_site(
+                        &site_id,
+                        &key_owned,
+                        user.as_ref(),
+                    );
+                    match client.get_issue_with_meta(&key_owned).await {
+                        Ok((mut detail, meta)) => {
+                            let _ = storage.upsert_issue_detail_for_site_merging(
+                                &site_id,
+                                &mut detail,
+                                !meta.remote_links_ok,
+                            );
+                            let _ = tx.send(UiMsg::IssueMutated {
+                                site_id,
+                                detail,
+                                toast: format!("{key_owned} assignee → {label}"),
+                                clear_draft_key: None,
+                            });
+                        }
+                        Err(e) => {
+                            let _ = tx.send(UiMsg::IssueAssignFailed {
+                                site_id,
+                                key: key_owned,
+                                previous_assignee: None,
+                                task_label,
+                                error: format!("Updated assignee, but failed to reload detail: {e}"),
+                            });
+                        }
                     }
-                    Err(e) => {
-                        let _ = tx.send(UiMsg::IssueAssignFailed {
-                            site_id,
-                            key: key_owned,
-                            previous_assignee: None,
-                            task_label,
-                            error: format!("Updated assignee, but failed to reload detail: {e}"),
-                        });
-                    }
-                },
+                }
                 Err(e) => {
                     let _ = tx.send(UiMsg::IssueAssignFailed {
                         site_id,
@@ -3249,12 +3821,11 @@ impl AppState {
             CommentTarget::Issue(_) => self.issue_write_site(site.as_deref()),
             CommentTarget::Page { .. } => site.or_else(|| self.active_page_site_id.clone()),
         };
+        let (site_id, client) = self.site_id_and_client_for(site.as_deref());
         let optimistic_id = format!("optimistic:{}", uuid::Uuid::new_v4());
         let now = chrono::Utc::now().to_rfc3339();
         let author = self
-            .me
-            .clone()
-            .or_else(|| self.client.cached_me())
+            .known_me_for_site(&site_id, &client)
             .unwrap_or_else(|| UserSummary {
                 id: "me".to_string(),
                 display_name: "You".to_string(),
@@ -3265,7 +3836,7 @@ impl AppState {
         match &target {
             CommentTarget::Issue(key) => {
                 let opened_matches =
-                    site_matches(self.active_issue_site_id.as_deref(), site.as_deref());
+                    site_matches(self.active_issue_site_id.as_deref(), Some(&site_id));
                 if let Some(detail) = self.active_issue.as_mut().filter(|_| opened_matches) {
                     if detail.summary.key == *key {
                         detail.comments.push(IssueComment {
@@ -3280,10 +3851,12 @@ impl AppState {
                         });
                     }
                 }
-                self.bump_local_comment_count(site.as_deref(), key, 1);
+                self.bump_local_comment_count(Some(&site_id), key, 1);
             }
             CommentTarget::Page { page_id, .. } => {
-                if let Some(page) = &mut self.active_page {
+                let opened_matches =
+                    site_matches(self.active_page_site_id.as_deref(), Some(&site_id));
+                if let Some(page) = self.active_page.as_mut().filter(|_| opened_matches) {
                     if page.summary.id == *page_id {
                         page.comments.push(ConfluenceComment {
                             id: optimistic_id.clone(),
@@ -3307,18 +3880,20 @@ impl AppState {
             return;
         }
 
-        let (site_id, client) = self.site_id_and_client_for(site.as_deref());
+        let storage = self.storage.clone();
         let tx = self.ui_tx.clone();
         match target {
             CommentTarget::Issue(key) => {
                 let task_label = format!("Comment on {key}");
                 ui.tasks.begin(&task_label);
                 tokio::spawn(async move {
-                    let res = client
-                        .add_issue_comment(&key, &body)
-                        .await
-                        .map(|_| ())
-                        .map_err(|e| e.to_string());
+                    let res = match client.add_issue_comment(&key, &body).await {
+                        Ok(comment) => {
+                            let _ = storage.append_issue_comment_for_site(&site_id, &key, &comment);
+                            Ok(())
+                        }
+                        Err(e) => Err(e.to_string()),
+                    };
                     let _ = tx.send(UiMsg::CommentAdded {
                         site_id,
                         issue_key: Some(key),
@@ -3334,11 +3909,14 @@ impl AppState {
                 let task_label = format!("Comment on {title}");
                 ui.tasks.begin(&task_label);
                 tokio::spawn(async move {
-                    let res = client
-                        .add_page_comment(&page_id, &body)
-                        .await
-                        .map(|_| ())
-                        .map_err(|e| e.to_string());
+                    let res = match client.add_page_comment(&page_id, &body).await {
+                        Ok(comment) => {
+                            let _ =
+                                storage.append_page_comment_for_site(&site_id, &page_id, &comment);
+                            Ok(())
+                        }
+                        Err(e) => Err(e.to_string()),
+                    };
                     let _ = tx.send(UiMsg::CommentAdded {
                         site_id,
                         issue_key: None,
@@ -3416,32 +3994,40 @@ impl AppState {
         });
     }
 
-    pub fn toggle_expand_page(&mut self, ui: &mut UiState, page: &PageSummary) {
-        // Same site as `current_confluence_tree`, so the toggled row is the one drawn.
-        let tree_site = self.tree_site(ui);
-        let (site_id, client) = self.site_id_and_client_for(Some(&tree_site));
-        let node = SiteKey::new(&site_id, &page.id);
-        if self.expanded_pages.remove(&node) {
+    /// Fetches direct child pages for `(site_id, page_id)`. When `force` is `true`, bypasses
+    /// the in-memory `page_children_map` cache so manual refresh / re-expand sees live changes.
+    pub fn request_page_children_for_site(
+        &mut self,
+        ui: &mut UiState,
+        site_id: &str,
+        page_id: &str,
+        title: &str,
+        force: bool,
+    ) {
+        let (site_id, client) = self.site_id_and_client_for(Some(site_id));
+        let node = SiteKey::new(&site_id, page_id);
+        if !force && self.page_children_map.contains_key(&node) {
             return;
         }
-        self.expanded_pages.insert(node.clone());
-
-        if self.page_children_map.contains_key(&node) {
-            return;
-        }
-        if let Ok(cached) = self.storage.list_child_pages_for_site(&site_id, &page.id) {
-            if !cached.is_empty() {
-                self.page_children_map.insert(node, cached);
+        if !self.page_children_map.contains_key(&node) {
+            if let Ok(cached) = self.storage.list_child_pages_for_site(&site_id, page_id) {
+                if !cached.is_empty() {
+                    self.page_children_map.insert(node, cached);
+                }
             }
         }
         if tokio::runtime::Handle::try_current().is_err() {
             return;
         }
-        let task_label = format!("Child pages: {}", page.title);
+        let task_label = if title.trim().is_empty() {
+            format!("Child pages: #{page_id}")
+        } else {
+            format!("Child pages: {title}")
+        };
         ui.tasks.begin(&task_label);
         let storage = self.storage.clone();
         let tx = self.ui_tx.clone();
-        let pid = page.id.clone();
+        let pid = page_id.to_string();
         tokio::spawn(async move {
             match sync::load_child_pages_for_site(&client, &storage, &site_id, &pid).await {
                 Ok(children) => {
@@ -3462,6 +4048,99 @@ impl AppState {
                 }
             }
         });
+    }
+
+    pub fn toggle_expand_page(&mut self, ui: &mut UiState, page: &PageSummary) {
+        // Same site as `current_confluence_tree`, so the toggled row is the one drawn.
+        let tree_site = self.tree_site(ui);
+        let (site_id, _) = self.site_id_and_client_for(Some(&tree_site));
+        let node = SiteKey::new(&site_id, &page.id);
+        if self.expanded_pages.remove(&node) {
+            return;
+        }
+        self.expanded_pages.insert(node);
+        // Re-expanding keeps cached children visible immediately while refreshing live children.
+        self.request_page_children_for_site(ui, &site_id, &page.id, &page.title, true);
+    }
+
+    /// Toggles expand/collapse on a Confluence tree row (e.g. chevron click) without forcibly
+    /// switching `active_page`.
+    pub fn toggle_page_expand_only(&mut self, ui: &mut UiState, row_idx: usize) {
+        let tree = self.current_confluence_tree(ui);
+        if let Some(row) = tree.get(row_idx) {
+            let page = row.page.clone();
+            ui.confluence_ui.selected_tree_row = row_idx;
+            self.toggle_expand_page(ui, &page);
+            self.clamp_selections(ui);
+        }
+    }
+
+    /// Context-aware manual refresh for the currently active workspace tab (called alongside
+    /// workspace sync on `r` / `Action::SyncAll`).
+    pub fn refresh_active_context(&mut self, ui: &mut UiState) {
+        match ui.active_tab {
+            WorkspaceTab::Board => {
+                if self.active_board_with_site(ui).is_some() {
+                    let sprint_id = self
+                        .active_board_sprint_id
+                        .or_else(|| self.sprints.get(ui.board_ui.selected_sprint).map(|s| s.id));
+                    self.request_board_load(ui, ui.board_ui.selected_board, sprint_id);
+                }
+                if ui.board_ui.drawer_open {
+                    if let Some((sid, key)) = self.current_open_issue_identity() {
+                        self.request_issue_detail_for_site(ui, Some(&sid), &key);
+                    }
+                }
+            }
+            WorkspaceTab::Issues => {
+                let jql = ui.issue_ui.jql.text.trim().to_string();
+                let non_default_jql = !jql.is_empty() && jql != "ORDER BY updated DESC";
+                if (self.issues_custom_query || non_default_jql) && !jql.is_empty() {
+                    let label = self
+                        .active_jql_label
+                        .clone()
+                        .unwrap_or_else(|| "Custom JQL".to_string());
+                    let site = self.active_jql_site_id.clone();
+                    self.request_jql_search_for_site(ui, site.as_deref(), jql, label);
+                }
+                if let Some((sid, key)) = self.current_open_issue_identity() {
+                    self.request_issue_detail_for_site(ui, Some(&sid), &key);
+                }
+            }
+            WorkspaceTab::MyWork => {
+                self.request_my_work_refresh(ui);
+            }
+            WorkspaceTab::Confluence => {
+                if let Some(sp) = self.active_space(ui).cloned() {
+                    let space_site = self.tree_site(ui);
+                    self.request_space_root_pages_for_site(ui, Some(&space_site), &sp.key);
+                    let expanded_nodes: Vec<(String, String)> = self
+                        .current_confluence_tree(ui)
+                        .into_iter()
+                        .filter(|row| row.expanded)
+                        .map(|row| (row.page.id, row.page.title))
+                        .collect();
+                    for (pid, title) in expanded_nodes {
+                        self.request_page_children_for_site(ui, &space_site, &pid, &title, true);
+                    }
+                }
+                if let Some((sid, pid)) = self.current_open_page_identity() {
+                    self.request_page_detail_for_site(ui, Some(&sid), &pid);
+                }
+            }
+            WorkspaceTab::Search => {
+                let q = ui.search_ui.query.text.clone();
+                if ui.search_ui.is_remote {
+                    self.request_remote_search(ui, &q);
+                } else {
+                    self.refresh_local_search(&q);
+                    self.clamp_selections(ui);
+                }
+            }
+            WorkspaceTab::Directory => {
+                self.refresh_scoped_cache_counts();
+            }
+        }
     }
 
     pub fn request_page_detail(&mut self, ui: &mut UiState, page_id: &str) {
@@ -3692,6 +4371,7 @@ impl AppState {
                         issue_key: None,
                         page_id: Some(page_id),
                         issue_comments: None,
+                        issue_comment_total: None,
                         page_comments: Some(res),
                     });
                 });
@@ -3699,7 +4379,7 @@ impl AppState {
             OpenItemTarget::JiraIssue { site_id, key } => {
                 let (sid, client) = self.site_id_and_client_for(Some(&site_id));
                 tokio::spawn(async move {
-                    let res = match client.list_issue_comments_collected(&key).await {
+                    let (res, total) = match client.list_issue_comments_collected(&key).await {
                         Ok((collected, total)) => {
                             // The server total keeps comment_count right past the comment cap.
                             let _ = storage.update_issue_comments_for_site_with_total(
@@ -3708,15 +4388,16 @@ impl AppState {
                                 &collected.items,
                                 total,
                             );
-                            Ok(collected.items)
+                            (Ok(collected.items), total)
                         }
-                        Err(e) => Err(e.to_string()),
+                        Err(e) => (Err(e.to_string()), None),
                     };
                     let _ = tx.send(UiMsg::CommentsRefreshed {
                         site_id: sid,
                         issue_key: Some(key),
                         page_id: None,
                         issue_comments: Some(res),
+                        issue_comment_total: total,
                         page_comments: None,
                     });
                 });
@@ -3813,31 +4494,53 @@ impl AppState {
         }
     }
 
-    pub fn request_my_work_refresh(&self, ui: &mut UiState) {
+    /// Refreshes My Work when switching to the My Work tab if never live-fetched this session
+    /// or older than 30 seconds (not only when lists are empty).
+    pub fn maybe_refresh_my_work_on_tab_switch(&mut self, ui: &mut UiState) {
+        const MY_WORK_STALE_SECS: u64 = 30;
+        let is_stale = self
+            .last_my_work_refresh_at
+            .is_none_or(|t| t.elapsed() >= Duration::from_secs(MY_WORK_STALE_SECS));
+        if is_stale || (self.my_issues.is_empty() && self.my_pages.is_empty()) {
+            self.request_my_work_refresh(ui);
+        }
+    }
+
+    pub fn request_my_work_refresh(&mut self, ui: &mut UiState) {
         if tokio::runtime::Handle::try_current().is_err() {
             return;
         }
+        self.my_work_req_seq = self.my_work_req_seq.wrapping_add(1);
+        let seq = self.my_work_req_seq;
+        self.last_my_work_refresh_at = Some(Instant::now());
         ui.tasks.begin("Loading My Work");
-        let clients: Vec<(String, String, AtlassianClient)> = match &self.site_scope {
+        let clients: Vec<(String, String, Option<String>, AtlassianClient)> = match &self.site_scope {
             SiteScope::Only(id) => {
                 let c = self
                     .site_pool
                     .client_for(id)
                     .unwrap_or_else(|_| self.client.clone());
-                vec![(id.clone(), self.site_display_label(id), c)]
+                let me_id = self.known_me_for_site(id, &c).map(|m| m.id);
+                vec![(id.clone(), self.site_display_label(id), me_id, c)]
             }
             SiteScope::All => {
                 let enabled = self.site_pool.enabled_clients();
                 if enabled.is_empty() {
+                    let sid = self.client.site_id().to_string();
+                    let me_id = self.known_me_for_site(&sid, &self.client).map(|m| m.id);
                     vec![(
-                        self.client.site_id().to_string(),
-                        self.site_display_label(self.client.site_id()),
+                        sid.clone(),
+                        self.site_display_label(&sid),
+                        me_id,
                         self.client.clone(),
                     )]
                 } else {
                     enabled
                         .into_iter()
-                        .map(|(s, c)| (s.id.clone(), s.display_name().to_string(), c))
+                        .map(|(s, c)| {
+                            let me_id = self.known_me_for_site(&s.id, &c).map(|m| m.id);
+                            (s.id.clone(), s.display_name().to_string(), me_id, c)
+                        })
                         .collect()
                 }
             }
@@ -3848,7 +4551,7 @@ impl AppState {
         tokio::spawn(async move {
             let mut all_issues: Vec<(String, Option<String>, IssueSummary)> = Vec::new();
             let mut all_pages: Vec<(String, Option<String>, PageSummary)> = Vec::new();
-            for (site_id, site_label, client) in clients {
+            for (site_id, site_label, me_id, client) in clients {
                 let pill = show_pills.then_some(site_label);
                 let issues = match client
                     .search_issues_jql(AtlassianClient::my_open_issues_jql(), 40, None, None)
@@ -3859,7 +4562,7 @@ impl AppState {
                         p.issues
                     }
                     Err(_) => storage
-                        .list_issues_for_site(&site_id, None, 25)
+                        .list_my_work_for_site(&site_id, me_id.as_deref(), 40)
                         .unwrap_or_default(),
                 };
                 for issue in issues {
@@ -3900,6 +4603,7 @@ impl AppState {
                 pages.push(item);
             }
             let _ = tx.send(UiMsg::MyWorkLoaded {
+                seq,
                 issues,
                 issue_site_ids,
                 issue_site_labels,
@@ -3910,11 +4614,13 @@ impl AppState {
         });
     }
 
-    pub fn request_remote_search(&self, ui: &mut UiState, query: &str) {
+    pub fn request_remote_search(&mut self, ui: &mut UiState, query: &str) {
         let q = query.trim().to_string();
         if q.is_empty() || tokio::runtime::Handle::try_current().is_err() {
             return;
         }
+        self.remote_search_req_seq = self.remote_search_req_seq.wrapping_add(1);
+        let seq = self.remote_search_req_seq;
         ui.tasks.begin(format!("Remote search: {q}"));
         let clients: Vec<(String, String, AtlassianClient)> = match &self.site_scope {
             SiteScope::Only(id) => {
@@ -4023,7 +4729,11 @@ impl AppState {
                 }
                 Ok((hits, site_ids, labels))
             };
-            let _ = tx.send(UiMsg::RemoteSearchLoaded { query: q, hits: res });
+            let _ = tx.send(UiMsg::RemoteSearchLoaded {
+                seq,
+                query: q,
+                hits: res,
+            });
         });
     }
 
@@ -4067,14 +4777,19 @@ impl AppState {
             UploadTarget::Page(_) => self.active_page_site_id.as_deref(),
         });
         let (site_id, client) = self.site_id_and_client_for(explicit_site);
+        let storage = self.storage.clone();
         let tx = self.ui_tx.clone();
         match target {
             UploadTarget::Issue(key) => {
                 tokio::spawn(async move {
-                    let res = client
-                        .upload_issue_attachment(&key, &path)
-                        .await
-                        .map_err(|e| e.to_string());
+                    let res = match client.upload_issue_attachment(&key, &path).await {
+                        Ok(atts) => {
+                            let _ =
+                                storage.append_issue_attachments_for_site(&site_id, &key, &atts);
+                            Ok(atts)
+                        }
+                        Err(e) => Err(e.to_string()),
+                    };
                     let _ = tx.send(UiMsg::AttachmentUploaded {
                         site_id,
                         issue_key: Some(key),
@@ -4085,10 +4800,14 @@ impl AppState {
             }
             UploadTarget::Page(id) => {
                 tokio::spawn(async move {
-                    let res = client
-                        .upload_page_attachment(&id, &path)
-                        .await
-                        .map_err(|e| e.to_string());
+                    let res = match client.upload_page_attachment(&id, &path).await {
+                        Ok(atts) => {
+                            let _ =
+                                storage.append_page_attachments_for_site(&site_id, &id, &atts);
+                            Ok(atts)
+                        }
+                        Err(e) => Err(e.to_string()),
+                    };
                     let _ = tx.send(UiMsg::AttachmentUploaded {
                         site_id,
                         issue_key: None,
@@ -4419,6 +5138,157 @@ impl AppState {
                 == std::cmp::Ordering::Greater
     }
 
+    fn purge_deleted_issue(
+        &mut self,
+        ui: &mut UiState,
+        site_id: &str,
+        key: &str,
+        notify_toast: bool,
+    ) {
+        let _ = self.storage.delete_issue_for_site(site_id, key);
+        let mut idx = 0usize;
+        while idx < self.issues.len() {
+            let matches_site = self
+                .issue_site_ids
+                .get(idx)
+                .map(|s| s.eq_ignore_ascii_case(site_id))
+                .unwrap_or(true);
+            if matches_site && self.issues[idx].key == key {
+                self.issues.remove(idx);
+                if idx < self.issue_site_ids.len() {
+                    self.issue_site_ids.remove(idx);
+                }
+            } else {
+                idx += 1;
+            }
+        }
+        if self
+            .board_issue_site_id
+            .as_deref()
+            .map(|s| s.eq_ignore_ascii_case(site_id))
+            .unwrap_or(true)
+        {
+            self.board_issues.retain(|i| i.key != key);
+        }
+        self.remove_my_issue(site_id, key);
+        let mut hit_idx = 0usize;
+        while hit_idx < self.search_hits.len() {
+            let matches_site = self
+                .search_hit_site_ids
+                .get(hit_idx)
+                .map(|s| s.eq_ignore_ascii_case(site_id))
+                .unwrap_or(true);
+            if matches_site
+                && self.search_hits[hit_idx].kind == crate::models::SearchHitKind::JiraIssue
+                && self.search_hits[hit_idx].id_or_key == key
+            {
+                self.search_hits.remove(hit_idx);
+                if hit_idx < self.search_hit_site_ids.len() {
+                    self.search_hit_site_ids.remove(hit_idx);
+                }
+                if hit_idx < self.search_hit_site_labels.len() {
+                    self.search_hit_site_labels.remove(hit_idx);
+                }
+            } else {
+                hit_idx += 1;
+            }
+        }
+        let cleared_active = self.active_issue.as_ref().is_some_and(|cur| {
+            cur.summary.key == key
+                && self
+                    .active_issue_site_id
+                    .as_deref()
+                    .map(|s| s.eq_ignore_ascii_case(site_id))
+                    .unwrap_or(true)
+        }) || self.active_issue_target.as_ref().is_some_and(|(s, k)| {
+            k == key && s.eq_ignore_ascii_case(site_id)
+        });
+        if cleared_active {
+            self.active_issue = None;
+            self.active_issue_site_id = None;
+            self.active_issue_target = None;
+            self.active_issue_detail_updated_at = None;
+            self.in_flight_issue_detail = None;
+            if notify_toast {
+                ui.info(format!("{key} was deleted remotely and removed from cache"));
+            }
+        }
+        self.refresh_scoped_cache_counts();
+        self.clamp_selections(ui);
+        self.sync_open_item_watch(ui);
+    }
+
+    fn purge_deleted_page(
+        &mut self,
+        ui: &mut UiState,
+        site_id: &str,
+        page_id: &str,
+        notify_toast: bool,
+    ) {
+        let _ = self.storage.delete_page_for_site(site_id, page_id);
+        for (k, roots) in self.root_pages_by_space.iter_mut() {
+            if k.is_site(site_id) {
+                roots.retain(|p| p.id != page_id);
+            }
+        }
+        for (k, children) in self.page_children_map.iter_mut() {
+            if k.is_site(site_id) {
+                children.retain(|p| p.id != page_id);
+            }
+        }
+        self.page_children_map
+            .remove(&SiteKey::new(site_id, page_id));
+        self.expanded_pages.remove(&SiteKey::new(site_id, page_id));
+        self.remove_my_page(site_id, page_id);
+        let mut hit_idx = 0usize;
+        while hit_idx < self.search_hits.len() {
+            let matches_site = self
+                .search_hit_site_ids
+                .get(hit_idx)
+                .map(|s| s.eq_ignore_ascii_case(site_id))
+                .unwrap_or(true);
+            if matches_site
+                && self.search_hits[hit_idx].kind == crate::models::SearchHitKind::ConfluencePage
+                && self.search_hits[hit_idx].id_or_key == page_id
+            {
+                self.search_hits.remove(hit_idx);
+                if hit_idx < self.search_hit_site_ids.len() {
+                    self.search_hit_site_ids.remove(hit_idx);
+                }
+                if hit_idx < self.search_hit_site_labels.len() {
+                    self.search_hit_site_labels.remove(hit_idx);
+                }
+            } else {
+                hit_idx += 1;
+            }
+        }
+        let cleared_active = self.active_page.as_ref().is_some_and(|cur| {
+            cur.summary.id == page_id
+                && self
+                    .active_page_site_id
+                    .as_deref()
+                    .map(|s| s.eq_ignore_ascii_case(site_id))
+                    .unwrap_or(true)
+        }) || self.active_page_target.as_ref().is_some_and(|(s, p)| {
+            p == page_id && s.eq_ignore_ascii_case(site_id)
+        });
+        if cleared_active {
+            self.active_page = None;
+            self.active_page_site_id = None;
+            self.active_page_target = None;
+            self.active_page_detail_version = None;
+            self.in_flight_page_detail = None;
+            if notify_toast {
+                ui.info(format!(
+                    "Page #{page_id} was deleted remotely and removed from cache"
+                ));
+            }
+        }
+        self.refresh_scoped_cache_counts();
+        self.clamp_selections(ui);
+        self.sync_open_item_watch(ui);
+    }
+
     pub fn handle_core_event(&mut self, ui: &mut UiState, ev: CoreEvent) {
         match ev {
             CoreEvent::SyncStarted => {
@@ -4427,10 +5297,11 @@ impl AppState {
             CoreEvent::SyncFinished { summary } => {
                 self.syncing = false;
                 self.sync_summary = summary.clone();
-                if let Ok(counts) = self.storage.cache_counts() {
-                    self.cache_counts = counts;
-                }
+                self.refresh_scoped_cache_counts();
+                self.reload_my_issues_from_storage();
+                self.reload_my_pages_from_storage();
                 self.maybe_refresh_open_items_after_sync(ui);
+                self.clamp_selections(ui);
                 ui.tasks.finish("Sync", None);
                 ui.success(summary);
             }
@@ -4444,6 +5315,7 @@ impl AppState {
                 } else {
                     self.reload_projects_all_sites();
                 }
+                self.clamp_selections(ui);
             }
             CoreEvent::BoardsUpdated { site_id, items } => {
                 let sid = self.event_site_or_effective(site_id);
@@ -4460,6 +5332,7 @@ impl AppState {
                     self.board_site_ids = filtered.iter().map(|(s, _)| s.clone()).collect();
                     self.boards = filtered.into_iter().map(|(_, b)| b).collect();
                 }
+                self.clamp_selections(ui);
             }
             CoreEvent::BoardIssuesUpdated {
                 site_id,
@@ -4486,14 +5359,33 @@ impl AppState {
                         .active_board_site_id(ui)
                         .map(|s| s.eq_ignore_ascii_case(&effective_sid))
                         .unwrap_or_else(|| self.site_scope.matches(&effective_sid));
+                let selected_sprint_id = self
+                    .active_board_sprint_id
+                    .or_else(|| self.sprints.get(ui.board_ui.selected_sprint).map(|s| s.id));
+                let incoming_sprint_id = sprint.as_ref().map(|s| s.id);
+                let sprint_matches = match (selected_sprint_id, incoming_sprint_id) {
+                    (Some(sel), Some(inc)) => sel == inc,
+                    (Some(sel), None) => self
+                        .sprints
+                        .iter()
+                        .find(|s| s.id == sel)
+                        .is_none_or(|s| s.state.eq_ignore_ascii_case("active")),
+                    (None, _) => true,
+                };
                 if matches_active_board {
-                    self.board_issues = issues;
-                    self.board_issue_site_id = Some(effective_sid);
                     if let Some(sp) = sprint {
                         if !self.sprints.iter().any(|s| s.id == sp.id) {
                             self.sprints.push(sp);
                         }
                     }
+                    if sprint_matches {
+                        self.board_issues = issues;
+                        self.board_issue_site_id = Some(effective_sid);
+                        if incoming_sprint_id.is_some() {
+                            self.active_board_sprint_id = incoming_sprint_id;
+                        }
+                    }
+                    self.clamp_selections(ui);
                 }
                 if let Some((sid, key, updated_at)) = active_refresh {
                     self.request_issue_detail_for_site_if_needed(
@@ -4520,19 +5412,46 @@ impl AppState {
                     })
                 });
                 if self.site_scope.matches(&effective_sid) {
-                    if self.is_multi_site_all_mode() {
-                        if let Ok(all) = self.storage.list_issues_all_sites(None, 200) {
-                            let filtered: Vec<(String, IssueSummary)> = all
-                                .into_iter()
-                                .filter(|(sid, _)| self.site_is_enabled_in_config(sid))
-                                .collect();
-                            self.issue_site_ids = filtered.iter().map(|(s, _)| s.clone()).collect();
-                            self.issues = filtered.into_iter().map(|(_, i)| i).collect();
+                    if !self.issues_custom_query {
+                        if self.is_multi_site_all_mode() {
+                            if let Ok(all) = self.storage.list_issues_all_sites(None, 200) {
+                                let filtered: Vec<(String, IssueSummary)> = all
+                                    .into_iter()
+                                    .filter(|(sid, _)| self.site_is_enabled_in_config(sid))
+                                    .collect();
+                                self.issue_site_ids =
+                                    filtered.iter().map(|(s, _)| s.clone()).collect();
+                                self.issues = filtered.into_iter().map(|(_, i)| i).collect();
+                            }
+                        } else {
+                            self.issue_site_ids = vec![effective_sid.clone(); issues.len()];
+                            self.issues = issues;
                         }
                     } else {
-                        self.issue_site_ids = vec![effective_sid; issues.len()];
-                        self.issues = issues;
+                        // Preserve custom JQL / Saved Filter rows, updating any matching issues in place.
+                        for inc in &issues {
+                            for (idx, it) in self.issues.iter_mut().enumerate() {
+                                let row_matches_site = self
+                                    .issue_site_ids
+                                    .get(idx)
+                                    .map(|s| s.eq_ignore_ascii_case(&effective_sid))
+                                    .unwrap_or(true);
+                                if row_matches_site && it.key == inc.key {
+                                    let prev_comments = it.comment_count;
+                                    let prev_atts = it.attachment_count;
+                                    *it = inc.clone();
+                                    if it.comment_count == 0 && prev_comments > 0 {
+                                        it.comment_count = prev_comments;
+                                    }
+                                    if it.attachment_count == 0 && prev_atts > 0 {
+                                        it.attachment_count = prev_atts;
+                                    }
+                                }
+                            }
+                        }
                     }
+                    self.reload_my_issues_from_storage();
+                    self.clamp_selections(ui);
                 }
                 if let Some((sid, key, updated_at)) = active_refresh {
                     self.request_issue_detail_for_site_if_needed(
@@ -4558,6 +5477,7 @@ impl AppState {
                     self.space_site_ids = filtered.iter().map(|(s, _)| s.clone()).collect();
                     self.spaces = filtered.into_iter().map(|(_, s)| s).collect();
                 }
+                self.clamp_selections(ui);
             }
             CoreEvent::SpacePagesUpdated {
                 site_id,
@@ -4588,6 +5508,10 @@ impl AppState {
                     self.root_pages_by_space
                         .insert(SiteKey::new(&effective_sid, &space_key), pages);
                 }
+                if self.site_scope.matches(&effective_sid) {
+                    self.reload_my_pages_from_storage();
+                }
+                self.clamp_selections(ui);
                 if let Some((sid, pid, ver)) = active_refresh {
                     self.request_page_detail_for_site_if_needed(ui, Some(&sid), &pid, Some(ver));
                 }
@@ -4598,6 +5522,10 @@ impl AppState {
                 } else {
                     site_id
                 };
+                if sync::is_open_issue_not_found(&summary) {
+                    self.purge_deleted_issue(ui, &effective_sid, &summary.key, true);
+                    return;
+                }
                 let matches_open = self.current_open_issue_identity().is_some_and(|(sid, key)| {
                     sid.eq_ignore_ascii_case(&effective_sid) && key == summary.key
                 });
@@ -4627,6 +5555,10 @@ impl AppState {
                 } else {
                     site_id
                 };
+                if sync::is_open_page_not_found(&summary) {
+                    self.purge_deleted_page(ui, &effective_sid, &summary.id, true);
+                    return;
+                }
                 let matches_open = self.current_open_page_identity().is_some_and(|(sid, pid)| {
                     sid.eq_ignore_ascii_case(&effective_sid) && pid == summary.id
                 });
@@ -4676,8 +5608,7 @@ impl AppState {
                 Ok(summary) => {
                     self.sync_summary = summary.clone();
                     ui.tasks.finish("Initial sync", None);
-                    self.load_cached_initial();
-                    self.apply_default_selection(ui);
+                    self.reload_cached_preserving_ui(ui);
                     ui.success(&summary);
                     self.notify_desktop("Atlassian Sync Complete", &summary);
                 }
@@ -4689,42 +5620,87 @@ impl AppState {
             },
             UiMsg::BoardsLoaded(Ok(boards)) => {
                 self.boards = boards;
+                self.clamp_selections(ui);
             }
             UiMsg::BoardsLoaded(Err(e)) => ui.error(e),
             UiMsg::BoardDataLoaded {
+                seq,
                 site_id,
                 board_id,
+                requested_sprint_id,
                 columns,
                 sprints,
                 issues,
             } => {
                 ui.tasks.finish(&format!("Board #{board_id}"), None);
-                if !self.site_scope.matches(&site_id) {
+                if seq != self.board_data_req_seq || !self.site_scope.matches(&site_id) {
                     return;
                 }
-                if let Some(b) = self.boards.iter_mut().find(|b| b.id == board_id) {
-                    if !columns.is_empty() {
+                let still_active = self.active_board(ui).is_some_and(|b| b.id == board_id)
+                    && self
+                        .active_board_site_id(ui)
+                        .is_none_or(|s| s.eq_ignore_ascii_case(&site_id));
+                if !still_active {
+                    return;
+                }
+                if !columns.is_empty() {
+                    if self.board_site_ids.len() == self.boards.len() {
+                        if let Some((b, _)) = self
+                            .boards
+                            .iter_mut()
+                            .zip(self.board_site_ids.iter())
+                            .find(|(b, b_sid)| {
+                                b.id == board_id && b_sid.eq_ignore_ascii_case(&site_id)
+                            })
+                        {
+                            b.columns = columns;
+                        }
+                    } else if let Some(b) = self.boards.iter_mut().find(|b| b.id == board_id) {
                         b.columns = columns;
                     }
                 }
+                let effective_sprint = requested_sprint_id.or_else(|| {
+                    sprints
+                        .iter()
+                        .find(|s| s.state.eq_ignore_ascii_case("active"))
+                        .map(|s| s.id)
+                });
                 self.sprints = sprints;
                 self.board_issues = issues;
                 self.board_issue_site_id = Some(site_id);
+                self.active_board_sprint_id = effective_sprint;
+                if let Some(sp_id) = effective_sprint {
+                    if let Some(pos) = self.sprints.iter().position(|s| s.id == sp_id) {
+                        ui.board_ui.selected_sprint = pos;
+                    }
+                }
                 ui.board_ui.selected_col = 0;
                 ui.board_ui.selected_row = 0;
+                self.clamp_selections(ui);
             }
-            UiMsg::BoardLoadFailed { board_id, error } => {
+            UiMsg::BoardLoadFailed {
+                seq,
+                site_id,
+                board_id,
+                error,
+            } => {
                 ui.tasks
                     .finish(&format!("Board #{board_id}"), Some(error.clone()));
+                if (seq != 0 && seq != self.board_data_req_seq)
+                    || !self.site_scope.matches(&site_id)
+                {
+                    return;
+                }
                 ui.error(format!("Failed to load board: {error}"));
             }
             UiMsg::IssuesLoaded {
+                seq,
                 site_id,
                 issues,
                 label,
             } => {
                 ui.tasks.finish(&format!("JQL: {label}"), None);
-                if !self.site_scope.matches(&site_id) {
+                if seq != self.issues_req_seq || !self.site_scope.matches(&site_id) {
                     return;
                 }
                 self.issue_site_ids = vec![site_id.clone(); issues.len()];
@@ -4732,10 +5708,21 @@ impl AppState {
                 ui.issue_ui.selected_issue = 0;
                 if let Some(first) = self.issues.first().cloned() {
                     self.request_issue_detail_for_site(ui, Some(&site_id), &first.key);
+                } else {
+                    self.active_issue = None;
+                    self.active_issue_site_id = None;
+                    self.active_issue_target = None;
+                    self.active_issue_detail_updated_at = None;
+                    self.in_flight_issue_detail = None;
+                    self.sync_open_item_watch(ui);
                 }
+                self.clamp_selections(ui);
             }
-            UiMsg::IssuesLoadFailed { label, error } => {
+            UiMsg::IssuesLoadFailed { seq, label, error } => {
                 ui.tasks.finish(&format!("JQL: {label}"), Some(error.clone()));
+                if seq != 0 && seq != self.issues_req_seq {
+                    return;
+                }
                 ui.error(format!("JQL search failed: {error}"));
             }
             UiMsg::SavedFiltersLoaded(filters) => {
@@ -4746,6 +5733,7 @@ impl AppState {
                     }
                 }
                 self.saved_filters = combined;
+                self.clamp_selections(ui);
             }
             UiMsg::IssueDetailLoaded {
                 seq,
@@ -4803,40 +5791,7 @@ impl AppState {
                     }
                     Err(err) => {
                         if not_found {
-                            let mut idx = 0usize;
-                            while idx < self.issues.len() {
-                                let matches_site = self
-                                    .issue_site_ids
-                                    .get(idx)
-                                    .map(|s| s.eq_ignore_ascii_case(&site_id))
-                                    .unwrap_or(true);
-                                if matches_site && self.issues[idx].key == key {
-                                    self.issues.remove(idx);
-                                    if idx < self.issue_site_ids.len() {
-                                        self.issue_site_ids.remove(idx);
-                                    }
-                                } else {
-                                    idx += 1;
-                                }
-                            }
-                            if self
-                                .board_issue_site_id
-                                .as_deref()
-                                .map(|s| s.eq_ignore_ascii_case(&site_id))
-                                .unwrap_or(true)
-                            {
-                                self.board_issues.retain(|i| i.key != key);
-                            }
-                            self.remove_my_issue(&site_id, &key);
-                            if self
-                                .active_issue
-                                .as_ref()
-                                .is_some_and(|cur| cur.summary.key == key)
-                            {
-                                self.active_issue = None;
-                                self.active_issue_target = None;
-                                self.active_issue_detail_updated_at = None;
-                            }
+                            self.purge_deleted_issue(ui, &site_id, &key, false);
                         }
                         ui.error(format!("Failed to load issue detail: {err}"));
                     }
@@ -4853,11 +5808,16 @@ impl AppState {
                 }
                 let key = detail.summary.key.clone();
                 let summary = detail.summary.summary.clone();
+                let is_create = toast.starts_with("Created ")
+                    || clear_draft_key
+                        .as_deref()
+                        .is_some_and(|dk| dk.contains("issue:new"));
                 ui.tasks.finish(&format!("Assign {key} to me"), None);
                 ui.tasks.finish(&format!("Assign {key}"), None);
                 ui.tasks.finish(&format!("Update {key}"), None);
                 ui.tasks.finish("Create issue", None);
                 if self.site_scope.matches(&site_id) {
+                    let mut inserted_at_zero = false;
                     if let Some(pos) = self.issues.iter().enumerate().position(|(idx, i)| {
                         i.key == key
                             && self
@@ -4867,10 +5827,13 @@ impl AppState {
                                 .unwrap_or(true)
                     }) {
                         self.issues[pos] = detail.summary.clone();
-                    } else {
+                    } else if is_create || !self.issues_custom_query {
+                        let had_issues = !self.issues.is_empty();
                         self.issues.insert(0, detail.summary.clone());
                         self.issue_site_ids.insert(0, site_id.clone());
+                        inserted_at_zero = had_issues;
                     }
+
                     if self
                         .board_issue_site_id
                         .as_deref()
@@ -4879,31 +5842,81 @@ impl AppState {
                     {
                         if let Some(it) = self.board_issues.iter_mut().find(|i| i.key == key) {
                             *it = detail.summary.clone();
+                        } else if is_create {
+                            let board_matches = self.active_board(ui).is_some_and(|b| {
+                                b.project_key.as_deref().is_none_or(|pk| {
+                                    pk.eq_ignore_ascii_case(&detail.summary.project_key)
+                                })
+                            });
+                            let sprint_matches = match self.active_board_sprint_id {
+                                None => true,
+                                Some(sid) => detail.summary.sprint_id == Some(sid),
+                            };
+                            if board_matches && sprint_matches {
+                                self.board_issues.insert(0, detail.summary.clone());
+                            }
                         }
                     }
-                    for (idx, it) in self.my_issues.iter_mut().enumerate() {
-                        let matches_site = self
-                            .my_issue_site_ids
-                            .get(idx)
-                            .map(|s| s.eq_ignore_ascii_case(&site_id))
-                            .unwrap_or(true);
-                        if matches_site && it.key == key {
-                            *it = detail.summary.clone();
+
+                    let (_, site_client) = self.site_id_and_client_for(Some(&site_id));
+                    let known_me = self.known_me_for_site(&site_id, &site_client);
+                    let is_open = !matches!(detail.summary.status.category, StatusCategory::Done);
+                    let assigned_to_me = known_me.as_ref().map(|me| {
+                        detail
+                            .summary
+                            .assignee
+                            .as_ref()
+                            .is_some_and(|u| u.id.eq_ignore_ascii_case(&me.id))
+                    });
+                    if let Some(pos) = self.my_issues.iter().enumerate().position(|(idx, it)| {
+                        it.key == key
+                            && self
+                                .my_issue_site_ids
+                                .get(idx)
+                                .map(|s| s.eq_ignore_ascii_case(&site_id))
+                                .unwrap_or(true)
+                    }) {
+                        if !is_open || assigned_to_me == Some(false) {
+                            self.remove_my_issue(&site_id, &key);
+                        } else {
+                            self.my_issues[pos] = detail.summary.clone();
                         }
+                    } else if is_open && assigned_to_me == Some(true) {
+                        let show_pill = self.is_multi_site_all_mode();
+                        let pill = show_pill.then(|| self.site_display_label(&site_id));
+                        self.my_issues.insert(0, detail.summary.clone());
+                        self.my_issue_site_ids.insert(0, site_id.clone());
+                        self.my_issue_site_labels.insert(0, pill);
                     }
-                    let active_matches_site = self
-                        .active_issue_site_id
-                        .as_deref()
-                        .map(|s| s.eq_ignore_ascii_case(&site_id))
-                        .unwrap_or(true);
-                    if active_matches_site {
+
+                    let should_update_active = is_create
+                        || self.active_issue.is_none()
+                        || self.active_issue.as_ref().is_some_and(|cur| {
+                            cur.summary.key == key
+                                && self
+                                    .active_issue_site_id
+                                    .as_deref()
+                                    .map(|s| s.eq_ignore_ascii_case(&site_id))
+                                    .unwrap_or(true)
+                        });
+                    if should_update_active {
                         let detail_ts = detail.summary.updated_at.clone();
                         self.active_issue = Some(detail);
                         self.active_issue_site_id = Some(site_id.clone());
                         self.active_issue_target = Some((site_id, key.clone()));
                         self.active_issue_detail_updated_at = Some(detail_ts);
+                        if inserted_at_zero && is_create && ui.active_tab == WorkspaceTab::Issues {
+                            ui.issue_ui.selected_issue = 0;
+                        } else if inserted_at_zero {
+                            ui.issue_ui.selected_issue =
+                                ui.issue_ui.selected_issue.saturating_add(1);
+                        }
+                    } else if inserted_at_zero {
+                        ui.issue_ui.selected_issue = ui.issue_ui.selected_issue.saturating_add(1);
                     }
                 }
+                self.refresh_scoped_cache_counts();
+                self.clamp_selections(ui);
                 ui.success(&toast);
                 self.notify_desktop_issue(&key, &summary);
             }
@@ -4915,6 +5928,10 @@ impl AppState {
             } => {
                 ui.tasks.finish(&format!("Transition {key}"), None);
                 self.apply_local_status_update(Some(&site_id), &key, &to_status);
+                if matches!(to_status.category, StatusCategory::Done) {
+                    self.remove_my_issue(&site_id, &key);
+                }
+                self.clamp_selections(ui);
                 ui.success(&toast);
                 self.notify_desktop_issue(&key, &format!("Transitioned to {}", to_status.name));
             }
@@ -4929,6 +5946,7 @@ impl AppState {
                 if let Some(prev) = previous_status {
                     self.apply_local_status_update(Some(&site_id), &key, &prev);
                 }
+                self.clamp_selections(ui);
                 ui.error(&error);
                 self.notify_desktop("Atlassian Jira Error", &error);
             }
@@ -4942,7 +5960,10 @@ impl AppState {
                 ui.tasks.finish(&task_label, Some(error.clone()));
                 if let Some(prev) = previous_assignee {
                     self.apply_local_assignee_update(Some(&site_id), &key, prev);
+                } else {
+                    self.reload_my_issues_from_storage();
                 }
+                self.clamp_selections(ui);
                 ui.error(&error);
                 self.notify_desktop("Atlassian Jira Error", &error);
             }
@@ -4952,11 +5973,18 @@ impl AppState {
                 self.notify_desktop("Atlassian Jira Error", &error);
             }
             UiMsg::TransitionsLoaded {
+                seq,
+                site_id,
                 issue_key,
                 transitions,
             } => {
+                if seq != self.transitions_req_seq.load(Ordering::Acquire) {
+                    return;
+                }
                 if let Some(Overlay::Transition(ov)) = ui.overlays.last_mut() {
-                    if ov.issue_key == issue_key {
+                    if ov.issue_key == issue_key
+                        && site_matches(ov.site_id.as_deref(), Some(&site_id))
+                    {
                         match transitions {
                             Ok(list) => ov.set_transitions(list),
                             Err(err) => ov.set_error(err),
@@ -4964,9 +5992,19 @@ impl AppState {
                     }
                 }
             }
-            UiMsg::AssignableUsersLoaded { query, users } => {
+            UiMsg::AssignableUsersLoaded {
+                seq,
+                site_id,
+                query,
+                users,
+            } => {
+                if seq != self.assignable_users_req_seq.load(Ordering::Acquire) {
+                    return;
+                }
                 if let Some(Overlay::Assignee(ov)) = ui.overlays.last_mut() {
-                    if ov.query.text == query {
+                    if ov.query.text == query
+                        && site_matches(ov.site_id.as_deref(), Some(&site_id))
+                    {
                         match users {
                             Ok(list) => ov.set_users(list),
                             Err(err) => ov.set_error(err),
@@ -5042,7 +6080,10 @@ impl AppState {
                     self.notify_desktop("Atlassian Comment Error", &msg);
                 }
             },
-            UiMsg::SpacesLoaded(Ok(spaces)) => self.spaces = spaces,
+            UiMsg::SpacesLoaded(Ok(spaces)) => {
+                self.spaces = spaces;
+                self.clamp_selections(ui);
+            }
             UiMsg::SpacesLoaded(Err(e)) => ui.error(e),
             UiMsg::RootPagesLoaded {
                 site_id,
@@ -5065,6 +6106,7 @@ impl AppState {
                         if matches_space {
                             self.root_pages_by_space
                                 .insert(SiteKey::new(&site_id, &space_key), list);
+                            self.clamp_selections(ui);
                         }
                     }
                     Err(e) => ui.error(format!("Failed to load root pages: {e}")),
@@ -5086,6 +6128,7 @@ impl AppState {
                     Ok(list) => {
                         self.page_children_map
                             .insert(SiteKey::new(&site_id, parent_id), list);
+                        self.clamp_selections(ui);
                     }
                     Err(e) => ui.error(format!("Failed to load child pages: {e}")),
                 }
@@ -5177,26 +6220,7 @@ impl AppState {
                     }
                     Err(e) => {
                         if not_found {
-                            for (k, roots) in self.root_pages_by_space.iter_mut() {
-                                if k.is_site(&site_id) {
-                                    roots.retain(|p| p.id != page_id);
-                                }
-                            }
-                            for (k, children) in self.page_children_map.iter_mut() {
-                                if k.is_site(&site_id) {
-                                    children.retain(|p| p.id != page_id);
-                                }
-                            }
-                            self.remove_my_page(&site_id, &page_id);
-                            if self
-                                .active_page
-                                .as_ref()
-                                .is_some_and(|cur| cur.summary.id == page_id)
-                            {
-                                self.active_page = None;
-                                self.active_page_target = None;
-                                self.active_page_detail_version = None;
-                            }
+                            self.purge_deleted_page(ui, &site_id, &page_id, false);
                         }
                         ui.error(format!("Failed to load page: {e}"));
                     }
@@ -5216,24 +6240,85 @@ impl AppState {
                 let sk = detail.summary.space_key.clone();
                 let title = detail.summary.title.clone();
                 let pid_owned = detail.summary.id.clone();
+                let mut parent_to_fetch: Option<(String, String)> = None;
                 if self.site_scope.matches(&site_id) {
                     if let Some(pid) = &detail.summary.parent_id {
                         let parent = SiteKey::new(&site_id, pid);
-                        let kids = self.page_children_map.entry(parent.clone()).or_default();
-                        kids.retain(|p| p.id != detail.summary.id);
-                        kids.push(detail.summary.clone());
-                        self.expanded_pages.insert(parent);
+                        if let Some(kids) = self.page_children_map.get_mut(&parent) {
+                            if let Some(existing) = kids.iter_mut().find(|p| p.id == detail.summary.id) {
+                                let prev_has_children = existing.has_children;
+                                *existing = detail.summary.clone();
+                                if existing.has_children.is_none() {
+                                    existing.has_children = prev_has_children;
+                                }
+                            } else {
+                                kids.push(detail.summary.clone());
+                            }
+                            self.expanded_pages.insert(parent);
+                        } else {
+                            // Do NOT insert a 1-element Vec when parent wasn't loaded yet, or
+                            // pre-existing siblings would be hidden; mark parent & fetch live children.
+                            let mut parent_title = String::new();
+                            for (k, roots) in self.root_pages_by_space.iter_mut() {
+                                if k.is_site(&site_id) {
+                                    if let Some(p) = roots.iter_mut().find(|p| p.id == *pid) {
+                                        p.has_children = Some(true);
+                                        parent_title = p.title.clone();
+                                    }
+                                }
+                            }
+                            for (k, kids) in self.page_children_map.iter_mut() {
+                                if k.is_site(&site_id) {
+                                    if let Some(p) = kids.iter_mut().find(|p| p.id == *pid) {
+                                        p.has_children = Some(true);
+                                        if parent_title.is_empty() {
+                                            parent_title = p.title.clone();
+                                        }
+                                    }
+                                }
+                            }
+                            self.expanded_pages.insert(parent);
+                            parent_to_fetch = Some((pid.clone(), parent_title));
+                        }
                     } else {
                         let roots = self
                             .root_pages_by_space
                             .entry(SiteKey::new(&site_id, &sk))
                             .or_default();
                         if let Some(existing) = roots.iter_mut().find(|p| p.id == detail.summary.id) {
+                            let prev_has_children = existing.has_children;
                             *existing = detail.summary.clone();
+                            if existing.has_children.is_none() {
+                                existing.has_children = prev_has_children;
+                            }
                         } else {
                             roots.push(detail.summary.clone());
                         }
                     }
+
+                    // Keep My Work recent pages updated.
+                    if let Some(pos) = self.my_pages.iter().enumerate().position(|(idx, p)| {
+                        p.id == pid_owned
+                            && self
+                                .my_page_site_ids
+                                .get(idx)
+                                .map(|s| s.eq_ignore_ascii_case(&site_id))
+                                .unwrap_or(true)
+                    }) {
+                        self.my_pages[pos] = detail.summary.clone();
+                    } else {
+                        let show_pill = self.is_multi_site_all_mode();
+                        let pill = show_pill.then(|| self.site_display_label(&site_id));
+                        self.my_pages.insert(0, detail.summary.clone());
+                        self.my_page_site_ids.insert(0, site_id.clone());
+                        self.my_page_site_labels.insert(0, pill);
+                        if self.my_pages.len() > 30 {
+                            self.my_pages.truncate(30);
+                            self.my_page_site_ids.truncate(30);
+                            self.my_page_site_labels.truncate(30);
+                        }
+                    }
+
                     let active_matches_site = self
                         .active_page_site_id
                         .as_deref()
@@ -5243,10 +6328,15 @@ impl AppState {
                         let detail_ver = detail.summary.version_number;
                         self.active_page = Some(detail);
                         self.active_page_site_id = Some(site_id.clone());
-                        self.active_page_target = Some((site_id, pid_owned));
+                        self.active_page_target = Some((site_id.clone(), pid_owned));
                         self.active_page_detail_version = Some(detail_ver);
                     }
                 }
+                if let Some((parent_id, parent_title)) = parent_to_fetch {
+                    self.request_page_children_for_site(ui, &site_id, &parent_id, &parent_title, true);
+                }
+                self.refresh_scoped_cache_counts();
+                self.clamp_selections(ui);
                 ui.success(&toast);
                 self.notify_desktop_page(&sk, &title);
             }
@@ -5256,6 +6346,7 @@ impl AppState {
                 self.notify_desktop("Atlassian Confluence Error", &error);
             }
             UiMsg::MyWorkLoaded {
+                seq,
                 issues,
                 issue_site_ids,
                 issue_site_labels,
@@ -5264,12 +6355,17 @@ impl AppState {
                 page_site_labels,
             } => {
                 ui.tasks.finish("Loading My Work", None);
+                if seq != self.my_work_req_seq {
+                    return;
+                }
                 self.my_issues = issues;
                 self.my_issue_site_ids = issue_site_ids;
                 self.my_issue_site_labels = issue_site_labels;
                 self.my_pages = pages;
                 self.my_page_site_ids = page_site_ids;
                 self.my_page_site_labels = page_site_labels;
+                self.last_my_work_refresh_at = Some(Instant::now());
+                self.clamp_selections(ui);
             }
             UiMsg::AttachmentsRefreshed {
                 site_id,
@@ -5279,12 +6375,16 @@ impl AppState {
             } => {
                 if let Ok(atts) = attachments {
                     if let Some(key) = issue_key {
+                        let new_count = atts.len();
+                        self.for_each_local_issue_mut(Some(&site_id), &key, |it| {
+                            it.attachment_count = new_count;
+                        });
                         if self.current_open_issue_identity().is_some_and(|(sid, cur_k)| {
                             sid.eq_ignore_ascii_case(&site_id) && cur_k == key
                         }) {
                             if let Some(ref mut detail) = self.active_issue {
                                 detail.attachments = atts.clone();
-                                detail.summary.attachment_count = atts.len();
+                                detail.summary.attachment_count = new_count;
                             }
                             for overlay in &mut ui.overlays {
                                 if let Overlay::Attachments(ov) = overlay {
@@ -5319,15 +6419,20 @@ impl AppState {
                 issue_key,
                 page_id,
                 issue_comments,
+                issue_comment_total,
                 page_comments,
             } => {
                 if let (Some(key), Some(Ok(comments))) = (issue_key, issue_comments) {
+                    let count = issue_comment_total.unwrap_or(0).max(comments.len());
+                    self.for_each_local_issue_mut(Some(&site_id), &key, |it| {
+                        it.comment_count = count;
+                    });
                     if self.current_open_issue_identity().is_some_and(|(sid, cur_k)| {
                         sid.eq_ignore_ascii_case(&site_id) && cur_k == key
                     }) {
                         if let Some(ref mut detail) = self.active_issue {
                             detail.comments = comments;
-                            detail.summary.comment_count = detail.comments.len();
+                            detail.summary.comment_count = count;
                         }
                     }
                 } else if let (Some(pid), Some(Ok(comments))) = (page_id, page_comments) {
@@ -5340,8 +6445,17 @@ impl AppState {
                     }
                 }
             }
-            UiMsg::RemoteSearchLoaded { query, hits } => {
-                ui.tasks.finish(&format!("Remote search: {query}"), None);
+            UiMsg::RemoteSearchLoaded { seq, query, hits } => {
+                ui.tasks.finish(
+                    &format!("Remote search: {query}"),
+                    hits.as_ref().err().cloned(),
+                );
+                if seq != self.remote_search_req_seq {
+                    return;
+                }
+                if ui.search_ui.query.text.trim() != query.trim() {
+                    return;
+                }
                 match hits {
                     Ok((list, site_ids, labels)) => {
                         self.search_hits = list;
@@ -5349,6 +6463,7 @@ impl AppState {
                         self.search_hit_site_labels = labels;
                         ui.search_ui.is_remote = true;
                         ui.search_ui.selected_hit = 0;
+                        self.clamp_selections(ui);
                     }
                     Err(e) => ui.error(format!("Remote search failed: {e}")),
                 }
@@ -5372,7 +6487,7 @@ impl AppState {
                         }
                         self.rebuild_site_pool();
                         let _ = self.save_config();
-                        self.load_cached_initial();
+                        self.reload_cached_preserving_ui(ui);
                         ui.success(format!("Discovered {count} Cloud site(s)"));
                     }
                     Err(e) => {
@@ -5384,8 +6499,7 @@ impl AppState {
                 self.syncing = false;
                 self.sync_summary = outcome.summary.clone();
                 ui.tasks.finish("Sync all sites", None);
-                self.load_cached_initial();
-                self.apply_default_selection(ui);
+                self.reload_cached_preserving_ui(ui);
                 self.maybe_refresh_open_items_after_sync(ui);
                 ui.success(outcome.summary);
             }
@@ -5485,21 +6599,64 @@ impl AppState {
                 page_id,
                 result,
             } => match result {
-                Ok(_) => {
+                Ok(uploaded) => {
                     ui.tasks.finish("Upload attachment", None);
                     ui.success("Attachment uploaded");
                     self.notify_desktop("Atlassian Upload", "Attachment uploaded");
                     if let Some(k) = issue_key {
+                        let added_len = uploaded.len();
+                        let mut reconciled_total: Option<usize> = None;
                         if self.current_open_issue_identity().is_some_and(|(sid, cur_k)| {
                             sid.eq_ignore_ascii_case(&site_id) && cur_k == k
                         }) {
+                            if let Some(ref mut detail) = self.active_issue {
+                                for att in &uploaded {
+                                    let exists = !att.id.is_empty()
+                                        && detail.attachments.iter().any(|e| e.id == att.id);
+                                    if !exists {
+                                        detail.attachments.push(att.clone());
+                                    }
+                                }
+                                detail.summary.attachment_count = detail.attachments.len();
+                                reconciled_total = Some(detail.attachments.len());
+                                for overlay in &mut ui.overlays {
+                                    if let Overlay::Attachments(ov) = overlay {
+                                        if ov.owner_label == detail.summary.key {
+                                            ov.items = detail.attachments.clone();
+                                        }
+                                    }
+                                }
+                            }
                             self.request_issue_detail_for_site(ui, Some(&site_id), &k);
                         }
+                        self.for_each_local_issue_mut(Some(&site_id), &k, |it| {
+                            if let Some(tot) = reconciled_total {
+                                it.attachment_count = tot;
+                            } else {
+                                it.attachment_count = it.attachment_count.saturating_add(added_len);
+                            }
+                        });
                     }
                     if let Some(pid) = page_id {
                         if self.current_open_page_identity().is_some_and(|(sid, cur_p)| {
                             sid.eq_ignore_ascii_case(&site_id) && cur_p == pid
                         }) {
+                            if let Some(ref mut page) = self.active_page {
+                                for att in &uploaded {
+                                    let exists = !att.id.is_empty()
+                                        && page.attachments.iter().any(|e| e.id == att.id);
+                                    if !exists {
+                                        page.attachments.push(att.clone());
+                                    }
+                                }
+                                for overlay in &mut ui.overlays {
+                                    if let Overlay::Attachments(ov) = overlay {
+                                        if ov.owner_label == page.summary.title {
+                                            ov.items = page.attachments.clone();
+                                        }
+                                    }
+                                }
+                            }
                             self.request_page_detail_for_site(ui, Some(&site_id), &pid);
                         }
                     }
@@ -6010,6 +7167,8 @@ mod tests {
             (
                 "Board #7",
                 UiMsg::BoardLoadFailed {
+                    seq: 0,
+                    site_id: "default".into(),
                     board_id: 7,
                     error: "HTTP 500".into(),
                 },
@@ -6017,6 +7176,7 @@ mod tests {
             (
                 "JQL: Mine",
                 UiMsg::IssuesLoadFailed {
+                    seq: 0,
                     label: "Mine".into(),
                     error: "HTTP 400".into(),
                 },
