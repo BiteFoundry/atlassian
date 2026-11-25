@@ -5,7 +5,7 @@
 use std::{
     borrow::Cow,
     collections::{HashMap, HashSet, VecDeque},
-    io::{self, Stdout, Write},
+    io::{self, BufWriter, Stdout, Write},
     sync::{
         atomic::{AtomicBool, Ordering},
         Arc,
@@ -20,8 +20,8 @@ use crossterm::{
     cursor::MoveTo,
     event::{
         DisableFocusChange, DisableMouseCapture, EnableFocusChange, EnableMouseCapture,
-        Event as CrosstermEvent, EventStream, KeyboardEnhancementFlags,
-        PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
+        Event as CrosstermEvent, KeyboardEnhancementFlags, PopKeyboardEnhancementFlags,
+        PushKeyboardEnhancementFlags,
     },
     execute, queue,
     terminal::{
@@ -29,7 +29,6 @@ use crossterm::{
         EndSynchronizedUpdate, EnterAlternateScreen, LeaveAlternateScreen,
     },
 };
-use futures::{FutureExt, StreamExt};
 use ratatui::{backend::CrosstermBackend, layout::Rect, Terminal};
 use tokio::sync::mpsc;
 
@@ -55,6 +54,7 @@ use crate::{
 };
 
 const MAX_COALESCED_EVENTS: usize = 64;
+const EVENT_READER_POLL: Duration = Duration::from_millis(25);
 const MAX_RAW_IMAGE_CACHE_BYTES: usize = 16 * 1024 * 1024;
 const MAX_RAW_IMAGE_CACHE_ENTRIES: usize = 32;
 
@@ -317,7 +317,11 @@ struct TerminalGuard {
 impl TerminalGuard {
     fn enter(
         image_pref: ImageProtocolPreference,
-    ) -> Result<(Self, Terminal<CrosstermBackend<Stdout>>, TerminalGraphicsCaps)> {
+    ) -> Result<(
+        Self,
+        Terminal<CrosstermBackend<BufWriter<Stdout>>>,
+        TerminalGraphicsCaps,
+    )> {
         #[cfg(windows)]
         let orig_conin_mode = win_console::snapshot_console_mode();
 
@@ -365,7 +369,7 @@ impl TerminalGuard {
             let _ = write_vt_mouse_enable(&mut stdout);
         }
 
-        let backend = CrosstermBackend::new(stdout);
+        let backend = CrosstermBackend::new(BufWriter::with_capacity(64 * 1024, stdout));
         let mut terminal = Terminal::new(backend)?;
         terminal.hide_cursor()?;
         terminal.clear()?;
@@ -498,6 +502,114 @@ fn install_panic_hook(keyboard_enhanced: bool, orig_conin_mode: Option<u32>) {
         win_console::restore_console_mode(orig_conin_mode);
         prev(info);
     }));
+}
+
+enum ReaderMsg {
+    Event(CrosstermEvent),
+    Eof,
+}
+
+/// Lock-free terminal event reader backed by a dedicated OS thread and Tokio unbounded channel.
+///
+/// Avoids `crossterm::event::EventStream::next().now_or_never()`, which on `crossterm 0.28`
+/// poisons `EventStream`'s background waker with `noop_waker` (causing up to 200ms timer-tick
+/// input stalls) and blocks the main thread on `INTERNAL_EVENT_READER` on Windows until the next
+/// console event arrives.
+struct TerminalEventReader {
+    rx: mpsc::UnboundedReceiver<ReaderMsg>,
+    tx: mpsc::UnboundedSender<ReaderMsg>,
+    stop: Arc<AtomicBool>,
+    handle: Option<std::thread::JoinHandle<()>>,
+}
+
+impl TerminalEventReader {
+    fn start() -> Self {
+        let (tx, rx) = mpsc::unbounded_channel();
+        let stop = Arc::new(AtomicBool::new(false));
+        let mut reader = Self {
+            rx,
+            tx,
+            stop,
+            handle: None,
+        };
+        reader.resume();
+        reader
+    }
+
+    #[cfg(test)]
+    fn from_channel(
+        tx: mpsc::UnboundedSender<ReaderMsg>,
+        rx: mpsc::UnboundedReceiver<ReaderMsg>,
+    ) -> Self {
+        Self {
+            rx,
+            tx,
+            stop: Arc::new(AtomicBool::new(true)),
+            handle: None,
+        }
+    }
+
+    fn resume(&mut self) {
+        if self.handle.is_some() {
+            return;
+        }
+        self.stop.store(false, Ordering::Release);
+        let stop = self.stop.clone();
+        let tx = self.tx.clone();
+        self.handle = std::thread::Builder::new()
+            .name("tui-event-reader".to_string())
+            .spawn(move || {
+                while !stop.load(Ordering::Acquire) {
+                    match crossterm::event::poll(EVENT_READER_POLL) {
+                        Ok(true) => match crossterm::event::read() {
+                            Ok(ev) => {
+                                if tx.send(ReaderMsg::Event(ev)).is_err() {
+                                    break;
+                                }
+                            }
+                            Err(_) => {
+                                let _ = tx.send(ReaderMsg::Eof);
+                                break;
+                            }
+                        },
+                        Ok(false) => continue,
+                        Err(_) => {
+                            let _ = tx.send(ReaderMsg::Eof);
+                            break;
+                        }
+                    }
+                }
+            })
+            .ok();
+    }
+
+    fn pause(&mut self) {
+        self.stop.store(true, Ordering::Release);
+        if let Some(handle) = self.handle.take() {
+            let _ = handle.join();
+        }
+    }
+
+    async fn recv(&mut self) -> Option<CrosstermEvent> {
+        match self.rx.recv().await {
+            Some(ReaderMsg::Event(ev)) => Some(ev),
+            Some(ReaderMsg::Eof) | None => None,
+        }
+    }
+
+    fn try_recv(&mut self) -> std::result::Result<CrosstermEvent, mpsc::error::TryRecvError> {
+        match self.rx.try_recv() {
+            Ok(ReaderMsg::Event(ev)) => Ok(ev),
+            Ok(ReaderMsg::Eof) => Err(mpsc::error::TryRecvError::Disconnected),
+            Err(err) => Err(err),
+        }
+    }
+}
+
+impl Drop for TerminalEventReader {
+    fn drop(&mut self) {
+        self.pause();
+    }
 }
 
 struct PixelDecodeMsg {
@@ -692,7 +804,7 @@ impl PixelPreviewRuntime {
 
     fn clear_graphics_before_suspend(
         &mut self,
-        terminal: &mut Terminal<CrosstermBackend<Stdout>>,
+        terminal: &mut Terminal<CrosstermBackend<BufWriter<Stdout>>>,
         ui: &mut UiState,
         guard: &mut TerminalGuard,
     ) {
@@ -780,7 +892,7 @@ fn resolve_pixel_payload<'a>(
 }
 
 fn draw_frame(
-    terminal: &mut Terminal<CrosstermBackend<Stdout>>,
+    terminal: &mut Terminal<CrosstermBackend<BufWriter<Stdout>>>,
     app: &mut AppState,
     ui: &mut UiState,
     guard: &mut TerminalGuard,
@@ -788,14 +900,23 @@ fn draw_frame(
 ) -> Result<()> {
     pixel_rt.sync_overlay_state(app, ui);
 
-    let _ = execute!(terminal.backend_mut(), BeginSynchronizedUpdate);
+    let _ = queue!(terminal.backend_mut(), BeginSynchronizedUpdate);
 
     let draw_res: Result<()> = (|| {
         let mut cursor_pos = None;
+        let mut cursor_set_in_draw = false;
         let mut frame_area = Rect::default();
         terminal.draw(|frame| {
             frame_area = frame.area();
             cursor_pos = ui::draw(frame, app, ui);
+            if ui.pending_pixel_graphics.is_empty()
+                && current_pending_pixel_graphic(frame_area, app, ui).is_none()
+            {
+                if let Some((cx, cy)) = cursor_pos {
+                    frame.set_cursor_position((cx, cy));
+                    cursor_set_in_draw = true;
+                }
+            }
         })?;
 
         let mut desired: Vec<ActivePixelGraphic> = Vec::new();
@@ -926,11 +1047,13 @@ fn draw_frame(
 
         guard.pixel_tracker.commit(desired, term_size);
 
-        if let Some((cx, cy)) = cursor_pos {
-            let _ = terminal.show_cursor();
-            let _ = terminal.set_cursor_position((cx, cy));
-        } else {
-            let _ = terminal.hide_cursor();
+        if plan.erase_and_redraw || plan.emit_desired || !cursor_set_in_draw {
+            if let Some((cx, cy)) = cursor_pos {
+                let _ = terminal.show_cursor();
+                let _ = terminal.set_cursor_position((cx, cy));
+            } else {
+                let _ = terminal.hide_cursor();
+            }
         }
         Ok(())
     })();
@@ -945,7 +1068,7 @@ enum TermEventOutcome {
     /// Layout, tab, overlay, or mouse-click target changed; redraw immediately so
     /// `ui.hitmap` is rebuilt before any subsequent queued mouse event is processed.
     RedrawNow,
-    /// Terminal dimensions changed; re-probe `cell_px` safely (dropping `EventStream` on Windows)
+    /// Terminal dimensions changed; re-probe `cell_px` safely (pausing `TerminalEventReader` on Windows)
     /// and reload any active image preview before redrawing.
     Resized,
     Quit,
@@ -1087,18 +1210,20 @@ pub async fn run_with_persona(
     ui.graphics_caps = graphics_caps;
     let mut pixel_rt = PixelPreviewRuntime::new(graphics_caps);
 
-    let mut events = EventStream::new();
+    let mut events = TerminalEventReader::start();
     let mut tick = tokio::time::interval(Duration::from_millis(200));
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let mut dirty = true;
 
     loop {
         if let Some((target, initial)) = ui.editor_request.take() {
+            events.pause();
             pixel_rt.clear_graphics_before_suspend(&mut terminal, &mut ui, &mut guard);
             guard.restore();
             let result = text_edit::external_edit(&initial);
             guard.resume()?;
             terminal.clear()?;
+            events.resume();
             dirty = true;
 
             match result {
@@ -1150,9 +1275,9 @@ pub async fn run_with_persona(
                     dirty = true;
                 }
             }
-            maybe_ev = events.next() => {
+            maybe_ev = events.recv() => {
                 match maybe_ev {
-                    Some(Ok(ev)) => match handle_terminal_event(ev, &mut app, &mut ui, &mut pixel_rt, &mut dirty) {
+                    Some(ev) => match handle_terminal_event(ev, &mut app, &mut ui, &mut pixel_rt, &mut dirty) {
                         TermEventOutcome::Quit => should_quit = true,
                         TermEventOutcome::RedrawNow => needs_immediate_redraw = true,
                         TermEventOutcome::Resized => {
@@ -1161,7 +1286,7 @@ pub async fn run_with_persona(
                         }
                         TermEventOutcome::Continue => {}
                     },
-                    Some(Err(_)) | None => should_quit = true,
+                    None => should_quit = true,
                 }
             }
         }
@@ -1222,9 +1347,8 @@ pub async fn run_with_persona(
                 && ui.editor_request.is_none()
                 && !needs_immediate_redraw
             {
-                let next_ev = events.next().now_or_never();
-                match next_ev {
-                    Some(Some(Ok(ev))) => {
+                match events.try_recv() {
+                    Ok(ev) => {
                         drained += 1;
                         progressed = true;
                         match handle_terminal_event(ev, &mut app, &mut ui, &mut pixel_rt, &mut dirty) {
@@ -1244,11 +1368,11 @@ pub async fn run_with_persona(
                             TermEventOutcome::Continue => {}
                         }
                     }
-                    Some(Some(Err(_))) | Some(None) => {
+                    Err(mpsc::error::TryRecvError::Disconnected) => {
                         should_quit = true;
                         break;
                     }
-                    None => break,
+                    Err(mpsc::error::TryRecvError::Empty) => break,
                 }
             }
             if should_quit || needs_immediate_redraw || !progressed {
@@ -1261,11 +1385,11 @@ pub async fn run_with_persona(
         if needs_resize_probe {
             #[cfg(windows)]
             {
-                drop(events);
+                events.pause();
                 let _ = img_preview::refresh_cell_pixel_size(&mut pixel_rt.graphics_caps);
                 win_console::enforce_windows_mouse_capture();
                 let _ = write_vt_mouse_enable(terminal.backend_mut());
-                events = EventStream::new();
+                events.resume();
             }
             #[cfg(not(windows))]
             {
@@ -1287,6 +1411,7 @@ pub async fn run_with_persona(
 
     app.html_server.shutdown();
     let _ = sync_ctrl.request(SyncCommand::Shutdown);
+    events.pause();
     drop(guard);
     Ok(())
 }
@@ -1500,5 +1625,68 @@ mod tests {
             &[Overlay::command_palette()],
             "inline:1"
         ));
+    }
+
+    #[tokio::test]
+    async fn terminal_event_reader_try_recv_is_non_blocking_and_wakes_immediately() {
+        use std::time::Instant;
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+
+        let (tx, rx) = mpsc::unbounded_channel();
+        let mut reader = TerminalEventReader::from_channel(tx.clone(), rx);
+
+        // Empty queue returns immediately without blocking.
+        let t0 = Instant::now();
+        assert!(matches!(
+            reader.try_recv(),
+            Err(mpsc::error::TryRecvError::Empty)
+        ));
+        assert!(t0.elapsed() < Duration::from_millis(5));
+
+        // Async recv wakes immediately on single keystroke without waiting for any tick.
+        let tx_bg = tx.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+            let _ = tx_bg.send(ReaderMsg::Event(CrosstermEvent::Key(KeyEvent::new(
+                KeyCode::Char('a'),
+                KeyModifiers::NONE,
+            ))));
+        });
+        let t1 = Instant::now();
+        let ev = tokio::time::timeout(Duration::from_millis(100), reader.recv())
+            .await
+            .expect("recv must wake immediately");
+        assert!(matches!(
+            ev,
+            Some(CrosstermEvent::Key(KeyEvent {
+                code: KeyCode::Char('a'),
+                ..
+            }))
+        ));
+        assert!(t1.elapsed() < Duration::from_millis(80));
+
+        // Subsequent try_recv does not poison future async recv wakers.
+        assert!(matches!(
+            reader.try_recv(),
+            Err(mpsc::error::TryRecvError::Empty)
+        ));
+        let _ = tx.send(ReaderMsg::Event(CrosstermEvent::Key(KeyEvent::new(
+            KeyCode::Char('b'),
+            KeyModifiers::NONE,
+        ))));
+        let ev2 = tokio::time::timeout(Duration::from_millis(50), reader.recv())
+            .await
+            .expect("second recv must wake immediately after try_recv");
+        assert!(matches!(
+            ev2,
+            Some(CrosstermEvent::Key(KeyEvent {
+                code: KeyCode::Char('b'),
+                ..
+            }))
+        ));
+
+        // Explicit EOF reports clean termination even while sender handle exists.
+        let _ = tx.send(ReaderMsg::Eof);
+        assert!(reader.recv().await.is_none());
     }
 }
