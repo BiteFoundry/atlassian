@@ -15,6 +15,7 @@ use std::{
 };
 
 use anyhow::Result;
+use futures::{stream, StreamExt};
 use serde_json::{json, Map, Value};
 use tokio::io::{AsyncBufReadExt, BufReader};
 
@@ -836,7 +837,10 @@ async fn call_tool(
                 resolve_mcp_client(config, client, site_arg.as_deref())?;
             let (assignee_id, raw_for_fallback) = match raw_assignee.as_deref() {
                 Some(v) if v.eq_ignore_ascii_case("me") => {
-                    let me = target_client.get_myself().await.map_err(format_error)?;
+                    let me = target_client
+                        .get_myself_cached()
+                        .await
+                        .map_err(format_error)?;
                     (Some(me.id), None)
                 }
                 Some(v) => (Some(v.to_string()), Some(v.to_string())),
@@ -916,7 +920,10 @@ async fn call_tool(
                 resolve_mcp_client(config, client, site_arg.as_deref())?;
             let (assignee_id, raw_for_fallback) = match raw_assignee {
                 Some(Some(v)) if v.eq_ignore_ascii_case("me") => {
-                    let me = target_client.get_myself().await.map_err(format_error)?;
+                    let me = target_client
+                        .get_myself_cached()
+                        .await
+                        .map_err(format_error)?;
                     (Some(Some(me.id)), None)
                 }
                 Some(Some(v)) => (Some(Some(v.clone())), Some(v)),
@@ -1032,7 +1039,10 @@ async fn call_tool(
             let (mut resolved, raw_for_fallback) = match raw_assignee.as_deref() {
                 None => (None, None),
                 Some(v) if v.eq_ignore_ascii_case("me") => {
-                    let me = target_client.get_myself().await.map_err(format_error)?;
+                    let me = target_client
+                        .get_myself_cached()
+                        .await
+                        .map_err(format_error)?;
                     (Some(me.id), None)
                 }
                 Some(v) => (Some(v.to_string()), Some(v.to_string())),
@@ -1089,7 +1099,16 @@ async fn call_tool(
                 .add_issue_comment(&key, &body_markdown)
                 .await
                 .map_err(format_error)?;
-            refresh_mcp_issue_cache(&target_client, storage, &target_site, &key).await;
+            if storage
+                .get_issue_detail_for_site(&target_site, &key)
+                .ok()
+                .flatten()
+                .is_some()
+            {
+                let _ = storage.append_issue_comment_for_site(&target_site, &key, &comment);
+            } else {
+                refresh_mcp_issue_cache(&target_client, storage, &target_site, &key).await;
+            }
             Ok(json!({ "ok": true, "site_id": target_site, "comment": comment }))
         }
 
@@ -1126,8 +1145,13 @@ async fn call_tool(
                 .create_issue_link(&inward, &outward, &link_type)
                 .await
                 .map_err(format_error)?;
-            refresh_mcp_issue_cache(&client, storage, &site, &inward).await;
-            refresh_mcp_issue_cache(&client, storage, &site, &outward).await;
+            Box::pin(async {
+                tokio::join!(
+                    refresh_mcp_issue_cache(&client, storage, &site, &inward),
+                    refresh_mcp_issue_cache(&client, storage, &site, &outward),
+                );
+            })
+            .await;
             Ok(json!({"ok": true, "site_id": site, "link": link}))
         }
 
@@ -1139,9 +1163,13 @@ async fn call_tool(
                 .move_issues_to_sprint(sprint_id, &keys)
                 .await
                 .map_err(format_error)?;
-            for key in &confirmed {
-                refresh_mcp_issue_cache(&client, storage, &site, key).await;
-            }
+            Box::pin(
+                stream::iter(&confirmed)
+                    .map(|key| refresh_mcp_issue_cache(&client, storage, &site, key))
+                    .buffer_unordered(4)
+                    .for_each(|()| async {}),
+            )
+            .await;
             Ok(
                 json!({"ok": true, "site_id": site, "sprint_id": sprint_id, "issue_keys": confirmed}),
             )
@@ -1331,9 +1359,10 @@ async fn call_tool(
             }
             let (target_site, target_client) =
                 resolve_mcp_client(config, client, site_arg.as_deref())?;
-            let (mut fetched, meta) = match target_client
-                .get_page_with_meta_in_cache(&page_id, &target_site, storage)
-                .await
+            let (mut fetched, meta) = match Box::pin(
+                target_client.get_page_with_meta_in_cache(&page_id, &target_site, storage),
+            )
+            .await
             {
                 Ok(res) => res,
                 Err(err) => {
@@ -1374,8 +1403,7 @@ async fn call_tool(
                 title,
                 body_markdown,
             };
-            let detail = target_client
-                .create_page(&req)
+            let detail = Box::pin(target_client.create_page(&req))
                 .await
                 .map_err(format_error)?;
             let _ = storage.upsert_page_detail_for_site(&target_site, &detail);
@@ -1405,16 +1433,26 @@ async fn call_tool(
             let (target_site, target_client) =
                 resolve_mcp_client(config, client, site_arg.as_deref())?;
             if args.optional_bool("dry_run")?.unwrap_or(false) {
-                let preview = target_client
-                    .preview_page_edit(&page_id, title, edit, prev_version, version_message)
-                    .await
-                    .map_err(format_error)?;
+                let preview = Box::pin(target_client.preview_page_edit(
+                    &page_id,
+                    title,
+                    edit,
+                    prev_version,
+                    version_message,
+                ))
+                .await
+                .map_err(format_error)?;
                 return Ok(
                     json!({ "ok": true, "site_id": target_site, "dry_run": true, "preview": preview }),
                 );
             }
-            let detail = target_client
-                .edit_page(&page_id, title, edit, prev_version, version_message)
+            let detail = Box::pin(target_client.edit_page(
+                &page_id,
+                title,
+                edit,
+                prev_version,
+                version_message,
+            ))
                 .await
                 .map_err(format_error)?;
             let _ = storage.upsert_page_detail_for_site(&target_site, &detail);
@@ -1434,7 +1472,16 @@ async fn call_tool(
                 .add_page_comment(&page_id, &body_markdown)
                 .await
                 .map_err(format_error)?;
-            refresh_mcp_page_cache(&target_client, storage, &target_site, &page_id).await;
+            if storage
+                .get_page_detail_for_site(&target_site, &page_id)
+                .ok()
+                .flatten()
+                .is_some()
+            {
+                let _ = storage.append_page_comment_for_site(&target_site, &page_id, &comment);
+            } else {
+                refresh_mcp_page_cache(&target_client, storage, &target_site, &page_id).await;
+            }
             Ok(json!({ "ok": true, "site_id": target_site, "comment": comment }))
         }
 
@@ -1499,7 +1546,17 @@ async fn call_tool(
                 .upload_page_attachment(&page_id, Path::new(&path))
                 .await
                 .map_err(format_error)?;
-            refresh_mcp_page_cache(&client, storage, &site, &page_id).await;
+            if !attachments.is_empty()
+                && storage
+                    .get_page_detail_for_site(&site, &page_id)
+                    .ok()
+                    .flatten()
+                    .is_some()
+            {
+                let _ = storage.append_page_attachments_for_site(&site, &page_id, &attachments);
+            } else {
+                refresh_mcp_page_cache(&client, storage, &site, &page_id).await;
+            }
             Ok(json!({"ok": true, "site_id": site, "page_id": page_id, "attachments": attachments}))
         }
 
@@ -1592,16 +1649,43 @@ async fn call_tool(
                     .find_effective_site(&target_site)
                     .map(|s| s.display_name().to_string());
                 let mut combined = Vec::new();
-                if scope == "all" || scope == "jira" {
-                    let jql = if looks_like_jql_expr(&query) {
-                        query.clone()
-                    } else {
-                        format!("text ~ \"{}\"", escape_jql_str(&query))
+                let want_jira = scope == "all" || scope == "jira";
+                let want_conf = scope == "all" || scope == "confluence";
+                let (jira_res, conf_res) = Box::pin(async {
+                    let jira_fut = async {
+                        if !want_jira {
+                            return Ok(None);
+                        }
+                        let jql = if looks_like_jql_expr(&query) {
+                            query.clone()
+                        } else {
+                            format!("text ~ \"{}\"", escape_jql_str(&query))
+                        };
+                        target_client
+                            .search_issues_jql(&jql, limit, None, None)
+                            .await
+                            .map(Some)
+                            .map_err(format_error)
                     };
-                    let page = target_client
-                        .search_issues_jql(&jql, limit, None, None)
-                        .await
-                        .map_err(format_error)?;
+                    let conf_fut = async {
+                        if !want_conf {
+                            return Ok(None);
+                        }
+                        let cql = if looks_like_cql_expr(&query) {
+                            query.clone()
+                        } else {
+                            format!("text ~ \"{}\"", escape_jql_str(&query))
+                        };
+                        target_client
+                            .search_confluence_cql(&cql, limit)
+                            .await
+                            .map(Some)
+                            .map_err(format_error)
+                    };
+                    tokio::join!(jira_fut, conf_fut)
+                })
+                .await;
+                if let Some(page) = jira_res? {
                     let _ = storage.upsert_issues_for_site(&target_site, &page.issues);
                     combined.extend(page.issues.iter().map(|i| {
                         FederatedSearchHit::new(
@@ -1611,16 +1695,7 @@ async fn call_tool(
                         )
                     }));
                 }
-                if scope == "all" || scope == "confluence" {
-                    let cql = if looks_like_cql_expr(&query) {
-                        query.clone()
-                    } else {
-                        format!("text ~ \"{}\"", escape_jql_str(&query))
-                    };
-                    let pages = target_client
-                        .search_confluence_cql(&cql, limit)
-                        .await
-                        .map_err(format_error)?;
+                if let Some(pages) = conf_res? {
                     let _ = storage.upsert_pages_for_site(&target_site, &pages);
                     combined.extend(pages.iter().map(|p| {
                         FederatedSearchHit::new(
@@ -1651,13 +1726,13 @@ async fn call_tool(
                     let targets = sync::sync_targets(&pool);
                     if targets.len() > 1 {
                         let mut breakers = sync::CircuitBreakerMap::new();
-                        let outcome = sync::run_multi_site_sync(
+                        let outcome = Box::pin(sync::run_multi_site_sync(
                             &targets,
                             storage,
                             &mut breakers,
                             sync::DEFAULT_MULTI_SITE_CONCURRENCY,
                             None,
-                        )
+                        ))
                         .await;
                         let counts = storage.cache_counts().map_err(format_error)?;
                         let payload = json!({
@@ -1677,9 +1752,13 @@ async fn call_tool(
             }
             let (target_site, target_client) =
                 resolve_mcp_client(config, client, scoped_site.as_deref())?;
-            let summary = sync::bootstrap_workspace_for_site(&target_site, &target_client, storage)
-                .await
-                .map_err(format_error)?;
+            let summary = Box::pin(sync::bootstrap_workspace_for_site(
+                &target_site,
+                &target_client,
+                storage,
+            ))
+            .await
+            .map_err(format_error)?;
             let counts = storage.cache_counts().map_err(format_error)?;
             Ok(json!({
                 "ok": true,
@@ -1699,11 +1778,17 @@ async fn call_tool(
                 resolve_mcp_client(config, client, site_arg.as_deref())?;
 
             let (owner_label, attachments) = if let Some(key) = issue_key {
-                let detail = target_client.get_issue(&key).await.map_err(format_error)?;
-                (format!("issue {key}"), detail.attachments)
+                let atts = target_client
+                    .list_issue_attachments(&key)
+                    .await
+                    .map_err(format_error)?;
+                (format!("issue {key}"), atts)
             } else if let Some(pid) = page_id {
-                let detail = target_client.get_page(&pid).await.map_err(format_error)?;
-                (format!("page {pid}"), detail.attachments)
+                let atts = target_client
+                    .list_page_attachments(&pid)
+                    .await
+                    .map_err(format_error)?;
+                (format!("page {pid}"), atts)
             } else {
                 return Err("either issue_key or page_id is required".to_string());
             };

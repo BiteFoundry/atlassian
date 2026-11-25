@@ -3,6 +3,7 @@
 use std::collections::HashSet;
 
 use anyhow::{bail, Context, Result};
+use futures::{stream, StreamExt};
 use reqwest::StatusCode;
 use serde_json::{json, Value};
 
@@ -44,24 +45,30 @@ impl AtlassianClient {
         let base = self.require_site_url()?;
         let url = format!("{base}/rest/agile/1.0/sprint/{sprint_id}/issue");
         self.post_json_empty(&url, &json!({"issues": keys})).await?;
-        let mut confirmed = Vec::with_capacity(keys.len());
-        for key in keys {
-            let issue = self
-                .get_agile_issue_fields(key, "sprint")
-                .await
-                .with_context(|| {
-                    format!("Jira accepted the move to sprint {sprint_id}. Reading {key} failed")
-                })?;
-            if issue.pointer("/fields/sprint/id").and_then(Value::as_i64) != Some(sprint_id) {
-                bail!("Jira accepted the move to sprint {sprint_id}. The read did not confirm membership for {key}");
-            }
-            confirmed.push(
-                issue
+        const VERIFY_CONCURRENCY: usize = 6;
+        let verified: Vec<Result<String>> = stream::iter(keys.iter().copied())
+            .map(|key| async move {
+                let issue = self
+                    .get_agile_issue_fields(key, "sprint")
+                    .await
+                    .with_context(|| {
+                        format!("Jira accepted the move to sprint {sprint_id}. Reading {key} failed")
+                    })?;
+                if issue.pointer("/fields/sprint/id").and_then(Value::as_i64) != Some(sprint_id) {
+                    bail!("Jira accepted the move to sprint {sprint_id}. The read did not confirm membership for {key}");
+                }
+                Ok(issue
                     .get("key")
                     .and_then(Value::as_str)
                     .unwrap_or(key)
-                    .to_owned(),
-            );
+                    .to_owned())
+            })
+            .buffered(VERIFY_CONCURRENCY)
+            .collect()
+            .await;
+        let mut confirmed = Vec::with_capacity(keys.len());
+        for res in verified {
+            confirmed.push(res?);
         }
         Ok(confirmed)
     }
@@ -755,5 +762,52 @@ mod tests {
         assert_eq!(page.items[0].state, "active");
         assert_eq!(page.items[1].origin_board_id, Some(20));
         assert_eq!(page.items[2].origin_board_id, None);
+    }
+
+    #[tokio::test]
+    async fn move_issues_to_sprint_verifies_memberships_concurrently_in_order() {
+        use std::{sync::Arc, time::Duration};
+        use axum::{extract::Path, http::StatusCode, routing::post};
+        use tokio::sync::Barrier;
+
+        let barrier = Arc::new(Barrier::new(3));
+        let b = barrier.clone();
+        let app = Router::new()
+            .route(
+                "/rest/agile/1.0/sprint/42/issue",
+                post(|| async { StatusCode::NO_CONTENT }),
+            )
+            .route(
+                "/rest/agile/1.0/issue/{key}",
+                get(move |Path(key): Path<String>| {
+                    let b = b.clone();
+                    async move {
+                        b.wait().await;
+                        Json(json!({ "key": key, "fields": { "sprint": { "id": 42 } } }))
+                    }
+                }),
+            );
+
+        let base_url = spawn_router(app).await;
+        let auth = AuthManager::with_credentials(
+            "sprint-par",
+            StoredCredentials::BearerPat {
+                site_url: base_url.clone(),
+                token: "tok".into(),
+                deployment: DeploymentKind::Cloud,
+            },
+        );
+        let client =
+            AtlassianClient::with_base_urls(&base_url, "", DeploymentKind::Cloud, auth).unwrap();
+
+        let keys = vec!["ENG-1".into(), "ENG-2".into(), "ENG-3".into()];
+        let confirmed = tokio::time::timeout(
+            Duration::from_secs(3),
+            client.move_issues_to_sprint(42, &keys),
+        )
+        .await
+        .expect("move_issues_to_sprint must verify issues concurrently")
+        .unwrap();
+        assert_eq!(confirmed, keys);
     }
 }

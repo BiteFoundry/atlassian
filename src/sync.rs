@@ -1975,63 +1975,75 @@ async fn run_full_sync_for_site(
         }
     };
 
-    // 1. Jira projects
-    if breakers.should_allow_site(site_id, SyncEndpoint::JiraProjects, Instant::now()) {
-        attempted_steps += 1;
-        match client.list_projects().await {
-            Ok(projects) => {
-                breakers.record_success_site(site_id, SyncEndpoint::JiraProjects);
-                succeeded_steps += 1;
-                project_count = projects.len();
-                if let Err(err) = storage.upsert_projects_for_site(site_id, &projects) {
-                    record_err(err, SyncErrorKind::Transient);
-                } else if let Some(tx) = core_tx {
-                    let stored = storage
-                        .list_projects_for_site(site_id)
-                        .unwrap_or(projects);
-                    let _ = tx.send(CoreEvent::ProjectsUpdated {
-                        site_id: site_id.to_string(),
-                        items: stored,
-                    });
-                }
-            }
-            Err(err) => {
-                let (kind, _) = breakers.record_failure_site(
-                    site_id,
-                    SyncEndpoint::JiraProjects,
-                    &err,
-                    Instant::now(),
-                );
-                record_err(err, kind);
-            }
-        }
-    } else {
-        skipped_steps += 1;
-    }
+    let now = Instant::now();
+    let allow_projects = breakers.should_allow_site(site_id, SyncEndpoint::JiraProjects, now);
+    let allow_boards = breakers.should_allow_site(site_id, SyncEndpoint::JiraAgileBoards, now);
+    let allow_issues = breakers.should_allow_site(site_id, SyncEndpoint::JiraIssues, now);
+    let allow_spaces = breakers.should_allow_site(site_id, SyncEndpoint::ConfluenceSpaces, now);
+    let allow_pages =
+        allow_spaces && breakers.should_allow_site(site_id, SyncEndpoint::ConfluencePages, now);
 
-    // 2. Jira Agile boards + top/default board columns, sprints, active sprint issues
-    if breakers.should_allow_site(site_id, SyncEndpoint::JiraAgileBoards, Instant::now()) {
-        attempted_steps += 1;
-        match client.list_boards(None).await {
+    // Run all 4 independent domains concurrently (Jira projects, Jira Agile boards + default board,
+    // my open Jira issues, and Confluence spaces + default space root pages), then fold metrics
+    // and circuit-breaker updates in deterministic order.
+    let projects_fut = Box::pin(async {
+        if !allow_projects {
+            return None;
+        }
+        Some(match client.list_projects().await {
+            Ok(projects) => {
+                let count = projects.len();
+                let storage_err = match storage.upsert_projects_for_site(site_id, &projects) {
+                    Ok(()) => {
+                        if let Some(tx) = core_tx {
+                            let stored = storage
+                                .list_projects_for_site(site_id)
+                                .unwrap_or(projects);
+                            let _ = tx.send(CoreEvent::ProjectsUpdated {
+                                site_id: site_id.to_string(),
+                                items: stored,
+                            });
+                        }
+                        None
+                    }
+                    Err(err) => Some(err),
+                };
+                Ok((count, storage_err))
+            }
+            Err(err) => Err(err),
+        })
+    });
+
+    let boards_fut = Box::pin(async {
+        if !allow_boards {
+            return None;
+        }
+        Some(match client.list_boards(None).await {
             Ok(mut boards) => {
-                breakers.record_success_site(site_id, SyncEndpoint::JiraAgileBoards);
-                succeeded_steps += 1;
-                board_count = boards.len();
-                if let Err(err) = storage.upsert_boards_for_site(site_id, &boards) {
-                    record_err(err, SyncErrorKind::Transient);
-                }
+                let count = boards.len();
+                let mut board_issues = 0usize;
+                let storage_err = storage.upsert_boards_for_site(site_id, &boards).err();
                 if let Some(target_board) = select_default_board(&boards, client.config()) {
                     let board_id = target_board.id;
-                    if let Ok(cols) = client.get_board_columns(board_id).await {
+                    let (cols_res, details_res) = tokio::join!(
+                        Box::pin(client.get_board_columns(board_id)),
+                        Box::pin(sync_board_details_for_site(
+                            site_id,
+                            client,
+                            storage,
+                            board_id,
+                            None,
+                            core_tx,
+                        )),
+                    );
+                    if let Ok(cols) = cols_res {
                         if let Some(b) = boards.iter_mut().find(|b| b.id == board_id) {
                             b.columns = cols;
                         }
                         let _ = storage.upsert_boards_for_site(site_id, &boards);
                     }
-                    if let Ok((_, count)) =
-                        sync_board_details_for_site(site_id, client, storage, board_id, None, core_tx).await
-                    {
-                        issue_count += count;
+                    if let Ok((_, fetched_count)) = details_res {
+                        board_issues += fetched_count;
                     }
                 }
                 if let Some(tx) = core_tx {
@@ -2040,121 +2052,217 @@ async fn run_full_sync_for_site(
                         items: boards,
                     });
                 }
+                Ok((count, board_issues, storage_err))
             }
-            Err(err) => {
-                let (kind, _) = breakers.record_failure_site(
-                    site_id,
-                    SyncEndpoint::JiraAgileBoards,
-                    &err,
-                    Instant::now(),
-                );
-                record_err(err, kind);
-            }
-        }
-    } else {
-        skipped_steps += 1;
-    }
+            Err(err) => Err(err),
+        })
+    });
 
-    // 3. My open Jira issues
-    if breakers.should_allow_site(site_id, SyncEndpoint::JiraIssues, Instant::now()) {
-        attempted_steps += 1;
-        match client
-            .search_all_issues_jql(AtlassianClient::my_open_issues_jql(), SYNC_MY_ISSUE_CAP)
-            .await
-        {
-            Ok(collected) => {
-                breakers.record_success_site(site_id, SyncEndpoint::JiraIssues);
-                succeeded_steps += 1;
-                let fetched = collected.items.len();
-                if fetched > issue_count {
-                    issue_count = fetched;
-                }
-                if let Err(err) = storage.upsert_issues_for_site(site_id, &collected.items) {
-                    record_err(err, SyncErrorKind::Transient);
-                } else if let Some(tx) = core_tx {
-                    let _ = tx.send(CoreEvent::IssuesUpdated {
-                        site_id: site_id.to_string(),
-                        issues: collected.items,
-                    });
-                }
-            }
-            Err(err) => {
-                let (kind, _) = breakers.record_failure_site(
-                    site_id,
-                    SyncEndpoint::JiraIssues,
-                    &err,
-                    Instant::now(),
-                );
-                record_err(err, kind);
-            }
+    let issues_fut = Box::pin(async {
+        if !allow_issues {
+            return None;
         }
-    } else {
-        skipped_steps += 1;
-    }
+        Some(
+            match client
+                .search_all_issues_jql(AtlassianClient::my_open_issues_jql(), SYNC_MY_ISSUE_CAP)
+                .await
+            {
+                Ok(collected) => {
+                    let fetched = collected.items.len();
+                    let storage_err = match storage.upsert_issues_for_site(site_id, &collected.items)
+                    {
+                        Ok(()) => {
+                            if let Some(tx) = core_tx {
+                                let _ = tx.send(CoreEvent::IssuesUpdated {
+                                    site_id: site_id.to_string(),
+                                    issues: collected.items,
+                                });
+                            }
+                            None
+                        }
+                        Err(err) => Some(err),
+                    };
+                    Ok((fetched, storage_err))
+                }
+                Err(err) => Err(err),
+            },
+        )
+    });
 
-    // 4. Confluence spaces + default/first space root pages
-    if breakers.should_allow_site(site_id, SyncEndpoint::ConfluenceSpaces, Instant::now()) {
-        attempted_steps += 1;
+    let spaces_fut = Box::pin(async {
+        if !allow_spaces {
+            return None;
+        }
         // Every space, not the first 50: the space list has no prune, so a partial
         // listing would simply hide the rest.
-        match client.list_all_spaces_collected().await.map(|all| all.items) {
+        Some(match client.list_all_spaces_collected().await.map(|all| all.items) {
             Ok(spaces) => {
-                breakers.record_success_site(site_id, SyncEndpoint::ConfluenceSpaces);
-                succeeded_steps += 1;
-                space_count = spaces.len();
-                if let Err(err) = storage.upsert_spaces_for_site(site_id, &spaces) {
-                    record_err(err, SyncErrorKind::Transient);
-                } else if let Some(tx) = core_tx {
-                    let stored = storage
-                        .list_spaces_for_site(site_id)
-                        .unwrap_or_else(|_| spaces.clone());
-                    let _ = tx.send(CoreEvent::SpacesUpdated {
-                        site_id: site_id.to_string(),
-                        items: stored,
-                    });
-                }
-                if let Some(target_space) = select_default_space(&spaces, client.config()) {
-                    if breakers.should_allow_site(
-                        site_id,
-                        SyncEndpoint::ConfluencePages,
-                        Instant::now(),
-                    ) {
-                        match sync_space_pages_for_site(
-                            site_id,
-                            client,
-                            storage,
-                            &target_space.key,
-                            core_tx,
-                        )
-                        .await
-                        {
-                            Ok(_) => {
-                                breakers.record_success_site(site_id, SyncEndpoint::ConfluencePages);
-                            }
-                            Err(err) => {
-                                breakers.record_failure_site(
-                                    site_id,
-                                    SyncEndpoint::ConfluencePages,
-                                    &err,
-                                    Instant::now(),
-                                );
-                            }
+                let count = spaces.len();
+                let storage_err = match storage.upsert_spaces_for_site(site_id, &spaces) {
+                    Ok(()) => {
+                        if let Some(tx) = core_tx {
+                            let stored = storage
+                                .list_spaces_for_site(site_id)
+                                .unwrap_or_else(|_| spaces.clone());
+                            let _ = tx.send(CoreEvent::SpacesUpdated {
+                                site_id: site_id.to_string(),
+                                items: stored,
+                            });
                         }
+                        None
+                    }
+                    Err(err) => Some(err),
+                };
+                let pages_outcome = if let Some(target_space) =
+                    select_default_space(&spaces, client.config())
+                {
+                    if allow_pages {
+                        Some(
+                            sync_space_pages_for_site(
+                                site_id,
+                                client,
+                                storage,
+                                &target_space.key,
+                                core_tx,
+                            )
+                            .await
+                            .map(|_| ()),
+                        )
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                };
+                Ok((count, storage_err, pages_outcome))
+            }
+            Err(err) => Err(err),
+        })
+    });
+
+    let (projects_res, boards_res, issues_res, spaces_res) =
+        tokio::join!(projects_fut, boards_fut, issues_fut, spaces_fut);
+
+    // 1. Fold Jira projects
+    match projects_res {
+        Some(Ok((count, storage_err))) => {
+            attempted_steps += 1;
+            breakers.record_success_site(site_id, SyncEndpoint::JiraProjects);
+            succeeded_steps += 1;
+            project_count = count;
+            if let Some(err) = storage_err {
+                record_err(err, SyncErrorKind::Transient);
+            }
+        }
+        Some(Err(err)) => {
+            attempted_steps += 1;
+            let (kind, _) = breakers.record_failure_site(
+                site_id,
+                SyncEndpoint::JiraProjects,
+                &err,
+                Instant::now(),
+            );
+            record_err(err, kind);
+        }
+        None => {
+            skipped_steps += 1;
+        }
+    }
+
+    // 2. Fold Jira Agile boards + default board
+    match boards_res {
+        Some(Ok((count, board_issues, storage_err))) => {
+            attempted_steps += 1;
+            breakers.record_success_site(site_id, SyncEndpoint::JiraAgileBoards);
+            succeeded_steps += 1;
+            board_count = count;
+            issue_count += board_issues;
+            if let Some(err) = storage_err {
+                record_err(err, SyncErrorKind::Transient);
+            }
+        }
+        Some(Err(err)) => {
+            attempted_steps += 1;
+            let (kind, _) = breakers.record_failure_site(
+                site_id,
+                SyncEndpoint::JiraAgileBoards,
+                &err,
+                Instant::now(),
+            );
+            record_err(err, kind);
+        }
+        None => {
+            skipped_steps += 1;
+        }
+    }
+
+    // 3. Fold My open Jira issues
+    match issues_res {
+        Some(Ok((fetched, storage_err))) => {
+            attempted_steps += 1;
+            breakers.record_success_site(site_id, SyncEndpoint::JiraIssues);
+            succeeded_steps += 1;
+            if fetched > issue_count {
+                issue_count = fetched;
+            }
+            if let Some(err) = storage_err {
+                record_err(err, SyncErrorKind::Transient);
+            }
+        }
+        Some(Err(err)) => {
+            attempted_steps += 1;
+            let (kind, _) = breakers.record_failure_site(
+                site_id,
+                SyncEndpoint::JiraIssues,
+                &err,
+                Instant::now(),
+            );
+            record_err(err, kind);
+        }
+        None => {
+            skipped_steps += 1;
+        }
+    }
+
+    // 4. Fold Confluence spaces + default space root pages
+    match spaces_res {
+        Some(Ok((count, storage_err, pages_outcome))) => {
+            attempted_steps += 1;
+            breakers.record_success_site(site_id, SyncEndpoint::ConfluenceSpaces);
+            succeeded_steps += 1;
+            space_count = count;
+            if let Some(err) = storage_err {
+                record_err(err, SyncErrorKind::Transient);
+            }
+            if let Some(outcome) = pages_outcome {
+                match outcome {
+                    Ok(()) => {
+                        breakers.record_success_site(site_id, SyncEndpoint::ConfluencePages);
+                    }
+                    Err(err) => {
+                        breakers.record_failure_site(
+                            site_id,
+                            SyncEndpoint::ConfluencePages,
+                            &err,
+                            Instant::now(),
+                        );
                     }
                 }
             }
-            Err(err) => {
-                let (kind, _) = breakers.record_failure_site(
-                    site_id,
-                    SyncEndpoint::ConfluenceSpaces,
-                    &err,
-                    Instant::now(),
-                );
-                record_err(err, kind);
-            }
         }
-    } else {
-        skipped_steps += 1;
+        Some(Err(err)) => {
+            attempted_steps += 1;
+            let (kind, _) = breakers.record_failure_site(
+                site_id,
+                SyncEndpoint::ConfluenceSpaces,
+                &err,
+                Instant::now(),
+            );
+            record_err(err, kind);
+        }
+        None => {
+            skipped_steps += 1;
+        }
     }
 
     let synced_at = chrono::Utc::now().to_rfc3339();
@@ -2188,7 +2296,11 @@ async fn sync_board(
     core_tx: Option<&mpsc::UnboundedSender<CoreEvent>>,
 ) -> Result<(Option<SprintSummary>, usize)> {
     let site_id = client.site_id();
-    if let Ok(cols) = client.get_board_columns(board_id).await {
+    let (cols_res, details_res) = tokio::join!(
+        client.get_board_columns(board_id),
+        sync_board_details_for_site(site_id, client, storage, board_id, sprint_id, core_tx),
+    );
+    if let Ok(cols) = cols_res {
         let mut boards = storage.list_boards_for_site(site_id, None).unwrap_or_default();
         if let Some(b) = boards.iter_mut().find(|b| b.id == board_id) {
             b.columns = cols;
@@ -2201,7 +2313,7 @@ async fn sync_board(
             }
         }
     }
-    sync_board_details_for_site(site_id, client, storage, board_id, sprint_id, core_tx).await
+    details_res
 }
 
 async fn sync_board_details_for_site(
@@ -2212,24 +2324,34 @@ async fn sync_board_details_for_site(
     explicit_sprint_id: Option<i64>,
     core_tx: Option<&mpsc::UnboundedSender<CoreEvent>>,
 ) -> Result<(Option<SprintSummary>, usize)> {
-    let sprints = client.list_board_sprints(board_id).await.unwrap_or_default();
-    if !sprints.is_empty() {
-        storage.upsert_sprints_for_site(site_id, &sprints)?;
-    }
-
-    let active_sprint = if let Some(sid) = explicit_sprint_id {
-        sprints.iter().find(|s| s.id == sid).cloned()
+    let (sprints, target_sprint_id, collected) = if let Some(sid) = explicit_sprint_id {
+        let (sprints_res, collected_res) = tokio::join!(
+            client.list_board_sprints(board_id),
+            client.list_all_board_issues(board_id, Some(sid), SYNC_BOARD_ISSUE_CAP),
+        );
+        let sprints = sprints_res.unwrap_or_default();
+        if !sprints.is_empty() {
+            storage.upsert_sprints_for_site(site_id, &sprints)?;
+        }
+        (sprints, Some(sid), collected_res?)
     } else {
-        sprints
+        let sprints = client.list_board_sprints(board_id).await.unwrap_or_default();
+        if !sprints.is_empty() {
+            storage.upsert_sprints_for_site(site_id, &sprints)?;
+        }
+        let target_sprint_id = sprints
             .iter()
             .find(|s| s.state.eq_ignore_ascii_case("active"))
-            .cloned()
+            .map(|s| s.id);
+        let collected = client
+            .list_all_board_issues(board_id, target_sprint_id, SYNC_BOARD_ISSUE_CAP)
+            .await?;
+        (sprints, target_sprint_id, collected)
     };
-    let target_sprint_id = explicit_sprint_id.or_else(|| active_sprint.as_ref().map(|s| s.id));
 
-    let collected = client
-        .list_all_board_issues(board_id, target_sprint_id, SYNC_BOARD_ISSUE_CAP)
-        .await?;
+    let active_sprint = target_sprint_id
+        .and_then(|sid| sprints.iter().find(|s| s.id == sid).cloned());
+
     store_board_issues_for_site(storage, site_id, board_id, target_sprint_id, &collected)?;
     let issues: Vec<IssueSummary> = collected.items;
     let count = issues.len();
@@ -3780,5 +3902,215 @@ mod tests {
         assert!(ctrl.request(SyncCommand::Shutdown));
         cloud_srv.abort();
         dc_srv.abort();
+    }
+
+    #[tokio::test]
+    async fn run_full_sync_overlaps_four_domains_and_board_subrequests() {
+        use axum::{routing::{get, post}, Json, Router};
+        use serde_json::json;
+        use tokio::{net::TcpListener, sync::Barrier};
+        use crate::{
+            auth::{AuthManager, StoredCredentials},
+            config::DeploymentKind,
+        };
+
+        let domain_barrier = Arc::new(Barrier::new(4));
+        let board_barrier = Arc::new(Barrier::new(2));
+        let bd1 = domain_barrier.clone();
+        let bd2 = domain_barrier.clone();
+        let bd3 = domain_barrier.clone();
+        let bd4 = domain_barrier.clone();
+        let bb1 = board_barrier.clone();
+        let bb2 = board_barrier.clone();
+
+        let mock = Router::new()
+            .route(
+                "/rest/api/3/project/search",
+                get(move || {
+                    let b = bd1.clone();
+                    async move {
+                        b.wait().await;
+                        Json(json!({ "values": [{ "id": "1", "key": "ENG", "name": "Eng" }] }))
+                    }
+                }),
+            )
+            .route(
+                "/rest/agile/1.0/board",
+                get(move || {
+                    let b = bd2.clone();
+                    async move {
+                        b.wait().await;
+                        Json(json!({
+                            "isLast": true,
+                            "values": [{ "id": 11, "name": "Eng Board", "type": "scrum", "location": { "projectKey": "ENG" } }]
+                        }))
+                    }
+                }),
+            )
+            .route(
+                "/rest/agile/1.0/board/11/configuration",
+                get(move || {
+                    let b = bb1.clone();
+                    async move {
+                        b.wait().await;
+                        Json(json!({ "columnConfig": { "columns": [{ "name": "To Do", "statuses": [{ "id": "1" }] }] } }))
+                    }
+                }),
+            )
+            .route(
+                "/rest/agile/1.0/board/11/sprint",
+                get(move || {
+                    let b = bb2.clone();
+                    async move {
+                        b.wait().await;
+                        Json(json!({ "isLast": true, "values": [{ "id": 101, "name": "Sprint 1", "state": "active" }] }))
+                    }
+                }),
+            )
+            .route(
+                "/rest/agile/1.0/sprint/101/issue",
+                get(|| async { Json(json!({ "issues": [], "total": 0 })) }),
+            )
+            .route(
+                "/rest/api/3/search/jql",
+                post(move || {
+                    let b = bd3.clone();
+                    async move {
+                        b.wait().await;
+                        Json(json!({ "issues": [] }))
+                    }
+                }),
+            )
+            .route(
+                "/wiki/api/v2/spaces",
+                get(move || {
+                    let b = bd4.clone();
+                    async move {
+                        b.wait().await;
+                        Json(json!({ "results": [{ "id": "5001", "key": "ENG", "name": "Eng" }] }))
+                    }
+                }),
+            )
+            .route(
+                "/wiki/api/v2/spaces/5001/pages",
+                get(|| async { Json(json!({ "results": [] })) }),
+            );
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base_url = format!("http://{}", listener.local_addr().unwrap());
+        let srv = tokio::spawn(async move {
+            let _ = axum::serve(listener, mock).await;
+        });
+
+        let auth = AuthManager::with_credentials(
+            "sync-par",
+            StoredCredentials::ApiToken {
+                site_url: base_url.clone(),
+                email: "alice@example.com".into(),
+                api_token: "tok".into(),
+                deployment: DeploymentKind::Cloud,
+            },
+        );
+        let client = AtlassianClient::with_base_urls(
+            &base_url,
+            format!("{base_url}/wiki"),
+            DeploymentKind::Cloud,
+            auth,
+        )
+        .unwrap();
+        let storage = Storage::open_in_memory().unwrap();
+        let mut breakers = CircuitBreakerRegistry::new();
+
+        let outcome = tokio::time::timeout(
+            Duration::from_secs(3),
+            run_full_sync_for_site("default", &client, &storage, None, &mut breakers),
+        )
+        .await
+        .expect("run_full_sync_for_site must overlap all 4 domains and board columns/sprints");
+
+        assert_eq!(outcome.attempted_steps, 4);
+        assert_eq!(outcome.succeeded_steps, 4);
+        assert_eq!(outcome.project_count, 1);
+        assert_eq!(outcome.board_count, 1);
+        assert_eq!(outcome.space_count, 1);
+        srv.abort();
+    }
+
+    #[tokio::test]
+    async fn sync_board_with_explicit_sprint_overlaps_columns_sprints_and_issues() {
+        use axum::{routing::get, Json, Router};
+        use serde_json::json;
+        use tokio::{net::TcpListener, sync::Barrier};
+        use crate::{
+            auth::{AuthManager, StoredCredentials},
+            config::DeploymentKind,
+        };
+
+        let barrier = Arc::new(Barrier::new(3));
+        let b1 = barrier.clone();
+        let b2 = barrier.clone();
+        let b3 = barrier.clone();
+
+        let mock = Router::new()
+            .route(
+                "/rest/agile/1.0/board/11/configuration",
+                get(move || {
+                    let b = b1.clone();
+                    async move {
+                        b.wait().await;
+                        Json(json!({ "columnConfig": { "columns": [{ "name": "To Do", "statuses": [{ "id": "1" }] }] } }))
+                    }
+                }),
+            )
+            .route(
+                "/rest/agile/1.0/board/11/sprint",
+                get(move || {
+                    let b = b2.clone();
+                    async move {
+                        b.wait().await;
+                        Json(json!({ "isLast": true, "values": [{ "id": 101, "name": "Sprint 1", "state": "active" }] }))
+                    }
+                }),
+            )
+            .route(
+                "/rest/agile/1.0/sprint/101/issue",
+                get(move || {
+                    let b = b3.clone();
+                    async move {
+                        b.wait().await;
+                        Json(json!({ "issues": [], "total": 0 }))
+                    }
+                }),
+            );
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base_url = format!("http://{}", listener.local_addr().unwrap());
+        let srv = tokio::spawn(async move {
+            let _ = axum::serve(listener, mock).await;
+        });
+
+        let auth = AuthManager::with_credentials(
+            "board-par",
+            StoredCredentials::ApiToken {
+                site_url: base_url.clone(),
+                email: "alice@example.com".into(),
+                api_token: "tok".into(),
+                deployment: DeploymentKind::Cloud,
+            },
+        );
+        let client =
+            AtlassianClient::with_base_urls(&base_url, "", DeploymentKind::Cloud, auth).unwrap();
+        let storage = Storage::open_in_memory().unwrap();
+
+        let (sprint, count) = tokio::time::timeout(
+            Duration::from_secs(3),
+            sync_board(&client, &storage, 11, Some(101), None),
+        )
+        .await
+        .expect("sync_board with explicit sprint must overlap columns, sprints, and issues")
+        .unwrap();
+        assert_eq!(sprint.unwrap().id, 101);
+        assert_eq!(count, 0);
+        srv.abort();
     }
 }

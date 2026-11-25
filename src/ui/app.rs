@@ -7,8 +7,14 @@ use std::{
     time::{Duration, Instant},
 };
 
+use futures::{stream, StreamExt};
 use regex::Regex;
 use tokio::sync::mpsc;
+
+/// Maximum uncached sibling issues/pages warmed per interactive TUI list/tree load.
+const INTERACTIVE_SIBLING_PREFETCH_LIMIT: usize = 3;
+/// Bounded concurrency for interactive TUI sibling detail prefetch.
+const INTERACTIVE_SIBLING_PREFETCH_CONCURRENCY: usize = 2;
 
 use crate::{
     adf,
@@ -2146,80 +2152,125 @@ impl AppState {
         let storage = self.storage.clone();
         let tx = self.ui_tx.clone();
         tokio::spawn(async move {
-            let mut primary_me_sent = false;
-            for (idx, (site_id, _site_name, client)) in targets.iter().enumerate() {
-                let is_primary =
-                    site_id.eq_ignore_ascii_case(&primary_site_id) || (targets.len() == 1 && idx == 0);
-                match client.get_myself().await {
-                    Ok(me) => {
-                        client.set_cached_me(me.clone());
-                        let _ = storage.save_identity_for_site(site_id, &me);
-                        if is_primary && !primary_me_sent {
-                            primary_me_sent = true;
-                            let _ = tx.send(UiMsg::MeLoaded(Ok(me)));
+            let me_targets = targets.clone();
+            let filter_targets = targets.clone();
+            let me_primary = primary_site_id.clone();
+            let me_storage = storage.clone();
+            let me_tx = tx.clone();
+            let me_fut = async move {
+                let primary_sent = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+                let total_targets = me_targets.len();
+                stream::iter(me_targets.into_iter().enumerate())
+                    .map(|(idx, (site_id, _site_name, client))| {
+                        let primary_sent = primary_sent.clone();
+                        let primary_site_id = me_primary.clone();
+                        let storage = me_storage.clone();
+                        let tx = me_tx.clone();
+                        async move {
+                            let is_primary = site_id.eq_ignore_ascii_case(&primary_site_id)
+                                || (total_targets == 1 && idx == 0);
+                            match client.get_myself().await {
+                                Ok(me) => {
+                                    client.set_cached_me(me.clone());
+                                    let _ = storage.save_identity_for_site(&site_id, &me);
+                                    if is_primary
+                                        && !primary_sent.swap(true, Ordering::AcqRel)
+                                    {
+                                        let _ = tx.send(UiMsg::MeLoaded(Ok(me)));
+                                    }
+                                }
+                                Err(e) => {
+                                    if is_primary
+                                        && !primary_sent.swap(true, Ordering::AcqRel)
+                                    {
+                                        let _ = tx.send(UiMsg::MeLoaded(Err(e.to_string())));
+                                    }
+                                }
+                            }
                         }
-                    }
-                    Err(e) => {
-                        if is_primary && !primary_me_sent {
-                            primary_me_sent = true;
-                            let _ = tx.send(UiMsg::MeLoaded(Err(e.to_string())));
-                        }
-                    }
-                }
-            }
-
-            let summary = if targets.len() == 1 {
-                let (site_id, _, client) = &targets[0];
-                sync::bootstrap_workspace_for_site(site_id, client, &storage)
-                    .await
-                    .map_err(|e| e.to_string())
-            } else {
-                let sync_targets: Vec<SiteSyncTarget> = targets
-                    .iter()
-                    .map(|(site_id, site_name, client)| SiteSyncTarget {
-                        site_id: site_id.clone(),
-                        site_name: site_name.clone(),
-                        client: client.clone(),
                     })
-                    .collect();
-                let mut breakers = sync::CircuitBreakerMap::new();
-                let outcome = sync::run_multi_site_sync(
-                    &sync_targets,
-                    &storage,
-                    &mut breakers,
-                    sync::DEFAULT_MULTI_SITE_CONCURRENCY,
-                    None,
-                )
-                .await;
-                if outcome.succeeded_sites > 0 {
-                    Ok(outcome.summary)
-                } else {
-                    let first_err = outcome
-                        .per_site
-                        .iter()
-                        .find_map(|r| r.error.clone())
-                        .unwrap_or(outcome.summary);
-                    Err(first_err)
-                }
+                    .buffer_unordered(sync::DEFAULT_MULTI_SITE_CONCURRENCY)
+                    .for_each(|()| async {})
+                    .await;
             };
-            let _ = tx.send(UiMsg::BootstrapFinished(summary));
 
-            let mut visible_filters = Vec::new();
-            for (site_id, _, client) in &targets {
-                if let Ok(filters) = client.list_favourite_filters().await {
-                    let _ = storage.upsert_saved_filters_for_site(site_id, &filters);
-                    if active_scope.matches(site_id) {
+            let sync_storage = storage.clone();
+            let sync_tx = tx.clone();
+            let sync_fut = async move {
+                let summary = if targets.len() == 1 {
+                    let (site_id, _, client) = &targets[0];
+                    sync::bootstrap_workspace_for_site(site_id, client, &sync_storage)
+                        .await
+                        .map_err(|e| e.to_string())
+                } else {
+                    let sync_targets: Vec<SiteSyncTarget> = targets
+                        .iter()
+                        .map(|(site_id, site_name, client)| SiteSyncTarget {
+                            site_id: site_id.clone(),
+                            site_name: site_name.clone(),
+                            client: client.clone(),
+                        })
+                        .collect();
+                    let mut breakers = sync::CircuitBreakerMap::new();
+                    let outcome = sync::run_multi_site_sync(
+                        &sync_targets,
+                        &sync_storage,
+                        &mut breakers,
+                        sync::DEFAULT_MULTI_SITE_CONCURRENCY,
+                        None,
+                    )
+                    .await;
+                    if outcome.succeeded_sites > 0 {
+                        Ok(outcome.summary)
+                    } else {
+                        let first_err = outcome
+                            .per_site
+                            .iter()
+                            .find_map(|r| r.error.clone())
+                            .unwrap_or(outcome.summary);
+                        Err(first_err)
+                    }
+                };
+                let _ = sync_tx.send(UiMsg::BootstrapFinished(summary));
+            };
+
+            let filters_fut = async move {
+                let per_site: Vec<(String, Vec<SavedFilter>)> = stream::iter(filter_targets)
+                    .map(|(site_id, _, client)| {
+                        let storage = storage.clone();
+                        async move {
+                            match client.list_favourite_filters().await {
+                                Ok(filters) => {
+                                    let _ = storage.upsert_saved_filters_for_site(&site_id, &filters);
+                                    Some((site_id, filters))
+                                }
+                                Err(_) => None,
+                            }
+                        }
+                    })
+                    .buffered(sync::DEFAULT_MULTI_SITE_CONCURRENCY)
+                    .filter_map(|item| async move { item })
+                    .collect()
+                    .await;
+                let mut visible_filters = Vec::new();
+                for (site_id, filters) in per_site {
+                    if active_scope.matches(&site_id) {
                         for f in filters {
-                            if !visible_filters.iter().any(|existing: &SavedFilter| existing.id == f.id) {
+                            if !visible_filters
+                                .iter()
+                                .any(|existing: &SavedFilter| existing.id == f.id)
+                            {
                                 visible_filters.push(f);
                             }
                         }
                     }
                 }
-            }
-            if !visible_filters.is_empty() {
-                let _ = tx.send(UiMsg::SavedFiltersLoaded(visible_filters));
-            }
+                if !visible_filters.is_empty() {
+                    let _ = tx.send(UiMsg::SavedFiltersLoaded(visible_filters));
+                }
+            };
+
+            tokio::join!(me_fut, sync_fut, filters_fut);
         });
     }
 
@@ -3020,26 +3071,47 @@ impl AppState {
         let storage = self.storage.clone();
         let tx = self.ui_tx.clone();
         tokio::spawn(async move {
-            let columns = client.get_board_columns(board_id).await.unwrap_or_default();
-            let sprints = client.list_board_sprints(board_id).await.unwrap_or_default();
-            if !sprints.is_empty() {
-                let _ = storage.upsert_sprints_for_site(&site_id, &sprints);
-            }
-            let effective_sprint = sprint_id.or_else(|| {
-                sprints
+            let (columns, sprints, issues_res) = if let Some(sid) = sprint_id {
+                let (cols_res, sprints_res, issues_res) = tokio::join!(
+                    client.get_board_columns(board_id),
+                    client.list_board_sprints(board_id),
+                    sync::load_board_issues_for_site(
+                        &client,
+                        &storage,
+                        &site_id,
+                        board_id,
+                        Some(sid),
+                    ),
+                );
+                let sprints = sprints_res.unwrap_or_default();
+                if !sprints.is_empty() {
+                    let _ = storage.upsert_sprints_for_site(&site_id, &sprints);
+                }
+                (cols_res.unwrap_or_default(), sprints, issues_res)
+            } else {
+                let (cols_res, sprints_res) = tokio::join!(
+                    client.get_board_columns(board_id),
+                    client.list_board_sprints(board_id),
+                );
+                let sprints = sprints_res.unwrap_or_default();
+                if !sprints.is_empty() {
+                    let _ = storage.upsert_sprints_for_site(&site_id, &sprints);
+                }
+                let effective_sprint = sprints
                     .iter()
                     .find(|s| s.state.eq_ignore_ascii_case("active"))
-                    .map(|s| s.id)
-            });
-            match sync::load_board_issues_for_site(
-                &client,
-                &storage,
-                &site_id,
-                board_id,
-                effective_sprint,
-            )
-            .await
-            {
+                    .map(|s| s.id);
+                let issues_res = sync::load_board_issues_for_site(
+                    &client,
+                    &storage,
+                    &site_id,
+                    board_id,
+                    effective_sprint,
+                )
+                .await;
+                (cols_res.unwrap_or_default(), sprints, issues_res)
+            };
+            match issues_res {
                 Ok(issues) => {
                     let _ = tx.send(UiMsg::BoardDataLoaded {
                         seq,
@@ -4558,40 +4630,64 @@ impl AppState {
         let storage = self.storage.clone();
         let tx = self.ui_tx.clone();
         tokio::spawn(async move {
+            let per_site: Vec<(
+                Vec<(String, Option<String>, IssueSummary)>,
+                Vec<(String, Option<String>, PageSummary)>,
+            )> = stream::iter(clients)
+                .map(|(site_id, site_label, me_id, client)| {
+                    let storage = storage.clone();
+                    async move {
+                        let pill = show_pills.then_some(site_label);
+                        let (issues_res, pages_res) = tokio::join!(
+                            client.search_issues_jql(
+                                AtlassianClient::my_open_issues_jql(),
+                                40,
+                                None,
+                                None,
+                            ),
+                            client.search_confluence_cql(
+                                "type = page ORDER BY lastmodified DESC",
+                                25,
+                            ),
+                        );
+                        let issues = match issues_res {
+                            Ok(p) => {
+                                let _ = storage.upsert_issues_for_site(&site_id, &p.issues);
+                                p.issues
+                            }
+                            Err(_) => storage
+                                .list_my_work_for_site(&site_id, me_id.as_deref(), 40)
+                                .unwrap_or_default(),
+                        };
+                        let pages = match pages_res {
+                            Ok(ps) => {
+                                let _ = storage.upsert_pages_for_site(&site_id, &ps);
+                                ps
+                            }
+                            Err(_) => storage
+                                .list_recent_pages_for_site(&site_id, 25)
+                                .unwrap_or_default(),
+                        };
+                        let site_issues = issues
+                            .into_iter()
+                            .map(|issue| (site_id.clone(), pill.clone(), issue))
+                            .collect();
+                        let site_pages = pages
+                            .into_iter()
+                            .map(|page| (site_id.clone(), pill.clone(), page))
+                            .collect();
+                        (site_issues, site_pages)
+                    }
+                })
+                .buffer_unordered(sync::DEFAULT_MULTI_SITE_CONCURRENCY)
+                .collect()
+                .await;
+
             let mut all_issues: Vec<(String, Option<String>, IssueSummary)> = Vec::new();
             let mut all_pages: Vec<(String, Option<String>, PageSummary)> = Vec::new();
-            for (site_id, site_label, me_id, client) in clients {
-                let pill = show_pills.then_some(site_label);
-                let issues = match client
-                    .search_issues_jql(AtlassianClient::my_open_issues_jql(), 40, None, None)
-                    .await
-                {
-                    Ok(p) => {
-                        let _ = storage.upsert_issues_for_site(&site_id, &p.issues);
-                        p.issues
-                    }
-                    Err(_) => storage
-                        .list_my_work_for_site(&site_id, me_id.as_deref(), 40)
-                        .unwrap_or_default(),
-                };
-                for issue in issues {
-                    all_issues.push((site_id.clone(), pill.clone(), issue));
-                }
-                let pages = match client
-                    .search_confluence_cql("type = page ORDER BY lastmodified DESC", 25)
-                    .await
-                {
-                    Ok(ps) => {
-                        let _ = storage.upsert_pages_for_site(&site_id, &ps);
-                        ps
-                    }
-                    Err(_) => storage
-                        .list_recent_pages_for_site(&site_id, 25)
-                        .unwrap_or_default(),
-                };
-                for page in pages {
-                    all_pages.push((site_id.clone(), pill.clone(), page));
-                }
+            for (si, sp) in per_site {
+                all_issues.extend(si);
+                all_pages.extend(sp);
             }
             all_issues.sort_by(|a, b| b.2.updated_at.cmp(&a.2.updated_at));
             all_pages.sort_by(|a, b| b.2.updated_at.cmp(&a.2.updated_at));
@@ -4661,63 +4757,80 @@ impl AppState {
             let escaped = q.replace('"', "\\\"");
             let jql = format!("text ~ \"{escaped}\" ORDER BY updated DESC");
             let cql = format!("text ~ \"{escaped}\" AND type = page");
+            let per_site: Vec<(Vec<(String, Option<String>, UnifiedSearchHit)>, Option<String>)> =
+                stream::iter(clients)
+                    .map(|(site_id, site_label, client)| {
+                        let jql = &jql;
+                        let cql = &cql;
+                        async move {
+                            let pill = show_pills.then_some(site_label);
+                            let (j_res, c_res) = tokio::join!(
+                                client.search_issues_jql(jql, 25, None, None),
+                                client.search_confluence_cql(cql, 25),
+                            );
+                            let mut hits = Vec::new();
+                            let mut site_err = None;
+                            match j_res {
+                                Ok(page) => {
+                                    for it in page.issues {
+                                        hits.push((
+                                            site_id.clone(),
+                                            pill.clone(),
+                                            UnifiedSearchHit {
+                                                kind: crate::models::SearchHitKind::JiraIssue,
+                                                id_or_key: it.key,
+                                                container: it.project_key,
+                                                title: it.summary,
+                                                snippet: it.status.name.clone(),
+                                                status_or_version: it.status.name,
+                                                updated_at: it.updated_at,
+                                                web_url: it.web_url,
+                                            },
+                                        ));
+                                    }
+                                }
+                                Err(e) => {
+                                    site_err = Some(e.to_string());
+                                }
+                            }
+                            match c_res {
+                                Ok(pages) => {
+                                    for pg in pages {
+                                        hits.push((
+                                            site_id.clone(),
+                                            pill.clone(),
+                                            UnifiedSearchHit {
+                                                kind: crate::models::SearchHitKind::ConfluencePage,
+                                                id_or_key: pg.id,
+                                                container: pg.space_key,
+                                                title: pg.title,
+                                                snippet: format!("v{}", pg.version_number),
+                                                status_or_version: format!("v{}", pg.version_number),
+                                                updated_at: pg.updated_at,
+                                                web_url: pg.web_url,
+                                            },
+                                        ));
+                                    }
+                                }
+                                Err(e) => {
+                                    if site_err.is_none() {
+                                        site_err = Some(e.to_string());
+                                    }
+                                }
+                            }
+                            (hits, site_err)
+                        }
+                    })
+                    .buffered(sync::DEFAULT_MULTI_SITE_CONCURRENCY)
+                    .collect()
+                    .await;
+
             let mut combined: Vec<(String, Option<String>, UnifiedSearchHit)> = Vec::new();
             let mut err_msg = None;
-            for (site_id, site_label, client) in clients {
-                let pill = show_pills.then_some(site_label);
-                let (j_res, c_res) = tokio::join!(
-                    client.search_issues_jql(&jql, 25, None, None),
-                    client.search_confluence_cql(&cql, 25),
-                );
-                match j_res {
-                    Ok(page) => {
-                        for it in page.issues {
-                            combined.push((
-                                site_id.clone(),
-                                pill.clone(),
-                                UnifiedSearchHit {
-                                    kind: crate::models::SearchHitKind::JiraIssue,
-                                    id_or_key: it.key,
-                                    container: it.project_key,
-                                    title: it.summary,
-                                    snippet: it.status.name.clone(),
-                                    status_or_version: it.status.name,
-                                    updated_at: it.updated_at,
-                                    web_url: it.web_url,
-                                },
-                            ));
-                        }
-                    }
-                    Err(e) => {
-                        if err_msg.is_none() {
-                            err_msg = Some(e.to_string());
-                        }
-                    }
-                }
-                match c_res {
-                    Ok(pages) => {
-                        for pg in pages {
-                            combined.push((
-                                site_id.clone(),
-                                pill.clone(),
-                                UnifiedSearchHit {
-                                    kind: crate::models::SearchHitKind::ConfluencePage,
-                                    id_or_key: pg.id,
-                                    container: pg.space_key,
-                                    title: pg.title,
-                                    snippet: format!("v{}", pg.version_number),
-                                    status_or_version: format!("v{}", pg.version_number),
-                                    updated_at: pg.updated_at,
-                                    web_url: pg.web_url,
-                                },
-                            ));
-                        }
-                    }
-                    Err(e) => {
-                        if err_msg.is_none() {
-                            err_msg = Some(e.to_string());
-                        }
-                    }
+            for (hits, site_err) in per_site {
+                combined.extend(hits);
+                if err_msg.is_none() {
+                    err_msg = site_err;
                 }
             }
             combined.sort_by(|a, b| b.2.updated_at.cmp(&a.2.updated_at));
@@ -4743,6 +4856,145 @@ impl AppState {
                 query: q,
                 hits: res,
             });
+        });
+    }
+
+    /// Bounded, budgeted interactive background prefetch of uncached sibling Jira issues.
+    /// Called ONLY on interactive TUI list/board loads (never by `sync.rs` polling loops).
+    pub(crate) fn prefetch_uncached_issues(
+        &self,
+        site_id: &str,
+        keys: &[String],
+        skip_key: Option<&str>,
+    ) {
+        if keys.is_empty() || tokio::runtime::Handle::try_current().is_err() {
+            return;
+        }
+        let (resolved_site, client) = self.site_id_and_client_for(Some(site_id));
+        if client.site_url().trim().is_empty() {
+            return;
+        }
+        let mut seen = HashSet::new();
+        let mut candidates = Vec::new();
+        for key in keys {
+            let trimmed = key.trim();
+            if trimmed.is_empty()
+                || skip_key.is_some_and(|sk| sk.eq_ignore_ascii_case(trimmed))
+                || !seen.insert(trimmed.to_ascii_uppercase())
+            {
+                continue;
+            }
+            let cached_fresh = self
+                .storage
+                .get_issue_detail_for_site(&resolved_site, trimmed)
+                .ok()
+                .flatten()
+                .is_some()
+                && !self
+                    .storage
+                    .is_issue_detail_stale_for_site(&resolved_site, trimmed)
+                    .unwrap_or(false);
+            if !cached_fresh {
+                candidates.push(trimmed.to_string());
+                if candidates.len() >= INTERACTIVE_SIBLING_PREFETCH_LIMIT {
+                    break;
+                }
+            }
+        }
+        if candidates.is_empty() {
+            return;
+        }
+        let storage = self.storage.clone();
+        tokio::spawn(async move {
+            stream::iter(candidates)
+                .map(|key| {
+                    let client = client.clone();
+                    let storage = storage.clone();
+                    let site_id = resolved_site.clone();
+                    async move {
+                        if let Ok((mut detail, meta)) = client.get_issue_with_meta(&key).await {
+                            let _ = storage.upsert_issue_detail_for_site_merging(
+                                &site_id,
+                                &mut detail,
+                                !meta.remote_links_ok,
+                            );
+                        }
+                    }
+                })
+                .buffer_unordered(INTERACTIVE_SIBLING_PREFETCH_CONCURRENCY)
+                .for_each(|()| async {})
+                .await;
+        });
+    }
+
+    /// Bounded, budgeted interactive background prefetch of uncached sibling Confluence pages.
+    /// Called ONLY on interactive TUI space/tree loads (never by `sync.rs` polling loops).
+    pub(crate) fn prefetch_uncached_pages(
+        &self,
+        site_id: &str,
+        page_ids: &[String],
+        skip_page_id: Option<&str>,
+    ) {
+        if page_ids.is_empty() || tokio::runtime::Handle::try_current().is_err() {
+            return;
+        }
+        let (resolved_site, client) = self.site_id_and_client_for(Some(site_id));
+        if client.confluence_root_url().trim().is_empty() {
+            return;
+        }
+        let mut seen = HashSet::new();
+        let mut candidates = Vec::new();
+        for pid in page_ids {
+            let trimmed = pid.trim();
+            if trimmed.is_empty()
+                || skip_page_id.is_some_and(|sp| sp == trimmed)
+                || !seen.insert(trimmed.to_string())
+            {
+                continue;
+            }
+            let cached_fresh = self
+                .storage
+                .get_page_detail_for_site(&resolved_site, trimmed)
+                .ok()
+                .flatten()
+                .is_some()
+                && !self
+                    .storage
+                    .is_page_detail_stale_for_site(&resolved_site, trimmed)
+                    .unwrap_or(false);
+            if !cached_fresh {
+                candidates.push(trimmed.to_string());
+                if candidates.len() >= INTERACTIVE_SIBLING_PREFETCH_LIMIT {
+                    break;
+                }
+            }
+        }
+        if candidates.is_empty() {
+            return;
+        }
+        let storage = self.storage.clone();
+        tokio::spawn(async move {
+            stream::iter(candidates)
+                .map(|pid| {
+                    let client = client.clone();
+                    let storage = storage.clone();
+                    let site_id = resolved_site.clone();
+                    async move {
+                        if let Ok((mut detail, meta)) = client
+                            .get_page_with_meta_in_cache(&pid, &site_id, &storage)
+                            .await
+                        {
+                            let _ = storage.upsert_page_detail_for_site_with_meta(
+                                &site_id,
+                                &mut detail,
+                                meta,
+                            );
+                        }
+                    }
+                })
+                .buffer_unordered(INTERACTIVE_SIBLING_PREFETCH_CONCURRENCY)
+                .for_each(|()| async {})
+                .await;
         });
     }
 
@@ -5698,8 +5950,9 @@ impl AppState {
                         .map(|s| s.id)
                 });
                 self.sprints = sprints;
+                let prefetch_keys: Vec<String> = issues.iter().map(|i| i.key.clone()).collect();
                 self.board_issues = issues;
-                self.board_issue_site_id = Some(site_id);
+                self.board_issue_site_id = Some(site_id.clone());
                 self.active_board_sprint_id = effective_sprint;
                 if let Some(sp_id) = effective_sprint {
                     if let Some(pos) = self.sprints.iter().position(|s| s.id == sp_id) {
@@ -5709,6 +5962,8 @@ impl AppState {
                 ui.board_ui.selected_col = 0;
                 ui.board_ui.selected_row = 0;
                 self.clamp_selections(ui);
+                let active_key = self.active_issue.as_ref().map(|d| d.summary.key.clone());
+                self.prefetch_uncached_issues(&site_id, &prefetch_keys, active_key.as_deref());
             }
             UiMsg::BoardLoadFailed {
                 seq,
@@ -5740,6 +5995,9 @@ impl AppState {
                 ui.issue_ui.selected_issue = 0;
                 if let Some(first) = self.issues.first().cloned() {
                     self.request_issue_detail_for_site(ui, Some(&site_id), &first.key);
+                    let sibling_keys: Vec<String> =
+                        self.issues.iter().skip(1).map(|i| i.key.clone()).collect();
+                    self.prefetch_uncached_issues(&site_id, &sibling_keys, Some(&first.key));
                 } else {
                     self.active_issue = None;
                     self.active_issue_site_id = None;
@@ -6136,9 +6394,17 @@ impl AppState {
                             .map(|s| s.eq_ignore_ascii_case(&site_id))
                             .unwrap_or(true);
                         if matches_space {
+                            let prefetch_ids: Vec<String> =
+                                list.iter().map(|p| p.id.clone()).collect();
                             self.root_pages_by_space
                                 .insert(SiteKey::new(&site_id, &space_key), list);
                             self.clamp_selections(ui);
+                            let active_pid = self.active_page.as_ref().map(|p| p.summary.id.clone());
+                            self.prefetch_uncached_pages(
+                                &site_id,
+                                &prefetch_ids,
+                                active_pid.as_deref(),
+                            );
                         }
                     }
                     Err(e) => ui.error(format!("Failed to load root pages: {e}")),
@@ -6158,9 +6424,16 @@ impl AppState {
                 }
                 match children {
                     Ok(list) => {
+                        let prefetch_ids: Vec<String> = list.iter().map(|p| p.id.clone()).collect();
                         self.page_children_map
                             .insert(SiteKey::new(&site_id, parent_id), list);
                         self.clamp_selections(ui);
+                        let active_pid = self.active_page.as_ref().map(|p| p.summary.id.clone());
+                        self.prefetch_uncached_pages(
+                            &site_id,
+                            &prefetch_ids,
+                            active_pid.as_deref(),
+                        );
                     }
                     Err(e) => ui.error(format!("Failed to load child pages: {e}")),
                 }
@@ -6351,12 +6624,16 @@ impl AppState {
                         }
                     }
 
+                    let is_create = toast.starts_with("Created ")
+                        || clear_draft_key
+                            .as_deref()
+                            .is_some_and(|dk| dk.contains("page:new"));
                     let active_matches_site = self
                         .active_page_site_id
                         .as_deref()
                         .map(|s| s.eq_ignore_ascii_case(&site_id))
                         .unwrap_or(true);
-                    if active_matches_site {
+                    if is_create || active_matches_site {
                         let detail_ver = detail.summary.version_number;
                         self.active_page = Some(detail);
                         self.active_page_site_id = Some(site_id.clone());
@@ -8573,5 +8850,356 @@ mod tests {
         app.apply_default_selection(&mut ui);
         assert_eq!(app.active_space_site_id(&ui), Some("site-b"));
         assert_eq!(app.current_confluence_tree(&ui)[0].page.title, "B ops home");
+    }
+
+    #[tokio::test]
+    async fn spawn_bootstrap_overlaps_identity_sync_and_filters() {
+        use std::sync::Arc;
+        use axum::{routing::{get, post}, Json, Router};
+        use serde_json::json;
+        use tokio::{net::TcpListener, sync::Barrier};
+
+        let barrier = Arc::new(Barrier::new(3));
+        let b_me = barrier.clone();
+        let b_sync = barrier.clone();
+        let b_filt = barrier.clone();
+
+        let mock = Router::new()
+            .route(
+                "/rest/api/3/myself",
+                get(move || {
+                    let b = b_me.clone();
+                    async move {
+                        b.wait().await;
+                        Json(json!({ "accountId": "acc-1", "displayName": "Alice" }))
+                    }
+                }),
+            )
+            .route(
+                "/rest/api/3/project/search",
+                get(move || {
+                    let b = b_sync.clone();
+                    async move {
+                        b.wait().await;
+                        Json(json!({ "values": [{ "id": "1", "key": "ENG", "name": "Eng" }] }))
+                    }
+                }),
+            )
+            .route(
+                "/rest/agile/1.0/board",
+                get(|| async { Json(json!({ "isLast": true, "values": [] })) }),
+            )
+            .route(
+                "/rest/api/3/search/jql",
+                post(|| async { Json(json!({ "issues": [] })) }),
+            )
+            .route(
+                "/wiki/api/v2/spaces",
+                get(|| async { Json(json!({ "results": [] })) }),
+            )
+            .route(
+                "/rest/api/3/filter/favourite",
+                get(move || {
+                    let b = b_filt.clone();
+                    async move {
+                        b.wait().await;
+                        Json(json!([{ "id": "10", "name": "My Bugs", "jql": "issuetype = Bug" }]))
+                    }
+                }),
+            );
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base_url = format!("http://{}", listener.local_addr().unwrap());
+        let srv = tokio::spawn(async move {
+            let _ = axum::serve(listener, mock).await;
+        });
+
+        let mut cfg = AppConfig::default();
+        cfg.site_url = base_url.clone();
+        cfg.confluence_url = format!("{base_url}/wiki");
+        cfg.sync_interval_secs = 300;
+        let auth = AuthManager::with_credentials(
+            "boot-par",
+            StoredCredentials::ApiToken {
+                site_url: base_url.clone(),
+                email: "alice@example.com".into(),
+                api_token: "tok".into(),
+                deployment: DeploymentKind::Cloud,
+            },
+        );
+        let client = AtlassianClient::new(cfg.clone(), auth.clone()).unwrap();
+        let storage = Storage::open_in_memory().unwrap();
+        let (core_tx, _core_rx) = mpsc::unbounded_channel();
+        let sync_ctrl =
+            sync::spawn_sync_engine(cfg.clone(), client.clone(), storage.clone(), core_tx);
+        let (ui_tx, mut ui_rx) = mpsc::unbounded_channel();
+        let app = AppState::new_with_persona(
+            cfg.clone(),
+            Persona::Jira,
+            auth,
+            client,
+            storage,
+            sync_ctrl,
+            ui_tx,
+        );
+        let mut ui = UiState::from_config_with_persona(&cfg, Persona::Jira);
+
+        app.spawn_bootstrap(&mut ui);
+
+        let mut got_me = false;
+        let mut got_boot = false;
+        let mut got_filters = false;
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while Instant::now() < deadline && !(got_me && got_boot && got_filters) {
+            if let Ok(Some(msg)) =
+                tokio::time::timeout(Duration::from_millis(500), ui_rx.recv()).await
+            {
+                match msg {
+                    UiMsg::MeLoaded(Ok(_)) => got_me = true,
+                    UiMsg::BootstrapFinished(Ok(_)) => got_boot = true,
+                    UiMsg::SavedFiltersLoaded(f) if !f.is_empty() => got_filters = true,
+                    _ => {}
+                }
+            }
+        }
+        assert!(
+            got_me && got_boot && got_filters,
+            "spawn_bootstrap must overlap identity, sync, and filters (me={got_me}, boot={got_boot}, filters={got_filters})"
+        );
+        srv.abort();
+    }
+
+    #[tokio::test]
+    async fn request_board_load_and_my_work_overlap_independent_requests() {
+        use std::sync::Arc;
+        use axum::{routing::{get, post}, Json, Router};
+        use serde_json::json;
+        use tokio::{net::TcpListener, sync::Barrier};
+
+        let board_barrier = Arc::new(Barrier::new(3));
+        let my_work_barrier = Arc::new(Barrier::new(2));
+        let b1 = board_barrier.clone();
+        let b2 = board_barrier.clone();
+        let b3 = board_barrier.clone();
+        let m1 = my_work_barrier.clone();
+        let m2 = my_work_barrier.clone();
+
+        let mock = Router::new()
+            .route(
+                "/rest/agile/1.0/board/11/configuration",
+                get(move || {
+                    let b = b1.clone();
+                    async move {
+                        b.wait().await;
+                        Json(json!({ "columnConfig": { "columns": [{ "name": "To Do", "statuses": [{ "id": "1" }] }] } }))
+                    }
+                }),
+            )
+            .route(
+                "/rest/agile/1.0/board/11/sprint",
+                get(move || {
+                    let b = b2.clone();
+                    async move {
+                        b.wait().await;
+                        Json(json!({ "isLast": true, "values": [{ "id": 101, "name": "Sprint 1", "state": "active" }] }))
+                    }
+                }),
+            )
+            .route(
+                "/rest/agile/1.0/sprint/101/issue",
+                get(move || {
+                    let b = b3.clone();
+                    async move {
+                        b.wait().await;
+                        Json(json!({ "issues": [], "total": 0 }))
+                    }
+                }),
+            )
+            .route(
+                "/rest/api/3/search/jql",
+                post(move || {
+                    let b = m1.clone();
+                    async move {
+                        b.wait().await;
+                        Json(json!({ "issues": [] }))
+                    }
+                }),
+            )
+            .route(
+                "/wiki/rest/api/search",
+                get(move || {
+                    let b = m2.clone();
+                    async move {
+                        b.wait().await;
+                        Json(json!({ "results": [] }))
+                    }
+                }),
+            );
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base_url = format!("http://{}", listener.local_addr().unwrap());
+        let srv = tokio::spawn(async move {
+            let _ = axum::serve(listener, mock).await;
+        });
+
+        let mut cfg = AppConfig::default();
+        cfg.site_url = base_url.clone();
+        cfg.confluence_url = format!("{base_url}/wiki");
+        cfg.sync_interval_secs = 300;
+        let auth = AuthManager::with_credentials(
+            "board-mw-par",
+            StoredCredentials::ApiToken {
+                site_url: base_url.clone(),
+                email: "alice@example.com".into(),
+                api_token: "tok".into(),
+                deployment: DeploymentKind::Cloud,
+            },
+        );
+        let client = AtlassianClient::new(cfg.clone(), auth.clone()).unwrap();
+        let storage = Storage::open_in_memory().unwrap();
+        let (core_tx, _core_rx) = mpsc::unbounded_channel();
+        let sync_ctrl =
+            sync::spawn_sync_engine(cfg.clone(), client.clone(), storage.clone(), core_tx);
+        let (ui_tx, mut ui_rx) = mpsc::unbounded_channel();
+        let mut app = AppState::new_with_persona(
+            cfg.clone(),
+            Persona::Jira,
+            auth,
+            client,
+            storage,
+            sync_ctrl,
+            ui_tx,
+        );
+        let mut ui = UiState::from_config_with_persona(&cfg, Persona::Jira);
+        app.boards = vec![board(11, "ENG")];
+        app.board_site_ids = vec!["default".into()];
+
+        app.request_board_load(&mut ui, 0, Some(101));
+        app.request_my_work_refresh(&mut ui);
+
+        let mut got_board = false;
+        let mut got_my_work = false;
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while Instant::now() < deadline && !(got_board && got_my_work) {
+            if let Ok(Some(msg)) =
+                tokio::time::timeout(Duration::from_millis(500), ui_rx.recv()).await
+            {
+                match msg {
+                    UiMsg::BoardDataLoaded { board_id: 11, .. } => got_board = true,
+                    UiMsg::MyWorkLoaded { .. } => got_my_work = true,
+                    _ => {}
+                }
+            }
+        }
+        assert!(got_board && got_my_work, "board={got_board}, my_work={got_my_work}");
+        srv.abort();
+    }
+
+    #[tokio::test]
+    async fn interactive_sibling_prefetch_respects_budget_and_skips_cached_items() {
+        use std::sync::{
+            atomic::{AtomicUsize, Ordering},
+            Arc, Mutex,
+        };
+        use axum::{extract::Path, routing::get, Json, Router};
+        use serde_json::json;
+        use tokio::net::TcpListener;
+
+        let fetched_keys = Arc::new(Mutex::new(Vec::<String>::new()));
+        let hits = Arc::new(AtomicUsize::new(0));
+        let fk = fetched_keys.clone();
+        let h = hits.clone();
+        let mock = Router::new()
+            .route(
+                "/rest/api/3/issue/{key}",
+                get(move |Path(key): Path<String>| {
+                    let fk = fk.clone();
+                    let h = h.clone();
+                    async move {
+                        h.fetch_add(1, Ordering::SeqCst);
+                        fk.lock().unwrap().push(key.clone());
+                        Json(json!({
+                            "id": key,
+                            "key": key,
+                            "fields": {
+                                "project": { "key": "ENG" },
+                                "summary": format!("Summary {key}"),
+                                "status": { "id": "1", "name": "To Do", "statusCategory": { "key": "new" } },
+                                "issuetype": { "id": "10", "name": "Task", "subtask": false },
+                                "updated": "2026-11-20T10:00:00.000+0000"
+                            }
+                        }))
+                    }
+                }),
+            )
+            .route(
+                "/rest/api/3/issue/{key}/remotelink",
+                get(|| async { Json(json!([])) }),
+            );
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base_url = format!("http://{}", listener.local_addr().unwrap());
+        let srv = tokio::spawn(async move {
+            let _ = axum::serve(listener, mock).await;
+        });
+
+        let mut cfg = AppConfig::default();
+        cfg.site_url = base_url.clone();
+        cfg.sync_interval_secs = 300;
+        let auth = AuthManager::with_credentials(
+            "prefetch-test",
+            StoredCredentials::ApiToken {
+                site_url: base_url.clone(),
+                email: "alice@example.com".into(),
+                api_token: "tok".into(),
+                deployment: DeploymentKind::Cloud,
+            },
+        );
+        let client = AtlassianClient::new(cfg.clone(), auth.clone()).unwrap();
+        let storage = Storage::open_in_memory().unwrap();
+        // Pre-cache ENG-2 so prefetch skips it.
+        storage
+            .upsert_issue_detail_for_site(
+                "default",
+                &IssueDetail {
+                    summary: sample_issue("ENG-2", "To Do", StatusCategory::Todo),
+                    description_markdown: "Already cached".into(),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        let (core_tx, _core_rx) = mpsc::unbounded_channel();
+        let sync_ctrl =
+            sync::spawn_sync_engine(cfg.clone(), client.clone(), storage.clone(), core_tx);
+        let (ui_tx, _ui_rx) = mpsc::unbounded_channel();
+        let app = AppState::new_with_persona(
+            cfg.clone(),
+            Persona::Jira,
+            auth,
+            client,
+            storage.clone(),
+            sync_ctrl,
+            ui_tx,
+        );
+
+        let keys: Vec<String> = ["ENG-1", "ENG-2", "ENG-3", "ENG-4", "ENG-5", "ENG-6"]
+            .into_iter()
+            .map(str::to_string)
+            .collect();
+        app.prefetch_uncached_issues("default", &keys, Some("ENG-1"));
+
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while Instant::now() < deadline && hits.load(Ordering::SeqCst) < INTERACTIVE_SIBLING_PREFETCH_LIMIT {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        tokio::time::sleep(Duration::from_millis(80)).await;
+
+        assert_eq!(hits.load(Ordering::SeqCst), INTERACTIVE_SIBLING_PREFETCH_LIMIT);
+        let mut seen = fetched_keys.lock().unwrap().clone();
+        seen.sort();
+        assert_eq!(seen, vec!["ENG-3", "ENG-4", "ENG-5"]);
+        assert!(storage.get_issue_detail_for_site("default", "ENG-3").unwrap().is_some());
+        assert!(storage.get_issue_detail_for_site("default", "ENG-6").unwrap().is_none());
+        srv.abort();
     }
 }

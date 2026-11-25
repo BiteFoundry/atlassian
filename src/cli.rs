@@ -8,6 +8,7 @@ use std::{
 
 use anyhow::{bail, Context, Result};
 use clap::{Parser, Subcommand, ValueEnum};
+use futures::{stream, StreamExt};
 use serde_json::{json, Map, Value};
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
@@ -4807,14 +4808,47 @@ async fn cmd_board(
             .context("No available Jira boards found. Specify `board <ID>`.")?,
     };
 
-    if board.columns.is_empty() {
-        if let Ok(cols) = client.get_board_columns(board.id).await {
-            board.columns = cols;
-        }
+    let need_cols = board.columns.is_empty();
+    let (cols_opt, sprints, issues) = if let Some(sid) = sprint_id {
+        let (cols_res, sprints_res, issues_res) = tokio::join!(
+            async {
+                if need_cols {
+                    client.get_board_columns(board.id).await.ok()
+                } else {
+                    None
+                }
+            },
+            client.list_board_sprints(board.id),
+            sync::load_board_issues_for_site(&client, &storage, site_id, board.id, Some(sid)),
+        );
+        let sprints = sprints_res.unwrap_or_default();
+        let _ = storage.upsert_sprints_for_site(site_id, &sprints);
+        (cols_res, sprints, issues_res?)
+    } else {
+        let (cols_res, sprints_res) = tokio::join!(
+            async {
+                if need_cols {
+                    client.get_board_columns(board.id).await.ok()
+                } else {
+                    None
+                }
+            },
+            client.list_board_sprints(board.id),
+        );
+        let sprints = sprints_res.unwrap_or_default();
+        let _ = storage.upsert_sprints_for_site(site_id, &sprints);
+        let active_id = sprints
+            .iter()
+            .find(|s| s.state.eq_ignore_ascii_case("active"))
+            .map(|s| s.id);
+        let issues =
+            sync::load_board_issues_for_site(&client, &storage, site_id, board.id, active_id)
+                .await?;
+        (cols_res, sprints, issues)
+    };
+    if let Some(cols) = cols_opt {
+        board.columns = cols;
     }
-
-    let sprints = client.list_board_sprints(board.id).await.unwrap_or_default();
-    let _ = storage.upsert_sprints_for_site(site_id, &sprints);
 
     let active_sprint = if let Some(sid) = sprint_id {
         sprints.iter().find(|s| s.id == sid).cloned()
@@ -4824,11 +4858,6 @@ async fn cmd_board(
             .find(|s| s.state.eq_ignore_ascii_case("active"))
             .cloned()
     };
-
-    let chosen_sprint_id = sprint_id.or_else(|| active_sprint.as_ref().map(|s| s.id));
-    let issues =
-        sync::load_board_issues_for_site(&client, &storage, site_id, board.id, chosen_sprint_id)
-            .await?;
 
     if json_out {
         println!(
@@ -5181,8 +5210,10 @@ async fn dispatch_jira_workflow(cfg: &AppConfig, command: JiraWorkflow) -> Resul
             let link = client
                 .create_issue_link(&inward_key, &outward_key, &link_type)
                 .await?;
-            refresh_cli_issue_cache(&client, &storage, &inward_key).await;
-            refresh_cli_issue_cache(&client, &storage, &outward_key).await;
+            tokio::join!(
+                refresh_cli_issue_cache(&client, &storage, &inward_key),
+                refresh_cli_issue_cache(&client, &storage, &outward_key),
+            );
             (
                 json!({"ok": true, "site_id": site_id, "link": link}),
                 json,
@@ -5198,9 +5229,11 @@ async fn dispatch_jira_workflow(cfg: &AppConfig, command: JiraWorkflow) -> Resul
             json,
         } => {
             let confirmed = client.move_issues_to_sprint(sprint_id, &keys).await?;
-            for key in &confirmed {
-                refresh_cli_issue_cache(&client, &storage, key).await;
-            }
+            stream::iter(&confirmed)
+                .map(|key| refresh_cli_issue_cache(&client, &storage, key))
+                .buffer_unordered(4)
+                .for_each(|()| async {})
+                .await;
             (
                 json!({"ok": true, "site_id": site_id, "sprint_id": sprint_id, "issue_keys": confirmed}),
                 json,
@@ -5456,7 +5489,17 @@ async fn cmd_issue_assign(
 async fn cmd_issue_comment(cfg: &AppConfig, key: &str, body: &str, json_out: bool) -> Result<()> {
     let (_auth, client, storage) = open_runtime(cfg, true)?;
     let comment = client.add_issue_comment(key, body).await?;
-    refresh_cli_issue_cache(&client, &storage, key).await;
+    let site_id = client.site_id();
+    if storage
+        .get_issue_detail_for_site(site_id, key)
+        .ok()
+        .flatten()
+        .is_some()
+    {
+        let _ = storage.append_issue_comment_for_site(site_id, key, &comment);
+    } else {
+        refresh_cli_issue_cache(&client, &storage, key).await;
+    }
     if json_out {
         println!(
             "{}",
@@ -5471,7 +5514,18 @@ async fn cmd_issue_comment(cfg: &AppConfig, key: &str, body: &str, json_out: boo
 async fn cmd_issue_attach(cfg: &AppConfig, key: &str, file: &Path, json_out: bool) -> Result<()> {
     let (_auth, client, storage) = open_runtime(cfg, true)?;
     let uploaded = client.upload_issue_attachment(key, file).await?;
-    refresh_cli_issue_cache(&client, &storage, key).await;
+    let site_id = client.site_id();
+    if !uploaded.is_empty()
+        && storage
+            .get_issue_detail_for_site(site_id, key)
+            .ok()
+            .flatten()
+            .is_some()
+    {
+        let _ = storage.append_issue_attachments_for_site(site_id, key, &uploaded);
+    } else {
+        refresh_cli_issue_cache(&client, &storage, key).await;
+    }
     if json_out {
         println!(
             "{}",
@@ -5491,8 +5545,8 @@ async fn cmd_issue_download(
     json_out: bool,
 ) -> Result<()> {
     let (_auth, client, _storage) = open_runtime(cfg, true)?;
-    let detail = client.get_issue(key).await?;
-    let attachment = select_attachment(&detail.attachments, attachment_id)
+    let attachments = client.list_issue_attachments(key).await?;
+    let attachment = select_attachment(&attachments, attachment_id)
         .with_context(|| format!("No attachment found to download on issue {key}."))?;
     let dest_dir = dir
         .map(Path::to_path_buf)
@@ -6041,7 +6095,17 @@ async fn cmd_page_comment(
 ) -> Result<()> {
     let (_auth, client, storage) = open_runtime(cfg, true)?;
     let comment = client.add_page_comment(page_id, body).await?;
-    refresh_cli_page_cache(&client, &storage, page_id).await;
+    let site_id = client.site_id();
+    if storage
+        .get_page_detail_for_site(site_id, page_id)
+        .ok()
+        .flatten()
+        .is_some()
+    {
+        let _ = storage.append_page_comment_for_site(site_id, page_id, &comment);
+    } else {
+        refresh_cli_page_cache(&client, &storage, page_id).await;
+    }
     if json_out {
         println!(
             "{}",
@@ -6061,7 +6125,18 @@ async fn cmd_page_attach(
 ) -> Result<()> {
     let (_auth, client, storage) = open_runtime(cfg, true)?;
     let uploaded = client.upload_page_attachment(page_id, file).await?;
-    refresh_cli_page_cache(&client, &storage, page_id).await;
+    let site_id = client.site_id();
+    if !uploaded.is_empty()
+        && storage
+            .get_page_detail_for_site(site_id, page_id)
+            .ok()
+            .flatten()
+            .is_some()
+    {
+        let _ = storage.append_page_attachments_for_site(site_id, page_id, &uploaded);
+    } else {
+        refresh_cli_page_cache(&client, &storage, page_id).await;
+    }
     if json_out {
         println!(
             "{}",
@@ -6085,8 +6160,8 @@ async fn cmd_page_download(
     json_out: bool,
 ) -> Result<()> {
     let (_auth, client, _storage) = open_runtime(cfg, true)?;
-    let detail = client.get_page(page_id).await?;
-    let attachment = select_attachment(&detail.attachments, attachment_id)
+    let attachments = client.list_page_attachments(page_id).await?;
+    let attachment = select_attachment(&attachments, attachment_id)
         .with_context(|| format!("No attachment found to download on page {page_id}."))?;
     let dest_dir = dir
         .map(Path::to_path_buf)
@@ -6249,9 +6324,9 @@ async fn cmd_preview(
 ) -> Result<()> {
     let (_auth, client, _storage) = open_runtime(cfg, true)?;
     let attachments = if looks_like_jira_key(target_id_or_key) {
-        client.get_issue(target_id_or_key).await?.attachments
+        client.list_issue_attachments(target_id_or_key).await?
     } else {
-        client.get_page(target_id_or_key).await?.attachments
+        client.list_page_attachments(target_id_or_key).await?
     };
 
     let selected = if let Some(aid) = attachment_id {

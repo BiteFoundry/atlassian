@@ -4,7 +4,10 @@
 use std::{
     collections::HashMap,
     path::PathBuf,
-    sync::{Arc, OnceLock, RwLock},
+    sync::{
+        atomic::AtomicBool,
+        Arc, OnceLock, RwLock,
+    },
     time::Duration,
 };
 
@@ -521,6 +524,9 @@ pub struct AtlassianClient {
     pub(crate) confluence_auth: Option<AuthManager>,
     pub(crate) me_cache: Arc<RwLock<Option<UserSummary>>>,
     pub(crate) space_id_cache: Arc<RwLock<HashMap<String, (String, String)>>>,
+    /// Remembers per client when Cloud `/rest/api/3/project/search` returned 404/405/400 so
+    /// subsequent `list_projects` calls go straight to `/rest/api/3/project`.
+    pub(crate) project_search_fallback: Arc<AtomicBool>,
     pub(crate) site_id: String,
     pub(crate) cloud_id: Option<String>,
     pub(crate) api_gateway_base: String,
@@ -543,6 +549,7 @@ impl AtlassianClient {
             confluence_auth: None,
             me_cache: Arc::new(RwLock::new(None)),
             space_id_cache: Arc::new(RwLock::new(HashMap::new())),
+            project_search_fallback: Arc::new(AtomicBool::new(false)),
             site_id,
             cloud_id: None,
             api_gateway_base: DEFAULT_OAUTH_API_BASE.to_string(),
@@ -601,6 +608,7 @@ impl AtlassianClient {
             confluence_auth: None,
             me_cache: Arc::new(RwLock::new(None)),
             space_id_cache: Arc::new(RwLock::new(HashMap::new())),
+            project_search_fallback: Arc::new(AtomicBool::new(false)),
             site_id: if site.id.trim().is_empty() {
                 "default".to_string()
             } else {
@@ -835,28 +843,42 @@ impl AtlassianClient {
         Ok(me)
     }
 
+    /// Returns the cached signed-in Jira user for this client if already fetched, otherwise
+    /// queries `/myself` and caches the verified identity.
+    pub async fn get_myself_cached(&self) -> Result<UserSummary> {
+        if let Some(me) = self.cached_me().filter(|u| !u.id.trim().is_empty()) {
+            return Ok(me);
+        }
+        self.get_myself().await
+    }
+
     /// Asks Jira and Confluence separately who the credential belongs to. Jira is probed
     /// when a site URL is configured, Confluence when a Confluence root resolves. A failure
     /// on one product is recorded, never fatal by itself.
     pub async fn probe_identity(&self) -> IdentityProbe {
-        let jira = if normalize_base_url(self.site_url()).is_empty() {
-            None
-        } else {
-            Some(
-                self.get_myself()
-                    .await
-                    .map_err(|err| ProbeFailure::from_error(&err)),
-            )
+        let jira_fut = async {
+            if normalize_base_url(self.site_url()).is_empty() {
+                None
+            } else {
+                Some(
+                    self.get_myself()
+                        .await
+                        .map_err(|err| ProbeFailure::from_error(&err)),
+                )
+            }
         };
-        let confluence = if self.confluence_root_url().trim().is_empty() {
-            None
-        } else {
-            Some(
-                self.get_confluence_current_user()
-                    .await
-                    .map_err(|err| ProbeFailure::from_error(&err)),
-            )
+        let confluence_fut = async {
+            if self.confluence_root_url().trim().is_empty() {
+                None
+            } else {
+                Some(
+                    self.get_confluence_current_user()
+                        .await
+                        .map_err(|err| ProbeFailure::from_error(&err)),
+                )
+            }
         };
+        let (jira, confluence) = tokio::join!(jira_fut, confluence_fut);
         IdentityProbe { jira, confluence }
     }
 
@@ -2965,5 +2987,110 @@ AiA+cNCCx29pol4ocp9J/G0R/45YiLiv6VdSopzRWi3hcw==\n\
         assert_eq!(b.confluence_credential_account(), Some("b-wiki"));
         // The stored Confluence account can never pick up a stray ATLASSIAN_PAT.
         assert_eq!(b.confluence_auth().env_policy(), EnvCredentialPolicy::Never);
+    }
+
+    #[tokio::test]
+    async fn probe_identity_queries_jira_and_confluence_concurrently() {
+        use axum::{routing::get, Json, Router};
+        use tokio::{net::TcpListener, sync::Barrier};
+
+        let barrier = Arc::new(Barrier::new(2));
+        let b1 = barrier.clone();
+        let b2 = barrier.clone();
+        let app = Router::new()
+            .route(
+                "/rest/api/3/myself",
+                get(move || {
+                    let b = b1.clone();
+                    async move {
+                        b.wait().await;
+                        Json(json!({ "accountId": "acc-1", "displayName": "Alice" }))
+                    }
+                }),
+            )
+            .route(
+                "/wiki/rest/api/user/current",
+                get(move || {
+                    let b = b2.clone();
+                    async move {
+                        b.wait().await;
+                        Json(json!({ "accountId": "acc-1", "displayName": "Alice" }))
+                    }
+                }),
+            );
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base_url = format!("http://{}", listener.local_addr().unwrap());
+        let srv = tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+
+        let auth = AuthManager::with_credentials(
+            "probe-par",
+            StoredCredentials::ApiToken {
+                site_url: base_url.clone(),
+                email: "alice@example.com".into(),
+                api_token: "tok".into(),
+                deployment: DeploymentKind::Cloud,
+            },
+        );
+        let client = AtlassianClient::with_base_urls(
+            &base_url,
+            format!("{base_url}/wiki"),
+            DeploymentKind::Cloud,
+            auth,
+        )
+        .unwrap();
+
+        let probe = tokio::time::timeout(Duration::from_secs(3), client.probe_identity())
+            .await
+            .expect("probe_identity must overlap Jira and Confluence requests");
+        assert_eq!(probe.jira.unwrap().unwrap().id, "acc-1");
+        assert_eq!(probe.confluence.unwrap().unwrap().id, "acc-1");
+        srv.abort();
+    }
+
+    #[tokio::test]
+    async fn get_myself_cached_reuses_verified_identity_across_calls() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use axum::{routing::get, Json, Router};
+        use tokio::net::TcpListener;
+
+        let hits = Arc::new(AtomicUsize::new(0));
+        let h = hits.clone();
+        let app = Router::new().route(
+            "/rest/api/3/myself",
+            get(move || {
+                let h = h.clone();
+                async move {
+                    h.fetch_add(1, Ordering::SeqCst);
+                    Json(json!({ "accountId": "acc-cached", "displayName": "Cached User" }))
+                }
+            }),
+        );
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base_url = format!("http://{}", listener.local_addr().unwrap());
+        let srv = tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+
+        let auth = AuthManager::with_credentials(
+            "me-cache",
+            StoredCredentials::ApiToken {
+                site_url: base_url.clone(),
+                email: "alice@example.com".into(),
+                api_token: "tok".into(),
+                deployment: DeploymentKind::Cloud,
+            },
+        );
+        let client =
+            AtlassianClient::with_base_urls(&base_url, "", DeploymentKind::Cloud, auth).unwrap();
+        let cloned = client.clone();
+
+        let first = client.get_myself_cached().await.unwrap();
+        let second = cloned.get_myself_cached().await.unwrap();
+        assert_eq!(first.id, "acc-cached");
+        assert_eq!(second.id, "acc-cached");
+        assert_eq!(hits.load(Ordering::SeqCst), 1);
+        srv.abort();
     }
 }

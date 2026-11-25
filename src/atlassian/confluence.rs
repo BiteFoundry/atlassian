@@ -3,6 +3,7 @@
 use std::collections::{HashMap, HashSet};
 
 use anyhow::{bail, Context, Result};
+use futures::{stream, StreamExt};
 use regex::Regex;
 use serde_json::{json, Map, Value};
 
@@ -495,68 +496,83 @@ impl AtlassianClient {
                     validate_source_version(&val)?;
                 }
 
-                let (labels, labels_ok, labels_more) = match self
-                    .get_json::<Value>(&format!(
-                        "{conf_root}/api/v2/pages/{encoded_id}/labels?limit=250"
-                    ))
-                    .await
-                {
-                    Ok(v) => (
-                        v.get("results")
-                            .and_then(|r| r.as_array())
-                            .map(|arr| {
-                                arr.iter()
-                                    .filter_map(|l| {
-                                        l.get("name").and_then(|n| n.as_str()).map(str::to_string)
-                                    })
-                                    .collect()
-                            })
-                            .unwrap_or_default(),
-                        true,
-                        v.pointer("/_links/next").and_then(Value::as_str).is_some(),
-                    ),
-                    Err(_) => (Vec::new(), false, false),
-                };
+                let labels_fut = Box::pin(async {
+                    match self
+                        .get_json::<Value>(&format!(
+                            "{conf_root}/api/v2/pages/{encoded_id}/labels?limit=250"
+                        ))
+                        .await
+                    {
+                        Ok(v) => (
+                            v.get("results")
+                                .and_then(|r| r.as_array())
+                                .map(|arr| {
+                                    arr.iter()
+                                        .filter_map(|l| {
+                                            l.get("name").and_then(|n| n.as_str()).map(str::to_string)
+                                        })
+                                        .collect()
+                                })
+                                .unwrap_or_default(),
+                            true,
+                            v.pointer("/_links/next").and_then(Value::as_str).is_some(),
+                        ),
+                        Err(_) => (Vec::new(), false, false),
+                    }
+                });
 
-                let (attachments, attachments_ok, attachments_more) = match self
-                    .get_json::<Value>(&format!(
-                        "{conf_root}/api/v2/pages/{encoded_id}/attachments?limit=250"
-                    ))
-                    .await
-                {
-                    Ok(v) => (
-                        v.get("results")
-                            .and_then(|r| r.as_array())
-                            .map(|arr| {
-                                arr.iter()
-                                    .map(|a| parse_attachment_item(a, &conf_root))
-                                    .collect()
-                            })
-                            .unwrap_or_default(),
-                        true,
-                        v.pointer("/_links/next").and_then(Value::as_str).is_some(),
-                    ),
-                    Err(_) => (Vec::new(), false, false),
-                };
+                let attachments_fut = Box::pin(async {
+                    match self
+                        .get_json::<Value>(&format!(
+                            "{conf_root}/api/v2/pages/{encoded_id}/attachments?limit=250"
+                        ))
+                        .await
+                    {
+                        Ok(v) => (
+                            v.get("results")
+                                .and_then(|r| r.as_array())
+                                .map(|arr| {
+                                    arr.iter()
+                                        .map(|a| parse_attachment_item(a, &conf_root))
+                                        .collect()
+                                })
+                                .unwrap_or_default(),
+                            true,
+                            v.pointer("/_links/next").and_then(Value::as_str).is_some(),
+                        ),
+                        Err(_) => (Vec::new(), false, false),
+                    }
+                });
 
-                let (comments, comments_ok, comments_more) =
+                let comments_fut = Box::pin(async {
                     match self.list_page_comments_page(page_id).await {
                         Ok((c, more)) => (c, true, more),
                         Err(_) => (Vec::new(), false, false),
-                    };
-                let (ancestors, ancestors_ok) = if require_native_body
-                    || summary
+                    }
+                });
+
+                let need_ancestors = !require_native_body
+                    && !summary
                         .parent_id
                         .as_deref()
                         .map(str::trim)
                         .unwrap_or("")
-                        .is_empty()
-                {
-                    (Vec::new(), true)
-                } else {
-                    self.fetch_cloud_page_ancestors(&conf_root, page_id.trim(), title_cache)
-                        .await
-                };
+                        .is_empty();
+                let ancestors_fut = Box::pin(async {
+                    if !need_ancestors {
+                        (Vec::new(), true)
+                    } else {
+                        self.fetch_cloud_page_ancestors(&conf_root, page_id.trim(), title_cache)
+                            .await
+                    }
+                });
+
+                let (
+                    (labels, labels_ok, labels_more),
+                    (attachments, attachments_ok, attachments_more),
+                    (comments, comments_ok, comments_more),
+                    (ancestors, ancestors_ok),
+                ) = tokio::join!(labels_fut, attachments_fut, comments_fut, ancestors_fut);
                 let body_markdown = blocks_to_markdown(&blocks);
                 let toc = extract_toc(&blocks);
                 let linked_issue_keys = extract_linked_issue_keys(&blocks, &body_raw);
@@ -601,7 +617,11 @@ impl AtlassianClient {
                 let url = format!(
                     "{conf_root}/rest/api/content/{encoded_id}?expand=body.storage,version,space,ancestors,metadata.labels,children.attachment"
                 );
-                let val: Value = self.get_json(&url).await?;
+                let (val_res, comments_res) = tokio::join!(
+                    Box::pin(self.get_json::<Value>(&url)),
+                    Box::pin(self.list_page_comments_page(page_id)),
+                );
+                let val: Value = val_res?;
                 let summary = parse_dc_page_summary(&val, &conf_root);
                 if require_native_body {
                     validate_source_version(&val)?;
@@ -661,11 +681,10 @@ impl AtlassianClient {
                 let body_markdown = blocks_to_markdown(&blocks);
                 let toc = extract_toc(&blocks);
                 let linked_issue_keys = extract_linked_issue_keys(&blocks, &body_raw);
-                let (comments, comments_ok, comments_more) =
-                    match self.list_page_comments_page(page_id).await {
-                        Ok((c, more)) => (c, true, more),
-                        Err(_) => (Vec::new(), false, false),
-                    };
+                let (comments, comments_ok, comments_more) = match comments_res {
+                    Ok((c, more)) => (c, true, more),
+                    Err(_) => (Vec::new(), false, false),
+                };
                 let mut incomplete = Vec::new();
                 if labels_more {
                     incomplete.push("labels".to_string());
@@ -818,16 +837,36 @@ impl AtlassianClient {
             _ => HashMap::new(),
         };
 
+        const ANCESTOR_TITLE_CONCURRENCY: usize = 4;
+        let to_fetch: Vec<(String, String)> = deduped
+            .iter()
+            .filter(|item| item.inline_title.is_empty() && !cached_titles.contains_key(&item.id))
+            .map(|item| (item.id.clone(), item.kind.clone()))
+            .collect();
+        let fetched_titles: HashMap<String, String> = if to_fetch.is_empty() {
+            HashMap::new()
+        } else {
+            stream::iter(to_fetch)
+                .map(|(id, kind)| async move {
+                    let fetched = self.fetch_cloud_ancestor_title(conf_root, &id, &kind).await;
+                    (id, fetched)
+                })
+                .buffer_unordered(ANCESTOR_TITLE_CONCURRENCY)
+                .filter_map(|(id, title)| async move { title.map(|t| (id, t)) })
+                .collect()
+                .await
+        };
+
         let mut ancestors = Vec::with_capacity(deduped.len());
         for item in deduped {
             let title = if !item.inline_title.is_empty() {
                 item.inline_title
             } else if let Some(cached) = cached_titles.get(&item.id) {
                 cached.clone()
+            } else if let Some(fetched) = fetched_titles.get(&item.id) {
+                fetched.clone()
             } else {
-                self.fetch_cloud_ancestor_title(conf_root, &item.id, &item.kind)
-                    .await
-                    .unwrap_or_else(|| item.id.clone())
+                item.id.clone()
             };
             ancestors.push(PageAncestor { id: item.id, title });
         }
@@ -2423,5 +2462,181 @@ mod tests {
                 .contains("Confluence space 'NOPE' not found."),
             "{missing_err}"
         );
+    }
+
+    #[tokio::test]
+    async fn cloud_fetch_page_loads_subresources_and_ancestor_titles_concurrently() {
+        use std::time::Duration;
+        use tokio::sync::Barrier;
+
+        let sub_barrier = Arc::new(Barrier::new(4));
+        let anc_barrier = Arc::new(Barrier::new(3));
+        let b_labels = sub_barrier.clone();
+        let b_atts = sub_barrier.clone();
+        let b_comments = sub_barrier.clone();
+        let b_ancs = sub_barrier.clone();
+        let a10 = anc_barrier.clone();
+        let a20 = anc_barrier.clone();
+        let a30 = anc_barrier.clone();
+
+        let app = Router::new()
+            .route(
+                "/wiki/api/v2/pages/500",
+                get(|| async {
+                    Json(json!({
+                        "id": "500",
+                        "spaceId": "101",
+                        "spaceKey": "ENG",
+                        "parentId": "30",
+                        "title": "Leaf",
+                        "status": "current",
+                        "version": { "number": 2 },
+                        "body": {
+                            "atlas_doc_format": {
+                                "representation": "atlas_doc_format",
+                                "value": "{\"type\":\"doc\",\"version\":1,\"content\":[{\"type\":\"paragraph\",\"content\":[{\"type\":\"text\",\"text\":\"Hello\"}]}]}"
+                            }
+                        }
+                    }))
+                }),
+            )
+            .route(
+                "/wiki/api/v2/pages/500/labels",
+                get(move || {
+                    let b = b_labels.clone();
+                    async move {
+                        b.wait().await;
+                        Json(json!({ "results": [{ "name": "runbook" }] }))
+                    }
+                }),
+            )
+            .route(
+                "/wiki/api/v2/pages/500/attachments",
+                get(move || {
+                    let b = b_atts.clone();
+                    async move {
+                        b.wait().await;
+                        Json(json!({ "results": [] }))
+                    }
+                }),
+            )
+            .route(
+                "/wiki/api/v2/pages/500/footer-comments",
+                get(move || {
+                    let b = b_comments.clone();
+                    async move {
+                        b.wait().await;
+                        Json(json!({ "results": [] }))
+                    }
+                }),
+            )
+            .route(
+                "/wiki/api/v2/pages/500/ancestors",
+                get(move || {
+                    let b = b_ancs.clone();
+                    async move {
+                        b.wait().await;
+                        Json(json!({
+                            "results": [
+                                { "id": "10", "type": "page" },
+                                { "id": "20", "type": "page" },
+                                { "id": "30", "type": "page" }
+                            ]
+                        }))
+                    }
+                }),
+            )
+            .route(
+                "/wiki/api/v2/pages/10",
+                get(move || {
+                    let b = a10.clone();
+                    async move {
+                        b.wait().await;
+                        Json(json!({ "id": "10", "title": "Root" }))
+                    }
+                }),
+            )
+            .route(
+                "/wiki/api/v2/pages/20",
+                get(move || {
+                    let b = a20.clone();
+                    async move {
+                        b.wait().await;
+                        Json(json!({ "id": "20", "title": "Middle" }))
+                    }
+                }),
+            )
+            .route(
+                "/wiki/api/v2/pages/30",
+                get(move || {
+                    let b = a30.clone();
+                    async move {
+                        b.wait().await;
+                        Json(json!({ "id": "30", "title": "Parent" }))
+                    }
+                }),
+            );
+
+        let base_url = spawn_router(app).await;
+        let client = make_client(&base_url, &format!("{base_url}/wiki"), DeploymentKind::Cloud);
+        let (detail, meta) =
+            tokio::time::timeout(Duration::from_secs(3), client.get_page_with_meta("500"))
+                .await
+                .expect("Cloud fetch_page must overlap subresources and ancestor title fetches")
+                .unwrap();
+        assert!(meta.labels_ok && meta.attachments_ok && meta.comments_ok && meta.ancestors_ok);
+        assert_eq!(detail.labels, vec!["runbook".to_string()]);
+        let titles: Vec<&str> = detail.ancestors.iter().map(|a| a.title.as_str()).collect();
+        assert_eq!(titles, vec!["Root", "Middle", "Parent"]);
+    }
+
+    #[tokio::test]
+    async fn dc_fetch_page_loads_content_and_comments_concurrently() {
+        use std::time::Duration;
+        use tokio::sync::Barrier;
+
+        let barrier = Arc::new(Barrier::new(2));
+        let b1 = barrier.clone();
+        let b2 = barrier.clone();
+        let app = Router::new()
+            .route(
+                "/rest/api/content/701",
+                get(move || {
+                    let b = b1.clone();
+                    async move {
+                        b.wait().await;
+                        Json(json!({
+                            "id": "701",
+                            "type": "page",
+                            "title": "DC Page",
+                            "space": { "id": 1, "key": "ENG" },
+                            "version": { "number": 3 },
+                            "body": { "storage": { "value": "<p>DC body</p>" } },
+                            "metadata": { "labels": { "results": [] } },
+                            "children": { "attachment": { "results": [] } }
+                        }))
+                    }
+                }),
+            )
+            .route(
+                "/rest/api/content/701/child/comment",
+                get(move || {
+                    let b = b2.clone();
+                    async move {
+                        b.wait().await;
+                        Json(json!({ "results": [] }))
+                    }
+                }),
+            );
+
+        let base_url = spawn_router(app).await;
+        let client = make_client(&base_url, &base_url, DeploymentKind::DataCenter);
+        let (detail, meta) =
+            tokio::time::timeout(Duration::from_secs(3), client.get_page_with_meta("701"))
+                .await
+                .expect("DC fetch_page must overlap content and comments requests")
+                .unwrap();
+        assert_eq!(detail.summary.title, "DC Page");
+        assert!(meta.comments_ok);
     }
 }

@@ -1098,7 +1098,7 @@ async fn create_issue(
     let (assignee_id, raw_assignee) = match body.assignee_id.as_deref().map(str::trim) {
         None | Some("") => (None, None),
         Some(raw) if raw.eq_ignore_ascii_case("me") => {
-            let me = client.get_myself().await?;
+            let me = client.get_myself_cached().await?;
             (Some(me.id), None)
         }
         Some(raw) => (Some(raw.to_string()), Some(raw.to_string())),
@@ -1251,7 +1251,7 @@ async fn patch_issue(
                 patch.assignee_id = Some(None);
                 None
             } else if trimmed.eq_ignore_ascii_case("me") {
-                let me = client.get_myself().await?;
+                let me = client.get_myself_cached().await?;
                 patch.assignee_id = Some(Some(me.id));
                 None
             } else {
@@ -1377,7 +1377,7 @@ async fn assign_issue(
     let (mut resolved, raw_assignee) = match body.assignee_id.as_deref().map(str::trim) {
         None | Some("") => (None, None),
         Some(raw) if raw.eq_ignore_ascii_case("me") => {
-            let me = client.get_myself().await?;
+            let me = client.get_myself_cached().await?;
             (Some(me.id), None)
         }
         Some(raw) => (Some(raw.to_string()), Some(raw.to_string())),
@@ -1441,7 +1441,19 @@ async fn add_issue_comment(
     let comment = client
         .add_issue_comment(key, &body.body_markdown)
         .await?;
-    refresh_issue_cache_after_write(&client, &state.storage, &target_site, key).await;
+    if state
+        .storage
+        .get_issue_detail_for_site(&target_site, key)
+        .ok()
+        .flatten()
+        .is_some()
+    {
+        let _ = state
+            .storage
+            .append_issue_comment_for_site(&target_site, key, &comment);
+    } else {
+        refresh_issue_cache_after_write(&client, &state.storage, &target_site, key).await;
+    }
     Ok(Json(json!({ "ok": true, "site_id": target_site, "comment": comment })))
 }
 
@@ -1718,7 +1730,19 @@ async fn add_page_comment(
     let comment = client
         .add_page_comment(id, &body.body_markdown)
         .await?;
-    refresh_page_cache_after_write(&client, &state.storage, &target_site, id).await;
+    if state
+        .storage
+        .get_page_detail_for_site(&target_site, id)
+        .ok()
+        .flatten()
+        .is_some()
+    {
+        let _ = state
+            .storage
+            .append_page_comment_for_site(&target_site, id, &comment);
+    } else {
+        refresh_page_cache_after_write(&client, &state.storage, &target_site, id).await;
+    }
     Ok(Json(json!({ "ok": true, "site_id": target_site, "comment": comment })))
 }
 
@@ -1768,13 +1792,32 @@ async fn search(
         let (target_site, client) = resolve_site_client(&state, query.site.as_deref())?;
         let target_name = site_name_lookup(&state.config, &target_site);
         let mut combined = Vec::new();
-        if scope == "all" || scope == "jira" {
+        let want_jira = scope == "all" || scope == "jira";
+        let want_conf = scope == "all" || scope == "confluence";
+        let jira_fut = async {
+            if !want_jira {
+                return Ok(None);
+            }
             let jql = if looks_like_jql_expr(q) {
                 q.to_string()
             } else {
                 format!("text ~ \"{}\"", escape_jql_str(q))
             };
-            let page = client.search_issues_jql(&jql, limit, None, None).await?;
+            client.search_issues_jql(&jql, limit, None, None).await.map(Some)
+        };
+        let conf_fut = async {
+            if !want_conf {
+                return Ok(None);
+            }
+            let cql = if looks_like_cql_expr(q) {
+                q.to_string()
+            } else {
+                format!("text ~ \"{}\"", escape_jql_str(q))
+            };
+            client.search_confluence_cql(&cql, limit).await.map(Some)
+        };
+        let (jira_res, conf_res) = tokio::join!(jira_fut, conf_fut);
+        if let Some(page) = jira_res? {
             let _ = state
                 .storage
                 .upsert_issues_for_site(&target_site, &page.issues);
@@ -1782,13 +1825,7 @@ async fn search(
                 FederatedSearchHit::new(target_site.clone(), target_name.clone(), issue_to_hit(i))
             }));
         }
-        if scope == "all" || scope == "confluence" {
-            let cql = if looks_like_cql_expr(q) {
-                q.to_string()
-            } else {
-                format!("text ~ \"{}\"", escape_jql_str(q))
-            };
-            let pages = client.search_confluence_cql(&cql, limit).await?;
+        if let Some(pages) = conf_res? {
             let _ = state.storage.upsert_pages_for_site(&target_site, &pages);
             combined.extend(pages.iter().map(|p| {
                 FederatedSearchHit::new(target_site.clone(), target_name.clone(), page_to_hit(p))
@@ -2581,5 +2618,168 @@ mod tests {
         assert_eq!(res.status(), StatusCode::OK);
         let jira_search: Value = res.json().await.unwrap();
         assert_eq!(jira_search["hits"][0]["id_or_key"], "ENG-42");
+    }
+
+    #[tokio::test]
+    async fn remote_search_all_overlaps_jira_and_confluence_and_cached_comment_avoids_refetch() {
+        use std::{
+            sync::atomic::{AtomicUsize, Ordering},
+            time::Duration,
+        };
+        use tokio::sync::Barrier;
+
+        let search_barrier = Arc::new(Barrier::new(2));
+        let b_jira = search_barrier.clone();
+        let b_conf = search_barrier.clone();
+        let issue_get_hits = Arc::new(AtomicUsize::new(0));
+        let igh = issue_get_hits.clone();
+
+        let upstream = Router::new()
+            .route(
+                "/rest/api/3/search/jql",
+                post(move || {
+                    let b = b_jira.clone();
+                    async move {
+                        b.wait().await;
+                        Json(json!({
+                            "issues": [{
+                                "id": "42",
+                                "key": "ENG-42",
+                                "fields": {
+                                    "project": { "key": "ENG" },
+                                    "summary": "Deploy fix",
+                                    "status": { "id": "1", "name": "In Progress", "statusCategory": { "key": "indeterminate" } },
+                                    "issuetype": { "id": "10", "name": "Task", "subtask": false },
+                                    "updated": "2026-11-20T10:00:00.000+0000"
+                                }
+                            }]
+                        }))
+                    }
+                }),
+            )
+            .route(
+                "/wiki/rest/api/search",
+                get(move || {
+                    let b = b_conf.clone();
+                    async move {
+                        b.wait().await;
+                        Json(json!({
+                            "results": [{
+                                "content": {
+                                    "id": "9001",
+                                    "type": "page",
+                                    "title": "Deploy Runbook",
+                                    "space": { "key": "ENG" },
+                                    "version": { "number": 2, "when": "2026-11-20T11:00:00.000Z" }
+                                }
+                            }]
+                        }))
+                    }
+                }),
+            )
+            .route(
+                "/rest/api/3/issue/ENG-42/comment",
+                post(|| async {
+                    Json(json!({
+                        "id": "cmt-9",
+                        "author": { "accountId": "acc-1", "displayName": "Alice" },
+                        "body": {
+                            "type": "doc",
+                            "version": 1,
+                            "content": [{ "type": "paragraph", "content": [{ "type": "text", "text": "LGTM" }] }]
+                        },
+                        "created": "2026-11-20T12:00:00.000+0000"
+                    }))
+                }),
+            )
+            .route(
+                "/rest/api/3/issue/ENG-42",
+                get(move || {
+                    let igh = igh.clone();
+                    async move {
+                        igh.fetch_add(1, Ordering::SeqCst);
+                        StatusCode::INTERNAL_SERVER_ERROR
+                    }
+                }),
+            );
+
+        let up_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let up_base = format!("http://{}", up_listener.local_addr().unwrap());
+        let up_srv = tokio::spawn(async move {
+            let _ = axum::serve(up_listener, upstream).await;
+        });
+
+        let mut cfg = AppConfig::default();
+        cfg.site_url = up_base.clone();
+        cfg.confluence_url = format!("{up_base}/wiki");
+        let auth = AuthManager::with_credentials(
+            "serve-par",
+            crate::auth::StoredCredentials::ApiToken {
+                site_url: up_base.clone(),
+                email: "alice@example.com".into(),
+                api_token: "tok".into(),
+                deployment: DeploymentKind::Cloud,
+            },
+        );
+        let client = AtlassianClient::new(cfg.clone(), auth.clone()).unwrap();
+        let storage = Storage::open_in_memory().unwrap();
+        // Pre-cache ENG-42 detail so posting a comment appends locally without extra GET.
+        storage
+            .upsert_issue_detail_for_site(
+                "default",
+                &crate::models::IssueDetail {
+                    summary: IssueSummary {
+                        id: "42".into(),
+                        key: "ENG-42".into(),
+                        project_key: "ENG".into(),
+                        summary: "Deploy fix".into(),
+                        ..Default::default()
+                    },
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+
+        let router = build_router(cfg, client, storage.clone(), ServeOptions::default());
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let api_srv = tokio::spawn(async move {
+            let _ = axum::serve(listener, router).await;
+        });
+
+        let http = reqwest::Client::new();
+        let search_res = tokio::time::timeout(
+            Duration::from_secs(3),
+            http.get(format!("{base}/search?q=Deploy&scope=all&remote=true"))
+                .send(),
+        )
+        .await
+        .expect("remote search scope=all must overlap Jira and Confluence requests")
+        .unwrap();
+        assert_eq!(search_res.status(), StatusCode::OK);
+        let body: Value = search_res.json().await.unwrap();
+        assert_eq!(body["hits"].as_array().unwrap().len(), 2);
+
+        let cmt_res = http
+            .post(format!("{base}/issues/ENG-42/comments"))
+            .json(&json!({ "body_markdown": "LGTM" }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(cmt_res.status(), StatusCode::OK);
+        assert_eq!(
+            issue_get_hits.load(Ordering::SeqCst),
+            0,
+            "commenting on a cached issue must append to SQLite without refetching full issue"
+        );
+        let cached = storage
+            .get_issue_detail_for_site("default", "ENG-42")
+            .unwrap()
+            .unwrap();
+        assert_eq!(cached.comments.len(), 1);
+        assert_eq!(cached.comments[0].id, "cmt-9");
+
+        api_srv.abort();
+        up_srv.abort();
     }
 }

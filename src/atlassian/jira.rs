@@ -1,6 +1,9 @@
 //! Jira Platform REST API (Cloud v3 `/rest/api/3/search/jql` + ADF, Data Center v2 `/rest/api/2/search` + Wiki Markup).
 
-use std::collections::HashSet;
+use std::{
+    collections::HashSet,
+    sync::atomic::Ordering,
+};
 
 use anyhow::{anyhow, bail, Context, Result};
 use chrono::DateTime;
@@ -76,6 +79,17 @@ impl AtlassianClient {
         let base = self.require_site_url()?;
         match self.deployment() {
             DeploymentKind::Cloud => {
+                if self.project_search_fallback.load(Ordering::Relaxed) {
+                    let fallback = self
+                        .get_json::<Value>(&format!("{base}/rest/api/3/project"))
+                        .await?;
+                    let items = fallback
+                        .as_array()
+                        .or_else(|| fallback.get("values").and_then(|v| v.as_array()))
+                        .map(Vec::as_slice)
+                        .unwrap_or(&[]);
+                    return Ok(items.iter().map(parse_project_summary).collect());
+                }
                 let mut start = 0usize;
                 let mut all = Vec::new();
                 let mut seen = HashSet::new();
@@ -101,6 +115,7 @@ impl AtlassianClient {
                                 })
                                 .unwrap_or(false);
                             if should_fallback {
+                                self.project_search_fallback.store(true, Ordering::Relaxed);
                                 let fallback = self
                                     .get_json::<Value>(&format!("{base}/rest/api/3/project"))
                                     .await?;
@@ -314,7 +329,11 @@ impl AtlassianClient {
             }
         };
 
-        let val: Value = self.get_json(&url).await?;
+        let (val_res, remote_links_res) = tokio::join!(
+            Box::pin(self.get_json::<Value>(&url)),
+            Box::pin(self.get_issue_remote_confluence_links(key)),
+        );
+        let val: Value = val_res?;
         let summary = normalize_issue_summary(&val, &base, self.deployment());
         let fields = val.get("fields").unwrap_or(&Value::Null);
 
@@ -382,8 +401,7 @@ impl AtlassianClient {
             })
             .unwrap_or_default();
 
-        let (mut linked_pages, remote_links_ok) = match self.get_issue_remote_confluence_links(key).await
-        {
+        let (mut linked_pages, remote_links_ok) = match remote_links_res {
             Ok(links) => (links, true),
             Err(_) => (Vec::new(), false),
         };
@@ -2324,5 +2342,111 @@ mod tests {
         let adf = detail.custom_fields.get("customfield_10050").unwrap();
         assert_eq!(adf.name.as_deref(), Some("Notes ADF"));
         assert_eq!(adf.markdown.as_deref(), Some("Verify rollback."));
+    }
+
+    #[tokio::test]
+    async fn list_projects_cloud_remembers_project_search_fallback_per_client() {
+        use std::sync::{
+            atomic::{AtomicUsize, Ordering},
+            Arc,
+        };
+        use axum::http::StatusCode;
+
+        let search_hits = Arc::new(AtomicUsize::new(0));
+        let fallback_hits = Arc::new(AtomicUsize::new(0));
+        let sh = search_hits.clone();
+        let fh = fallback_hits.clone();
+        let app = Router::new()
+            .route(
+                "/rest/api/3/project/search",
+                get(move || {
+                    let sh = sh.clone();
+                    async move {
+                        sh.fetch_add(1, Ordering::SeqCst);
+                        (StatusCode::NOT_FOUND, "not found")
+                    }
+                }),
+            )
+            .route(
+                "/rest/api/3/project",
+                get(move || {
+                    let fh = fh.clone();
+                    async move {
+                        fh.fetch_add(1, Ordering::SeqCst);
+                        Json(json!([{ "id": "10000", "key": "PROJ", "name": "Main" }]))
+                    }
+                }),
+            );
+
+        let base_url = spawn_router(app).await;
+        let client = make_client(&base_url, DeploymentKind::Cloud);
+        let cloned = client.clone();
+
+        let p1 = client.list_projects().await.unwrap();
+        let p2 = cloned.list_projects().await.unwrap();
+        assert_eq!(p1.len(), 1);
+        assert_eq!(p2.len(), 1);
+        assert_eq!(p1[0].key, "PROJ");
+        assert_eq!(
+            search_hits.load(Ordering::SeqCst),
+            1,
+            "second list_projects must skip failing /project/search"
+        );
+        assert_eq!(fallback_hits.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn get_issue_with_meta_fetches_issue_and_remotelink_concurrently() {
+        use std::{sync::Arc, time::Duration};
+        use tokio::sync::Barrier;
+
+        let barrier = Arc::new(Barrier::new(2));
+        let b1 = barrier.clone();
+        let b2 = barrier.clone();
+        let app = Router::new()
+            .route(
+                "/rest/api/3/issue/ENG-99",
+                get(move || {
+                    let b = b1.clone();
+                    async move {
+                        b.wait().await;
+                        Json(json!({
+                            "id": "99",
+                            "key": "ENG-99",
+                            "fields": {
+                                "project": { "key": "ENG" },
+                                "summary": "Parallel issue load",
+                                "status": { "id": "1", "name": "To Do", "statusCategory": { "key": "new" } },
+                                "issuetype": { "id": "10", "name": "Task", "subtask": false }
+                            }
+                        }))
+                    }
+                }),
+            )
+            .route(
+                "/rest/api/3/issue/ENG-99/remotelink",
+                get(move || {
+                    let b = b2.clone();
+                    async move {
+                        b.wait().await;
+                        Json(json!([{
+                            "application": { "type": "com.atlassian.confluence" },
+                            "object": { "url": "https://acme.atlassian.net/wiki/spaces/ENG/pages/42", "title": "Spec" }
+                        }]))
+                    }
+                }),
+            );
+
+        let base_url = spawn_router(app).await;
+        let client = make_client(&base_url, DeploymentKind::Cloud);
+        let (detail, meta) =
+            tokio::time::timeout(Duration::from_secs(3), client.get_issue_with_meta("ENG-99"))
+                .await
+                .expect("get_issue_with_meta must overlap issue and remotelink requests")
+                .unwrap();
+        assert_eq!(detail.summary.key, "ENG-99");
+        assert!(meta.remote_links_ok);
+        assert_eq!(detail.linked_pages.len(), 1);
+        assert_eq!(detail.linked_pages[0].page_id, "42");
     }
 }
