@@ -34,6 +34,7 @@ pub struct AttachmentRow {
     pub author_name: Option<String>,
     pub is_image: bool,
     pub is_html: bool,
+    pub is_markdown: bool,
 }
 
 impl AttachmentRow {
@@ -45,6 +46,9 @@ impl AttachmentRow {
         };
         let is_image = img_preview::is_image_attachment(&item.mime_type, &filename);
         let is_html = !is_image && html_preview::is_html_attachment(&item.mime_type, &filename);
+        let is_markdown = !is_image
+            && !is_html
+            && html_preview::is_markdown_attachment(&item.mime_type, &filename);
         Self {
             index,
             id: item.id.clone(),
@@ -54,6 +58,7 @@ impl AttachmentRow {
             author_name: item.author_name.clone(),
             is_image,
             is_html,
+            is_markdown,
         }
     }
 
@@ -62,6 +67,8 @@ impl AttachmentRow {
             "[IMG]"
         } else if self.is_html {
             "[HTML]"
+        } else if self.is_markdown {
+            "[MD]"
         } else {
             "[FILE]"
         }
@@ -186,6 +193,17 @@ impl AttachmentsOverlay {
             .is_some_and(|att| html_preview::is_html_attachment(&att.mime_type, &att.filename))
     }
 
+    pub fn is_selected_markdown(&self) -> bool {
+        self.selected_attachment()
+            .is_some_and(|att| html_preview::is_markdown_attachment(&att.mime_type, &att.filename))
+    }
+
+    pub fn is_selected_markup(&self) -> bool {
+        self.selected_attachment().is_some_and(|att| {
+            html_preview::is_previewable_markup_attachment(&att.mime_type, &att.filename)
+        })
+    }
+
     pub fn handle(&mut self, action: &Action) -> OverlayOutcome {
         match action {
             Action::MoveUp | Action::CursorUp | Action::PrevField => {
@@ -204,7 +222,7 @@ impl AttachmentsOverlay {
                 if self.is_selected_image() {
                     self.pending_command = Some(AttachmentCommand::PreviewImage(idx));
                     OverlayOutcome::CloseAndDispatch(Action::OpenImagePreview)
-                } else if self.is_selected_html() {
+                } else if self.is_selected_markup() {
                     self.pending_command = Some(AttachmentCommand::PreviewHtml(idx));
                     OverlayOutcome::CloseAndDispatch(Action::OpenHtmlPreview)
                 } else {
@@ -219,12 +237,14 @@ impl AttachmentsOverlay {
                 if self.is_selected_image() {
                     self.pending_command = Some(AttachmentCommand::PreviewImage(idx));
                     OverlayOutcome::CloseAndDispatch(Action::OpenImagePreview)
-                } else if self.is_selected_html() {
+                } else if self.is_selected_markup() {
                     self.pending_command = Some(AttachmentCommand::PreviewHtml(idx));
                     OverlayOutcome::CloseAndDispatch(Action::OpenHtmlPreview)
                 } else {
-                    self.notice =
-                        Some("Selected file is not a previewable image or HTML — press d to download".to_string());
+                    self.notice = Some(
+                        "Selected file is not a previewable image, HTML, or Markdown file — press d to download"
+                            .to_string(),
+                    );
                     OverlayOutcome::Handled
                 }
             }
@@ -232,11 +252,12 @@ impl AttachmentsOverlay {
                 let Some(idx) = self.selected_index() else {
                     return OverlayOutcome::Handled;
                 };
-                if self.is_selected_html() {
+                if self.is_selected_markup() {
                     self.pending_command = Some(AttachmentCommand::PreviewHtml(idx));
                     OverlayOutcome::CloseAndDispatch(Action::OpenHtmlPreview)
                 } else {
-                    self.notice = Some("Selected attachment is not an HTML file".to_string());
+                    self.notice =
+                        Some("Selected attachment is not an HTML or Markdown file".to_string());
                     OverlayOutcome::Handled
                 }
             }
@@ -349,7 +370,7 @@ impl AttachmentsOverlay {
                     Style::default()
                         .fg(theme.confluence_teal)
                         .add_modifier(Modifier::BOLD)
-                } else if row.is_html {
+                } else if row.is_html || row.is_markdown {
                     Style::default()
                         .fg(theme.accent)
                         .add_modifier(Modifier::BOLD)
@@ -611,6 +632,55 @@ mod tests {
             OverlayOutcome::CloseAndDispatch(Action::OpenHtmlPreview)
         );
         assert_eq!(ov.pending_command, Some(AttachmentCommand::PreviewHtml(2)));
+
+        ov.select(3);
+        assert_eq!(
+            ov.handle(&Action::Activate),
+            OverlayOutcome::CloseAndDispatch(Action::OpenHtmlPreview)
+        );
+        assert_eq!(ov.pending_command, Some(AttachmentCommand::PreviewHtml(3)));
+    }
+
+    #[test]
+    fn markdown_attachment_shows_md_badge_and_routes_to_preview() {
+        let mut items = sample_attachments();
+        items.push(AttachmentItem {
+            id: "att-md-1".into(),
+            filename: "README.md".into(),
+            mime_type: "text/markdown".into(),
+            size: 1024,
+            author_name: Some("Alice".into()),
+            created_at: "2026-11-19T04:00:00Z".into(),
+            content_url: "https://acme.atlassian.net/att/md1".into(),
+            thumbnail_url: None,
+        });
+        items.push(AttachmentItem {
+            id: "att-md-2".into(),
+            filename: "NOTES.md".into(),
+            mime_type: "application/octet-stream".into(),
+            size: 512,
+            author_name: None,
+            created_at: "2026-11-19T05:00:00Z".into(),
+            content_url: "https://acme.atlassian.net/att/md2".into(),
+            thumbnail_url: None,
+        });
+
+        let mut ov = AttachmentsOverlay::new("ENG-1", items);
+        let rows = ov.rows();
+        assert!(!rows[2].is_image);
+        assert!(!rows[2].is_html);
+        assert!(rows[2].is_markdown);
+        assert_eq!(rows[2].icon(), "[MD]");
+        assert!(rows[3].is_markdown);
+        assert_eq!(rows[3].icon(), "[MD]");
+
+        ov.select(2);
+        assert_eq!(
+            ov.handle(&Action::Input('v')),
+            OverlayOutcome::CloseAndDispatch(Action::OpenHtmlPreview)
+        );
+        assert_eq!(ov.pending_command, Some(AttachmentCommand::PreviewHtml(2)));
+        assert!(ov.notice.is_none());
 
         ov.select(3);
         assert_eq!(

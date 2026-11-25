@@ -2,6 +2,10 @@
 
 use std::{collections::HashSet, sync::OnceLock};
 
+use bitefoundry_html::pulldown_cmark::{
+    BlockQuoteKind, CodeBlockKind, Event, HeadingLevel, Options, Parser, Tag, TagEnd,
+    TextMergeStream,
+};
 use chrono::DateTime;
 use regex::Regex;
 use scraper::{ElementRef, Html, Node};
@@ -2375,375 +2379,873 @@ fn scan_text_for_refs(text: &str, collector: &mut RefCollector) {
 // 5. Markdown Parser -> `DocBlock` + Compilers (ADF v1 / Storage XHTML / Jira Wiki)
 // ============================================================================
 
-/// Parses GitHub-Flavored Markdown into `Vec<DocBlock>`.
+/// Parses GitHub-Flavored Markdown into `Vec<DocBlock>` using `bitefoundry_html::pulldown_cmark`.
 pub fn parse_markdown(markdown: &str) -> Vec<DocBlock> {
     if markdown.trim().is_empty() {
         return Vec::new();
     }
-    let lines: Vec<&str> = markdown.lines().collect();
-    let mut blocks = Vec::new();
-    let mut i = 0usize;
+    let options = Options::ENABLE_TABLES
+        | Options::ENABLE_TASKLISTS
+        | Options::ENABLE_STRIKETHROUGH
+        | Options::ENABLE_GFM;
+    let mut builder = MdAstBuilder::default();
+    for event in TextMergeStream::new(Parser::new_ext(markdown, options)) {
+        builder.push_event(event);
+    }
+    builder.finish()
+}
 
-    while i < lines.len() {
-        let line = lines[i];
-        let trimmed = line.trim();
+fn parse_md_inlines(input: &str) -> Vec<InlineNode> {
+    let trimmed = input.trim();
+    if trimmed.is_empty() {
+        return Vec::new();
+    }
+    let single_line = trimmed.replace('\r', "").replace('\n', " ");
+    let wrapped = format!("# {single_line}");
+    let blocks = parse_markdown(&wrapped);
+    match blocks.into_iter().next() {
+        Some(DocBlock::Heading { spans, .. } | DocBlock::Paragraph { spans }) => spans,
+        _ => Vec::new(),
+    }
+}
 
+enum MdContainer {
+    Root(Vec<DocBlock>),
+    Blockquote {
+        panel_meta: Option<(PanelKind, Option<String>)>,
+        checked_callout: bool,
+        blocks: Vec<DocBlock>,
+    },
+    Expand {
+        title: String,
+        blocks: Vec<DocBlock>,
+    },
+    List {
+        start: Option<usize>,
+        items: Vec<MdListItem>,
+    },
+    ListItem {
+        task_checked: Option<bool>,
+        blocks: Vec<DocBlock>,
+        tight_inlines: Vec<InlineNode>,
+    },
+    Table {
+        headers: Vec<Vec<InlineNode>>,
+        rows: Vec<Vec<Vec<InlineNode>>>,
+        cur_row: Vec<Vec<InlineNode>>,
+        in_head: bool,
+    },
+}
+
+struct MdListItem {
+    task_checked: Option<bool>,
+    blocks: Vec<DocBlock>,
+}
+
+enum InlineTarget {
+    Paragraph {
+        spans: Vec<InlineNode>,
+        only_image: Option<(String, String)>,
+        saw_non_image: bool,
+    },
+    Heading {
+        level: u8,
+        spans: Vec<InlineNode>,
+    },
+    TableCell {
+        spans: Vec<InlineNode>,
+    },
+}
+
+struct MdCodeBlock {
+    language: Option<String>,
+    code: String,
+}
+
+struct MdImageCapture {
+    dest_url: String,
+    alt: String,
+}
+
+struct MdAstBuilder {
+    stack: Vec<MdContainer>,
+    inline_target: Option<InlineTarget>,
+    code_block: Option<MdCodeBlock>,
+    html_block: Option<String>,
+    image_capture: Option<MdImageCapture>,
+    bold_depth: usize,
+    italic_depth: usize,
+    strike_depth: usize,
+    underline_depth: usize,
+    code_depth: usize,
+    link_stack: Vec<String>,
+}
+
+impl Default for MdAstBuilder {
+    fn default() -> Self {
+        Self {
+            stack: vec![MdContainer::Root(Vec::new())],
+            inline_target: None,
+            code_block: None,
+            html_block: None,
+            image_capture: None,
+            bold_depth: 0,
+            italic_depth: 0,
+            strike_depth: 0,
+            underline_depth: 0,
+            code_depth: 0,
+            link_stack: Vec::new(),
+        }
+    }
+}
+
+impl MdAstBuilder {
+    fn current_style(&self) -> InlineStyle {
+        InlineStyle {
+            bold: self.bold_depth > 0,
+            italic: self.italic_depth > 0,
+            strike: self.strike_depth > 0,
+            underline: self.underline_depth > 0,
+            code: self.code_depth > 0,
+            link_url: self.link_stack.last().cloned(),
+        }
+    }
+
+    fn flush_list_item_tight_inlines(&mut self) {
+        if let Some(MdContainer::ListItem {
+            blocks,
+            tight_inlines,
+            ..
+        }) = self.stack.last_mut()
+        {
+            if !tight_inlines.is_empty() {
+                let spans = std::mem::take(tight_inlines);
+                blocks.push(DocBlock::Paragraph { spans });
+            }
+        }
+    }
+
+    fn push_block(&mut self, block: DocBlock) {
+        self.flush_list_item_tight_inlines();
+        match self.stack.last_mut() {
+            Some(MdContainer::Root(blocks))
+            | Some(MdContainer::Blockquote { blocks, .. })
+            | Some(MdContainer::Expand { blocks, .. })
+            | Some(MdContainer::ListItem { blocks, .. }) => blocks.push(block),
+            _ => {
+                if let Some(MdContainer::Root(blocks)) = self.stack.first_mut() {
+                    blocks.push(block);
+                }
+            }
+        }
+    }
+
+    fn push_inline_node(&mut self, node: InlineNode) {
+        if let Some(ref mut img) = self.image_capture {
+            if let InlineNode::Text { text, .. } = node {
+                img.alt.push_str(&text);
+            }
+            return;
+        }
+        match self.inline_target.as_mut() {
+            Some(InlineTarget::Paragraph {
+                spans,
+                saw_non_image,
+                ..
+            }) => {
+                *saw_non_image = true;
+                spans.push(node);
+            }
+            Some(InlineTarget::Heading { spans, .. })
+            | Some(InlineTarget::TableCell { spans }) => {
+                spans.push(node);
+            }
+            None => {
+                if let Some(MdContainer::ListItem { tight_inlines, .. }) = self.stack.last_mut() {
+                    tight_inlines.push(node);
+                }
+            }
+        }
+    }
+
+    fn push_text(&mut self, text: &str) {
+        if text.is_empty() {
+            return;
+        }
+        if let Some(ref mut cb) = self.code_block {
+            cb.code.push_str(text);
+            return;
+        }
+        if let Some(ref mut img) = self.image_capture {
+            img.alt.push_str(text);
+            return;
+        }
+        let style = self.current_style();
+        let nodes = split_text_with_issue_refs(text, &style);
+        for node in nodes {
+            self.push_inline_node(node);
+        }
+    }
+
+    fn try_consume_blockquote_callout_header(&mut self) -> bool {
+        let is_unchecked_bq = matches!(
+            self.stack.last(),
+            Some(MdContainer::Blockquote {
+                checked_callout: false,
+                blocks,
+                ..
+            }) if blocks.is_empty()
+        );
+        if !is_unchecked_bq {
+            return false;
+        }
+        let Some(InlineTarget::Paragraph {
+            spans,
+            only_image,
+            saw_non_image,
+        }) = self.inline_target.as_mut()
+        else {
+            return false;
+        };
+        let plain = inlines_to_plain_text(spans);
+        let matched = parse_callout_header(plain.trim());
+        if let Some(MdContainer::Blockquote {
+            panel_meta,
+            checked_callout,
+            ..
+        }) = self.stack.last_mut()
+        {
+            *checked_callout = true;
+            if let Some((kind, title)) = matched {
+                *panel_meta = Some((kind, title));
+                spans.clear();
+                *only_image = None;
+                *saw_non_image = false;
+                return true;
+            }
+        }
+        false
+    }
+
+    fn handle_inline_html(&mut self, raw: &str) {
+        let trimmed = raw.trim();
+        if trimmed.is_empty() || (trimmed.starts_with("<!--") && trimmed.ends_with("-->")) {
+            return;
+        }
+        let Some(inner) = trimmed.strip_prefix('<').and_then(|s| s.strip_suffix('>')) else {
+            self.push_text(raw);
+            return;
+        };
+        let inner = inner.trim();
+        let is_closing = inner.starts_with('/');
+        let tag_body = inner.trim_start_matches('/').trim();
+        let tag_name: String = tag_body
+            .chars()
+            .take_while(|c| c.is_ascii_alphanumeric() || *c == ':' || *c == '-')
+            .collect::<String>()
+            .to_ascii_lowercase();
+
+        match (is_closing, tag_name.as_str()) {
+            (false, "u") => self.underline_depth += 1,
+            (true, "u") => self.underline_depth = self.underline_depth.saturating_sub(1),
+            (false, "b" | "strong") => self.bold_depth += 1,
+            (true, "b" | "strong") => self.bold_depth = self.bold_depth.saturating_sub(1),
+            (false, "i" | "em") => self.italic_depth += 1,
+            (true, "i" | "em") => self.italic_depth = self.italic_depth.saturating_sub(1),
+            (false, "s" | "del" | "strike") => self.strike_depth += 1,
+            (true, "s" | "del" | "strike") => {
+                self.strike_depth = self.strike_depth.saturating_sub(1)
+            }
+            (false, "code") => self.code_depth += 1,
+            (true, "code") => self.code_depth = self.code_depth.saturating_sub(1),
+            (false, "br") => self.push_inline_node(InlineNode::HardBreak),
+            (false, "a") => {
+                let href = extract_inline_html_href(trimmed).unwrap_or_default();
+                self.link_stack.push(href);
+            }
+            (true, "a") => {
+                self.link_stack.pop();
+            }
+            (_, "style" | "script" | "noscript" | "details" | "summary") => {}
+            _ => {
+                self.push_inline_node(InlineNode::Text {
+                    text: raw.to_string(),
+                    style: self.current_style(),
+                });
+            }
+        }
+    }
+
+    fn handle_html_block(&mut self, raw: &str) {
+        let trimmed = raw.trim();
         if trimmed.is_empty() {
-            i += 1;
-            continue;
+            return;
+        }
+        if trimmed.starts_with("<!--") && trimmed.ends_with("-->") {
+            return;
         }
 
-        // Fenced code block ```lang
-        if trimmed.starts_with("```") {
-            let fence_len = trimmed.bytes().take_while(|&b| b == b'`').count();
-            let fence = "`".repeat(fence_len);
-            let lang = trimmed[fence_len..].trim();
-            let language = if lang.is_empty() {
-                None
-            } else {
-                Some(lang.to_string())
-            };
-            i += 1;
-            let mut code_lines = Vec::new();
-            while i < lines.len() {
-                let cur = lines[i];
-                if cur.trim().starts_with(&fence) && cur.trim().trim_start_matches('`').is_empty()
+        let lower = trimmed.to_ascii_lowercase();
+
+        // Case 1: Closing `</details>` for an open `MdContainer::Expand` frame
+        if lower.starts_with("</details") {
+            if let Some(end_gt) = trimmed.find('>') {
+                if matches!(self.stack.last(), Some(MdContainer::Expand { .. })) {
+                    if let Some(MdContainer::Expand { title, blocks }) = self.stack.pop() {
+                        self.push_block(DocBlock::Expand { title, blocks });
+                    }
+                    let rest = trimmed[end_gt + 1..].trim();
+                    if !rest.is_empty() {
+                        for b in parse_markdown(rest) {
+                            self.push_block(b);
+                        }
+                    }
+                    return;
+                }
+            }
+        }
+
+        // Case 2: Opening `<details...>` (either self-contained with `</details>` or split across blank lines)
+        if lower.starts_with("<details") && trimmed[8..].starts_with(['>', ' ', '\t', '\n', '\r']) {
+            if let Some(open_end) = trimmed.find('>') {
+                if let Some((close_start, close_end)) = find_matching_details_close(trimmed, open_end + 1)
                 {
-                    i += 1;
-                    break;
-                }
-                code_lines.push(cur);
-                i += 1;
-            }
-            blocks.push(DocBlock::CodeBlock {
-                language,
-                code: code_lines.join("\n"),
-            });
-            continue;
-        }
+                    let inner = &trimmed[open_end + 1..close_start];
+                    let (title, body) = extract_details_summary(inner);
+                    let blocks = parse_markdown(body);
+                    self.push_block(DocBlock::Expand { title, blocks });
 
-        // Horizontal rule
-        if is_md_rule(trimmed) {
-            blocks.push(DocBlock::Rule);
-            i += 1;
-            continue;
-        }
-
-        // ATX Heading (# .. ######)
-        if let Some((level, rest)) = parse_md_heading(trimmed) {
-            blocks.push(DocBlock::Heading {
-                level,
-                spans: parse_md_inlines(rest),
-            });
-            i += 1;
-            continue;
-        }
-
-        // Blockquote / GFM Callout Panel (> [!INFO] / > [!WARNING] / > ...)
-        if trimmed.starts_with('>') {
-            let mut quote_lines = Vec::new();
-            while i < lines.len() {
-                let t = lines[i].trim();
-                if let Some(rest) = t.strip_prefix('>') {
-                    quote_lines.push(rest.strip_prefix(' ').unwrap_or(rest));
-                    i += 1;
+                    let trailing = trimmed[close_end..].trim();
+                    if !trailing.is_empty() {
+                        for b in parse_markdown(trailing) {
+                            self.push_block(b);
+                        }
+                    }
+                    return;
                 } else {
-                    break;
+                    let inner = &trimmed[open_end + 1..];
+                    let (title, body) = extract_details_summary(inner);
+                    let initial_blocks = if body.trim().is_empty() {
+                        Vec::new()
+                    } else {
+                        parse_markdown(body)
+                    };
+                    self.flush_list_item_tight_inlines();
+                    self.stack.push(MdContainer::Expand {
+                        title,
+                        blocks: initial_blocks,
+                    });
+                    return;
                 }
             }
-            if let Some(first) = quote_lines.first().copied() {
-                if let Some((kind, title)) = parse_callout_header(first.trim()) {
-                    let body = quote_lines[1..].join("\n");
-                    blocks.push(DocBlock::Panel {
+        }
+
+        // Case 3: Generic HTML block — delegate to sanitized `parse_storage_xhtml`
+        for b in parse_storage_xhtml(trimmed) {
+            self.push_block(b);
+        }
+    }
+
+    fn push_event(&mut self, event: Event<'_>) {
+        match event {
+            Event::Start(tag) => match tag {
+                Tag::Paragraph => {
+                    self.inline_target = Some(InlineTarget::Paragraph {
+                        spans: Vec::new(),
+                        only_image: None,
+                        saw_non_image: false,
+                    });
+                }
+                Tag::Heading { level, .. } => {
+                    let lvl = match level {
+                        HeadingLevel::H1 => 1,
+                        HeadingLevel::H2 => 2,
+                        HeadingLevel::H3 => 3,
+                        HeadingLevel::H4 => 4,
+                        HeadingLevel::H5 => 5,
+                        HeadingLevel::H6 => 6,
+                    };
+                    self.inline_target = Some(InlineTarget::Heading {
+                        level: lvl,
+                        spans: Vec::new(),
+                    });
+                }
+                Tag::BlockQuote(kind_opt) => {
+                    self.flush_list_item_tight_inlines();
+                    let panel_meta = kind_opt.map(|k| {
+                        let pk = match k {
+                            BlockQuoteKind::Note | BlockQuoteKind::Important => PanelKind::Note,
+                            BlockQuoteKind::Tip => PanelKind::Success,
+                            BlockQuoteKind::Warning => PanelKind::Warning,
+                            BlockQuoteKind::Caution => PanelKind::Error,
+                        };
+                        (pk, None)
+                    });
+                    self.stack.push(MdContainer::Blockquote {
+                        checked_callout: panel_meta.is_some(),
+                        panel_meta,
+                        blocks: Vec::new(),
+                    });
+                }
+                Tag::CodeBlock(kind) => {
+                    self.flush_list_item_tight_inlines();
+                    let language = match kind {
+                        CodeBlockKind::Fenced(info) => info
+                            .split_whitespace()
+                            .next()
+                            .filter(|s| !s.is_empty())
+                            .map(ToString::to_string),
+                        CodeBlockKind::Indented => None,
+                    };
+                    self.code_block = Some(MdCodeBlock {
+                        language,
+                        code: String::new(),
+                    });
+                }
+                Tag::HtmlBlock => {
+                    self.flush_list_item_tight_inlines();
+                    self.html_block = Some(String::new());
+                }
+                Tag::List(start) => {
+                    self.flush_list_item_tight_inlines();
+                    self.stack.push(MdContainer::List {
+                        start: start.map(|n| (n as usize).max(1)),
+                        items: Vec::new(),
+                    });
+                }
+                Tag::Item => {
+                    self.stack.push(MdContainer::ListItem {
+                        task_checked: None,
+                        blocks: Vec::new(),
+                        tight_inlines: Vec::new(),
+                    });
+                }
+                Tag::Table(_) => {
+                    self.flush_list_item_tight_inlines();
+                    self.stack.push(MdContainer::Table {
+                        headers: Vec::new(),
+                        rows: Vec::new(),
+                        cur_row: Vec::new(),
+                        in_head: false,
+                    });
+                }
+                Tag::TableHead => {
+                    if let Some(MdContainer::Table {
+                        cur_row, in_head, ..
+                    }) = self.stack.last_mut()
+                    {
+                        cur_row.clear();
+                        *in_head = true;
+                    }
+                }
+                Tag::TableRow => {
+                    if let Some(MdContainer::Table { cur_row, .. }) = self.stack.last_mut() {
+                        cur_row.clear();
+                    }
+                }
+                Tag::TableCell => {
+                    self.inline_target = Some(InlineTarget::TableCell { spans: Vec::new() });
+                }
+                Tag::Emphasis => self.italic_depth += 1,
+                Tag::Strong => self.bold_depth += 1,
+                Tag::Strikethrough => self.strike_depth += 1,
+                Tag::Link { dest_url, .. } => {
+                    self.link_stack.push(dest_url.into_string());
+                }
+                Tag::Image { dest_url, .. } => {
+                    self.image_capture = Some(MdImageCapture {
+                        dest_url: dest_url.into_string(),
+                        alt: String::new(),
+                    });
+                }
+                _ => {}
+            },
+            Event::End(tag_end) => match tag_end {
+                TagEnd::Paragraph => {
+                    self.try_consume_blockquote_callout_header();
+                    if let Some(InlineTarget::Paragraph {
+                        spans,
+                        only_image,
+                        saw_non_image,
+                    }) = self.inline_target.take()
+                    {
+                        if let (Some((alt_label, target)), false) = (only_image, saw_non_image) {
+                            let is_external = target.starts_with("http://")
+                                || target.starts_with("https://");
+                            let alt = if alt_label.is_empty() || alt_label == target {
+                                None
+                            } else {
+                                Some(alt_label)
+                            };
+                            self.push_block(DocBlock::Media {
+                                id_or_filename: target.clone(),
+                                alt,
+                                url: is_external.then_some(target),
+                            });
+                        } else if !spans.is_empty() {
+                            self.push_block(DocBlock::Paragraph { spans });
+                        }
+                    }
+                }
+                TagEnd::Heading(_) => {
+                    if let Some(InlineTarget::Heading { level, spans }) = self.inline_target.take() {
+                        self.push_block(DocBlock::Heading { level, spans });
+                    }
+                }
+                TagEnd::BlockQuote(_) => {
+                    if let Some(MdContainer::Blockquote {
+                        panel_meta, blocks, ..
+                    }) = self.stack.pop()
+                    {
+                        match panel_meta {
+                            Some((kind, title)) => {
+                                self.push_block(DocBlock::Panel {
+                                    kind,
+                                    title,
+                                    blocks,
+                                });
+                            }
+                            None => {
+                                self.push_block(DocBlock::Blockquote { blocks });
+                            }
+                        }
+                    }
+                }
+                TagEnd::CodeBlock => {
+                    if let Some(cb) = self.code_block.take() {
+                        let code = cb
+                            .code
+                            .strip_suffix("\r\n")
+                            .or_else(|| cb.code.strip_suffix('\n'))
+                            .unwrap_or(&cb.code)
+                            .to_string();
+                        self.push_block(DocBlock::CodeBlock {
+                            language: cb.language,
+                            code,
+                        });
+                    }
+                }
+                TagEnd::HtmlBlock => {
+                    if let Some(raw) = self.html_block.take() {
+                        self.handle_html_block(&raw);
+                    }
+                }
+                TagEnd::Item => {
+                    if let Some(MdContainer::ListItem {
+                        task_checked,
+                        mut blocks,
+                        tight_inlines,
+                    }) = self.stack.pop()
+                    {
+                        if !tight_inlines.is_empty() {
+                            blocks.push(DocBlock::Paragraph {
+                                spans: tight_inlines,
+                            });
+                        }
+                        if let Some(MdContainer::List { items, .. }) = self.stack.last_mut() {
+                            items.push(MdListItem {
+                                task_checked,
+                                blocks,
+                            });
+                        }
+                    }
+                }
+                TagEnd::List(_) => {
+                    if let Some(MdContainer::List { start, items }) = self.stack.pop() {
+                        if start.is_none()
+                            && !items.is_empty()
+                            && items.iter().all(|it| it.task_checked.is_some())
+                        {
+                            let task_items = items
+                                .into_iter()
+                                .map(|it| TaskItem {
+                                    checked: it.task_checked.unwrap_or(false),
+                                    content: flatten_task_item_inlines(it.blocks),
+                                })
+                                .collect();
+                            self.push_block(DocBlock::TaskList { items: task_items });
+                        } else if let Some(s) = start {
+                            self.push_block(DocBlock::OrderedList {
+                                start: s,
+                                items: items.into_iter().map(|it| it.blocks).collect(),
+                            });
+                        } else {
+                            self.push_block(DocBlock::BulletList {
+                                items: items.into_iter().map(|it| it.blocks).collect(),
+                            });
+                        }
+                    }
+                }
+                TagEnd::TableCell => {
+                    if let Some(InlineTarget::TableCell { spans }) = self.inline_target.take() {
+                        if let Some(MdContainer::Table { cur_row, .. }) = self.stack.last_mut() {
+                            cur_row.push(spans);
+                        }
+                    }
+                }
+                TagEnd::TableHead => {
+                    if let Some(MdContainer::Table {
+                        headers,
+                        cur_row,
+                        in_head,
+                        ..
+                    }) = self.stack.last_mut()
+                    {
+                        if !cur_row.is_empty() {
+                            *headers = std::mem::take(cur_row);
+                        }
+                        *in_head = false;
+                    }
+                }
+                TagEnd::TableRow => {
+                    if let Some(MdContainer::Table {
+                        headers,
+                        rows,
+                        cur_row,
+                        in_head,
+                    }) = self.stack.last_mut()
+                    {
+                        let row = std::mem::take(cur_row);
+                        if !row.is_empty() {
+                            if *in_head {
+                                *headers = row;
+                            } else {
+                                rows.push(row);
+                            }
+                        }
+                    }
+                }
+                TagEnd::Table => {
+                    if let Some(MdContainer::Table { headers, rows, .. }) = self.stack.pop() {
+                        self.push_block(DocBlock::Table { headers, rows });
+                    }
+                }
+                TagEnd::Emphasis => self.italic_depth = self.italic_depth.saturating_sub(1),
+                TagEnd::Strong => self.bold_depth = self.bold_depth.saturating_sub(1),
+                TagEnd::Strikethrough => self.strike_depth = self.strike_depth.saturating_sub(1),
+                TagEnd::Link => {
+                    self.link_stack.pop();
+                }
+                TagEnd::Image => {
+                    if let Some(img) = self.image_capture.take() {
+                        let target = img.dest_url.trim().to_string();
+                        let label = img.alt.trim().to_string();
+                        let base_style = self.current_style();
+                        if let Some(InlineTarget::Paragraph {
+                            spans,
+                            only_image,
+                            saw_non_image,
+                        }) = self.inline_target.as_mut()
+                        {
+                            if !*saw_non_image && only_image.is_none() && spans.is_empty() {
+                                *only_image = Some((label, target));
+                                return;
+                            }
+                            if let Some((prev_alt, prev_url)) = only_image.take() {
+                                *saw_non_image = true;
+                                spans.push(InlineNode::Text {
+                                    text: if prev_alt.is_empty() {
+                                        prev_url.clone()
+                                    } else {
+                                        prev_alt
+                                    },
+                                    style: InlineStyle {
+                                        link_url: (!prev_url.is_empty()).then_some(prev_url),
+                                        ..base_style.clone()
+                                    },
+                                });
+                            }
+                        }
+                        self.push_inline_node(InlineNode::Text {
+                            text: if label.is_empty() {
+                                target.clone()
+                            } else {
+                                label
+                            },
+                            style: InlineStyle {
+                                link_url: (!target.is_empty()).then_some(target),
+                                ..base_style
+                            },
+                        });
+                    }
+                }
+                _ => {}
+            },
+            Event::Text(text) => self.push_text(&text),
+            Event::Code(code) => {
+                if let Some(ref mut img) = self.image_capture {
+                    img.alt.push_str(&code);
+                } else {
+                    let mut style = self.current_style();
+                    style.code = true;
+                    self.push_inline_node(InlineNode::Text {
+                        text: code.into_string(),
+                        style,
+                    });
+                }
+            }
+            Event::Html(html) => {
+                if let Some(ref mut buf) = self.html_block {
+                    buf.push_str(&html);
+                } else {
+                    self.handle_html_block(&html);
+                }
+            }
+            Event::InlineHtml(html) => self.handle_inline_html(&html),
+            Event::SoftBreak => {
+                if self.try_consume_blockquote_callout_header() {
+                    return;
+                }
+                if let Some(ref mut cb) = self.code_block {
+                    cb.code.push('\n');
+                } else if let Some(ref mut img) = self.image_capture {
+                    img.alt.push(' ');
+                } else {
+                    self.push_inline_node(InlineNode::Text {
+                        text: " ".to_string(),
+                        style: self.current_style(),
+                    });
+                }
+            }
+            Event::HardBreak => {
+                if self.try_consume_blockquote_callout_header() {
+                    return;
+                }
+                self.push_inline_node(InlineNode::HardBreak);
+            }
+            Event::Rule => self.push_block(DocBlock::Rule),
+            Event::TaskListMarker(checked) => {
+                if let Some(MdContainer::ListItem { task_checked, .. }) = self.stack.last_mut() {
+                    *task_checked = Some(checked);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn finish(mut self) -> Vec<DocBlock> {
+        while self.stack.len() > 1 {
+            match self.stack.pop() {
+                Some(MdContainer::Expand { title, blocks }) => {
+                    self.push_block(DocBlock::Expand { title, blocks });
+                }
+                Some(MdContainer::Blockquote {
+                    panel_meta, blocks, ..
+                }) => match panel_meta {
+                    Some((kind, title)) => self.push_block(DocBlock::Panel {
                         kind,
                         title,
-                        blocks: parse_markdown(&body),
+                        blocks,
+                    }),
+                    None => self.push_block(DocBlock::Blockquote { blocks }),
+                },
+                _ => {}
+            }
+        }
+        match self.stack.pop() {
+            Some(MdContainer::Root(blocks)) => blocks,
+            _ => Vec::new(),
+        }
+    }
+}
+
+fn flatten_task_item_inlines(blocks: Vec<DocBlock>) -> Vec<InlineNode> {
+    let mut out = Vec::new();
+    for (idx, block) in blocks.into_iter().enumerate() {
+        if idx > 0 && !out.is_empty() {
+            out.push(InlineNode::HardBreak);
+        }
+        match block {
+            DocBlock::Paragraph { spans } | DocBlock::Heading { spans, .. } => out.extend(spans),
+            other => {
+                let text = blocks_to_plain_text(&[other]);
+                if !text.trim().is_empty() {
+                    out.push(InlineNode::Text {
+                        text,
+                        style: InlineStyle::default(),
                     });
-                    continue;
                 }
             }
-            blocks.push(DocBlock::Blockquote {
-                blocks: parse_markdown(&quote_lines.join("\n")),
-            });
-            continue;
-        }
-
-        // GFM Pipe Table
-        if trimmed.starts_with('|') && i + 1 < lines.len() && is_md_table_separator(lines[i + 1].trim()) {
-            let headers = split_md_table_row(trimmed)
-                .into_iter()
-                .map(|c| parse_md_inlines(&c))
-                .collect();
-            i += 2;
-            let mut rows = Vec::new();
-            while i < lines.len() {
-                let t = lines[i].trim();
-                if t.starts_with('|') {
-                    rows.push(
-                        split_md_table_row(t)
-                            .into_iter()
-                            .map(|c| parse_md_inlines(&c))
-                            .collect(),
-                    );
-                    i += 1;
-                } else {
-                    break;
-                }
-            }
-            blocks.push(DocBlock::Table { headers, rows });
-            continue;
-        }
-
-        // Standalone Markdown image: ![alt](url)
-        if let Some((label, target)) = parse_md_image_line(trimmed) {
-            let is_external = target.starts_with("http://") || target.starts_with("https://");
-            let alt = if label.is_empty() || label == target {
-                None
-            } else {
-                Some(label)
-            };
-            blocks.push(DocBlock::Media {
-                id_or_filename: target.clone(),
-                alt,
-                url: is_external.then_some(target),
-            });
-            i += 1;
-            continue;
-        }
-
-        // Task list: - [ ] / - [x]
-        if parse_md_task_line(trimmed).is_some() {
-            let mut items = Vec::new();
-            while i < lines.len() {
-                if let Some((checked, text)) = parse_md_task_line(lines[i].trim()) {
-                    items.push(TaskItem {
-                        checked,
-                        content: parse_md_inlines(text),
-                    });
-                    i += 1;
-                } else {
-                    break;
-                }
-            }
-            blocks.push(DocBlock::TaskList { items });
-            continue;
-        }
-
-        // Bullet list: - / * / + (including 2-space+ indented nested sublists)
-        if parse_md_bullet_line(trimmed).is_some() {
-            let base_indent = md_leading_indent(line);
-            let items = parse_md_list_items(&lines, &mut i, base_indent, false);
-            blocks.push(DocBlock::BulletList { items });
-            continue;
-        }
-
-        // Ordered list: 1. ... (including indented nested sublists)
-        if let Some((first_num, _)) = parse_md_ordered_line(trimmed) {
-            let base_indent = md_leading_indent(line);
-            let items = parse_md_list_items(&lines, &mut i, base_indent, true);
-            blocks.push(DocBlock::OrderedList {
-                start: first_num.max(1),
-                items,
-            });
-            continue;
-        }
-
-        // Paragraph
-        let mut para_lines = Vec::new();
-        while i < lines.len() {
-            let t = lines[i].trim();
-            if t.is_empty()
-                || t.starts_with("```")
-                || is_md_rule(t)
-                || parse_md_heading(t).is_some()
-                || t.starts_with('>')
-                || parse_md_image_line(t).is_some()
-                || parse_md_task_line(t).is_some()
-                || parse_md_bullet_line(t).is_some()
-                || parse_md_ordered_line(t).is_some()
-                || (t.starts_with('|')
-                    && i + 1 < lines.len()
-                    && is_md_table_separator(lines[i + 1].trim()))
-            {
-                break;
-            }
-            para_lines.push(t);
-            i += 1;
-        }
-        let joined = para_lines.join(" ");
-        blocks.push(DocBlock::Paragraph {
-            spans: parse_md_inlines(&joined),
-        });
-    }
-
-    blocks
-}
-
-fn md_leading_indent(line: &str) -> usize {
-    let mut indent = 0usize;
-    for ch in line.chars() {
-        match ch {
-            ' ' => indent += 1,
-            '\t' => indent += 2,
-            _ => break,
         }
     }
-    indent
+    out
 }
 
-fn strip_md_indent(line: &str, mut amount: usize) -> &str {
-    let mut byte_idx = 0usize;
-    for (idx, ch) in line.char_indices() {
-        if amount == 0 {
-            return &line[idx..];
-        }
-        match ch {
-            ' ' => {
-                amount -= 1;
-                byte_idx = idx + 1;
-            }
-            '\t' => {
-                amount = amount.saturating_sub(2);
-                byte_idx = idx + 1;
-            }
-            _ => return &line[idx..],
-        }
-    }
-    &line[byte_idx..]
-}
-
-fn parse_md_list_items(
-    lines: &[&str],
-    i: &mut usize,
-    base_indent: usize,
-    ordered: bool,
-) -> Vec<Vec<DocBlock>> {
-    let mut items = Vec::new();
-    while *i < lines.len() {
-        let cur = lines[*i];
-        let t = cur.trim();
-        if t.is_empty() {
-            break;
-        }
-        if md_leading_indent(cur) != base_indent {
-            break;
-        }
-        let rest = if ordered {
-            parse_md_ordered_line(t).map(|(_, r)| r)
-        } else {
-            if parse_md_task_line(t).is_some() {
-                None
-            } else {
-                parse_md_bullet_line(t)
-            }
-        };
-        let Some(rest) = rest else {
-            break;
-        };
-
-        let mut item_blocks = vec![DocBlock::Paragraph {
-            spans: parse_md_inlines(rest),
-        }];
-        *i += 1;
-
-        // Collect nested/continuation lines indented strictly deeper than `base_indent`,
-        // allowing blank separator lines emitted by `blocks_to_markdown`.
-        let mut child_lines: Vec<&str> = Vec::new();
-        while *i < lines.len() {
-            let next_line = lines[*i];
-            if next_line.trim().is_empty() {
-                let mut look = *i + 1;
-                while look < lines.len() && lines[look].trim().is_empty() {
-                    look += 1;
-                }
-                if look < lines.len() && md_leading_indent(lines[look]) > base_indent {
-                    while *i < look {
-                        child_lines.push("");
-                        *i += 1;
+fn extract_inline_html_href(tag_html: &str) -> Option<String> {
+    let frag = Html::parse_fragment(tag_html);
+    for node in frag.root_element().descendants() {
+        if let Some(el) = ElementRef::wrap(node) {
+            if el.value().name().eq_ignore_ascii_case("a") {
+                if let Some(href) = el.value().attr("href") {
+                    let trimmed = href.trim();
+                    if !trimmed.is_empty() {
+                        return Some(trimmed.to_string());
                     }
-                    continue;
                 }
-                break;
-            }
-            if md_leading_indent(next_line) > base_indent {
-                child_lines.push(next_line);
-                *i += 1;
-            } else {
-                break;
             }
         }
+    }
+    None
+}
 
-        if let Some(min_indent) = child_lines
-            .iter()
-            .filter(|l| !l.trim().is_empty())
-            .map(|l| md_leading_indent(l))
-            .min()
+fn find_matching_details_close(raw: &str, search_from: usize) -> Option<(usize, usize)> {
+    let lower = raw.to_ascii_lowercase();
+    let mut depth = 1usize;
+    let mut pos = search_from;
+    while pos < lower.len() {
+        let rest = &lower[pos..];
+        let Some(rel_lt) = rest.find('<') else {
+            break;
+        };
+        let tag_start = pos + rel_lt;
+        let after = &lower[tag_start..];
+        if after.starts_with("<details")
+            && after[8..].starts_with(['>', ' ', '\t', '\n', '\r'])
         {
-            let dedented: String = child_lines
-                .iter()
-                .map(|l| {
-                    if l.trim().is_empty() {
-                        ""
-                    } else {
-                        strip_md_indent(l, min_indent)
-                    }
-                })
-                .collect::<Vec<_>>()
-                .join("\n");
-            item_blocks.extend(parse_markdown(&dedented));
-        }
-
-        items.push(item_blocks);
-
-        // Allow a single blank line between loose items of the same list level.
-        if *i < lines.len() && lines[*i].trim().is_empty() {
-            let mut look = *i + 1;
-            while look < lines.len() && lines[look].trim().is_empty() {
-                look += 1;
+            depth += 1;
+            pos = tag_start + 8;
+        } else if after.starts_with("</details")
+            && after[9..].starts_with(['>', ' ', '\t', '\n', '\r'])
+        {
+            depth -= 1;
+            if depth == 0 {
+                let close_gt = raw[tag_start..].find('>')?;
+                return Some((tag_start, tag_start + close_gt + 1));
             }
-            if look < lines.len() && md_leading_indent(lines[look]) == base_indent {
-                let nt = lines[look].trim();
-                let same_list = if ordered {
-                    parse_md_ordered_line(nt).is_some()
-                } else {
-                    parse_md_task_line(nt).is_none() && parse_md_bullet_line(nt).is_some()
-                };
-                if same_list {
-                    *i = look;
+            pos = tag_start + 9;
+        } else {
+            pos = tag_start + 1;
+        }
+    }
+    None
+}
+
+fn extract_details_summary(inner: &str) -> (String, &str) {
+    let lower = inner.to_ascii_lowercase();
+    if let Some(sum_start) = lower.find("<summary") {
+        let after_tag = &lower[sum_start + 8..];
+        if after_tag.starts_with(['>', ' ', '\t', '\n', '\r']) {
+            if let Some(rel_gt) = inner[sum_start..].find('>') {
+                let content_start = sum_start + rel_gt + 1;
+                if let Some(rel_close) = lower[content_start..].find("</summary") {
+                    let close_start = content_start + rel_close;
+                    if let Some(rel_close_gt) = inner[close_start..].find('>') {
+                        let raw_title = &inner[content_start..close_start];
+                        let frag = Html::parse_fragment(raw_title);
+                        let title_text = collect_raw_text(frag.root_element()).trim().to_string();
+                        let title = if title_text.is_empty() {
+                            "Details".to_string()
+                        } else {
+                            title_text
+                        };
+                        let body = &inner[close_start + rel_close_gt + 1..];
+                        return (title, body);
+                    }
                 }
             }
         }
     }
-    items
-}
-
-fn parse_md_image_line(trimmed: &str) -> Option<(String, String)> {
-    let rest = trimmed.strip_prefix("![")?;
-    let rest = rest.strip_suffix(')')?;
-    let sep = rest.rfind("](")?;
-    let label = rest[..sep].trim();
-    let target = rest[sep + 2..].trim();
-    if target.is_empty() || target.chars().any(char::is_whitespace) {
-        return None;
-    }
-    Some((label.to_string(), target.to_string()))
-}
-
-fn is_md_rule(trimmed: &str) -> bool {
-    let clean: String = trimmed.chars().filter(|c| !c.is_whitespace()).collect();
-    clean.len() >= 3
-        && (clean.chars().all(|c| c == '-')
-            || clean.chars().all(|c| c == '*')
-            || clean.chars().all(|c| c == '_'))
-}
-
-fn parse_md_heading(trimmed: &str) -> Option<(u8, &str)> {
-    let hashes = trimmed.bytes().take_while(|&b| b == b'#').count();
-    if (1..=6).contains(&hashes) && trimmed[hashes..].starts_with(' ') {
-        Some((hashes as u8, trimmed[hashes + 1..].trim()))
-    } else {
-        None
-    }
+    ("Details".to_string(), inner)
 }
 
 fn parse_callout_header(line: &str) -> Option<(PanelKind, Option<String>)> {
@@ -2770,237 +3272,6 @@ fn parse_callout_header(line: &str) -> Option<(PanelKind, Option<String>)> {
         }
     }
     None
-}
-
-fn is_md_table_separator(trimmed: &str) -> bool {
-    if !trimmed.contains('-') || !trimmed.starts_with('|') {
-        return false;
-    }
-    trimmed
-        .trim_matches('|')
-        .split('|')
-        .all(|cell| {
-            let c = cell.trim();
-            !c.is_empty() && c.chars().all(|ch| ch == '-' || ch == ':')
-        })
-}
-
-fn split_md_table_row(line: &str) -> Vec<String> {
-    let mut trimmed = line.trim();
-    if let Some(rest) = trimmed.strip_prefix('|') {
-        trimmed = rest;
-    }
-    if trimmed.ends_with('|') {
-        let backslashes = trimmed[..trimmed.len() - 1]
-            .bytes()
-            .rev()
-            .take_while(|&b| b == b'\\')
-            .count();
-        if backslashes % 2 == 0 {
-            trimmed = &trimmed[..trimmed.len() - 1];
-        }
-    }
-
-    let mut cells = Vec::new();
-    let mut cur = String::new();
-    let chars: Vec<char> = trimmed.chars().collect();
-    let mut i = 0usize;
-    while i < chars.len() {
-        if chars[i] == '\\' && i + 1 < chars.len() && chars[i + 1] == '|' {
-            cur.push('|');
-            i += 2;
-        } else if chars[i] == '|' {
-            cells.push(cur.trim().to_string());
-            cur.clear();
-            i += 1;
-        } else {
-            cur.push(chars[i]);
-            i += 1;
-        }
-    }
-    cells.push(cur.trim().to_string());
-    cells
-}
-
-fn parse_md_task_line(trimmed: &str) -> Option<(bool, &str)> {
-    let rest = trimmed
-        .strip_prefix("- ")
-        .or_else(|| trimmed.strip_prefix("* "))?;
-    if let Some(after) = rest.strip_prefix("[x] ").or_else(|| rest.strip_prefix("[X] ")) {
-        Some((true, after.trim()))
-    } else if let Some(after) = rest.strip_prefix("[ ] ") {
-        Some((false, after.trim()))
-    } else {
-        None
-    }
-}
-
-fn parse_md_bullet_line(trimmed: &str) -> Option<&str> {
-    trimmed
-        .strip_prefix("- ")
-        .or_else(|| trimmed.strip_prefix("* "))
-        .or_else(|| trimmed.strip_prefix("+ "))
-        .map(str::trim)
-}
-
-fn parse_md_ordered_line(trimmed: &str) -> Option<(usize, &str)> {
-    let digits = trimmed.bytes().take_while(|b| b.is_ascii_digit()).count();
-    if digits == 0 {
-        return None;
-    }
-    let after = &trimmed[digits..];
-    if let Some(rest) = after.strip_prefix(". ") {
-        let num = trimmed[..digits].parse::<usize>().ok()?;
-        Some((num, rest.trim()))
-    } else {
-        None
-    }
-}
-
-fn parse_md_inlines(input: &str) -> Vec<InlineNode> {
-    let mut out = Vec::new();
-    let mut buf = String::new();
-    let chars: Vec<char> = input.chars().collect();
-    let mut i = 0usize;
-
-    let flush_buf = |buf: &mut String, out: &mut Vec<InlineNode>| {
-        if !buf.is_empty() {
-            let taken = std::mem::take(buf);
-            out.extend(split_text_with_issue_refs(&taken, &InlineStyle::default()));
-        }
-    };
-
-    while i < chars.len() {
-        // Inline code: variable-length backtick spans (`...`, `` `x` ``, etc.)
-        if chars[i] == '`' {
-            let tick_len = chars[i..].iter().take_while(|&&c| c == '`').count();
-            let mut j = i + tick_len;
-            let mut found_end = None;
-            while j < chars.len() {
-                if chars[j] == '`' {
-                    let run = chars[j..].iter().take_while(|&&c| c == '`').count();
-                    if run == tick_len {
-                        found_end = Some(j);
-                        break;
-                    }
-                    j += run;
-                } else {
-                    j += 1;
-                }
-            }
-            if let Some(end) = found_end {
-                flush_buf(&mut buf, &mut out);
-                let mut code_text: String = chars[i + tick_len..end].iter().collect();
-                if code_text.len() >= 2
-                    && code_text.starts_with(' ')
-                    && code_text.ends_with(' ')
-                    && code_text.chars().any(|c| c != ' ')
-                {
-                    code_text = code_text[1..code_text.len() - 1].to_string();
-                }
-                if !code_text.is_empty() {
-                    out.push(InlineNode::Text {
-                        text: code_text,
-                        style: InlineStyle {
-                            code: true,
-                            ..Default::default()
-                        },
-                    });
-                }
-                i = end + tick_len;
-                continue;
-            }
-            for _ in 0..tick_len {
-                buf.push('`');
-            }
-            i += tick_len;
-            continue;
-        }
-
-        // Bold: **...**
-        if i + 1 < chars.len() && chars[i] == '*' && chars[i + 1] == '*' {
-            if let Some(end) = find_char_seq(&chars, i + 2, &['*', '*']) {
-                flush_buf(&mut buf, &mut out);
-                let inner: String = chars[i + 2..end].iter().collect();
-                out.push(InlineNode::Text {
-                    text: inner,
-                    style: InlineStyle {
-                        bold: true,
-                        ..Default::default()
-                    },
-                });
-                i = end + 2;
-                continue;
-            }
-        }
-
-        // Strike: ~~...~~
-        if i + 1 < chars.len() && chars[i] == '~' && chars[i + 1] == '~' {
-            if let Some(end) = find_char_seq(&chars, i + 2, &['~', '~']) {
-                flush_buf(&mut buf, &mut out);
-                let inner: String = chars[i + 2..end].iter().collect();
-                out.push(InlineNode::Text {
-                    text: inner,
-                    style: InlineStyle {
-                        strike: true,
-                        ..Default::default()
-                    },
-                });
-                i = end + 2;
-                continue;
-            }
-        }
-
-        // Italic: *...* or _..._
-        if (chars[i] == '*' || chars[i] == '_') && is_wiki_delim_open(&chars, i) {
-            let delim = chars[i];
-            if let Some(end) = find_closing_wiki_delim(&chars, i + 1, delim) {
-                flush_buf(&mut buf, &mut out);
-                let inner: String = chars[i + 1..end].iter().collect();
-                out.push(InlineNode::Text {
-                    text: inner,
-                    style: InlineStyle {
-                        italic: true,
-                        ..Default::default()
-                    },
-                });
-                i = end + 1;
-                continue;
-            }
-        }
-
-        // Link: [text](url)
-        if chars[i] == '[' {
-            if let Some(close_br) = chars[i + 1..].iter().position(|&c| c == ']').map(|p| i + 1 + p) {
-                if close_br + 1 < chars.len() && chars[close_br + 1] == '(' {
-                    if let Some(close_paren) = chars[close_br + 2..]
-                        .iter()
-                        .position(|&c| c == ')')
-                        .map(|p| close_br + 2 + p)
-                    {
-                        flush_buf(&mut buf, &mut out);
-                        let label: String = chars[i + 1..close_br].iter().collect();
-                        let url: String = chars[close_br + 2..close_paren].iter().collect();
-                        out.push(InlineNode::Text {
-                            text: label,
-                            style: InlineStyle {
-                                link_url: Some(url),
-                                ..Default::default()
-                            },
-                        });
-                        i = close_paren + 1;
-                        continue;
-                    }
-                }
-            }
-        }
-
-        buf.push(chars[i]);
-        i += 1;
-    }
-
-    flush_buf(&mut buf, &mut out);
-    out
 }
 
 /// Compiles Markdown into Atlassian Document Format (ADF v1) JSON value.
@@ -3842,5 +4113,93 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn parse_markdown_nested_inlines_escapes_callouts_and_details_u() {
+        let md = concat!(
+            "***both*** and **bold *italic*** and \\*escaped\\*\n\n",
+            "> [!INFO] Custom Info\n> Info line\n\n",
+            "> [!WARNING]\n> Watch out\n\n",
+            "> [!TIP] Fast Path\n> Use cache\n\n",
+            "<details><summary>More</summary><u>Under</u></details>"
+        );
+        let blocks = parse_markdown(md);
+        assert_eq!(blocks.len(), 5, "unexpected blocks: {blocks:#?}");
+
+        // 1. Nested inline styles & backslash escapes
+        match &blocks[0] {
+            DocBlock::Paragraph { spans } => {
+                assert!(spans.iter().any(|n| matches!(
+                    n,
+                    InlineNode::Text { text, style }
+                        if text == "both" && style.bold && style.italic
+                )));
+                assert!(spans.iter().any(|n| matches!(
+                    n,
+                    InlineNode::Text { text, style }
+                        if text == "bold " && style.bold && !style.italic
+                )));
+                assert!(spans.iter().any(|n| matches!(
+                    n,
+                    InlineNode::Text { text, style }
+                        if text == "italic" && style.bold && style.italic
+                )));
+                assert!(spans.iter().any(|n| matches!(
+                    n,
+                    InlineNode::Text { text, style }
+                        if text.contains("*escaped*") && !style.bold && !style.italic
+                )));
+            }
+            other => panic!("expected Paragraph, got {other:?}"),
+        }
+
+        // 2-4. Callouts -> DocBlock::Panel
+        assert!(matches!(
+            &blocks[1],
+            DocBlock::Panel {
+                kind: PanelKind::Info,
+                title: Some(t),
+                blocks: inner,
+            } if t == "Custom Info" && !inner.is_empty()
+        ));
+        assert!(matches!(
+            &blocks[2],
+            DocBlock::Panel {
+                kind: PanelKind::Warning,
+                title: None,
+                blocks: inner,
+            } if !inner.is_empty()
+        ));
+        assert!(matches!(
+            &blocks[3],
+            DocBlock::Panel {
+                kind: PanelKind::Success,
+                title: Some(t),
+                blocks: inner,
+            } if t == "Fast Path" && !inner.is_empty()
+        ));
+
+        // 5. <details><summary> + <u> -> DocBlock::Expand + underline: true
+        match &blocks[4] {
+            DocBlock::Expand { title, blocks: inner } => {
+                assert_eq!(title, "More");
+                assert!(matches!(
+                    inner.as_slice(),
+                    [DocBlock::Paragraph { spans }]
+                        if spans.iter().any(|n| matches!(
+                            n,
+                            InlineNode::Text { text, style }
+                                if text == "Under" && style.underline
+                        ))
+                ));
+            }
+            other => panic!("expected Expand, got {other:?}"),
+        }
+
+        // Round-trip blocks_to_markdown -> parse_markdown
+        let rt_md = blocks_to_markdown(&blocks[4..5]);
+        let rt_blocks = parse_markdown(&rt_md);
+        assert_eq!(rt_blocks, blocks[4..5], "round-trip failed for:\n{rt_md}");
     }
 }

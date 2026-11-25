@@ -2265,7 +2265,7 @@ fn open_image_preview_with(
 ) {
     if let Some(idx) = preferred_idx {
         if let Some(att) = atts.get(idx) {
-            if html_preview::is_html_attachment(&att.mime_type, &att.filename) {
+            if html_preview::is_previewable_markup_attachment(&att.mime_type, &att.filename) {
                 open_html_attachment_preview(app, ui, label, att.clone());
                 return;
             }
@@ -2280,12 +2280,12 @@ fn open_image_preview_with(
         }
         ui.push_overlay(Overlay::ImagePreview(ov));
         app.request_load_preview_image(ui);
-    } else if let Some(html_att) = atts
+    } else if let Some(markup_att) = atts
         .iter()
-        .find(|att| html_preview::is_html_attachment(&att.mime_type, &att.filename))
+        .find(|att| html_preview::is_previewable_markup_attachment(&att.mime_type, &att.filename))
         .cloned()
     {
-        open_html_attachment_preview(app, ui, label, html_att);
+        open_html_attachment_preview(app, ui, label, markup_att);
     } else {
         ui.info("No image attachments to preview");
     }
@@ -2987,6 +2987,160 @@ mod tests {
             }
             other => panic!("expected auto-routed HtmlPreview overlay, got {other:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn markdown_attachment_end_to_end_preview_renders_and_toggles_raw() {
+        use axum::{routing::get, Router};
+        use bitefoundry_html::SourceKind;
+        use ratatui::{backend::TestBackend, Terminal};
+        use tokio::net::TcpListener;
+
+        let router = Router::new().route(
+            "/readme.md",
+            get(|| async { "# Title\n\n**bold** | [link](https://example.com)\n" }),
+        );
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, router).await;
+        });
+        let base_url = format!("http://{addr}");
+
+        let cfg = AppConfig {
+            site_url: base_url.clone(),
+            ..Default::default()
+        };
+        let auth = AuthManager::with_credentials(
+            "test",
+            crate::auth::StoredCredentials::BearerPat {
+                site_url: base_url.clone(),
+                token: "test-token".into(),
+                deployment: crate::config::DeploymentKind::Cloud,
+            },
+        );
+        let client = AtlassianClient::new(cfg.clone(), auth.clone()).unwrap();
+        let storage = Storage::open_in_memory().unwrap();
+        let (core_tx, _) = mpsc::unbounded_channel();
+        let sync_ctrl =
+            sync::spawn_sync_engine(cfg.clone(), client.clone(), storage.clone(), core_tx);
+        let (ui_tx, mut ui_rx) = mpsc::unbounded_channel();
+
+        let mut app = AppState::new_with_persona(
+            cfg.clone(),
+            Persona::Jira,
+            auth,
+            client,
+            storage,
+            sync_ctrl,
+            ui_tx,
+        );
+        let mut ui = UiState::from_config_with_persona(&cfg, Persona::Jira);
+
+        let mut issue = IssueDetail::default();
+        issue.summary.key = "ATL-42".into();
+        issue.attachments = vec![AttachmentItem {
+            id: "att-md".into(),
+            filename: "README.md".into(),
+            mime_type: "application/octet-stream".into(),
+            size: 64,
+            author_name: Some("Alice".into()),
+            created_at: String::new(),
+            content_url: format!("{base_url}/readme.md"),
+            thumbnail_url: None,
+        }];
+        app.active_issue = Some(issue);
+        ui.active_tab = WorkspaceTab::Issues;
+
+        // Open Attachments overlay and verify [MD] badge
+        dispatch(Action::OpenAttachments, &mut app, &mut ui);
+        match ui.overlays.last() {
+            Some(Overlay::Attachments(ov)) => {
+                let rows = ov.rows();
+                assert_eq!(rows.len(), 1);
+                assert!(rows[0].is_markdown);
+                assert_eq!(rows[0].icon(), "[MD]");
+            }
+            other => panic!("expected Attachments overlay, got {other:?}"),
+        }
+
+        // Press `v` -> dispatches HtmlPreview loading overlay and fetches bytes
+        dispatch(Action::Input('v'), &mut app, &mut ui);
+        assert!(
+            matches!(ui.overlays.last(), Some(Overlay::HtmlPreview(_))),
+            "pressing `v` on README.md must open Overlay::HtmlPreview"
+        );
+
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            let msg = tokio::time::timeout_at(deadline, ui_rx.recv())
+                .await
+                .expect("HtmlAttachmentLoaded timed out")
+                .expect("ui_rx closed");
+            let is_loaded = matches!(msg, crate::ui::app::UiMsg::HtmlAttachmentLoaded { .. });
+            app.handle_ui_msg(&mut ui, msg);
+            if is_loaded {
+                break;
+            }
+        }
+
+        let backend = TestBackend::new(96, 24);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal
+            .draw(|f| {
+                let _ = crate::ui::draw(f, &app, &mut ui);
+            })
+            .unwrap();
+        let rendered_screen: String = terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|c| c.symbol())
+            .collect();
+
+        match ui.overlays.last() {
+            Some(Overlay::HtmlPreview(ov)) => {
+                let sess = ov.session().expect("expected loaded Markdown session");
+                assert_eq!(sess.source_kind(), SourceKind::Markdown);
+                assert!(!ov.is_js_active());
+                assert!(
+                    sess.serve_html().contains("<!DOCTYPE html>"),
+                    "serve_html() should produce standalone HTML for `o`"
+                );
+            }
+            other => panic!("expected HtmlPreview overlay, got {other:?}"),
+        }
+        assert!(rendered_screen.contains("Title"), "expected heading:\n{rendered_screen}");
+        assert!(rendered_screen.contains("bold"), "expected bold text:\n{rendered_screen}");
+        assert!(rendered_screen.contains("link"), "expected link text:\n{rendered_screen}");
+        assert!(
+            !rendered_screen.contains("**"),
+            "raw `**` leaked into rendered Markdown preview:\n{rendered_screen}"
+        );
+
+        // Press `r` to toggle Raw Markdown mode -> shows raw `# Title`
+        dispatch(Action::Input('r'), &mut app, &mut ui);
+        assert!(
+            matches!(ui.overlays.last(), Some(Overlay::HtmlPreview(ov)) if ov.is_raw_mode()),
+            "pressing `r` must toggle raw mode"
+        );
+        terminal
+            .draw(|f| {
+                let _ = crate::ui::draw(f, &app, &mut ui);
+            })
+            .unwrap();
+        let raw_screen: String = terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|c| c.symbol())
+            .collect();
+        assert!(
+            raw_screen.contains("# Title"),
+            "expected raw `# Title` after pressing `r`:\n{raw_screen}"
+        );
     }
 
     fn key_action(ui: &UiState, code: crossterm::event::KeyCode) -> Option<Action> {

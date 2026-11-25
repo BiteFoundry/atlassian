@@ -416,6 +416,7 @@ pub enum UiMsg {
         title: String,
         source_url: String,
         task_label: String,
+        content_kind: bitefoundry_html::ContentKind,
         result: Result<String, String>,
     },
     PreviewImageSniffedAsHtml {
@@ -4912,7 +4913,7 @@ impl AppState {
         });
     }
 
-    /// Downloads an `.html`/`.htm` attachment asynchronously and feeds it into `Overlay::HtmlPreview`.
+    /// Downloads an `.html`/`.htm`/`.md` attachment asynchronously and feeds it into `Overlay::HtmlPreview`.
     pub fn request_load_html_attachment(
         &self,
         ui: &mut UiState,
@@ -4926,17 +4927,36 @@ impl AppState {
         let (_, client) = self.site_id_and_client_for(site_id);
         let tx = self.ui_tx.clone();
         let source_url = att.content_url.clone();
-        let task_label = format!("HTML: {}", att.filename);
+        let mime_hint = att.mime_type.clone();
+        let file_name = att.filename.clone();
+        let is_md = crate::ui::overlays::html_preview::is_markdown_attachment(
+            &att.mime_type,
+            &att.filename,
+        );
+        let task_label = if is_md {
+            format!("MD: {}", att.filename)
+        } else {
+            format!("HTML: {}", att.filename)
+        };
         ui.tasks.begin(&task_label);
         tokio::spawn(async move {
-            let result = match client.fetch_attachment_bytes(&att).await {
-                Ok(bytes) => Ok(String::from_utf8_lossy(&bytes).into_owned()),
-                Err(err) => Err(err.to_string()),
+            let mime = (!mime_hint.trim().is_empty()).then_some(mime_hint.as_str());
+            let fname = (!file_name.trim().is_empty()).then_some(file_name.as_str());
+            let (content_kind, result) = match client.fetch_attachment_bytes(&att).await {
+                Ok(bytes) => {
+                    let kind = bitefoundry_html::sniff_content_kind(mime, fname, Some(&bytes));
+                    (kind, Ok(String::from_utf8_lossy(&bytes).into_owned()))
+                }
+                Err(err) => {
+                    let kind = bitefoundry_html::sniff_content_kind(mime, fname, None);
+                    (kind, Err(err.to_string()))
+                }
             };
             let _ = tx.send(UiMsg::HtmlAttachmentLoaded {
                 title,
                 source_url,
                 task_label,
+                content_kind,
                 result,
             });
         });
@@ -6543,20 +6563,41 @@ impl AppState {
                 title,
                 source_url,
                 task_label,
+                content_kind,
                 result,
             } => {
                 ui.tasks.finish(&task_label, result.as_ref().err().cloned());
+                let effective_kind = if content_kind == bitefoundry_html::ContentKind::Markdown {
+                    bitefoundry_html::ContentKind::Markdown
+                } else if let Ok(ref raw) = result {
+                    let sniffed = bitefoundry_html::sniff_content_kind(
+                        None,
+                        Some(title.as_str()),
+                        Some(raw.as_bytes()),
+                    );
+                    if sniffed == bitefoundry_html::ContentKind::Markdown {
+                        bitefoundry_html::ContentKind::Markdown
+                    } else {
+                        content_kind
+                    }
+                } else {
+                    content_kind
+                };
                 if let Some(Overlay::HtmlPreview(ov)) = ui.overlays.last_mut() {
                     if !source_url.is_empty() {
                         ov.source_url = source_url;
                     }
-                    ov.set_loaded(result);
-                } else if let Ok(html) = result {
-                    let mut ov = HtmlPreviewOverlay::new(title, html);
+                    ov.set_loaded_with_kind(effective_kind, result);
+                } else if let Ok(body) = result {
+                    let mut ov = if effective_kind == bitefoundry_html::ContentKind::Markdown {
+                        HtmlPreviewOverlay::new_markdown(title, body)
+                    } else {
+                        HtmlPreviewOverlay::new(title, body)
+                    };
                     ov.source_url = source_url;
                     ui.push_overlay(Overlay::HtmlPreview(ov));
                 } else if let Err(err) = result {
-                    ui.error(format!("Failed to load HTML attachment: {err}"));
+                    ui.error(format!("Failed to load attachment preview: {err}"));
                 }
             }
             UiMsg::PreviewImageSniffedAsHtml {
@@ -7220,6 +7261,7 @@ mod tests {
                     title: "Page — report.html".into(),
                     source_url: String::new(),
                     task_label: "HTML: report.html".into(),
+                    content_kind: bitefoundry_html::ContentKind::Html,
                     result: Err("HTTP 403".into()),
                 },
             ),

@@ -89,12 +89,7 @@ pub(crate) fn blocks_or_markdown<'a>(
     markdown: Option<&str>,
 ) -> Cow<'a, [DocBlock]> {
     match markdown {
-        Some(text) if blocks.is_empty() => Cow::Owned(vec![DocBlock::Paragraph {
-            spans: vec![InlineNode::Text {
-                text: text.to_owned(),
-                style: InlineStyle::default(),
-            }],
-        }]),
+        Some(text) if blocks.is_empty() => Cow::Owned(crate::adf::parse_markdown(text)),
         _ => Cow::Borrowed(blocks),
     }
 }
@@ -904,8 +899,73 @@ mod tests {
         assert!(matches!(&blocks, Cow::Borrowed(_)));
         assert_eq!(blocks.as_ptr(), fallback.as_ptr());
         let lines = render_blocks(&blocks, 80, &Theme::default(), None, false);
-        assert_eq!(lines_to_strings(&lines), ["Cached **plain** text"]);
+        assert_eq!(lines_to_strings(&lines), ["Cached plain text"]);
+        assert!(
+            lines[0]
+                .spans
+                .iter()
+                .any(|s| s.content == "plain" && s.style.add_modifier.contains(Modifier::BOLD)),
+            "expected bold span for `plain` in {:?}",
+            lines[0].spans
+        );
         assert!(blocks_or_markdown(&[], None).is_empty());
+    }
+
+    #[test]
+    fn blocks_or_markdown_and_roundtrip_details_u() {
+        let md = "## Heading\n**bold** and _italic_";
+        let fallback = blocks_or_markdown(&[], Some(md));
+        assert!(matches!(&fallback, Cow::Owned(_)));
+        assert!(
+            matches!(fallback.first(), Some(DocBlock::Heading { level: 2, .. })),
+            "expected H2 heading block, got {fallback:?}"
+        );
+        let rendered = render_blocks(&fallback, 80, &Theme::default(), None, false);
+        let text = lines_to_strings(&rendered).join("\n");
+        assert!(text.contains("Heading"), "expected heading text:\n{text}");
+        assert!(text.contains("bold"), "expected bold text:\n{text}");
+        assert!(text.contains("italic"), "expected italic text:\n{text}");
+        assert!(!text.contains("##"), "raw `##` leaked into rendered output:\n{text}");
+        assert!(!text.contains("**"), "raw `**` leaked into rendered output:\n{text}");
+        assert!(
+            rendered.iter().flat_map(|l| &l.spans).any(|s| {
+                s.content.contains("bold") && s.style.add_modifier.contains(Modifier::BOLD)
+            }),
+            "expected BOLD modifier on `bold`"
+        );
+        assert!(
+            rendered.iter().flat_map(|l| &l.spans).any(|s| {
+                s.content.contains("italic") && s.style.add_modifier.contains(Modifier::ITALIC)
+            }),
+            "expected ITALIC modifier on `italic`"
+        );
+
+        // <details><summary> + <u> underline round-trip
+        let details_blocks =
+            crate::adf::parse_markdown("<details><summary>More</summary><u>Under</u></details>");
+        assert_eq!(details_blocks.len(), 1, "expected single Expand block: {details_blocks:?}");
+        match &details_blocks[0] {
+            DocBlock::Expand { title, blocks } => {
+                assert_eq!(title, "More");
+                assert!(
+                    matches!(
+                        blocks.as_slice(),
+                        [DocBlock::Paragraph { spans }]
+                            if spans.iter().any(|n| matches!(
+                                n,
+                                InlineNode::Text { text, style }
+                                    if text == "Under" && style.underline
+                            ))
+                    ),
+                    "expected underlined `Under` paragraph inside Expand, got {blocks:?}"
+                );
+            }
+            other => panic!("expected DocBlock::Expand, got {other:?}"),
+        }
+
+        let roundtrip_md = crate::adf::blocks_to_markdown(&details_blocks);
+        let reparsed = crate::adf::parse_markdown(&roundtrip_md);
+        assert_eq!(reparsed, details_blocks, "round-trip mismatch for:\n{roundtrip_md}");
     }
 
     #[test]

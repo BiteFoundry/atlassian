@@ -9,7 +9,7 @@ use std::{
     sync::{Arc, OnceLock},
 };
 
-use bitefoundry_html::{ContentKind, HtmlEffect, HtmlTheme, HtmlViewSession};
+use bitefoundry_html::{ContentKind, HtmlEffect, HtmlTheme, HtmlViewSession, SourceKind};
 use ratatui::{
     layout::Rect,
     style::{Color, Modifier, Style},
@@ -137,7 +137,44 @@ impl HtmlPreviewOverlay {
         overlay
     }
 
-    /// Creates a placeholder overlay while an HTML attachment is being downloaded asynchronously.
+    /// Opens an interactive Markdown preview immediately backed by `HtmlViewSession::new_markdown`.
+    pub fn new_markdown(title: impl Into<String>, raw_md: impl Into<String>) -> Self {
+        let title_str = title.into();
+        let md_str = raw_md.into();
+        let title_opt = if title_str.trim().is_empty() {
+            None
+        } else {
+            Some(title_str.clone())
+        };
+        let session = HtmlViewSession::new_markdown(title_opt, md_str);
+        let resolved_title = session
+            .title()
+            .map(ToString::to_string)
+            .unwrap_or_else(|| {
+                if title_str.trim().is_empty() {
+                    "Markdown Document".to_string()
+                } else {
+                    title_str
+                }
+            });
+
+        Self {
+            title: resolved_title,
+            source_url: String::new(),
+            session: Some(session),
+            loading: false,
+            error: None,
+            last_served_url: None,
+            pending_commands: Vec::new(),
+            last_content_rect: Rect::default(),
+            last_scroll_y: 0,
+            last_mode_pill_rect: Rect::default(),
+            last_browser_pill_rect: Rect::default(),
+            graphic_cache: HashMap::new(),
+        }
+    }
+
+    /// Creates a placeholder overlay while an HTML or Markdown attachment is being downloaded asynchronously.
     pub fn loading(title: impl Into<String>, source_url: impl Into<String>) -> Self {
         let title_str = title.into();
         Self {
@@ -162,17 +199,22 @@ impl HtmlPreviewOverlay {
 
     /// Populates the overlay after an async HTML attachment fetch completes.
     pub fn set_loaded(&mut self, result: Result<String, String>) {
+        self.set_loaded_with_kind(ContentKind::Html, result);
+    }
+
+    /// Populates the overlay after an async HTML or Markdown attachment fetch completes.
+    pub fn set_loaded_with_kind(&mut self, kind: ContentKind, result: Result<String, String>) {
         self.loading = false;
         self.graphic_cache.clear();
         match result {
-            Ok(html) => {
+            Ok(body) => {
                 self.error = None;
                 let title_opt = if self.title.trim().is_empty() {
                     None
                 } else {
                     Some(self.title.clone())
                 };
-                let mut session = HtmlViewSession::new(title_opt, html);
+                let mut session = HtmlViewSession::from_content(title_opt, kind, body);
                 let init_effects = session.take_pending_effects();
                 if self.title.trim().is_empty() {
                     if let Some(t) = session.title() {
@@ -187,6 +229,12 @@ impl HtmlPreviewOverlay {
                 self.error = Some(err);
             }
         }
+    }
+
+    pub fn is_markdown(&self) -> bool {
+        self.session
+            .as_ref()
+            .is_some_and(|s| s.source_kind() == SourceKind::Markdown)
     }
 
     pub fn is_editing_input(&self) -> bool {
@@ -345,7 +393,7 @@ impl HtmlPreviewOverlay {
                 self.apply_effects(effects);
                 OverlayOutcome::Handled
             }
-            Action::Input('m') | Action::Input('M') => {
+            Action::Input('m') | Action::Input('M') | Action::Input('r') | Action::Input('R') => {
                 self.toggle_raw_mode();
                 OverlayOutcome::Handled
             }
@@ -447,7 +495,7 @@ impl HtmlPreviewOverlay {
         if let Some(sess) = self.session.as_ref() {
             self.pending_commands.push(HtmlPreviewCommand::ServeInBrowser {
                 title: self.title.clone(),
-                html: sess.raw_html().to_string(),
+                html: sess.serve_html(),
             });
         } else if !self.source_url.trim().is_empty() {
             self.pending_commands
@@ -538,13 +586,19 @@ impl HtmlPreviewOverlay {
             .saturating_sub(2 + if show_close_pill { close_w + 2 } else { 0 })
             as usize;
 
+        let is_md = self.is_markdown();
         let mode_label = if self.is_raw_mode() {
-            "Raw HTML"
+            if is_md { "Raw MD" } else { "Raw HTML" }
         } else {
             "Rendered"
         };
         let js_badge = if self.is_js_active() { " · JS" } else { "" };
-        let title = format!(" HTML Preview — {} [{mode_label}{js_badge}] ", self.title);
+        let kind_prefix = if is_md {
+            "Markdown Preview"
+        } else {
+            "HTML Preview"
+        };
+        let title = format!(" {kind_prefix} — {} [{mode_label}{js_badge}] ", self.title);
 
         let block = Block::default()
             .borders(Borders::ALL)
@@ -894,6 +948,18 @@ pub fn is_html_attachment(mime_type: &str, filename: &str) -> bool {
     let mime = (!mime_type.trim().is_empty()).then_some(mime_type);
     let name = (!filename.trim().is_empty()).then_some(filename);
     bitefoundry_html::sniff_content_kind(mime, name, None) == ContentKind::Html
+}
+
+/// Strictly checks whether an attachment's MIME type or filename identifies it as Markdown.
+pub fn is_markdown_attachment(mime_type: &str, filename: &str) -> bool {
+    let mime = (!mime_type.trim().is_empty()).then_some(mime_type);
+    let name = (!filename.trim().is_empty()).then_some(filename);
+    bitefoundry_html::sniff_content_kind(mime, name, None) == ContentKind::Markdown
+}
+
+/// Returns `true` when an attachment is HTML or Markdown and previewable via [`HtmlPreviewOverlay`].
+pub fn is_previewable_markup_attachment(mime_type: &str, filename: &str) -> bool {
+    is_html_attachment(mime_type, filename) || is_markdown_attachment(mime_type, filename)
 }
 
 /// Pre-processes Confluence Storage XHTML (`ac:structured-macro`, `<ac:parameter>`, CDATA,
