@@ -3081,7 +3081,7 @@ async fn cli_view_json_is_compact_and_full_restores_structure() {
         assert_eq!(issue_default, issue_compact);
         assert_eq!(
             issue_default["issue"]["hint"],
-            "atlassian view ATL-1 --json --full"
+            "atlassian view ATL-1 --json --fields <field> (or --full)"
         );
         assert!(issue_default["issue"]["omitted"].is_object());
         assert!(issue_default["issue"].get("description_raw").is_none());
@@ -3099,7 +3099,7 @@ async fn cli_view_json_is_compact_and_full_restores_structure() {
         assert_eq!(issue_off_default, issue_off_compact);
         assert_eq!(
             issue_off_default["issue"]["hint"],
-            "atlassian view ATL-1 --json --full --offline"
+            "atlassian view ATL-1 --json --fields <field> (or --full) --offline"
         );
         assert!(issue_off_full["issue"]["description_raw"].is_string());
 
