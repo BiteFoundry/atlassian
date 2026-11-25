@@ -14,7 +14,7 @@
 #   docker run -i --rm atlassian mcp --read-only
 FROM debian:bookworm-slim
 
-ARG ATLASSIAN_VERSION=0.8.3
+ARG ATLASSIAN_VERSION=0.8.4
 ARG TARGETARCH
 
 LABEL org.opencontainers.image.title="atlassian" \
