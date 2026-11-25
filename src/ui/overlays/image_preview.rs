@@ -17,7 +17,7 @@ use unicode_width::UnicodeWidthStr;
 
 use crate::{
     img_preview::{
-        self, RenderedTerminalImage, TerminalGraphicsCaps, TerminalImageProtocol,
+        self, FitBox, RenderedTerminalImage, TerminalGraphicsCaps, TerminalImageProtocol,
     },
     models::AttachmentItem,
     ui::{
@@ -47,7 +47,7 @@ pub struct ImagePreviewOverlay {
     pub site_id: Option<String>,
     pub items: Vec<AttachmentItem>,
     pub index: usize,
-    /// Zoom percentage (`25..=200`, default `100`).
+    /// Zoom percentage (`25..=300`, default `100`).
     pub zoom_pct: u16,
     /// Vertical viewport scroll offset (in terminal cell rows) for tall/zoomed images.
     pub scroll_y: u16,
@@ -203,21 +203,36 @@ impl ImagePreviewOverlay {
         )
     }
 
-    pub fn target_dimensions(&self, term_width: u16, term_height: u16) -> (u16, u16) {
+    /// Returns the modal's actual inner image canvas dimensions `(view_cols, view_rows)`.
+    pub fn viewport_dimensions(term_width: u16, term_height: u16) -> (u16, u16) {
         let area = Rect::new(0, 0, term_width.max(24), term_height.max(12));
         let (_, img_area, _) = Self::content_areas(area);
-        let inner_w = img_area.width.max(12);
-        let inner_h = img_area.height.max(6);
-        let base_cols = inner_w.saturating_sub(2).max(12).min(inner_w);
-        let max_cols = inner_w.saturating_mul(2).max(base_cols).min(240);
-        let scaled_cols = ((base_cols as u32 * self.zoom_pct as u32) / 100)
-            .clamp(8, max_cols as u32) as u16;
-        // Pass `scrollable_max_rows >= scaled_cols` so `img_preview` fits tall images to width
-        // and lets them scroll vertically immediately at 100% zoom.
-        let scrollable_max_rows = ((inner_h as u32 * 4 * self.zoom_pct as u32) / 100)
-            .max(scaled_cols as u32)
-            .clamp(6, 240) as u16;
-        (scaled_cols, scrollable_max_rows)
+        (img_area.width.max(1), img_area.height.max(1))
+    }
+
+    /// Builds the explicit [`FitBox`] sizing contract for the current terminal size and zoom level.
+    pub fn fit_box(&self, term_width: u16, term_height: u16) -> FitBox {
+        let (view_cols, view_rows) = Self::viewport_dimensions(term_width, term_height);
+        FitBox::scrollable(view_cols, view_rows, self.zoom_pct)
+    }
+
+    /// Builds the viewport-, zoom-, cell-pixel-, and protocol-scoped cache key for `att`.
+    pub fn preview_image_cache_key(
+        &self,
+        att: &AttachmentItem,
+        term_width: u16,
+        term_height: u16,
+    ) -> String {
+        let fit = self.fit_box(term_width, term_height);
+        let cache_id = self.cache_id(att);
+        img_preview::preview_cache_key(
+            &cache_id,
+            fit.view_cols,
+            fit.view_rows,
+            fit.zoom_pct,
+            self.cell_px,
+            self.protocol,
+        )
     }
 
     pub fn next_image(&mut self) {
@@ -239,7 +254,7 @@ impl ImagePreviewOverlay {
     }
 
     pub fn zoom_in(&mut self) {
-        self.zoom_pct = (self.zoom_pct + 25).min(200);
+        self.zoom_pct = (self.zoom_pct + 25).min(300);
         self.fit_to_window = self.zoom_pct == 100;
     }
 
@@ -292,25 +307,16 @@ impl ImagePreviewOverlay {
         app: &'a AppState,
     ) -> Option<(String, &'a RenderedTerminalImage)> {
         let cur = self.current()?;
-        let (cols, rows) = self.target_dimensions(area.width, area.height);
-        let cache_id = self.cache_id(cur);
-        let proto_key = img_preview::preview_cache_key(&cache_id, cols, rows, self.protocol);
+        let proto_key = self.preview_image_cache_key(cur, area.width, area.height);
         if self.protocol.is_pixel() {
             return app
                 .pixel_image_cache
                 .get(&proto_key)
                 .map(|image| (proto_key, image));
         }
-        if let Some(rendered) = app.image_cache.get(&proto_key) {
-            return Some((proto_key, rendered));
-        }
-        if self.protocol == TerminalImageProtocol::Halfblock {
-            let legacy_key = AppState::image_cache_key(&cache_id, cols, rows);
-            if let Some(rendered) = app.image_cache.get(&legacy_key) {
-                return Some((legacy_key, rendered));
-            }
-        }
-        None
+        app.image_cache
+            .get(&proto_key)
+            .map(|rendered| (proto_key, rendered))
     }
 
     /// Computes viewport geometry `(avail_w, avail_h, show_scrollbar, max_scroll_x, max_scroll_y)` for a rendered image.
@@ -864,12 +870,20 @@ mod tests {
         };
         let size = image(128).approx_heap_bytes();
         app.image_cache = DecodedImageCache::with_limits(size * 2, 64);
-        let overlay =
+        let mut overlay =
             ImagePreviewOverlay::from_attachments("ATL-1", &sample_attachments(), None).unwrap();
+        overlay.protocol = TerminalImageProtocol::Halfblock;
         let area = Rect::new(0, 0, 140, 40);
-        let (cols, rows) = overlay.target_dimensions(area.width, area.height);
+        let fit = overlay.fit_box(area.width, area.height);
         let key = |id| {
-            img_preview::preview_cache_key(id, cols, rows, TerminalImageProtocol::Halfblock)
+            img_preview::preview_cache_key(
+                id,
+                fit.view_cols,
+                fit.view_rows,
+                fit.zoom_pct,
+                overlay.cell_px,
+                TerminalImageProtocol::Halfblock,
+            )
         };
         for id in ["1", "2", "3"] {
             app.handle_ui_msg(
@@ -893,8 +907,6 @@ mod tests {
         );
         assert_eq!(app.image_cache.len(), 1);
         assert!(app.image_cache.total_bytes() > app.image_cache.max_bytes());
-        let mut overlay = overlay;
-        overlay.protocol = TerminalImageProtocol::Halfblock;
         assert_eq!(overlay.lookup_cached(area, &app).unwrap().0, key("2"));
     }
 
@@ -923,14 +935,24 @@ mod tests {
         overlay.handle(&Action::Input('+'));
         assert_eq!(overlay.zoom_pct, 125);
         assert!(!overlay.fit_to_window);
-        let (cols_125, rows_125) = overlay.target_dimensions(120, 40);
+        let fit_125 = overlay.fit_box(120, 40);
 
         overlay.handle(&Action::Input('0'));
         assert_eq!(overlay.zoom_pct, 100);
         assert!(overlay.fit_to_window);
-        let (cols_100, rows_100) = overlay.target_dimensions(120, 40);
-        assert!(cols_125 > cols_100);
-        assert!(rows_125 > rows_100);
+        let fit_100 = overlay.fit_box(120, 40);
+        assert_eq!(fit_125.view_cols, fit_100.view_cols);
+        assert_eq!(fit_125.view_rows, fit_100.view_rows);
+        assert!(fit_125.zoom_pct > fit_100.zoom_pct);
+        assert!(fit_100.scrollable);
+
+        // Verify zoom scales up to 300%
+        for _ in 0..10 {
+            overlay.handle(&Action::Input('+'));
+        }
+        assert_eq!(overlay.zoom_pct, 300);
+        overlay.handle(&Action::Input('0'));
+        assert_eq!(overlay.zoom_pct, 100);
 
         overlay.handle(&Action::Input('f'));
         assert_eq!(overlay.zoom_pct, 150);
@@ -974,7 +996,6 @@ mod tests {
         let atts = sample_attachments();
         let mut overlay = ImagePreviewOverlay::from_attachments("ATL-42", &atts, Some(1)).unwrap();
         let area = Rect::new(0, 0, 100, 30);
-        let (cols, rows) = overlay.target_dimensions(area.width, area.height);
 
         for (proto, badge) in [
             (TerminalImageProtocol::Sixel, "[Sixel]"),
@@ -1012,7 +1033,7 @@ mod tests {
         let proto = TerminalImageProtocol::Sixel;
         overlay.protocol = proto;
         let cur = overlay.current().unwrap();
-        let cache_key = img_preview::preview_cache_key(&cur.id, cols, rows, proto);
+        let cache_key = overlay.preview_image_cache_key(cur, area.width, area.height);
         app.pixel_image_cache.insert(
             cache_key.clone(),
             RenderedTerminalImage {
@@ -1103,12 +1124,12 @@ mod tests {
             let mut overlay = ImagePreviewOverlay::from_attachments("ATL-99", &atts, Some(1))
                 .unwrap()
                 .with_graphics_caps(caps);
-            let (cols, rows) = overlay.target_dimensions(area.width, area.height);
+            let fit = overlay.fit_box(area.width, area.height);
             let rendered =
-                img_preview::decode_and_render_for_protocol(&png, cols, rows, (25, 25, 25), caps)
+                img_preview::decode_and_render_for_protocol(&png, fit, (25, 25, 25), caps)
                     .unwrap();
             let cur = overlay.current().unwrap();
-            let base_key = img_preview::preview_cache_key(&cur.id, cols, rows, proto);
+            let base_key = overlay.preview_image_cache_key(cur, area.width, area.height);
             let total_rows = if proto == TerminalImageProtocol::Halfblock {
                 rendered.lines.len() as u16
             } else {

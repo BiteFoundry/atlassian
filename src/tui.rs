@@ -30,7 +30,7 @@ use crossterm::{
     },
 };
 use futures::{FutureExt, StreamExt};
-use ratatui::{backend::CrosstermBackend, layout::Rect, style::Color, Terminal};
+use ratatui::{backend::CrosstermBackend, layout::Rect, Terminal};
 use tokio::sync::mpsc;
 
 use crate::{
@@ -534,10 +534,6 @@ impl PixelPreviewRuntime {
         }
     }
 
-    fn on_resize(&mut self) {
-        self.graphics_caps = self.graphics_caps.refresh_cell_pixel_size();
-    }
-
     fn insert_raw_bytes(&mut self, att_id: String, bytes: Arc<[u8]>) {
         let entry_bytes = bytes.len();
         if entry_bytes > MAX_RAW_IMAGE_CACHE_BYTES {
@@ -584,9 +580,9 @@ impl PixelPreviewRuntime {
             return;
         }
 
-        let (cols, rows) = ov.target_dimensions(ui.term_width, ui.term_height);
+        let fit = ov.fit_box(ui.term_width, ui.term_height);
         let att_id = ov.cache_id(&att);
-        let cache_key = img_preview::preview_cache_key(&att_id, cols, rows, ov.protocol);
+        let cache_key = ov.preview_image_cache_key(&att, ui.term_width, ui.term_height);
 
         if let Some(cached) = self.decoded_cache.get(&cache_key) {
             if !app.pixel_image_cache.contains_key(&cache_key) {
@@ -642,7 +638,7 @@ impl PixelPreviewRuntime {
 
             let rendered = match bytes_res {
                 Ok(bytes) => tokio::task::spawn_blocking(move || {
-                    img_preview::decode_and_render_for_protocol(&bytes, cols, rows, bg_rgb, caps)
+                    img_preview::decode_and_render_for_protocol(&bytes, fit, bg_rgb, caps)
                         .map_err(|e| e.to_string())
                 })
                 .await
@@ -734,10 +730,7 @@ impl PixelPreviewRuntime {
 }
 
 fn theme_preview_bg_rgb(theme: &ui::theme::Theme) -> (u8, u8, u8) {
-    match theme.card_bg {
-        Color::Rgb(r, g, b) => (r, g, b),
-        _ => img_preview::DEFAULT_PREVIEW_BG_RGB,
-    }
+    img_preview::color_to_rgb(theme.bg_elevated, img_preview::DEFAULT_PREVIEW_BG_RGB)
 }
 
 fn current_pending_pixel_graphic(
@@ -916,6 +909,9 @@ enum TermEventOutcome {
     /// Layout, tab, overlay, or mouse-click target changed; redraw immediately so
     /// `ui.hitmap` is rebuilt before any subsequent queued mouse event is processed.
     RedrawNow,
+    /// Terminal dimensions changed; re-probe `cell_px` safely (dropping `EventStream` on Windows)
+    /// and reload any active image preview before redrawing.
+    Resized,
     Quit,
 }
 
@@ -975,13 +971,8 @@ fn handle_terminal_event(
         CrosstermEvent::Resize(w, h) => {
             ui.term_width = w;
             ui.term_height = h;
-            pixel_rt.on_resize();
             *dirty = true;
-            force_redraw = true;
-            if matches!(ui.overlays.last(), Some(Overlay::ImagePreview(_))) {
-                let _ = action::dispatch(Action::LoadPreviewImage, app, ui);
-                pixel_rt.sync_overlay_state(app, ui);
-            }
+            return TermEventOutcome::Resized;
         }
         CrosstermEvent::FocusGained => {
             app.handle_focus_gained(ui);
@@ -1093,6 +1084,7 @@ pub async fn run_with_persona(
 
         let mut should_quit = false;
         let mut needs_immediate_redraw = false;
+        let mut needs_resize_probe = false;
         tokio::select! {
             _ = tick.tick() => {
                 let before = ui.toasts.len();
@@ -1127,6 +1119,10 @@ pub async fn run_with_persona(
                     Some(Ok(ev)) => match handle_terminal_event(ev, &mut app, &mut ui, &mut pixel_rt, &mut dirty) {
                         TermEventOutcome::Quit => should_quit = true,
                         TermEventOutcome::RedrawNow => needs_immediate_redraw = true,
+                        TermEventOutcome::Resized => {
+                            needs_immediate_redraw = true;
+                            needs_resize_probe = true;
+                        }
                         TermEventOutcome::Continue => {}
                     },
                     Some(Err(_)) | None => should_quit = true,
@@ -1190,7 +1186,8 @@ pub async fn run_with_persona(
                 && ui.editor_request.is_none()
                 && !needs_immediate_redraw
             {
-                match events.next().now_or_never() {
+                let next_ev = events.next().now_or_never();
+                match next_ev {
                     Some(Some(Ok(ev))) => {
                         drained += 1;
                         progressed = true;
@@ -1201,6 +1198,11 @@ pub async fn run_with_persona(
                             }
                             TermEventOutcome::RedrawNow => {
                                 needs_immediate_redraw = true;
+                                break;
+                            }
+                            TermEventOutcome::Resized => {
+                                needs_immediate_redraw = true;
+                                needs_resize_probe = true;
                                 break;
                             }
                             TermEventOutcome::Continue => {}
@@ -1219,6 +1221,31 @@ pub async fn run_with_persona(
         }
         if should_quit {
             break;
+        }
+        if needs_resize_probe {
+            #[cfg(windows)]
+            {
+                drop(events);
+                let _ = img_preview::refresh_cell_pixel_size(&mut pixel_rt.graphics_caps);
+                win_console::enforce_windows_mouse_capture();
+                let _ = write_vt_mouse_enable(terminal.backend_mut());
+                events = EventStream::new();
+            }
+            #[cfg(not(windows))]
+            {
+                let _ = img_preview::refresh_cell_pixel_size(&mut pixel_rt.graphics_caps);
+            }
+            ui.graphics_caps = pixel_rt.graphics_caps;
+            let has_img_preview = if let Some(Overlay::ImagePreview(ov)) = ui.overlays.last_mut() {
+                ov.apply_graphics_caps(pixel_rt.graphics_caps);
+                true
+            } else {
+                false
+            };
+            if has_img_preview {
+                let _ = action::dispatch(Action::LoadPreviewImage, &mut app, &mut ui);
+                pixel_rt.sync_overlay_state(&mut app, &mut ui);
+            }
         }
     }
 
@@ -1298,16 +1325,14 @@ mod tests {
         rt.sync_overlay_state(&mut app, &mut ui);
 
         let area = Rect::new(0, 0, 100, 30);
-        let (cols, rows) = match ui.overlays.last() {
+        let cache_key = match ui.overlays.last() {
             Some(Overlay::ImagePreview(ov)) => {
                 assert_eq!(ov.protocol, TerminalImageProtocol::Kitty);
-                ov.target_dimensions(area.width, area.height)
+                let cur = ov.current().unwrap();
+                ov.preview_image_cache_key(cur, area.width, area.height)
             }
             _ => panic!("expected ImagePreview overlay"),
         };
-
-        let cache_key =
-            img_preview::preview_cache_key("att-9", cols, rows, TerminalImageProtocol::Kitty);
         rt.handle_pixel_msg(
             &mut app,
             &mut ui,

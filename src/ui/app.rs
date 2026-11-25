@@ -934,9 +934,15 @@ impl AppState {
         ui.show_nav_rail = self.config.show_nav_rail;
         ui.inline_images = self.config.inline_images;
         ui.notify = self.config.notify;
+        let prev_cell_px = ui.graphics_caps.cell_px;
+        let prev_cell_px_exact = ui.graphics_caps.cell_px_exact;
         ui.graphics_caps = img_preview::detect_graphics_caps(config_protocol_to_img_pref(
             self.config.image_protocol,
         ));
+        if prev_cell_px_exact && !ui.graphics_caps.cell_px_exact {
+            ui.graphics_caps.cell_px = prev_cell_px;
+            ui.graphics_caps.cell_px_exact = true;
+        }
     }
 
     fn notify_desktop(&self, summary: &str, body: &str) {
@@ -4852,8 +4858,8 @@ impl AppState {
         let Some(att) = ov.current().cloned() else {
             return;
         };
-        let (cols, rows) = ov.target_dimensions(ui.term_width, ui.term_height);
-        let cache_key = img_preview::preview_cache_key(&ov.cache_id(&att), cols, rows, ov.protocol);
+        let fit = ov.fit_box(ui.term_width, ui.term_height);
+        let cache_key = ov.preview_image_cache_key(&att, ui.term_width, ui.term_height);
         if self.image_cache.contains_key(&cache_key)
             || tokio::runtime::Handle::try_current().is_err()
         {
@@ -4862,10 +4868,10 @@ impl AppState {
         let (_, client) = self.site_id_and_client_for(ov.site_id.as_deref());
         let tx = self.ui_tx.clone();
         let caps = ov.graphics_caps();
-        let bg_rgb = match ui.theme.card_bg {
-            ratatui::style::Color::Rgb(r, g, b) => (r, g, b),
-            _ => img_preview::DEFAULT_PREVIEW_BG_RGB,
-        };
+        let bg_rgb = img_preview::color_to_rgb(
+            ui.theme.bg_elevated,
+            img_preview::DEFAULT_PREVIEW_BG_RGB,
+        );
         tokio::spawn(async move {
             match client.fetch_attachment_bytes(&att).await {
                 Ok(bytes) => {
@@ -4882,9 +4888,13 @@ impl AppState {
                         });
                         return;
                     }
-                    let res =
-                        img_preview::decode_and_render_for_protocol(&bytes, cols, rows, bg_rgb, caps)
-                            .map_err(|e| e.to_string());
+                    let res = img_preview::decode_and_render_halfblocks_with_cell_px(
+                        &bytes,
+                        fit,
+                        bg_rgb,
+                        caps.cell_px,
+                    )
+                    .map_err(|e| e.to_string());
                     let _ = tx.send(UiMsg::ImageLoaded {
                         cache_key,
                         rendered: res,

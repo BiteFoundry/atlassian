@@ -903,8 +903,12 @@ pub fn apply_settings_command(cmd: SettingsCommand, app: &mut AppState, ui: &mut
         SettingsCommand::CycleColorTheme => {
             app.config.theme = app.config.theme.next();
             app.sync_ui_from_config(ui);
+            app.image_cache.clear();
             mutated = true;
             ui.info(format!("Color theme: {}", app.config.theme.label()));
+            if matches!(ui.overlays.last(), Some(Overlay::ImagePreview(_))) {
+                app.request_load_preview_image(ui);
+            }
         }
         SettingsCommand::ShowDownloadFolder => {
             ui.info(format!(
