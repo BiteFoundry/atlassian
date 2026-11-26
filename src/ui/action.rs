@@ -426,6 +426,7 @@ pub fn dispatch(action: Action, app: &mut AppState, ui: &mut UiState) -> bool {
                     if row.expanded {
                         let node = SiteKey::new(&app.tree_site(ui), &row.page.id);
                         app.expanded_pages.remove(&node);
+                        app.user_collapsed_pages.insert(node);
                     } else if let Some(pid) = &row.page.parent_id {
                         if let Some(parent_idx) = tree.iter().position(|r| &r.page.id == pid) {
                             ui.confluence_ui.selected_tree_row = parent_idx;
@@ -1371,9 +1372,9 @@ fn handle_mouse_click(row: u16, col: u16, app: &mut AppState, ui: &mut UiState) 
             let tree = app.current_confluence_tree(ui);
             if let Some(row) = tree.get(idx) {
                 let page = row.page.clone();
-                let has_children = row.has_children;
+                let expandable = row.expandable;
                 app.request_page_detail_for_site(ui, site_id.as_deref(), &page.id);
-                if is_double_click && has_children {
+                if is_double_click && expandable {
                     app.toggle_expand_page(ui, &page);
                 }
             }
@@ -1979,7 +1980,7 @@ fn activate_selection(app: &mut AppState, ui: &mut UiState) {
                     if let Some(row) = tree.get(ui.confluence_ui.selected_tree_row) {
                         let page = row.page.clone();
                         app.request_page_detail_for_site(ui, site_id.as_deref(), &page.id);
-                        if row.has_children {
+                        if row.expandable {
                             app.toggle_expand_page(ui, &page);
                         }
                     }
@@ -3606,6 +3607,81 @@ mod tests {
         ui.hitmap.add(Rect::new(20, 5, 40, 15), HitTarget::OverlayBody);
         dispatch(Action::MouseClick { row: 1, col: 1 }, &mut app, &mut ui);
         assert!(ui.overlays.is_empty());
+    }
+
+    #[tokio::test]
+    async fn unknown_children_row_expands_on_enter_double_click_chevron_then_settles() {
+        let (mut app, mut ui, _dir) = test_app_and_ui();
+        spaces_section(&mut app, &mut ui);
+        let site = app.tree_site(&ui);
+        // Cloud (and DC without the children.page expansion) leaves has_children unknown.
+        let home = PageSummary {
+            id: "p-home".into(),
+            space_key: "ENG".into(),
+            title: "Space Home".into(),
+            has_children: None,
+            ..Default::default()
+        };
+        app.root_pages_by_space
+            .insert(SiteKey::new(&site, "ENG"), vec![home]);
+        let node = SiteKey::new(&site, "p-home");
+        ui.confluence_ui.nav_section = 1;
+        ui.confluence_ui.selected_tree_row = 0;
+
+        let row = app.current_confluence_tree(&ui)[0].clone();
+        assert!(row.expandable, "unknown children must be expandable");
+        assert!(!row.has_children);
+
+        // Enter expands; Enter again collapses.
+        dispatch(Action::Activate, &mut app, &mut ui);
+        assert!(app.expanded_pages.contains(&node));
+        dispatch(Action::Activate, &mut app, &mut ui);
+        assert!(!app.expanded_pages.contains(&node));
+
+        // Double-click on the title expands; a single click only opens the page.
+        ui.hitmap.clear();
+        ui.hitmap.add_line(2, 6, 25, HitTarget::TreeRow(0));
+        ui.hitmap.add_line(2, 6, 3, HitTarget::TreeChevron(0));
+        ui.last_click = None;
+        dispatch(Action::MouseClick { row: 6, col: 10 }, &mut app, &mut ui);
+        assert!(!app.expanded_pages.contains(&node));
+        dispatch(Action::MouseClick { row: 6, col: 10 }, &mut app, &mut ui);
+        assert!(app.expanded_pages.contains(&node));
+
+        // Chevron click collapses and expands.
+        ui.last_click = None;
+        dispatch(Action::MouseClick { row: 6, col: 2 }, &mut app, &mut ui);
+        assert!(!app.expanded_pages.contains(&node));
+        ui.last_click = None;
+        dispatch(Action::MouseClick { row: 6, col: 2 }, &mut app, &mut ui);
+        assert!(app.expanded_pages.contains(&node));
+
+        // An empty child listing settles the row to a confirmed leaf.
+        app.handle_ui_msg(
+            &mut ui,
+            UiMsg::ChildPagesLoaded {
+                site_id: site.clone(),
+                parent_id: "p-home".into(),
+                task_label: "Child pages: Space Home".into(),
+                children: Ok(vec![]),
+            },
+        );
+        assert_eq!(
+            app.root_pages_by_space[&SiteKey::new(&site, "ENG")][0].has_children,
+            Some(false)
+        );
+        let row = app.current_confluence_tree(&ui)[0].clone();
+        assert!(!row.expandable);
+        assert!(!row.has_children);
+
+        // A confirmed leaf no longer toggles on Enter or double-click.
+        app.expanded_pages.remove(&node);
+        dispatch(Action::Activate, &mut app, &mut ui);
+        assert!(!app.expanded_pages.contains(&node));
+        ui.last_click = None;
+        dispatch(Action::MouseClick { row: 6, col: 10 }, &mut app, &mut ui);
+        dispatch(Action::MouseClick { row: 6, col: 10 }, &mut app, &mut ui);
+        assert!(!app.expanded_pages.contains(&node));
     }
 
     #[tokio::test]

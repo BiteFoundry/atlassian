@@ -140,7 +140,7 @@ fn draw_space_and_tree(frame: &mut Frame, area: Rect, app: &AppState, ui: &mut U
                 sidebar_style
             };
             let indent = indent_step.repeat(row.depth);
-            let branch = if row.has_children {
+            let branch = if row.expandable {
                 if row.expanded {
                     "▾ "
                 } else {
@@ -161,7 +161,7 @@ fn draw_space_and_tree(frame: &mut Frame, area: Rect, app: &AppState, ui: &mut U
                 rows[1].width,
                 HitTarget::TreeRow(abs_idx),
             );
-            if row.has_children {
+            if row.expandable {
                 let indent_w = indent.width() as u16;
                 let chev_x = rows[1].x.saturating_add(indent_w);
                 if chev_x < rows[1].right() {
@@ -1149,6 +1149,47 @@ mod tests {
         let visible = app.visible_space_indices(&ui);
         assert_eq!(visible.first(), Some(&40));
         assert_eq!(visible.len(), 40);
+    }
+
+    #[tokio::test]
+    async fn page_tree_draws_chevron_for_unknown_children_and_dot_for_confirmed_leaf() {
+        use crate::{models::PageSummary, ui::app::SiteKey};
+
+        let (mut app, mut ui) = single_site();
+        app.spaces = vec![space("ENG", "Engineering")];
+        let site = app.tree_site(&ui);
+        app.root_pages_by_space.insert(
+            SiteKey::new(&site, "ENG"),
+            vec![
+                PageSummary {
+                    id: "home".into(),
+                    space_key: "ENG".into(),
+                    title: "Space Home".into(),
+                    has_children: None,
+                    ..Default::default()
+                },
+                PageSummary {
+                    id: "leaf".into(),
+                    space_key: "ENG".into(),
+                    title: "Leaf Page".into(),
+                    has_children: Some(false),
+                    ..Default::default()
+                },
+            ],
+        );
+
+        let rows = render_nav(&app, &mut ui, 40, 20);
+        let home_y = row_of(&rows, "Space Home").expect("home row drawn");
+        let leaf_y = row_of(&rows, "Leaf Page").expect("leaf row drawn");
+        let home_row = &rows[home_y as usize];
+        let leaf_row = &rows[leaf_y as usize];
+        assert!(home_row.contains("▸ Space Home"), "{home_row}");
+        assert!(leaf_row.contains("· Leaf Page"), "{leaf_row}");
+
+        let chev_x = home_row.chars().position(|c| c == '▸').unwrap() as u16;
+        assert_eq!(ui.hitmap.hit(home_y, chev_x), Some(HitTarget::TreeChevron(0)));
+        let dot_x = leaf_row.chars().position(|c| c == '·').unwrap() as u16;
+        assert_eq!(ui.hitmap.hit(leaf_y, dot_x), Some(HitTarget::TreeRow(1)));
     }
 
     #[tokio::test]

@@ -148,7 +148,11 @@ pub struct TreeRow {
     pub page: PageSummary,
     pub depth: usize,
     pub expanded: bool,
+    /// Children are confirmed: `has_children == Some(true)` or loaded children exist.
     pub has_children: bool,
+    /// The row can be expanded: not a confirmed leaf. Unknown (`has_children == None`, children
+    /// not loaded yet) is expandable, so expanding it loads the children and settles the row.
+    pub expandable: bool,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -623,6 +627,8 @@ pub struct AppState {
     /// Keyed by `(site, parent page id)`: page ids are only unique per site.
     pub page_children_map: HashMap<SiteKey, Vec<PageSummary>>,
     pub expanded_pages: HashSet<SiteKey>,
+    /// Pages the user collapsed in this session; space-home auto-expand leaves them collapsed.
+    pub user_collapsed_pages: HashSet<SiteKey>,
     pub active_page: Option<PageDetail>,
 
     pub my_issues: Vec<IssueSummary>,
@@ -743,6 +749,7 @@ impl AppState {
             root_pages_by_space: HashMap::new(),
             page_children_map: HashMap::new(),
             expanded_pages: HashSet::new(),
+            user_collapsed_pages: HashSet::new(),
             active_page: None,
             my_issues: Vec::new(),
             my_issue_site_ids: Vec::new(),
@@ -4137,11 +4144,67 @@ impl AppState {
         let (site_id, _) = self.site_id_and_client_for(Some(&tree_site));
         let node = SiteKey::new(&site_id, &page.id);
         if self.expanded_pages.remove(&node) {
+            self.user_collapsed_pages.insert(node);
             return;
         }
+        self.user_collapsed_pages.remove(&node);
         self.expanded_pages.insert(node);
         // Re-expanding keeps cached children visible immediately while refreshing live children.
         self.request_page_children_for_site(ui, &site_id, &page.id, &page.title, true);
+    }
+
+    /// Expands the active space's homepage root (else its sole root page) when its roots arrive,
+    /// and loads its first-level children, as Confluence web does. A page the user collapsed in
+    /// this session and a confirmed leaf stay collapsed; other spaces are left alone.
+    fn auto_expand_space_home(&mut self, ui: &mut UiState, site_id: &str, space_key: &str) {
+        let Some(space) = self.active_space(ui).filter(|sp| sp.key == space_key) else {
+            return;
+        };
+        if self
+            .active_space_site_id(ui)
+            .is_some_and(|s| !s.eq_ignore_ascii_case(site_id))
+        {
+            return;
+        }
+        let homepage_id = space
+            .homepage_id
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string);
+        let Some(roots) = self.root_pages_by_space.get(&SiteKey::new(site_id, space_key)) else {
+            return;
+        };
+        let target = homepage_id
+            .as_deref()
+            .and_then(|hid| roots.iter().find(|p| p.id == hid))
+            .or_else(|| match roots.as_slice() {
+                [only] => Some(only),
+                _ => None,
+            });
+        let Some(page) = target.filter(|p| p.has_children != Some(false)) else {
+            return;
+        };
+        let (page_id, title) = (page.id.clone(), page.title.clone());
+        let node = SiteKey::new(site_id, &page_id);
+        if self.user_collapsed_pages.contains(&node) {
+            return;
+        }
+        self.expanded_pages.insert(node);
+        self.request_page_children_for_site(ui, site_id, &page_id, &title, false);
+    }
+
+    /// Records a complete, empty child listing on the parent's tree rows so it renders as a leaf.
+    fn mark_page_childless(&mut self, site_id: &str, page_id: &str) {
+        let rows = self
+            .root_pages_by_space
+            .iter_mut()
+            .chain(self.page_children_map.iter_mut())
+            .filter(|(k, _)| k.is_site(site_id))
+            .flat_map(|(_, pages)| pages.iter_mut());
+        for page in rows.filter(|p| p.id == page_id) {
+            page.has_children = Some(false);
+        }
     }
 
     /// Toggles expand/collapse on a Confluence tree row (e.g. chevron click) without forcibly
@@ -5791,6 +5854,7 @@ impl AppState {
                 if matches_space_site {
                     self.root_pages_by_space
                         .insert(SiteKey::new(&effective_sid, &space_key), pages);
+                    self.auto_expand_space_home(ui, &effective_sid, &space_key);
                 }
                 if self.site_scope.matches(&effective_sid) {
                     self.reload_my_pages_from_storage();
@@ -6398,6 +6462,7 @@ impl AppState {
                                 list.iter().map(|p| p.id.clone()).collect();
                             self.root_pages_by_space
                                 .insert(SiteKey::new(&site_id, &space_key), list);
+                            self.auto_expand_space_home(ui, &site_id, &space_key);
                             self.clamp_selections(ui);
                             let active_pid = self.active_page.as_ref().map(|p| p.summary.id.clone());
                             self.prefetch_uncached_pages(
@@ -6425,6 +6490,9 @@ impl AppState {
                 match children {
                     Ok(list) => {
                         let prefetch_ids: Vec<String> = list.iter().map(|p| p.id.clone()).collect();
+                        if list.is_empty() {
+                            self.mark_page_childless(&site_id, &parent_id);
+                        }
                         self.page_children_map
                             .insert(SiteKey::new(&site_id, parent_id), list);
                         self.clamp_selections(ui);
@@ -6482,11 +6550,7 @@ impl AppState {
                             .get_mut(&SiteKey::new(&site_id, &d.summary.space_key))
                         {
                             if let Some(existing) = roots.iter_mut().find(|p| p.id == d.summary.id) {
-                                let had_children = existing.has_children == Some(true);
-                                *existing = d.summary.clone();
-                                if had_children {
-                                    existing.has_children = Some(true);
-                                }
+                                keep_known_children_state(existing, &d.summary);
                             }
                         }
                         if let Some(ref parent_id) = d.summary.parent_id {
@@ -6494,11 +6558,7 @@ impl AppState {
                                 self.page_children_map.get_mut(&SiteKey::new(&site_id, parent_id))
                             {
                                 if let Some(existing) = kids.iter_mut().find(|p| p.id == d.summary.id) {
-                                    let had_children = existing.has_children == Some(true);
-                                    *existing = d.summary.clone();
-                                    if had_children {
-                                        existing.has_children = Some(true);
-                                    }
+                                    keep_known_children_state(existing, &d.summary);
                                 }
                             }
                         }
@@ -7137,6 +7197,16 @@ impl SiteKey {
     }
 }
 
+/// Replaces a tree row with a fresh detail summary, keeping a known children state: a row with
+/// children stays expandable and a settled leaf stays a leaf when the detail does not say.
+fn keep_known_children_state(existing: &mut PageSummary, incoming: &PageSummary) {
+    let prev = existing.has_children;
+    *existing = incoming.clone();
+    if prev == Some(true) || existing.has_children.is_none() {
+        existing.has_children = prev;
+    }
+}
+
 pub fn flatten_page_tree(
     roots: &[PageSummary],
     site_id: &str,
@@ -7160,12 +7230,18 @@ pub fn flatten_page_tree(
             let children = children_map.get(&node);
             let has_children =
                 page.has_children == Some(true) || children.is_some_and(|c| !c.is_empty());
+            // A loaded, empty child list or `has_children == Some(false)` is a confirmed leaf.
+            let expandable = match children {
+                Some(kids) => !kids.is_empty(),
+                None => page.has_children != Some(false),
+            };
             let is_expanded = expanded.contains(&node);
             out.push(TreeRow {
                 page: page.clone(),
                 depth,
                 expanded: is_expanded,
                 has_children,
+                expandable,
             });
             if is_expanded {
                 if let Some(kids) = children {
@@ -7646,6 +7722,141 @@ mod tests {
         let other = flatten_page_tree(&[root], "site-b", &children_map, &expanded);
         assert_eq!(other.len(), 1);
         assert!(!other[0].expanded);
+    }
+
+    #[test]
+    fn confluence_tree_marks_unknown_children_expandable_and_confirmed_leaves_not() {
+        let unknown = page("1", "ENG", "Unknown");
+        let leaf = PageSummary {
+            has_children: Some(false),
+            ..page("2", "ENG", "Leaf")
+        };
+        let loaded_empty = page("3", "ENG", "Loaded empty");
+        let gained_child = PageSummary {
+            has_children: Some(false),
+            ..page("4", "ENG", "Gained a child")
+        };
+        let mut children_map = HashMap::new();
+        children_map.insert(SiteKey::new("default", "3"), Vec::new());
+        children_map.insert(SiteKey::new("default", "4"), vec![page("5", "ENG", "Kid")]);
+        let rows = flatten_page_tree(
+            &[unknown, leaf, loaded_empty, gained_child],
+            "default",
+            &children_map,
+            &HashSet::new(),
+        );
+        let flags: Vec<(bool, bool)> = rows
+            .iter()
+            .map(|r| (r.expandable, r.has_children))
+            .collect();
+        assert_eq!(
+            flags,
+            vec![(true, false), (false, false), (false, false), (true, true)]
+        );
+    }
+
+    #[tokio::test]
+    async fn root_pages_loaded_auto_expands_space_homepage_or_sole_root() {
+        let (mut app, mut ui) = two_site_app();
+        app.site_scope = SiteScope::Only("site-a".into());
+        ui.active_tab = WorkspaceTab::Confluence;
+        let eng = SpaceSummary {
+            homepage_id: Some("home".into()),
+            ..space("ENG")
+        };
+        app.spaces = vec![eng, space("OPS"), space("DOCS")];
+        app.space_site_ids = vec!["site-a".to_string(); 3];
+        ui.confluence_ui.selected_space = 0;
+        // Cached first-level children of the homepage show without waiting for the network.
+        let cached_child = PageSummary {
+            parent_id: Some("home".into()),
+            ..page("home-kid", "ENG", "Getting started")
+        };
+        app.storage
+            .upsert_pages_for_site("site-a", &[cached_child])
+            .unwrap();
+
+        let roots = vec![page("other", "ENG", "Archive"), page("home", "ENG", "ENG Home")];
+        let eng_roots_loaded = |pages: Vec<PageSummary>| UiMsg::RootPagesLoaded {
+            site_id: "site-a".into(),
+            space_key: "ENG".into(),
+            pages: Ok(pages),
+        };
+        app.handle_ui_msg(&mut ui, eng_roots_loaded(roots.clone()));
+        let home = SiteKey::new("site-a", "home");
+        assert!(app.expanded_pages.contains(&home), "homepage root auto-expands");
+        assert!(!app
+            .expanded_pages
+            .contains(&SiteKey::new("site-a", "other")));
+        let titles: Vec<String> = app
+            .current_confluence_tree(&ui)
+            .iter()
+            .map(|r| r.page.title.clone())
+            .collect();
+        assert_eq!(titles, vec!["Archive", "ENG Home", "Getting started"]);
+
+        // A page the user collapsed in this session stays collapsed when roots arrive again.
+        app.toggle_expand_page(&mut ui, &roots[1]);
+        assert!(!app.expanded_pages.contains(&home));
+        app.handle_ui_msg(&mut ui, eng_roots_loaded(roots.clone()));
+        assert!(!app.expanded_pages.contains(&home));
+        app.handle_core_event(
+            &mut ui,
+            CoreEvent::SpacePagesUpdated {
+                site_id: "site-a".into(),
+                space_key: "ENG".into(),
+                pages: roots.clone(),
+            },
+        );
+        assert!(!app.expanded_pages.contains(&home));
+
+        // No homepage id: the sole root page auto-expands (background sync path too).
+        ui.confluence_ui.selected_space = 1;
+        app.handle_core_event(
+            &mut ui,
+            CoreEvent::SpacePagesUpdated {
+                site_id: "site-a".into(),
+                space_key: "OPS".into(),
+                pages: vec![page("ops-root", "OPS", "OPS Home")],
+            },
+        );
+        assert!(app
+            .expanded_pages
+            .contains(&SiteKey::new("site-a", "ops-root")));
+
+        // Left alone: a confirmed-leaf sole root, several roots without a homepage id, and the
+        // roots of a space that is not the active one.
+        ui.confluence_ui.selected_space = 2;
+        let docs_loaded = |pages: Vec<PageSummary>| UiMsg::RootPagesLoaded {
+            site_id: "site-a".into(),
+            space_key: "DOCS".into(),
+            pages: Ok(pages),
+        };
+        app.handle_ui_msg(
+            &mut ui,
+            docs_loaded(vec![PageSummary {
+                has_children: Some(false),
+                ..page("docs-root", "DOCS", "DOCS Home")
+            }]),
+        );
+        app.handle_ui_msg(
+            &mut ui,
+            docs_loaded(vec![page("d1", "DOCS", "One"), page("d2", "DOCS", "Two")]),
+        );
+        app.handle_ui_msg(
+            &mut ui,
+            UiMsg::RootPagesLoaded {
+                site_id: "site-a".into(),
+                space_key: "OPS".into(),
+                pages: Ok(vec![page("ops-only", "OPS", "Other OPS root")]),
+            },
+        );
+        for id in ["docs-root", "d1", "d2", "ops-only"] {
+            assert!(
+                !app.expanded_pages.contains(&SiteKey::new("site-a", id)),
+                "{id} must not auto-expand"
+            );
+        }
     }
 
     #[tokio::test]

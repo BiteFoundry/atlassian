@@ -163,7 +163,7 @@ impl AtlassianClient {
                 let conf_root = self.require_confluence_root()?;
                 let encoded_key = urlencoding::encode(input);
                 let mut url = format!(
-                    "{conf_root}/rest/api/space/{encoded_key}/content/page?depth=root&limit={lim}&expand=version,space"
+                    "{conf_root}/rest/api/space/{encoded_key}/content/page?depth=root&limit={lim}&expand=version,space,children.page"
                 );
                 if start > 0 {
                     url.push_str(&format!("&start={start}"));
@@ -271,7 +271,7 @@ impl AtlassianClient {
                 let start = parse_offset_cursor(cursor).map_err(anyhow::Error::msg)?;
                 let conf_root = self.require_confluence_root()?;
                 let mut url = format!(
-                    "{conf_root}/rest/api/content/{encoded_id}/child/page?limit={lim}&expand=version,space"
+                    "{conf_root}/rest/api/content/{encoded_id}/child/page?limit={lim}&expand=version,space,children.page"
                 );
                 if start > 0 {
                     url.push_str(&format!("&start={start}"));
@@ -1733,9 +1733,28 @@ fn parse_dc_page_summary(val: &Value, conf_root: &str) -> PageSummary {
         author_name,
         updated_at,
         position,
-        has_children: None,
+        has_children: parse_dc_has_children(val),
         web_url,
     }
+}
+
+/// Reads `children.page` of a Data Center content object (present when the request asked for
+/// `expand=children.page`): `Some(true)` when it lists or counts a child, `Some(false)` when it is
+/// an expanded, empty listing, `None` when the expansion is absent and nothing is known.
+fn parse_dc_has_children(val: &Value) -> Option<bool> {
+    let listing = val.get("children")?.get("page")?;
+    if !listing.is_object() {
+        return None;
+    }
+    let size = listing.get("size").and_then(Value::as_u64);
+    let results = listing.get("results").and_then(Value::as_array);
+    if size.is_some_and(|n| n > 0) || results.is_some_and(|r| !r.is_empty()) {
+        return Some(true);
+    }
+    if size == Some(0) || results.is_some() {
+        return Some(false);
+    }
+    None
 }
 
 fn parse_confluence_comment(val: &Value, page_id: &str) -> ConfluenceComment {
@@ -1854,6 +1873,120 @@ mod tests {
             },
         );
         AtlassianClient::with_base_urls(site_url, conf_url, deployment, auth).unwrap()
+    }
+
+    #[test]
+    fn dc_page_summary_reads_children_page_expansion() {
+        let has_children = |children: Value| {
+            let mut val = json!({
+                "id": "10",
+                "title": "Space Home",
+                "status": "current",
+                "space": { "id": 1, "key": "ENG" },
+                "version": { "number": 3 }
+            });
+            if !children.is_null() {
+                val["children"] = children;
+            }
+            parse_dc_page_summary(&val, "https://wiki.example.com").has_children
+        };
+
+        // size > 0, or listed results (size omitted): has children.
+        assert_eq!(
+            has_children(json!({ "page": { "results": [], "start": 0, "limit": 0, "size": 4 } })),
+            Some(true)
+        );
+        assert_eq!(
+            has_children(json!({ "page": { "results": [{ "id": "11", "title": "Kid" }] } })),
+            Some(true)
+        );
+        // Expanded and empty: confirmed leaf.
+        assert_eq!(
+            has_children(json!({ "page": { "results": [], "start": 0, "limit": 25, "size": 0 } })),
+            Some(false)
+        );
+        // Not expanded: unknown.
+        assert_eq!(has_children(Value::Null), None);
+        assert_eq!(
+            has_children(json!({ "attachment": { "results": [], "size": 0 } })),
+            None
+        );
+        assert_eq!(
+            has_children(json!({ "_expandable": { "page": "/rest/api/content/10/child/page" } })),
+            None
+        );
+    }
+
+    #[tokio::test]
+    async fn dc_tree_listings_expand_children_page_and_report_has_children() {
+        let expands: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+        let (roots_seen, kids_seen) = (expands.clone(), expands.clone());
+        let app = Router::new()
+            .route(
+                "/rest/api/space/ENG/content/page",
+                get(move |Query(q): Query<HashMap<String, String>>| {
+                    let seen = roots_seen.clone();
+                    async move {
+                        seen.lock()
+                            .unwrap()
+                            .push(q.get("expand").cloned().unwrap_or_default());
+                        Json(json!({
+                            "results": [
+                                { "id": "1", "title": "Space Home", "space": { "key": "ENG" },
+                                  "children": { "page": { "results": [], "size": 3 } } },
+                                { "id": "2", "title": "Archive", "space": { "key": "ENG" },
+                                  "children": { "page": { "results": [], "size": 0 } } }
+                            ],
+                            "size": 2,
+                            "_links": {}
+                        }))
+                    }
+                }),
+            )
+            .route(
+                "/rest/api/content/1/child/page",
+                get(move |Query(q): Query<HashMap<String, String>>| {
+                    let seen = kids_seen.clone();
+                    async move {
+                        seen.lock()
+                            .unwrap()
+                            .push(q.get("expand").cloned().unwrap_or_default());
+                        Json(json!({
+                            "results": [
+                                { "id": "3", "title": "Guide", "space": { "key": "ENG" },
+                                  "children": { "page": { "results": [{ "id": "5" }] } } },
+                                { "id": "4", "title": "FAQ", "space": { "key": "ENG" },
+                                  "children": { "page": { "results": [], "size": 0 } } }
+                            ],
+                            "size": 2,
+                            "_links": {}
+                        }))
+                    }
+                }),
+            );
+        let base_url = spawn_router(app).await;
+        let dc = make_client(&base_url, &base_url, DeploymentKind::DataCenter);
+
+        let roots = dc.list_space_root_pages_page("ENG", 50, None).await.unwrap();
+        assert_eq!(
+            roots.items.iter().map(|p| p.has_children).collect::<Vec<_>>(),
+            vec![Some(true), Some(false)]
+        );
+        let kids = dc.list_child_pages_page("1", 50, None).await.unwrap();
+        assert_eq!(
+            kids.items.iter().map(|p| p.has_children).collect::<Vec<_>>(),
+            vec![Some(true), Some(false)]
+        );
+        assert!(kids.items.iter().all(|p| p.parent_id.as_deref() == Some("1")));
+
+        let expands = expands.lock().unwrap().clone();
+        assert_eq!(expands.len(), 2, "{expands:?}");
+        assert!(
+            expands
+                .iter()
+                .all(|e| e.split(',').any(|part| part == "children.page")),
+            "both DC tree listings must expand children.page: {expands:?}"
+        );
     }
 
     #[tokio::test]

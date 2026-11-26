@@ -2432,6 +2432,9 @@ pub fn store_child_pages_for_site(
     if collected.complete {
         let keep: Vec<String> = collected.items.iter().map(|p| p.id.clone()).collect();
         storage.prune_child_pages_for_site(site_id, parent_id, &keep)?;
+        if collected.items.is_empty() {
+            storage.set_page_has_no_children_for_site(site_id, parent_id)?;
+        }
     }
     Ok(())
 }
