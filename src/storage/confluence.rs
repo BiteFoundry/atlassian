@@ -803,55 +803,6 @@ impl Storage {
         }
     }
 
-    pub fn list_pages_all_sites(
-        &self,
-        space_key: Option<&str>,
-        limit: usize,
-    ) -> Result<Vec<(String, PageSummary)>> {
-        if limit == 0 {
-            return Ok(Vec::new());
-        }
-        let conn = self.lock_conn()?;
-        if let Some(sk) = space_key {
-            let mut stmt = conn.prepare(
-                "
-                SELECT
-                    site_id,
-                    id, space_id, space_key, parent_id, title, status,
-                    version_number, author_name, updated_at, position, has_children, web_url
-                FROM pages
-                WHERE space_key = ?1
-                ORDER BY updated_at DESC, site_id ASC, title COLLATE NOCASE ASC, id ASC
-                LIMIT ?2
-                ",
-            )?;
-            let rows = stmt.query_map(params![sk, limit as i64], |row| {
-                let site_id: String = row.get(0)?;
-                let page = map_page_summary_row(row, 1)?;
-                Ok((site_id, page))
-            })?;
-            Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
-        } else {
-            let mut stmt = conn.prepare(
-                "
-                SELECT
-                    site_id,
-                    id, space_id, space_key, parent_id, title, status,
-                    version_number, author_name, updated_at, position, has_children, web_url
-                FROM pages
-                ORDER BY updated_at DESC, site_id ASC, title COLLATE NOCASE ASC, id ASC
-                LIMIT ?1
-                ",
-            )?;
-            let rows = stmt.query_map(params![limit as i64], |row| {
-                let site_id: String = row.get(0)?;
-                let page = map_page_summary_row(row, 1)?;
-                Ok((site_id, page))
-            })?;
-            Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
-        }
-    }
-
     pub fn list_space_root_pages(&self, space_key: &str) -> Result<Vec<PageSummary>> {
         self.list_space_root_pages_for_site(DEFAULT_SITE_ID, space_key)
     }

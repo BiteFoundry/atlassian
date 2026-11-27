@@ -1354,6 +1354,9 @@ pub(crate) fn expand_tilde(input: &str) -> PathBuf {
 }
 
 #[cfg(test)]
+pub(crate) static TEST_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+#[cfg(test)]
 mod tests {
     use super::*;
 
@@ -1726,8 +1729,7 @@ mod tests {
 
     #[test]
     fn effective_oauth_client_config_prefers_env_over_file() {
-        static OAUTH_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-        let _lock = OAUTH_ENV_LOCK.lock().unwrap();
+        let _lock = TEST_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
 
         let prev_id = std::env::var("ATLASSIAN_OAUTH_CLIENT_ID").ok();
         let prev_secret = std::env::var("ATLASSIAN_OAUTH_CLIENT_SECRET").ok();
@@ -1865,8 +1867,7 @@ scopes = []
 
     #[test]
     fn env_dir_overrides_expand_tilde() {
-        static DIR_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-        let _lock = DIR_ENV_LOCK.lock().unwrap();
+        let _lock = TEST_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
 
         let prev_cfg = std::env::var("ATLASSIAN_CONFIG_DIR").ok();
         let prev_data = std::env::var("ATLASSIAN_DATA_DIR").ok();

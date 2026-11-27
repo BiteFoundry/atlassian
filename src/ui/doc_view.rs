@@ -143,11 +143,6 @@ pub fn render_blocks_with_options(
     out
 }
 
-/// Renders a slice of `InlineNode`s into styled `Span`s.
-pub fn inline_nodes_to_spans(nodes: &[InlineNode], theme: &Theme) -> Vec<Span<'static>> {
-    inline_nodes_to_spans_with_hrefs(nodes, theme, false)
-}
-
 /// Renders a slice of `InlineNode`s into styled `Span`s, optionally appending ` (https://...)` next to link labels.
 pub fn inline_nodes_to_spans_with_hrefs(
     nodes: &[InlineNode],
@@ -217,59 +212,6 @@ pub fn inline_nodes_to_spans_with_hrefs(
         }
     }
     spans
-}
-
-pub fn inline_nodes_plain_text(nodes: &[InlineNode]) -> String {
-    inline_nodes_plain_text_with_hrefs(nodes, false)
-}
-
-fn inline_nodes_plain_text_with_hrefs(nodes: &[InlineNode], show_hrefs: bool) -> String {
-    let mut out = String::new();
-    for node in nodes {
-        match node {
-            InlineNode::Text { text, style } => {
-                out.push_str(text);
-                if show_hrefs {
-                    if let Some(url) = style.link_url.as_deref().map(str::trim).filter(|u| !u.is_empty()) {
-                        if text.trim() != url {
-                            out.push_str(" (");
-                            out.push_str(url);
-                            out.push(')');
-                        }
-                    }
-                }
-            }
-            InlineNode::Mention { display, .. } => {
-                if !display.starts_with('@') {
-                    out.push('@');
-                }
-                out.push_str(display);
-            }
-            InlineNode::StatusLozenge { text, category } => {
-                let lbl = if text.trim().is_empty() {
-                    category.badge_label()
-                } else {
-                    text.trim()
-                };
-                out.push('[');
-                out.push_str(&lbl.to_ascii_uppercase());
-                out.push(']');
-            }
-            InlineNode::IssueRef { key } => {
-                out.push('[');
-                out.push_str(key);
-                out.push(']');
-            }
-            InlineNode::PageRef { title, .. } => {
-                out.push_str("[Wiki: ");
-                out.push_str(title);
-                out.push(']');
-            }
-            InlineNode::Emoji { text } => out.push_str(text),
-            InlineNode::HardBreak => out.push('\n'),
-        }
-    }
-    out
 }
 
 fn map_inline_style(style: &InlineStyle, theme: &Theme) -> Style {

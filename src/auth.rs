@@ -229,16 +229,6 @@ impl StoredCredentials {
     }
 }
 
-#[derive(Debug, Clone, Default)]
-pub struct LoginOptions {
-    pub site_url: Option<String>,
-    pub confluence_url: Option<String>,
-    pub email: Option<String>,
-    pub token: Option<String>,
-    pub pat: Option<String>,
-    pub deployment: Option<DeploymentKind>,
-}
-
 /// Configuration for [`run_oauth_loopback_login`] and [`start_oauth_loopback_session`].
 #[derive(Debug, Clone)]
 pub struct OAuthLoopbackOptions {
@@ -1178,68 +1168,6 @@ impl AuthManager {
         Ok(refreshed)
     }
 
-    pub fn login_with_options(&self, opts: &LoginOptions) -> Result<StoredCredentials> {
-        let cfg = AppConfig::load().unwrap_or_default();
-        let site_url = opts
-            .site_url
-            .as_deref()
-            .map(normalize_base_url)
-            .filter(|s| !s.is_empty())
-            .unwrap_or_else(|| cfg.site_url.clone());
-
-        if let Some(pat) = opts
-            .pat
-            .as_deref()
-            .map(str::trim)
-            .filter(|s| !s.is_empty())
-        {
-            let deployment = opts.deployment.unwrap_or_else(|| {
-                if !site_url.is_empty() {
-                    DeploymentKind::infer_from_url(&site_url)
-                } else {
-                    DeploymentKind::DataCenter
-                }
-            });
-            let creds = StoredCredentials::BearerPat {
-                site_url,
-                token: pat.to_string(),
-                deployment,
-            };
-            self.save_credentials(&creds)?;
-            return Ok(creds);
-        }
-
-        let token = opts
-            .token
-            .as_deref()
-            .map(str::trim)
-            .filter(|s| !s.is_empty())
-            .ok_or_else(|| anyhow!("Please provide an API token or Personal Access Token (PAT)."))?;
-        let email = opts
-            .email
-            .as_deref()
-            .map(str::trim)
-            .filter(|s| !s.is_empty())
-            .ok_or_else(|| anyhow!("Email (or username) is required for API token login."))?;
-
-        let deployment = opts.deployment.unwrap_or_else(|| {
-            if !site_url.is_empty() {
-                DeploymentKind::infer_from_url(&site_url)
-            } else {
-                DeploymentKind::Cloud
-            }
-        });
-
-        let creds = StoredCredentials::ApiToken {
-            site_url,
-            email: email.to_string(),
-            api_token: token.to_string(),
-            deployment,
-        };
-        self.save_credentials(&creds)?;
-        Ok(creds)
-    }
-
     pub fn authorization_header(&self) -> Result<String> {
         let creds = self.load_credentials()?.ok_or_else(|| {
             anyhow!("Not signed in. Run `atlassian login` or `confluence login` first.")
@@ -1423,13 +1351,10 @@ mod tests {
         routing::post,
         Json,
     };
-    use std::sync::{
-        atomic::{AtomicUsize, Ordering},
-        Mutex,
-    };
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use tempfile::tempdir;
 
-    static ENV_LOCK: Mutex<()> = Mutex::new(());
+    use crate::config::TEST_ENV_LOCK as ENV_LOCK;
 
     struct EnvGuard {
         saved: Vec<(&'static str, Option<String>)>,

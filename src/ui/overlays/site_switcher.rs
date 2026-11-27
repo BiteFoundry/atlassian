@@ -13,20 +13,17 @@ use ratatui::{
 };
 use unicode_width::UnicodeWidthStr;
 
-use crate::{
-    config::DeploymentKind,
-    ui::{
-        app::{AppState, UiState},
-        doc_view::truncate_width,
-        hitmap::{ButtonId, HitMap, HitTarget},
-        keymap::Action,
-        overlays::{
-            centered_rect, modal_block, modal_pill_secondary, read_clipboard_text,
-            register_modal_chrome, render_button_bar, sanitize_single_line, OverlayOutcome,
-        },
-        text_edit::TextBuffer,
-        theme::Theme,
+use crate::ui::{
+    app::{AppState, UiState},
+    doc_view::truncate_width,
+    hitmap::{ButtonId, HitMap, HitTarget},
+    keymap::Action,
+    overlays::{
+        centered_rect, modal_block, modal_pill_secondary, read_clipboard_text,
+        register_modal_chrome, render_button_bar, sanitize_single_line, OverlayOutcome,
     },
+    text_edit::TextBuffer,
+    theme::Theme,
 };
 
 /// A connected Atlassian site entry displayed inside `SiteSwitcherOverlay`.
@@ -105,48 +102,6 @@ impl SiteSwitcherOverlay {
             filter_mode: false,
             pending_command: None,
         }
-    }
-
-    /// Builds a fallback single-site switcher overlay from legacy `AppState` configuration.
-    pub fn from_app(app: &AppState) -> Self {
-        let mut entries = Vec::new();
-        let raw_url = app.config.site_url.trim();
-        if !raw_url.is_empty() {
-            let host = raw_url
-                .trim_start_matches("https://")
-                .trim_start_matches("http://")
-                .trim_end_matches('/');
-            let name = host
-                .split('.')
-                .next()
-                .filter(|s| !s.is_empty())
-                .unwrap_or(host)
-                .to_string();
-            let deployment_label = match app.config.deployment {
-                DeploymentKind::Cloud => "Cloud".to_string(),
-                DeploymentKind::DataCenter => "Data Center".to_string(),
-            };
-            let auth_label = if app.auth.is_logged_in() {
-                match app.config.deployment {
-                    DeploymentKind::Cloud => "Cloud Token".to_string(),
-                    DeploymentKind::DataCenter => "Data Center".to_string(),
-                }
-            } else {
-                "Offline".to_string()
-            };
-            entries.push(SiteSwitcherEntry {
-                site_id: "default".to_string(),
-                name,
-                site_url: raw_url.to_string(),
-                deployment_label,
-                auth_label,
-                enabled: true,
-                is_active: false,
-                issue_count: app.cache_counts.issues,
-                page_count: app.cache_counts.pages,
-            });
-        }
-        Self::new(entries)
     }
 
     /// Returns whether `All Sites (Federated)` is the currently active scope.
@@ -760,7 +715,7 @@ mod tests {
     use crate::{
         atlassian::AtlassianClient,
         auth::AuthManager,
-        config::{AppConfig, Persona, ThemePreset},
+        config::{AppConfig, DeploymentKind, Persona, ThemePreset},
         storage::Storage,
         sync,
     };
