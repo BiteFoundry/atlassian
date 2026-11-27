@@ -16,6 +16,7 @@ use crate::{
     img_preview,
     models::{parse_offset_cursor, slice_page, BoardSummary, IssueUpdate, OutgoingIssue},
     resolver::resolve_rejected_assignee,
+    safe_text::sanitize_terminal_inline,
     serve,
     storage::{IssueListFilter, Storage},
     sync,
@@ -301,10 +302,10 @@ async fn cmd_projects(
         for p in &page.items {
             println!(
                 "{:<10} {:<28} [{}] lead={}",
-                p.key,
-                p.name,
-                p.project_type,
-                p.lead_name.as_deref().unwrap_or("-")
+                sanitize_terminal_inline(&p.key),
+                sanitize_terminal_inline(&p.name),
+                sanitize_terminal_inline(&p.project_type),
+                sanitize_terminal_inline(p.lead_name.as_deref().unwrap_or("-"))
             );
         }
         if let Some(next) = page.next_cursor.as_deref() {
@@ -364,9 +365,9 @@ async fn cmd_boards(
             println!(
                 "#{:<6} {:<32} ({}) project={}",
                 b.id,
-                b.name,
-                b.board_type,
-                b.project_key.as_deref().unwrap_or("-")
+                sanitize_terminal_inline(&b.name),
+                sanitize_terminal_inline(&b.board_type),
+                sanitize_terminal_inline(b.project_key.as_deref().unwrap_or("-"))
             );
         }
         if let Some(next) = page.next_cursor.as_deref() {
@@ -409,10 +410,10 @@ async fn cmd_sprints(
             println!(
                 "#{:<6} [{}] {:<28} {} ~ {}",
                 s.id,
-                s.state,
-                s.name,
-                s.start_date.as_deref().unwrap_or("-"),
-                s.end_date.as_deref().unwrap_or("-")
+                sanitize_terminal_inline(&s.state),
+                sanitize_terminal_inline(&s.name),
+                sanitize_terminal_inline(s.start_date.as_deref().unwrap_or("-")),
+                sanitize_terminal_inline(s.end_date.as_deref().unwrap_or("-"))
             );
         }
         if let Some(next) = page.next_cursor.as_deref() {
@@ -642,7 +643,11 @@ async fn cmd_issues(
                 .unwrap_or("-");
             println!(
                 "{:<12} [{:<12}] ({:<6}) {:<12} {}",
-                issue.key, issue.status.name, prio, assignee, issue.summary
+                sanitize_terminal_inline(&issue.key),
+                sanitize_terminal_inline(&issue.status.name),
+                sanitize_terminal_inline(prio),
+                sanitize_terminal_inline(assignee),
+                sanitize_terminal_inline(&issue.summary)
             );
         }
         if let Some(page) = remote_page {

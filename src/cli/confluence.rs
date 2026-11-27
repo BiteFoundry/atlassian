@@ -14,6 +14,7 @@ use crate::{
     config::{self, AppConfig},
     img_preview,
     models::{parse_offset_cursor, slice_page, OutgoingPage},
+    safe_text::sanitize_terminal_inline,
     serve,
     storage::Storage,
 };
@@ -213,7 +214,12 @@ async fn cmd_spaces(
         println!("No spaces found.");
     } else {
         for s in &page.items {
-            println!("{:<12} {:<32} [{}]", s.key, s.name, s.space_type);
+            println!(
+                "{:<12} {:<32} [{}]",
+                sanitize_terminal_inline(&s.key),
+                sanitize_terminal_inline(&s.name),
+                sanitize_terminal_inline(&s.space_type)
+            );
         }
         if let Some(next) = page.next_cursor.as_deref() {
             eprintln!("Next page: --cursor {next}");
@@ -302,7 +308,10 @@ async fn cmd_pages(
             };
             println!(
                 "{children_mark} {:<12} [{}] v{} {}",
-                p.id, p.space_key, p.version_number, p.title
+                sanitize_terminal_inline(&p.id),
+                sanitize_terminal_inline(&p.space_key),
+                p.version_number,
+                sanitize_terminal_inline(&p.title)
             );
         }
         if let Some(next) = page.next_cursor.as_deref() {
@@ -697,7 +706,12 @@ async fn cmd_page_search(
             println!("No results found.");
         } else {
             for p in &pages {
-                println!("{:<12} [{}] {}", p.id, p.space_key, p.title);
+                println!(
+                    "{:<12} [{}] {}",
+                    sanitize_terminal_inline(&p.id),
+                    sanitize_terminal_inline(&p.space_key),
+                    sanitize_terminal_inline(&p.title)
+                );
             }
         }
     } else {
@@ -726,7 +740,11 @@ async fn cmd_page_search(
             for h in &hits {
                 println!(
                     "{:<12} [{} · {}] {} — {}",
-                    h.id_or_key, h.container, h.status_or_version, h.title, h.snippet
+                    sanitize_terminal_inline(&h.id_or_key),
+                    sanitize_terminal_inline(&h.container),
+                    sanitize_terminal_inline(&h.status_or_version),
+                    sanitize_terminal_inline(&h.title),
+                    sanitize_terminal_inline(&h.snippet)
                 );
             }
         }

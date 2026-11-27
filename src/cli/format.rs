@@ -13,6 +13,7 @@ use crate::{
     atlassian::AtlassianClient,
     img_preview,
     models::{AttachmentItem, BoardSummary, IssueDetail, IssueSummary, PageDetail, SprintSummary, StatusCategory},
+    safe_text::{sanitize_terminal_inline, sanitize_terminal_text},
 };
 
 pub(super) const DELETE_JSON_REQUIRES_YES: &str = "Deleting in --json mode requires passing --yes.";
@@ -93,59 +94,93 @@ pub(crate) fn looks_like_jira_key(raw: &str) -> bool {
 
 pub(super) fn print_issue_detail(detail: &IssueDetail) {
     let s = &detail.summary;
-    println!("{} — {}", s.key, s.summary);
+    println!(
+        "{} — {}",
+        sanitize_terminal_inline(&s.key),
+        sanitize_terminal_inline(&s.summary)
+    );
     println!(
         "Status: [{}] ({}) · Type: {} · Priority: {}",
-        s.status.name,
+        sanitize_terminal_inline(&s.status.name),
         s.status.category.badge_label(),
-        s.issue_type.name,
-        s.priority.as_ref().map(|p| p.name.as_str()).unwrap_or("-")
+        sanitize_terminal_inline(&s.issue_type.name),
+        s.priority
+            .as_ref()
+            .map(|p| sanitize_terminal_inline(&p.name))
+            .unwrap_or(std::borrow::Cow::Borrowed("-"))
     );
     println!(
         "Assignee: {} · Reporter: {} · Sprint: {}",
         s.assignee
             .as_ref()
-            .map(|u| u.display_name.as_str())
-            .unwrap_or("Unassigned"),
+            .map(|u| sanitize_terminal_inline(&u.display_name))
+            .unwrap_or(std::borrow::Cow::Borrowed("Unassigned")),
         s.reporter
             .as_ref()
-            .map(|u| u.display_name.as_str())
-            .unwrap_or("-"),
-        s.sprint_name.as_deref().unwrap_or("-")
+            .map(|u| sanitize_terminal_inline(&u.display_name))
+            .unwrap_or(std::borrow::Cow::Borrowed("-")),
+        s.sprint_name
+            .as_deref()
+            .map(sanitize_terminal_inline)
+            .unwrap_or(std::borrow::Cow::Borrowed("-"))
     );
     if !s.labels.is_empty() {
-        println!("Labels: {}", s.labels.join(", "));
+        let labels: Vec<_> = s.labels.iter().map(|l| sanitize_terminal_inline(l)).collect();
+        println!("Labels: {}", labels.join(", "));
     }
     if !s.web_url.is_empty() {
-        println!("URL: {}", s.web_url);
+        println!("URL: {}", sanitize_terminal_inline(&s.web_url));
     }
 
     if !detail.description_markdown.trim().is_empty() {
-        println!("\n--- Description ---\n{}", detail.description_markdown.trim());
+        println!(
+            "\n--- Description ---\n{}",
+            sanitize_terminal_text(detail.description_markdown.trim())
+        );
     }
     if !detail.subtasks.is_empty() {
         println!("\n--- Subtasks ({}) ---", detail.subtasks.len());
         for sub in &detail.subtasks {
-            println!("  {} [{}] {}", sub.key, sub.status.name, sub.summary);
+            println!(
+                "  {} [{}] {}",
+                sanitize_terminal_inline(&sub.key),
+                sanitize_terminal_inline(&sub.status.name),
+                sanitize_terminal_inline(&sub.summary)
+            );
         }
     }
     if !detail.linked_pages.is_empty() {
         println!("\n--- Linked Confluence Pages ({}) ---", detail.linked_pages.len());
         for page in &detail.linked_pages {
-            println!("  [{}] {} ({})", page.page_id, page.title, page.web_url);
+            println!(
+                "  [{}] {} ({})",
+                sanitize_terminal_inline(&page.page_id),
+                sanitize_terminal_inline(&page.title),
+                sanitize_terminal_inline(&page.web_url)
+            );
         }
     }
     if !detail.attachments.is_empty() {
         println!("\n--- Attachments ({}) ---", detail.attachments.len());
         for att in &detail.attachments {
-            println!("  [{}] {} ({}, {}B)", att.id, att.filename, att.mime_type, att.size);
+            println!(
+                "  [{}] {} ({}, {}B)",
+                sanitize_terminal_inline(&att.id),
+                sanitize_terminal_inline(&att.filename),
+                sanitize_terminal_inline(&att.mime_type),
+                att.size
+            );
         }
     }
     if !detail.comments.is_empty() {
         println!("\n--- Comments ({}) ---", detail.comments.len());
         for c in &detail.comments {
-            println!("  [{}] {}:", c.created_at, c.author.display_name);
-            for line in c.body_markdown.lines() {
+            println!(
+                "  [{}] {}:",
+                sanitize_terminal_inline(&c.created_at),
+                sanitize_terminal_inline(&c.author.display_name)
+            );
+            for line in sanitize_terminal_text(&c.body_markdown).lines() {
                 println!("    {line}");
             }
         }
@@ -154,40 +189,75 @@ pub(super) fn print_issue_detail(detail: &IssueDetail) {
 
 pub(super) fn print_page_detail(detail: &PageDetail) {
     let s = &detail.summary;
-    println!("[{}] {} (v{})", s.id, s.title, s.version_number);
+    println!(
+        "[{}] {} (v{})",
+        sanitize_terminal_inline(&s.id),
+        sanitize_terminal_inline(&s.title),
+        s.version_number
+    );
     println!(
         "Space: {} · Author: {} · Updated: {}",
-        s.space_key,
-        s.author_name.as_deref().unwrap_or("-"),
-        s.updated_at
+        sanitize_terminal_inline(&s.space_key),
+        s.author_name
+            .as_deref()
+            .map(sanitize_terminal_inline)
+            .unwrap_or(std::borrow::Cow::Borrowed("-")),
+        sanitize_terminal_inline(&s.updated_at)
     );
     if !detail.ancestors.is_empty() {
-        let trail: Vec<&str> = detail.ancestors.iter().map(|a| a.title.as_str()).collect();
+        let trail: Vec<_> = detail
+            .ancestors
+            .iter()
+            .map(|a| sanitize_terminal_inline(&a.title))
+            .collect();
         println!("Path: {}", trail.join(" > "));
     }
     if !detail.labels.is_empty() {
-        println!("Labels: {}", detail.labels.join(", "));
+        let labels: Vec<_> = detail
+            .labels
+            .iter()
+            .map(|l| sanitize_terminal_inline(l))
+            .collect();
+        println!("Labels: {}", labels.join(", "));
     }
     if !s.web_url.is_empty() {
-        println!("URL: {}", s.web_url);
+        println!("URL: {}", sanitize_terminal_inline(&s.web_url));
     }
     if !detail.body_markdown.trim().is_empty() {
-        println!("\n--- Body ---\n{}", detail.body_markdown.trim());
+        println!(
+            "\n--- Body ---\n{}",
+            sanitize_terminal_text(detail.body_markdown.trim())
+        );
     }
     if !detail.linked_issue_keys.is_empty() {
-        println!("\n--- Linked Jira Issues ---\n  {}", detail.linked_issue_keys.join(", "));
+        let keys: Vec<_> = detail
+            .linked_issue_keys
+            .iter()
+            .map(|k| sanitize_terminal_inline(k))
+            .collect();
+        println!("\n--- Linked Jira Issues ---\n  {}", keys.join(", "));
     }
     if !detail.attachments.is_empty() {
         println!("\n--- Attachments ({}) ---", detail.attachments.len());
         for att in &detail.attachments {
-            println!("  [{}] {} ({}, {}B)", att.id, att.filename, att.mime_type, att.size);
+            println!(
+                "  [{}] {} ({}, {}B)",
+                sanitize_terminal_inline(&att.id),
+                sanitize_terminal_inline(&att.filename),
+                sanitize_terminal_inline(&att.mime_type),
+                att.size
+            );
         }
     }
     if !detail.comments.is_empty() {
         println!("\n--- Comments ({}) ---", detail.comments.len());
         for c in &detail.comments {
-            println!("  [{}] {}:", c.created_at, c.author_name);
-            for line in c.body_markdown.lines() {
+            println!(
+                "  [{}] {}:",
+                sanitize_terminal_inline(&c.created_at),
+                sanitize_terminal_inline(&c.author_name)
+            );
+            for line in sanitize_terminal_text(&c.body_markdown).lines() {
                 println!("    {line}");
             }
         }
@@ -204,6 +274,7 @@ pub(super) async fn render_attachments_preview(
         if !img_preview::is_image_attachment(&att.mime_type, &att.filename) {
             continue;
         }
+        let safe_name = sanitize_terminal_inline(&att.filename);
         match client.fetch_attachment_bytes(att).await {
             Ok(bytes) => {
                 match img_preview::render_for_stdout(
@@ -212,16 +283,16 @@ pub(super) async fn render_attachments_preview(
                     rows.unwrap_or(18),
                 ) {
                     Ok(rendered) => {
-                        println!("\n[Image preview: {}]", att.filename);
+                        println!("\n[Image preview: {safe_name}]");
                         println!("{rendered}");
                     }
                     Err(err) => {
-                        eprintln!("Skipped image rendering ({}): {err:#}", att.filename);
+                        eprintln!("Skipped image rendering ({safe_name}): {err:#}");
                     }
                 }
             }
             Err(err) => {
-                eprintln!("Skipped image download ({}): {err:#}", att.filename);
+                eprintln!("Skipped image download ({safe_name}): {err:#}");
             }
         }
     }
@@ -279,11 +350,19 @@ pub(crate) fn format_kanban_board(
     let col_width: usize = 28;
     let mut out = String::new();
     let sprint_label = sprint
-        .map(|s| format!(" · Sprint: {} [{}]", s.name, s.state))
+        .map(|s| {
+            format!(
+                " · Sprint: {} [{}]",
+                sanitize_terminal_inline(&s.name),
+                sanitize_terminal_inline(&s.state)
+            )
+        })
         .unwrap_or_default();
     out.push_str(&format!(
         "Board #{}: {} ({}){sprint_label}\n",
-        board.id, board.name, board.board_type
+        board.id,
+        sanitize_terminal_inline(&board.name),
+        sanitize_terminal_inline(&board.board_type)
     ));
 
     let col_count = columns.len().max(1);
@@ -360,9 +439,10 @@ pub(crate) fn format_kanban_board(
 }
 
 fn pad_width(raw: &str, max_width: usize) -> String {
+    let clean = sanitize_terminal_inline(raw);
     let mut acc = String::new();
     let mut width = 0;
-    for ch in raw.chars() {
+    for ch in clean.chars() {
         let cw = ch.width().unwrap_or(0);
         if width + cw > max_width {
             if max_width >= 1 {
@@ -384,5 +464,49 @@ fn pad_width(raw: &str, max_width: usize) -> String {
     }
     let _ = acc.width();
     acc
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::models::{IssueStatus, IssueType, UserSummary};
+
+    #[test]
+    fn kanban_board_sanitizes_ansi_bidi_and_unicode_tags() {
+        let board = BoardSummary {
+            id: 7,
+            name: "\x1b[31mEvil\x1b[0m Board".into(),
+            board_type: "scrum".into(),
+            project_key: Some("ENG".into()),
+            ..Default::default()
+        };
+        let issue = IssueSummary {
+            key: "ENG-1".into(),
+            id: "1".into(),
+            summary: format!("Fix\x1b]52;c;secret\x07 \u{202E}bug{}\nfake", '\u{E0001}'),
+            status: IssueStatus {
+                id: "1".into(),
+                name: "To Do".into(),
+                category: StatusCategory::Todo,
+            },
+            issue_type: IssueType {
+                name: "Task".into(),
+                ..Default::default()
+            },
+            assignee: Some(UserSummary {
+                display_name: "Alice\x1b[2J".into(),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+
+        let rendered = format_kanban_board(&board, None, &[issue]);
+        assert!(!rendered.contains('\x1b'));
+        assert!(!rendered.contains('\u{202E}'));
+        assert!(!rendered.contains('\u{E0001}'));
+        assert!(rendered.contains("Board #7: Evil Board (scrum)"));
+        assert!(rendered.contains("ENG-1 (Alice)"));
+        assert!(rendered.contains("Fix bug fake"));
+    }
 }
 
