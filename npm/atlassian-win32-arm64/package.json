@@ -1,6 +1,6 @@
 {
   "name": "@bitefoundry/atlassian-win32-arm64",
-  "version": "0.8.9",
+  "version": "0.8.10",
   "description": "Prebuilt atlassian binary for Windows arm64",
   "repository": {
     "type": "git",
