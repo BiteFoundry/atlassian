@@ -3,7 +3,7 @@
 use std::collections::HashSet;
 
 use anyhow::{bail, Context, Result};
-use futures::{stream, StreamExt};
+use futures_util::{stream, StreamExt};
 use reqwest::StatusCode;
 use serde_json::{json, Value};
 

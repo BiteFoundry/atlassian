@@ -302,8 +302,8 @@ impl AttachmentsOverlay {
         let theme = &ui.theme;
         let rect = centered_rect(
             area,
-            area.width.saturating_sub(6).min(78).max(30),
-            area.height.saturating_sub(4).min(20).max(9),
+            area.width.saturating_sub(6).clamp(30, 78),
+            area.height.saturating_sub(4).clamp(9, 20),
         );
         frame.render_widget(Clear, rect);
 

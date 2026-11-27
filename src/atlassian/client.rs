@@ -582,11 +582,13 @@ impl AtlassianClient {
         http: reqwest::Client,
         api_gateway_base: Option<String>,
     ) -> Self {
-        let mut config = AppConfig::default();
-        config.site_url = normalize_base_url(&site.site_url);
-        config.confluence_url = normalize_base_url(&site.confluence_url);
-        config.deployment = site.deployment;
-        config.profile = site.account_id.clone();
+        let config = AppConfig {
+            site_url: normalize_base_url(&site.site_url),
+            confluence_url: normalize_base_url(&site.confluence_url),
+            deployment: site.deployment,
+            profile: site.account_id.clone(),
+            ..AppConfig::default()
+        };
 
         let gateway = api_gateway_base
             .as_deref()
@@ -636,10 +638,12 @@ impl AtlassianClient {
         deployment: DeploymentKind,
         auth: AuthManager,
     ) -> Result<Self> {
-        let mut config = AppConfig::default();
-        config.site_url = normalize_base_url(&site_url.into());
-        config.confluence_url = normalize_base_url(&confluence_url.into());
-        config.deployment = deployment;
+        let config = AppConfig {
+            site_url: normalize_base_url(&site_url.into()),
+            confluence_url: normalize_base_url(&confluence_url.into()),
+            deployment,
+            ..AppConfig::default()
+        };
         Self::new(config, auth)
     }
 
@@ -945,7 +949,7 @@ impl AtlassianClient {
             .get(CONTENT_LENGTH)
             .and_then(|v| v.to_str().ok())
             .and_then(|v| v.trim().parse::<u64>().ok())
-            .map_or(true, |len| len > 0);
+            .is_none_or(|len| len > 0);
         let content_type = if resp.status() == StatusCode::OK && has_body && is_json_rest_path(target_url) {
             headers.get(CONTENT_TYPE).and_then(|v| v.to_str().ok())
         } else {
@@ -2791,13 +2795,15 @@ AiA+cNCCx29pol4ocp9J/G0R/45YiLiv6VdSopzRWi3hcw==\n\
     #[test]
     fn pool_clients_inherit_workspace_defaults() {
         let dir = tempfile::tempdir().unwrap();
-        let mut cfg = AppConfig::default();
-        cfg.default_space_key = Some("DOCS".into());
-        cfg.default_board_id = Some(42);
-        cfg.default_project = Some("ENG".into());
-        cfg.sync_interval_secs = 90;
-        cfg.default_site = Some("corp".into());
-        cfg.sites = vec![dc_site("corp", "https://jira.corp.example/", "")];
+        let cfg = AppConfig {
+            default_space_key: Some("DOCS".into()),
+            default_board_id: Some(42),
+            default_project: Some("ENG".into()),
+            sync_interval_secs: 90,
+            default_site: Some("corp".into()),
+            sites: vec![dc_site("corp", "https://jira.corp.example/", "")],
+            ..AppConfig::default()
+        };
 
         let pool = SiteClientPool::from_config_with_options(
             &cfg,
@@ -2921,11 +2927,13 @@ AiA+cNCCx29pol4ocp9J/G0R/45YiLiv6VdSopzRWi3hcw==\n\
             confluence_url: None,
         };
 
-        let mut cfg = AppConfig::default();
-        cfg.sites = vec![
-            dc_site("a", "https://jira.a.example", "https://wiki.a.example"),
-            dc_site("b", "https://jira.b.example", "https://wiki.b.example"),
-        ];
+        let cfg = AppConfig {
+            sites: vec![
+                dc_site("a", "https://jira.a.example", "https://wiki.a.example"),
+                dc_site("b", "https://jira.b.example", "https://wiki.b.example"),
+            ],
+            ..AppConfig::default()
+        };
         let pool =
             SiteClientPool::from_config_with_env(&cfg, Some(cred_path.clone()), None, None, &env)
                 .unwrap();
@@ -2945,8 +2953,10 @@ AiA+cNCCx29pol4ocp9J/G0R/45YiLiv6VdSopzRWi3hcw==\n\
         );
 
         // A single-site configuration keeps today's behaviour: environment first.
-        let mut single = AppConfig::default();
-        single.sites = vec![dc_site("a", "https://jira.a.example", "https://wiki.a.example")];
+        let single = AppConfig {
+            sites: vec![dc_site("a", "https://jira.a.example", "https://wiki.a.example")],
+            ..AppConfig::default()
+        };
         let pool =
             SiteClientPool::from_config_with_env(&single, Some(cred_path.clone()), None, None, &env)
                 .unwrap();

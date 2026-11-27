@@ -689,7 +689,7 @@ impl AppConfig {
             .as_deref()
             .map(|active| {
                 self.find_effective_site(active)
-                    .map_or(true, |site| !site.id.eq_ignore_ascii_case(&found.id))
+                    .is_none_or(|site| !site.id.eq_ignore_ascii_case(&found.id))
             })
             .unwrap_or(false);
         Ok(if shadows { self.active_site.take() } else { None })

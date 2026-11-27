@@ -499,11 +499,7 @@ fn is_http_url(url: &str) -> bool {
 
 fn clean_extracted_url(raw: &str) -> String {
     let mut s = raw.trim().to_string();
-    loop {
-        let last = match s.chars().last() {
-            Some(c) => c,
-            None => break,
-        };
+    while let Some(last) = s.chars().last() {
         let strip = match last {
             '.' | ',' | ';' | ':' | '!' | '?' | '>' | '"' | '\'' => true,
             ')' => {

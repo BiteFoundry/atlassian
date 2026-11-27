@@ -2883,7 +2883,7 @@ async fn regression_atlassian_bug_08_full_body_adf_roundtrip_and_no_empty_text()
         nodes[4]
             .get("content")
             .and_then(Value::as_array)
-            .map_or(true, |arr| arr.is_empty()),
+            .is_none_or(|arr| arr.is_empty()),
         "empty codeBlock must have empty/omitted content: {}",
         nodes[4]
     );

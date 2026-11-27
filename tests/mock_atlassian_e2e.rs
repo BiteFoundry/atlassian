@@ -76,7 +76,11 @@ fn generate_test_png_bytes() -> Vec<u8> {
     out.into_inner()
 }
 
-fn check_basic_auth(headers: &HeaderMap, expected_email: &str, expected_token: &str) -> Result<(), Response> {
+fn check_basic_auth(
+    headers: &HeaderMap,
+    expected_email: &str,
+    expected_token: &str,
+) -> Result<(), Box<Response>> {
     let expected_raw = format!("{expected_email}:{expected_token}");
     let expected_header = format!("Basic {}", BASE64_STANDARD.encode(expected_raw.as_bytes()));
     let actual = headers
@@ -85,15 +89,17 @@ fn check_basic_auth(headers: &HeaderMap, expected_email: &str, expected_token: &
     if actual == Some(expected_header.as_str()) {
         Ok(())
     } else {
-        Err((
-            StatusCode::UNAUTHORIZED,
-            Json(json!({ "errorMessages": ["Invalid Cloud Basic credentials"] })),
-        )
-            .into_response())
+        Err(Box::new(
+            (
+                StatusCode::UNAUTHORIZED,
+                Json(json!({ "errorMessages": ["Invalid Cloud Basic credentials"] })),
+            )
+                .into_response(),
+        ))
     }
 }
 
-fn check_bearer_auth(headers: &HeaderMap, expected_pat: &str) -> Result<(), Response> {
+fn check_bearer_auth(headers: &HeaderMap, expected_pat: &str) -> Result<(), Box<Response>> {
     let expected_header = format!("Bearer {expected_pat}");
     let actual = headers
         .get(header::AUTHORIZATION)
@@ -101,11 +107,13 @@ fn check_bearer_auth(headers: &HeaderMap, expected_pat: &str) -> Result<(), Resp
     if actual == Some(expected_header.as_str()) {
         Ok(())
     } else {
-        Err((
-            StatusCode::UNAUTHORIZED,
-            Json(json!({ "errorMessages": ["Invalid Data Center Bearer PAT"] })),
-        )
-            .into_response())
+        Err(Box::new(
+            (
+                StatusCode::UNAUTHORIZED,
+                Json(json!({ "errorMessages": ["Invalid Data Center Bearer PAT"] })),
+            )
+                .into_response(),
+        ))
     }
 }
 
@@ -512,7 +520,7 @@ fn build_mock_atlassian_router(state: Arc<MockAtlassianState>) -> Router {
             "/rest/api/3/myself",
             get(|State(st): State<Arc<MockAtlassianState>>, headers: HeaderMap| async move {
                 if let Err(resp) = check_basic_auth(&headers, &st.cloud_email, &st.cloud_token) {
-                    return resp;
+                    return *resp;
                 }
                 Json(json!({
                     "accountId": "acc-alice",
@@ -527,7 +535,7 @@ fn build_mock_atlassian_router(state: Arc<MockAtlassianState>) -> Router {
             "/rest/api/3/project/search",
             get(|State(st): State<Arc<MockAtlassianState>>, headers: HeaderMap| async move {
                 if let Err(resp) = check_basic_auth(&headers, &st.cloud_email, &st.cloud_token) {
-                    return resp;
+                    return *resp;
                 }
                 Json(json!({
                     "values": [{
@@ -545,7 +553,7 @@ fn build_mock_atlassian_router(state: Arc<MockAtlassianState>) -> Router {
             "/rest/agile/1.0/board",
             get(|State(st): State<Arc<MockAtlassianState>>, headers: HeaderMap| async move {
                 if let Err(resp) = check_basic_auth(&headers, &st.cloud_email, &st.cloud_token) {
-                    return resp;
+                    return *resp;
                 }
                 Json(json!({
                     "values": [{
@@ -562,7 +570,7 @@ fn build_mock_atlassian_router(state: Arc<MockAtlassianState>) -> Router {
             "/rest/agile/1.0/board/{board_id}/configuration",
             get(|State(st): State<Arc<MockAtlassianState>>, headers: HeaderMap| async move {
                 if let Err(resp) = check_basic_auth(&headers, &st.cloud_email, &st.cloud_token) {
-                    return resp;
+                    return *resp;
                 }
                 Json(json!({
                     "columnConfig": {
@@ -580,7 +588,7 @@ fn build_mock_atlassian_router(state: Arc<MockAtlassianState>) -> Router {
             "/rest/agile/1.0/board/{board_id}/sprint",
             get(|State(st): State<Arc<MockAtlassianState>>, headers: HeaderMap| async move {
                 if let Err(resp) = check_basic_auth(&headers, &st.cloud_email, &st.cloud_token) {
-                    return resp;
+                    return *resp;
                 }
                 Json(json!({
                     "values": [{
@@ -598,7 +606,7 @@ fn build_mock_atlassian_router(state: Arc<MockAtlassianState>) -> Router {
             "/rest/agile/1.0/sprint/{sprint_id}/issue",
             get(|State(st): State<Arc<MockAtlassianState>>, headers: HeaderMap| async move {
                 if let Err(resp) = check_basic_auth(&headers, &st.cloud_email, &st.cloud_token) {
-                    return resp;
+                    return *resp;
                 }
                 let guard = st.issues.read().unwrap();
                 let mut list: Vec<Value> = guard
@@ -613,7 +621,7 @@ fn build_mock_atlassian_router(state: Arc<MockAtlassianState>) -> Router {
             "/rest/agile/1.0/board/{board_id}/issue",
             get(|State(st): State<Arc<MockAtlassianState>>, headers: HeaderMap| async move {
                 if let Err(resp) = check_basic_auth(&headers, &st.cloud_email, &st.cloud_token) {
-                    return resp;
+                    return *resp;
                 }
                 let guard = st.issues.read().unwrap();
                 let list: Vec<Value> = guard
@@ -632,7 +640,7 @@ fn build_mock_atlassian_router(state: Arc<MockAtlassianState>) -> Router {
             "/rest/api/3/search/jql",
             post(|State(st): State<Arc<MockAtlassianState>>, headers: HeaderMap, Json(body): Json<Value>| async move {
                 if let Err(resp) = check_basic_auth(&headers, &st.cloud_email, &st.cloud_token) {
-                    return resp;
+                    return *resp;
                 }
                 st.captured_cloud_jql_requests.write().unwrap().push(body.clone());
                 let guard = st.issues.read().unwrap();
@@ -670,7 +678,7 @@ fn build_mock_atlassian_router(state: Arc<MockAtlassianState>) -> Router {
             "/rest/api/3/issue",
             post(|State(st): State<Arc<MockAtlassianState>>, headers: HeaderMap, Json(body): Json<Value>| async move {
                 if let Err(resp) = check_basic_auth(&headers, &st.cloud_email, &st.cloud_token) {
-                    return resp;
+                    return *resp;
                 }
                 st.captured_cloud_create_issue_bodies.write().unwrap().push(body.clone());
                 let fields = body.get("fields").cloned().unwrap_or(Value::Null);
@@ -715,7 +723,7 @@ fn build_mock_atlassian_router(state: Arc<MockAtlassianState>) -> Router {
             "/rest/api/3/issue/{key}",
             get(|State(st): State<Arc<MockAtlassianState>>, headers: HeaderMap, Path(key): Path<String>| async move {
                 if let Err(resp) = check_basic_auth(&headers, &st.cloud_email, &st.cloud_token) {
-                    return resp;
+                    return *resp;
                 }
                 let guard = st.issues.read().unwrap();
                 match guard.get(&key) {
@@ -725,7 +733,7 @@ fn build_mock_atlassian_router(state: Arc<MockAtlassianState>) -> Router {
             })
             .delete(|State(st): State<Arc<MockAtlassianState>>, headers: HeaderMap, Path(key): Path<String>| async move {
                 if let Err(resp) = check_basic_auth(&headers, &st.cloud_email, &st.cloud_token) {
-                    return resp;
+                    return *resp;
                 }
                 st.issues.write().unwrap().remove(&key);
                 StatusCode::NO_CONTENT.into_response()
@@ -735,7 +743,7 @@ fn build_mock_atlassian_router(state: Arc<MockAtlassianState>) -> Router {
             "/rest/api/3/issue/{key}/remotelink",
             get(|State(st): State<Arc<MockAtlassianState>>, headers: HeaderMap, Path(key): Path<String>| async move {
                 if let Err(resp) = check_basic_auth(&headers, &st.cloud_email, &st.cloud_token) {
-                    return resp;
+                    return *resp;
                 }
                 st.remotelink_requests.fetch_add(1, Ordering::SeqCst);
                 let guard = st.issues.read().unwrap();
@@ -750,7 +758,7 @@ fn build_mock_atlassian_router(state: Arc<MockAtlassianState>) -> Router {
             "/rest/api/3/issue/{key}/transitions",
             get(|State(st): State<Arc<MockAtlassianState>>, headers: HeaderMap| async move {
                 if let Err(resp) = check_basic_auth(&headers, &st.cloud_email, &st.cloud_token) {
-                    return resp;
+                    return *resp;
                 }
                 Json(json!({
                     "transitions": [
@@ -762,7 +770,7 @@ fn build_mock_atlassian_router(state: Arc<MockAtlassianState>) -> Router {
             })
             .post(|State(st): State<Arc<MockAtlassianState>>, headers: HeaderMap, Path(key): Path<String>, Json(body): Json<Value>| async move {
                 if let Err(resp) = check_basic_auth(&headers, &st.cloud_email, &st.cloud_token) {
-                    return resp;
+                    return *resp;
                 }
                 let tid = body.pointer("/transition/id").and_then(|v| v.as_str()).unwrap_or("");
                 let mut guard = st.issues.write().unwrap();
@@ -784,7 +792,7 @@ fn build_mock_atlassian_router(state: Arc<MockAtlassianState>) -> Router {
             "/rest/api/3/issue/{key}/assignee",
             put(|State(st): State<Arc<MockAtlassianState>>, headers: HeaderMap, Path(key): Path<String>, Json(body): Json<Value>| async move {
                 if let Err(resp) = check_basic_auth(&headers, &st.cloud_email, &st.cloud_token) {
-                    return resp;
+                    return *resp;
                 }
                 let aid = body.get("accountId").and_then(|v| v.as_str()).map(str::to_string);
                 let mut guard = st.issues.write().unwrap();
@@ -799,7 +807,7 @@ fn build_mock_atlassian_router(state: Arc<MockAtlassianState>) -> Router {
             "/rest/api/3/issue/{key}/comment",
             post(|State(st): State<Arc<MockAtlassianState>>, headers: HeaderMap, Path(key): Path<String>, Json(body): Json<Value>| async move {
                 if let Err(resp) = check_basic_auth(&headers, &st.cloud_email, &st.cloud_token) {
-                    return resp;
+                    return *resp;
                 }
                 let cid = format!("c-{}", st.next_num());
                 let comment_json = json!({
@@ -819,7 +827,7 @@ fn build_mock_atlassian_router(state: Arc<MockAtlassianState>) -> Router {
             "/rest/api/3/issue/{key}/attachments",
             post(|State(st): State<Arc<MockAtlassianState>>, headers: HeaderMap, Path(key): Path<String>, body: Bytes| async move {
                 if let Err(resp) = check_basic_auth(&headers, &st.cloud_email, &st.cloud_token) {
-                    return resp;
+                    return *resp;
                 }
                 let xsrf = headers
                     .get("X-Atlassian-Token")
@@ -862,7 +870,7 @@ fn build_mock_atlassian_router(state: Arc<MockAtlassianState>) -> Router {
             "/rest/api/3/attachment/content/{id}",
             get(|State(st): State<Arc<MockAtlassianState>>, headers: HeaderMap, Path(id): Path<String>| async move {
                 if let Err(resp) = check_basic_auth(&headers, &st.cloud_email, &st.cloud_token) {
-                    return resp;
+                    return *resp;
                 }
                 let guard = st.attachments.read().unwrap();
                 match guard.get(&id) {
@@ -876,7 +884,7 @@ fn build_mock_atlassian_router(state: Arc<MockAtlassianState>) -> Router {
             "/wiki/api/v2/spaces",
             get(|State(st): State<Arc<MockAtlassianState>>, headers: HeaderMap| async move {
                 if let Err(resp) = check_basic_auth(&headers, &st.cloud_email, &st.cloud_token) {
-                    return resp;
+                    return *resp;
                 }
                 Json(json!({
                     "results": [{
@@ -896,7 +904,7 @@ fn build_mock_atlassian_router(state: Arc<MockAtlassianState>) -> Router {
             "/wiki/api/v2/spaces/{space_id}/pages",
             get(|State(st): State<Arc<MockAtlassianState>>, headers: HeaderMap, Path(space_id): Path<String>| async move {
                 if let Err(resp) = check_basic_auth(&headers, &st.cloud_email, &st.cloud_token) {
-                    return resp;
+                    return *resp;
                 }
                 let guard = st.pages.read().unwrap();
                 let mut results: Vec<Value> = guard
@@ -912,7 +920,7 @@ fn build_mock_atlassian_router(state: Arc<MockAtlassianState>) -> Router {
             "/wiki/api/v2/pages",
             post(|State(st): State<Arc<MockAtlassianState>>, headers: HeaderMap, Json(body): Json<Value>| async move {
                 if let Err(resp) = check_basic_auth(&headers, &st.cloud_email, &st.cloud_token) {
-                    return resp;
+                    return *resp;
                 }
                 st.captured_cloud_create_page_bodies.write().unwrap().push(body.clone());
                 let pid = format!("{}", 2000 + st.next_num());
@@ -939,7 +947,7 @@ fn build_mock_atlassian_router(state: Arc<MockAtlassianState>) -> Router {
             "/wiki/api/v2/pages/{page_id}",
             get(|State(st): State<Arc<MockAtlassianState>>, headers: HeaderMap, Path(page_id): Path<String>| async move {
                 if let Err(resp) = check_basic_auth(&headers, &st.cloud_email, &st.cloud_token) {
-                    return resp;
+                    return *resp;
                 }
                 let guard = st.pages.read().unwrap();
                 match guard.get(&page_id) {
@@ -949,7 +957,7 @@ fn build_mock_atlassian_router(state: Arc<MockAtlassianState>) -> Router {
             })
             .put(|State(st): State<Arc<MockAtlassianState>>, headers: HeaderMap, Path(page_id): Path<String>, Json(body): Json<Value>| async move {
                 if let Err(resp) = check_basic_auth(&headers, &st.cloud_email, &st.cloud_token) {
-                    return resp;
+                    return *resp;
                 }
                 let mut guard = st.pages.write().unwrap();
                 let Some(rec) = guard.get_mut(&page_id) else {
@@ -974,7 +982,7 @@ fn build_mock_atlassian_router(state: Arc<MockAtlassianState>) -> Router {
             })
             .delete(|State(st): State<Arc<MockAtlassianState>>, headers: HeaderMap, Path(page_id): Path<String>| async move {
                 if let Err(resp) = check_basic_auth(&headers, &st.cloud_email, &st.cloud_token) {
-                    return resp;
+                    return *resp;
                 }
                 st.pages.write().unwrap().remove(&page_id);
                 StatusCode::NO_CONTENT.into_response()
@@ -984,7 +992,7 @@ fn build_mock_atlassian_router(state: Arc<MockAtlassianState>) -> Router {
             "/wiki/api/v2/pages/{page_id}/children",
             get(|State(st): State<Arc<MockAtlassianState>>, headers: HeaderMap, Path(page_id): Path<String>| async move {
                 if let Err(resp) = check_basic_auth(&headers, &st.cloud_email, &st.cloud_token) {
-                    return resp;
+                    return *resp;
                 }
                 let guard = st.pages.read().unwrap();
                 let results: Vec<Value> = guard
@@ -999,7 +1007,7 @@ fn build_mock_atlassian_router(state: Arc<MockAtlassianState>) -> Router {
             "/wiki/api/v2/pages/{page_id}/labels",
             get(|State(st): State<Arc<MockAtlassianState>>, headers: HeaderMap, Path(page_id): Path<String>| async move {
                 if let Err(resp) = check_basic_auth(&headers, &st.cloud_email, &st.cloud_token) {
-                    return resp;
+                    return *resp;
                 }
                 let guard = st.pages.read().unwrap();
                 let labels: Vec<Value> = guard
@@ -1013,7 +1021,7 @@ fn build_mock_atlassian_router(state: Arc<MockAtlassianState>) -> Router {
             "/wiki/api/v2/pages/{page_id}/attachments",
             get(|State(st): State<Arc<MockAtlassianState>>, headers: HeaderMap| async move {
                 if let Err(resp) = check_basic_auth(&headers, &st.cloud_email, &st.cloud_token) {
-                    return resp;
+                    return *resp;
                 }
                 Json(json!({ "results": [] })).into_response()
             }),
@@ -1022,7 +1030,7 @@ fn build_mock_atlassian_router(state: Arc<MockAtlassianState>) -> Router {
             "/wiki/api/v2/pages/{page_id}/footer-comments",
             get(|State(st): State<Arc<MockAtlassianState>>, headers: HeaderMap, Path(page_id): Path<String>| async move {
                 if let Err(resp) = check_basic_auth(&headers, &st.cloud_email, &st.cloud_token) {
-                    return resp;
+                    return *resp;
                 }
                 let guard = st.pages.read().unwrap();
                 let results = guard.get(&page_id).map(|p| p.comments.clone()).unwrap_or_default();
@@ -1033,7 +1041,7 @@ fn build_mock_atlassian_router(state: Arc<MockAtlassianState>) -> Router {
             "/wiki/api/v2/footer-comments",
             post(|State(st): State<Arc<MockAtlassianState>>, headers: HeaderMap, Json(body): Json<Value>| async move {
                 if let Err(resp) = check_basic_auth(&headers, &st.cloud_email, &st.cloud_token) {
-                    return resp;
+                    return *resp;
                 }
                 let Some(page_id) = body.get("pageId").and_then(|v| v.as_str()).filter(|s| !s.is_empty()) else {
                     return (StatusCode::BAD_REQUEST, Json(json!({ "message": "pageId required" }))).into_response();
@@ -1060,7 +1068,7 @@ fn build_mock_atlassian_router(state: Arc<MockAtlassianState>) -> Router {
             "/wiki/rest/api/search",
             get(|State(st): State<Arc<MockAtlassianState>>, headers: HeaderMap, Query(q): Query<HashMap<String, String>>| async move {
                 if let Err(resp) = check_basic_auth(&headers, &st.cloud_email, &st.cloud_token) {
-                    return resp;
+                    return *resp;
                 }
                 let cql = q.get("cql").cloned().unwrap_or_default();
                 let guard = st.pages.read().unwrap();
@@ -1088,7 +1096,7 @@ fn build_mock_atlassian_router(state: Arc<MockAtlassianState>) -> Router {
             "/rest/api/2/myself",
             get(|State(st): State<Arc<MockAtlassianState>>, headers: HeaderMap| async move {
                 if let Err(resp) = check_bearer_auth(&headers, &st.dc_pat) {
-                    return resp;
+                    return *resp;
                 }
                 Json(json!({
                     "name": "dc-admin",
@@ -1104,7 +1112,7 @@ fn build_mock_atlassian_router(state: Arc<MockAtlassianState>) -> Router {
             "/rest/api/2/search",
             post(|State(st): State<Arc<MockAtlassianState>>, headers: HeaderMap, Json(body): Json<Value>| async move {
                 if let Err(resp) = check_bearer_auth(&headers, &st.dc_pat) {
-                    return resp;
+                    return *resp;
                 }
                 st.captured_dc_search_requests.write().unwrap().push(body.clone());
                 let start_at = body.get("startAt").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
@@ -1132,7 +1140,7 @@ fn build_mock_atlassian_router(state: Arc<MockAtlassianState>) -> Router {
             "/rest/api/2/issue",
             post(|State(st): State<Arc<MockAtlassianState>>, headers: HeaderMap, Json(body): Json<Value>| async move {
                 if let Err(resp) = check_bearer_auth(&headers, &st.dc_pat) {
-                    return resp;
+                    return *resp;
                 }
                 st.captured_dc_create_issue_bodies.write().unwrap().push(body.clone());
                 let fields = body.get("fields").cloned().unwrap_or(Value::Null);
@@ -1169,7 +1177,7 @@ fn build_mock_atlassian_router(state: Arc<MockAtlassianState>) -> Router {
             "/rest/api/2/issue/{key}",
             get(|State(st): State<Arc<MockAtlassianState>>, headers: HeaderMap, Path(key): Path<String>| async move {
                 if let Err(resp) = check_bearer_auth(&headers, &st.dc_pat) {
-                    return resp;
+                    return *resp;
                 }
                 let guard = st.issues.read().unwrap();
                 match guard.get(&key) {
@@ -1182,7 +1190,7 @@ fn build_mock_atlassian_router(state: Arc<MockAtlassianState>) -> Router {
             "/rest/api/2/issue/{key}/remotelink",
             get(|State(st): State<Arc<MockAtlassianState>>, headers: HeaderMap| async move {
                 if let Err(resp) = check_bearer_auth(&headers, &st.dc_pat) {
-                    return resp;
+                    return *resp;
                 }
                 st.remotelink_requests.fetch_add(1, Ordering::SeqCst);
                 Json(json!([])).into_response()
@@ -1192,7 +1200,7 @@ fn build_mock_atlassian_router(state: Arc<MockAtlassianState>) -> Router {
             "/rest/api/space",
             get(|State(st): State<Arc<MockAtlassianState>>, headers: HeaderMap| async move {
                 if let Err(resp) = check_bearer_auth(&headers, &st.dc_pat) {
-                    return resp;
+                    return *resp;
                 }
                 Json(json!({
                     "results": [{
@@ -1212,7 +1220,7 @@ fn build_mock_atlassian_router(state: Arc<MockAtlassianState>) -> Router {
             "/rest/api/content",
             post(|State(st): State<Arc<MockAtlassianState>>, headers: HeaderMap, Json(body): Json<Value>| async move {
                 if let Err(resp) = check_bearer_auth(&headers, &st.dc_pat) {
-                    return resp;
+                    return *resp;
                 }
                 st.captured_dc_create_page_bodies.write().unwrap().push(body.clone());
                 let pid = format!("{}", 3000 + st.next_num());
@@ -1239,7 +1247,7 @@ fn build_mock_atlassian_router(state: Arc<MockAtlassianState>) -> Router {
             "/rest/api/content/{page_id}",
             get(|State(st): State<Arc<MockAtlassianState>>, headers: HeaderMap, Path(page_id): Path<String>| async move {
                 if let Err(resp) = check_bearer_auth(&headers, &st.dc_pat) {
-                    return resp;
+                    return *resp;
                 }
                 let guard = st.pages.read().unwrap();
                 match guard.get(&page_id) {
@@ -1252,7 +1260,7 @@ fn build_mock_atlassian_router(state: Arc<MockAtlassianState>) -> Router {
             "/rest/api/content/{page_id}/child/comment",
             get(|State(st): State<Arc<MockAtlassianState>>, headers: HeaderMap| async move {
                 if let Err(resp) = check_bearer_auth(&headers, &st.dc_pat) {
-                    return resp;
+                    return *resp;
                 }
                 Json(json!({ "results": [] })).into_response()
             }),
@@ -1632,9 +1640,11 @@ async fn e2e_serve_http_mcp_image_preview_and_self_updater() {
     let atlassian_url = spawn_server(build_mock_atlassian_router(state.clone())).await;
     *state.base_url.write().unwrap() = atlassian_url.clone();
 
-    let mut cfg = AppConfig::default();
-    cfg.site_url = atlassian_url.clone();
-    cfg.deployment = DeploymentKind::Cloud;
+    let cfg = AppConfig {
+        site_url: atlassian_url.clone(),
+        deployment: DeploymentKind::Cloud,
+        ..AppConfig::default()
+    };
 
     let auth = AuthManager::with_credentials(
         "srv-e2e",
@@ -1841,7 +1851,7 @@ async fn e2e_serve_http_mcp_image_preview_and_self_updater() {
     // 4. Self-updater against mock GitHub release endpoint
     let asset_name = if cfg!(windows) { "jira.exe" } else { "jira" };
     let new_binary_payload = b"mock-updated-jira-binary-v9.9.9".to_vec();
-    let sha_hex = hex::encode(Sha256::digest(&new_binary_payload));
+    let sha_hex = atlassian_cli::encode_hex(Sha256::digest(&new_binary_payload));
     let sums_txt = format!("{sha_hex}  {asset_name}\n");
 
     let gh_base_holder = Arc::new(RwLock::new(String::new()));
@@ -2031,13 +2041,14 @@ async fn e2e_multi_site_oauth_3lo_refresh_collision_free_sync_and_federation() {
             "/ex/jira/{cloud_id}/rest/api/3/project/search",
             get(|State(st): State<Arc<MockOAuthGatewayState>>, Path(cid): Path<String>, headers: HeaderMap| async move {
                 // Force a 401 on the very first request to Acme Cloud with v1 token to verify automatic refresh!
-                if cid == "cloud-id-acme" && check_oauth_bearer(&headers, "oauth-tok-v1") {
-                    if st.acme_forced_401.fetch_add(1, Ordering::SeqCst) == 0 {
-                        return (
-                            StatusCode::UNAUTHORIZED,
-                            Json(json!({ "message": "Access token expired" })),
-                        );
-                    }
+                if cid == "cloud-id-acme"
+                    && check_oauth_bearer(&headers, "oauth-tok-v1")
+                    && st.acme_forced_401.fetch_add(1, Ordering::SeqCst) == 0
+                {
+                    return (
+                        StatusCode::UNAUTHORIZED,
+                        Json(json!({ "message": "Access token expired" })),
+                    );
                 }
                 if !check_oauth_bearer(&headers, "oauth-tok-v1")
                     && !check_oauth_bearer(&headers, "oauth-tok-v2")
@@ -2213,7 +2224,7 @@ async fn e2e_multi_site_oauth_3lo_refresh_collision_free_sync_and_federation() {
             "/rest/api/2/project",
             get(|headers: HeaderMap| async move {
                 if let Err(resp) = check_bearer_auth(&headers, "dc-pat-secret") {
-                    return resp;
+                    return *resp;
                 }
                 Json(json!([{
                     "id": "90001",
@@ -2228,7 +2239,7 @@ async fn e2e_multi_site_oauth_3lo_refresh_collision_free_sync_and_federation() {
             "/rest/agile/1.0/board",
             get(|headers: HeaderMap| async move {
                 if let Err(resp) = check_bearer_auth(&headers, "dc-pat-secret") {
-                    return resp;
+                    return *resp;
                 }
                 Json(json!({
                     "values": [{
@@ -2275,7 +2286,7 @@ async fn e2e_multi_site_oauth_3lo_refresh_collision_free_sync_and_federation() {
             "/rest/api/2/search",
             post(|headers: HeaderMap| async move {
                 if let Err(resp) = check_bearer_auth(&headers, "dc-pat-secret") {
-                    return resp;
+                    return *resp;
                 }
                 Json(json!({
                     "startAt": 0,
@@ -2300,7 +2311,7 @@ async fn e2e_multi_site_oauth_3lo_refresh_collision_free_sync_and_federation() {
             "/rest/api/space",
             get(|headers: HeaderMap| async move {
                 if let Err(resp) = check_bearer_auth(&headers, "dc-pat-secret") {
-                    return resp;
+                    return *resp;
                 }
                 Json(json!({
                     "results": [{
@@ -2317,7 +2328,7 @@ async fn e2e_multi_site_oauth_3lo_refresh_collision_free_sync_and_federation() {
             "/rest/api/content",
             get(|headers: HeaderMap| async move {
                 if let Err(resp) = check_bearer_auth(&headers, "dc-pat-secret") {
-                    return resp;
+                    return *resp;
                 }
                 Json(json!({
                     "results": [{
@@ -4674,7 +4685,7 @@ fn build_split_pat_router(state: Arc<SplitPatMock>) -> Router {
             if path.starts_with("/wiki") {
                 state.confluence_auth.write().unwrap().push(auth);
                 if let Err(resp) = check_bearer_auth(&headers, "PAT-C") {
-                    return resp;
+                    return *resp;
                 }
                 if path == "/wiki/rest/api/space" {
                     return Json(json!({
@@ -4691,7 +4702,7 @@ fn build_split_pat_router(state: Arc<SplitPatMock>) -> Router {
             }
             state.jira_auth.write().unwrap().push(auth);
             if let Err(resp) = check_bearer_auth(&headers, "PAT-J") {
-                return resp;
+                return *resp;
             }
             match path.as_str() {
                 "/jira/rest/api/2/myself" => Json(json!({
@@ -4710,22 +4721,23 @@ fn build_split_pat_router(state: Arc<SplitPatMock>) -> Router {
 }
 
 fn split_pat_config(base_url: &str, confluence_account: Option<&str>) -> AppConfig {
-    let mut cfg = AppConfig::default();
-    cfg.site_url = format!("{base_url}/jira");
-    cfg.confluence_url = format!("{base_url}/wiki");
-    cfg.deployment = DeploymentKind::DataCenter;
-    cfg.default_site = Some("corp".into());
-    cfg.sites = vec![atlassian_cli::config::SiteProfile {
-        id: "corp".into(),
-        name: "Corp DC".into(),
+    AppConfig {
         site_url: format!("{base_url}/jira"),
         confluence_url: format!("{base_url}/wiki"),
         deployment: DeploymentKind::DataCenter,
-        account_id: "corp".into(),
-        confluence_account_id: confluence_account.map(str::to_string),
-        ..Default::default()
-    }];
-    cfg
+        default_site: Some("corp".into()),
+        sites: vec![atlassian_cli::config::SiteProfile {
+            id: "corp".into(),
+            name: "Corp DC".into(),
+            site_url: format!("{base_url}/jira"),
+            confluence_url: format!("{base_url}/wiki"),
+            deployment: DeploymentKind::DataCenter,
+            account_id: "corp".into(),
+            confluence_account_id: confluence_account.map(str::to_string),
+            ..Default::default()
+        }],
+        ..AppConfig::default()
+    }
 }
 
 #[tokio::test]
@@ -4990,7 +5002,9 @@ async fn regression_ent_anon_dc_200_anonymous_is_reported_as_unauthorized() {
         web_url: format!("{base_url}/display/DOCS"),
         pinned: false,
     };
-    storage.upsert_spaces_for_site("corp", &[cached.clone()]).unwrap();
+    storage
+        .upsert_spaces_for_site("corp", std::slice::from_ref(&cached))
+        .unwrap();
     let _ = sync::bootstrap_workspace_for_site("corp", &client, &storage).await;
     let after = storage.list_spaces_for_site("corp").unwrap();
     assert_eq!(
@@ -5071,9 +5085,20 @@ impl PagedDcMock {
     }
 
     /// The slice of "items" a server capped at "page_cap" returns for (start, requested).
-    fn slice(&self, items: &[Value], start: usize, requested: usize) -> Result<(Vec<Value>, usize, bool), Response> {
+    fn slice(
+        &self,
+        items: &[Value],
+        start: usize,
+        requested: usize,
+    ) -> Result<(Vec<Value>, usize, bool), Box<Response>> {
         if start > 0 && self.fail_after_first_page.load(Ordering::SeqCst) {
-            return Err((StatusCode::BAD_REQUEST, "injected failure past the first page").into_response());
+            return Err(Box::new(
+                (
+                    StatusCode::BAD_REQUEST,
+                    "injected failure past the first page",
+                )
+                    .into_response(),
+            ));
         }
         let max = requested.min(self.page_cap).max(1);
         let slice: Vec<Value> = items.iter().skip(start).take(max).cloned().collect();
@@ -5089,7 +5114,7 @@ impl PagedDcMock {
             Ok((slice, max, _)) => {
                 Json(json!({ "startAt": start, "maxResults": max, "total": items.len(), field: slice })).into_response()
             }
-            Err(resp) => resp,
+            Err(resp) => *resp,
         }
     }
 
@@ -5105,7 +5130,7 @@ impl PagedDcMock {
                 }
                 Json(body).into_response()
             }
-            Err(resp) => resp,
+            Err(resp) => *resp,
         }
     }
 }

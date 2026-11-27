@@ -2302,7 +2302,7 @@ fn open_html_preview(app: &AppState, ui: &mut UiState) {
             let mut ov = HtmlPreviewOverlay::new(page.summary.title.clone(), html);
             ov.source_url = page.summary.web_url.clone();
             let cmds = ov.take_pending_commands();
-            ui.push_overlay(Overlay::HtmlPreview(ov));
+            ui.push_overlay(Overlay::HtmlPreview(Box::new(ov)));
             apply_html_preview_commands(cmds, app, ui);
             return;
         }
@@ -2314,7 +2314,7 @@ fn open_html_preview(app: &AppState, ui: &mut UiState) {
         let mut ov = HtmlPreviewOverlay::new(title, html);
         ov.source_url = issue.summary.web_url.clone();
         let cmds = ov.take_pending_commands();
-        ui.push_overlay(Overlay::HtmlPreview(ov));
+        ui.push_overlay(Overlay::HtmlPreview(Box::new(ov)));
         apply_html_preview_commands(cmds, app, ui);
         return;
     }
@@ -2324,7 +2324,7 @@ fn open_html_preview(app: &AppState, ui: &mut UiState) {
         let mut ov = HtmlPreviewOverlay::new(page.summary.title.clone(), html);
         ov.source_url = page.summary.web_url.clone();
         let cmds = ov.take_pending_commands();
-        ui.push_overlay(Overlay::HtmlPreview(ov));
+        ui.push_overlay(Overlay::HtmlPreview(Box::new(ov)));
         apply_html_preview_commands(cmds, app, ui);
         return;
     }
@@ -2344,7 +2344,7 @@ fn open_html_attachment_preview(
         format!("{owner} — {}", att.filename)
     };
     let ov = HtmlPreviewOverlay::loading(title.clone(), att.content_url.clone());
-    ui.push_overlay(Overlay::HtmlPreview(ov));
+    ui.push_overlay(Overlay::HtmlPreview(Box::new(ov)));
     let site = app.current_attachments_site(ui);
     app.request_load_html_attachment(ui, site.as_deref(), title, att);
 }

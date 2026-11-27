@@ -93,7 +93,7 @@ pub enum Overlay {
     CrossLink(CrossLinkOverlay),
     Links(LinksOverlay),
     ImagePreview(ImagePreviewOverlay),
-    HtmlPreview(HtmlPreviewOverlay),
+    HtmlPreview(Box<HtmlPreviewOverlay>),
     PathInput(PathInputOverlay),
     FilePicker(FilePickerOverlay),
     CommandPalette(CommandPalette),
@@ -612,7 +612,7 @@ fn help_modal_rect(area: Rect) -> (Rect, bool) {
         if wide {
             area.width.saturating_sub(4).min(102)
         } else {
-            area.width.saturating_sub(4).min(76).max(32)
+            area.width.saturating_sub(4).clamp(32, 76)
         },
         area.height.saturating_sub(2).min(if wide { 22 } else { 28 }).max(12),
     );

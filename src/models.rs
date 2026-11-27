@@ -901,7 +901,7 @@ pub enum CoreEvent {
     },
     OpenIssueRevision {
         site_id: String,
-        summary: IssueSummary,
+        summary: Box<IssueSummary>,
     },
     OpenPageRevision {
         site_id: String,

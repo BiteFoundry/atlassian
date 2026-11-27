@@ -1520,7 +1520,7 @@ mod tests {
             web_url: "https://acme.atlassian.net/wiki/spaces/ENG".into(),
             pinned: false,
         };
-        storage.upsert_spaces(&[sp.clone()]).unwrap();
+        storage.upsert_spaces(std::slice::from_ref(&sp)).unwrap();
         storage.set_space_pinned("ENG", true).unwrap();
         storage.upsert_spaces(&[sp]).unwrap();
         assert!(storage.list_spaces().unwrap()[0].pinned);

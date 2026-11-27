@@ -15,7 +15,7 @@ use std::{
 };
 
 use anyhow::Result;
-use futures::{stream, StreamExt};
+use futures_util::{stream, StreamExt};
 use serde_json::{json, Map, Value};
 use tokio::io::{AsyncBufReadExt, BufReader};
 
@@ -207,8 +207,10 @@ fn tool_uses_current_site_cache(
     };
     reads_cache
         && resolve_mcp_site_id(config, client, arguments.get("site").and_then(Value::as_str))
-            .is_ok_and(|scope| scope.map_or(true, |site| site.eq_ignore_ascii_case(client.site_id())))
+            .is_ok_and(|scope| scope.is_none_or(|site| site.eq_ignore_ascii_case(client.site_id())))
 }
+
+type BodyInputs = (Option<String>, Option<String>, Option<TextReplacement>);
 
 /// Single-line JSON-RPC handler exposed for deterministic unit & integration testing.
 pub async fn handle_rpc_line(
@@ -2386,10 +2388,7 @@ impl<'a> Args<'a> {
         Ok(())
     }
 
-    fn body_inputs(
-        &self,
-        full: &str,
-    ) -> Result<(Option<String>, Option<String>, Option<TextReplacement>), String> {
+    fn body_inputs(&self, full: &str) -> Result<BodyInputs, String> {
         let replacement = self
             .get("replace_text")?
             .map(|value| {

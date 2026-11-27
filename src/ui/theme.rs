@@ -558,9 +558,7 @@ impl Theme {
 
     /// Non-destructive selection style: tints background without clobbering child span foreground colors.
     pub fn selection(&self) -> Style {
-        if self.no_color {
-            Style::default().add_modifier(Modifier::REVERSED | Modifier::BOLD)
-        } else if self.ansi16_only {
+        if self.no_color || self.ansi16_only {
             Style::default().add_modifier(Modifier::REVERSED | Modifier::BOLD)
         } else {
             Style::default().bg(self.bg_selected)

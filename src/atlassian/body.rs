@@ -90,7 +90,11 @@ impl<'a> BodyEdit<'a> {
                 if nodes.is_empty() {
                     return Ok(None);
                 }
-                original["content"].as_array_mut().unwrap().append(nodes);
+                original
+                    .get_mut("content")
+                    .and_then(Value::as_array_mut)
+                    .ok_or(BodyEditError("the original body is not an ADF document"))?
+                    .append(nodes);
             }
             Self::Replace(edit) => {
                 let mut runs = Vec::new();
@@ -101,24 +105,50 @@ impl<'a> BodyEdit<'a> {
                 }
                 let mut node = &mut original;
                 for &index in path {
-                    node = &mut node["content"][index];
+                    node = node
+                        .get_mut("content")
+                        .and_then(Value::as_array_mut)
+                        .and_then(|children| children.get_mut(index))
+                        .ok_or(BodyEditError("matched ADF text node path is invalid"))?;
                 }
-                let mut text = node["text"].as_str().unwrap().to_owned();
+                let mut text = node
+                    .get("text")
+                    .and_then(Value::as_str)
+                    .ok_or(BodyEditError("matched ADF node is missing text"))?
+                    .to_owned();
                 text.replace_range(range, &edit.new_text);
                 if text.is_empty() {
                     // An ADF text node must have a nonempty text value.
-                    let (index, parents) = path.split_last().unwrap();
+                    let (&index, parents) = path
+                        .split_last()
+                        .ok_or(BodyEditError("matched ADF text node path is empty"))?;
                     let mut parent = &mut original;
-                    for &index in parents {
-                        parent = &mut parent["content"][index];
+                    for &parent_idx in parents {
+                        parent = parent
+                            .get_mut("content")
+                            .and_then(Value::as_array_mut)
+                            .and_then(|children| children.get_mut(parent_idx))
+                            .ok_or(BodyEditError("matched ADF parent node path is invalid"))?;
                     }
-                    parent["content"].as_array_mut().unwrap().remove(*index);
+                    let siblings = parent
+                        .get_mut("content")
+                        .and_then(Value::as_array_mut)
+                        .ok_or(BodyEditError("matched ADF parent is missing content array"))?;
+                    if index >= siblings.len() {
+                        return Err(
+                            BodyEditError("matched ADF text node index is out of bounds").into(),
+                        );
+                    }
+                    siblings.remove(index);
                 } else {
                     node["text"] = Value::String(text);
                 }
             }
             Self::Section(edit) => {
-                let content = original["content"].as_array_mut().unwrap();
+                let content = original
+                    .get_mut("content")
+                    .and_then(Value::as_array_mut)
+                    .ok_or(BodyEditError("the original body is not an ADF document"))?;
                 let target = section_body_range(content, &edit.heading)?;
                 let mut fragment = markdown_to_adf(&edit.markdown);
                 let replacement = fragment["content"]
@@ -131,12 +161,22 @@ impl<'a> BodyEdit<'a> {
                         column_index,
                         range,
                     } => (
-                        content[section_index]["content"][column_index]["content"]
-                            .as_array_mut()
-                            .unwrap(),
+                        content
+                            .get_mut(section_index)
+                            .and_then(|section| section.get_mut("content"))
+                            .and_then(Value::as_array_mut)
+                            .and_then(|columns| columns.get_mut(column_index))
+                            .and_then(|column| column.get_mut("content"))
+                            .and_then(Value::as_array_mut)
+                            .ok_or(BodyEditError(
+                                "matched ADF layout column is missing content array",
+                            ))?,
                         range,
                     ),
                 };
+                if range.end > container.len() {
+                    return Err(BodyEditError("section range is out of bounds").into());
+                }
                 if container[range.clone()] == replacement[..] {
                     return Ok(None);
                 }
@@ -366,10 +406,15 @@ impl<T> TextRun<T> {
 
 /// Locate a single occurrence, including overlapping matches, within one source text node.
 fn unique_match<'a, T>(runs: &'a [TextRun<T>], needle: &str) -> Result<(&'a T, Range<usize>)> {
+    let first_char_len = needle
+        .chars()
+        .next()
+        .ok_or(BodyEditError("old_text must contain non-whitespace text"))?
+        .len_utf8();
     let mut found = None;
     for run in runs {
         if let Some(start) = run.text.find(needle) {
-            let next = start + needle.chars().next().unwrap().len_utf8();
+            let next = start + first_char_len;
             if found.is_some() || run.text[next..].contains(needle) {
                 return Err(BodyEditError("old_text matches more than one occurrence").into());
             }
@@ -412,10 +457,13 @@ fn adf_text_runs(node: &Value, path: &mut Vec<usize>, runs: &mut Vec<TextRun<Vec
 // Token offsets refer to the original XHTML so attributes, namespace prefixes and
 // formatting are preserved byte-for-byte. XML quoted attributes can contain '>'.
 static XHTML_TOKEN: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r#"(?s)<!--.*?-->|<!\[CDATA\[.*?\]\]>|<(?:[^"'>]|"[^"]*"|'[^']*')*>|[^<]+"#).unwrap()
+    Regex::new(r#"(?s)<!--.*?-->|<!\[CDATA\[.*?\]\]>|<(?:[^"'>]|"[^"]*"|'[^']*')*>|[^<]+"#)
+        .expect("valid xhtml token regex")
 });
-static ENTITY: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"&(?:#[xX][0-9a-fA-F]+|#[0-9]+|[a-zA-Z][a-zA-Z0-9]*);").unwrap());
+static ENTITY: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"&(?:#[xX][0-9a-fA-F]+|#[0-9]+|[a-zA-Z][a-zA-Z0-9]*);")
+        .expect("valid html entity regex")
+});
 
 fn decode_entities(text: &str) -> (String, Vec<(usize, usize)>) {
     let mut decoded = String::new();
@@ -512,17 +560,20 @@ fn replace_storage_text(original: &str, edit: &TextReplacement) -> Result<Option
     if edit.old_text == edit.new_text {
         return Ok(None);
     }
-    let to_offset = |pos| {
+    let to_offset = |pos| -> Result<usize> {
         let &(decoded, raw) = offsets
             .iter()
             .rev()
             .find(|(decoded, _)| *decoded <= pos)
-            .unwrap();
-        start + raw + pos - decoded
+            .ok_or(BodyEditError(
+                "failed to map decoded offset back to original XHTML",
+            ))?;
+        Ok(start + raw + pos - decoded)
     };
+    let raw_range = to_offset(range.start)?..to_offset(range.end)?;
     Ok(replace_range(
         original,
-        to_offset(range.start)..to_offset(range.end),
+        raw_range,
         &xml_escape(&edit.new_text),
     ))
 }
@@ -536,8 +587,8 @@ fn find_wiki_opaque_token(slice: &str) -> Option<usize> {
             }
         }
     }
-    if slice.starts_with("{noformat}") {
-        if let Some(close_rel) = slice["{noformat}".len()..].find("{noformat}") {
+    if let Some(after_open) = slice.strip_prefix("{noformat}") {
+        if let Some(close_rel) = after_open.find("{noformat}") {
             return Some("{noformat}".len() + close_rel + "{noformat}".len());
         }
     }
@@ -673,7 +724,7 @@ fn find_wiki_inline_delim_close(line: &str, open_end: usize, delim: char) -> Opt
             && prev_char.is_some_and(|p| !p.is_whitespace())
             && iter
                 .peek()
-                .map_or(true, |&(_, next_ch)| !next_ch.is_alphanumeric())
+                .is_none_or(|&(_, next_ch)| !next_ch.is_alphanumeric())
         {
             return Some(open_end + rel);
         }
@@ -682,8 +733,10 @@ fn find_wiki_inline_delim_close(line: &str, open_end: usize, delim: char) -> Opt
     None
 }
 
+type WikiTextRun = TextRun<(usize, Vec<(usize, usize)>)>;
+
 fn push_wiki_decoded_segment(
-    run: &mut TextRun<(usize, Vec<(usize, usize)>)>,
+    run: &mut WikiTextRun,
     original: &str,
     seg_start: usize,
     seg_end: usize,
@@ -716,15 +769,13 @@ fn replace_wiki_text(original: &str, edit: &TextReplacement) -> Result<Option<St
     // Parse wiki markup into display-text runs with exact source byte offset maps.
     // Words with internal `_` / `+` and prose `!` stay literal; actual formatting pairs,
     // images, links, macros, and code blocks remain protected boundaries.
-    let mut runs: Vec<TextRun<(usize, Vec<(usize, usize)>)>> = Vec::new();
+    let mut runs: Vec<WikiTextRun> = Vec::new();
     let mut run = TextRun::default();
     let mut seg_start = 0usize;
     let mut i = 0usize;
     let mut active_close: Option<usize> = None;
 
-    let flush_seg = |run: &mut TextRun<(usize, Vec<(usize, usize)>)>,
-                     seg_start: &mut usize,
-                     end: usize| {
+    let flush_seg = |run: &mut WikiTextRun, seg_start: &mut usize, end: usize| {
         if *seg_start < end {
             push_wiki_decoded_segment(run, original, *seg_start, end);
             *seg_start = end;
@@ -734,8 +785,10 @@ fn replace_wiki_text(original: &str, edit: &TextReplacement) -> Result<Option<St
     while i < original.len() {
         if active_close == Some(i) {
             flush_seg(&mut run, &mut seg_start, i);
-            let ch_len = original[i..].chars().next().unwrap().len_utf8();
-            i += ch_len;
+            let Some(close_ch) = original[i..].chars().next() else {
+                break;
+            };
+            i += close_ch.len_utf8();
             seg_start = i;
             active_close = None;
             continue;
@@ -768,12 +821,14 @@ fn replace_wiki_text(original: &str, edit: &TextReplacement) -> Result<Option<St
         }
 
         // Real inline formatting pairs (*bold*, _italic_, +underline+, ^sup^, ~sub~)
-        let ch = rest.chars().next().unwrap();
+        let Some(ch) = rest.chars().next() else {
+            break;
+        };
         if active_close.is_none() && matches!(ch, '*' | '_' | '+' | '^' | '~') {
             let prev_ok = original[..i]
                 .chars()
                 .next_back()
-                .map_or(true, |p| !p.is_alphanumeric() && p != '\\');
+                .is_none_or(|p| !p.is_alphanumeric() && p != '\\');
             if prev_ok {
                 let line_end = i + rest.find('\n').unwrap_or(rest.len());
                 let open_end = i + ch.len_utf8();
@@ -799,13 +854,15 @@ fn replace_wiki_text(original: &str, edit: &TextReplacement) -> Result<Option<St
     if edit.old_text == edit.new_text {
         return Ok(None);
     }
-    let to_offset = |pos: usize| {
+    let to_offset = |pos: usize| -> Result<usize> {
         let &(decoded, raw) = offsets
             .iter()
             .rev()
             .find(|(decoded, _)| *decoded <= pos)
-            .unwrap();
-        seg_base + raw + pos - decoded
+            .ok_or(BodyEditError(
+                "failed to map decoded offset back to original wiki text",
+            ))?;
+        Ok(seg_base + raw + pos - decoded)
     };
     // Escape wiki metacharacters once so the replacement stays literal in Jira Wiki.
     let literal: String = edit
@@ -816,11 +873,8 @@ fn replace_wiki_text(original: &str, edit: &TextReplacement) -> Result<Option<St
             escape.then_some('\\').into_iter().chain(Some(c))
         })
         .collect();
-    Ok(replace_range(
-        original,
-        to_offset(range.start)..to_offset(range.end),
-        &literal,
-    ))
+    let raw_range = to_offset(range.start)?..to_offset(range.end)?;
+    Ok(replace_range(original, raw_range, &literal))
 }
 
 fn replace_range(original: &str, range: Range<usize>, replacement: &str) -> Option<String> {

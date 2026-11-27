@@ -680,7 +680,7 @@ fn self_closing_ac_ri_regex() -> &'static Regex {
     })
 }
 
-fn preprocess_storage_xhtml(xhtml: &str) -> String {
+pub(crate) fn preprocess_storage_xhtml(xhtml: &str) -> String {
     let escaped_cdata = cdata_regex().replace_all(xhtml, |caps: &regex::Captures<'_>| {
         let inner = &caps[1];
         inner
@@ -1442,8 +1442,7 @@ pub fn parse_jira_wiki(markup: &str) -> Vec<DocBlock> {
         }
 
         // {quote}...{quote}
-        if trimmed.starts_with("{quote}") {
-            let after_open = &trimmed["{quote}".len()..];
+        if let Some(after_open) = trimmed.strip_prefix("{quote}") {
             if let Some(pos) = after_open.find("{quote}") {
                 blocks.push(DocBlock::Blockquote {
                     blocks: parse_jira_wiki(&after_open[..pos]),
@@ -1967,10 +1966,8 @@ fn render_blocks_to_lines(
                 for code_line in code.lines() {
                     lines.push(format!("{prefix}{code_line}"));
                 }
-                if code.ends_with('\n') || code.is_empty() {
-                    if code.is_empty() {
-                        lines.push(prefix.to_string());
-                    }
+                if code.is_empty() {
+                    lines.push(prefix.to_string());
                 }
                 lines.push(format!("{prefix}{fence}"));
             }

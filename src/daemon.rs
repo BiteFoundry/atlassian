@@ -67,7 +67,7 @@ pub struct DaemonSiteStatus {
     pub circuit_open: bool,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub struct DaemonStatus {
     pub running: bool,
     pub pid: Option<u32>,
@@ -84,27 +84,6 @@ pub struct DaemonStatus {
     pub last_error: Option<String>,
     #[serde(default)]
     pub sites: Vec<DaemonSiteStatus>,
-}
-
-impl Default for DaemonStatus {
-    fn default() -> Self {
-        Self {
-            running: false,
-            pid: None,
-            version: None,
-            transport: None,
-            endpoint: None,
-            profile: None,
-            site_url: None,
-            uptime_secs: None,
-            attached_clients: 0,
-            sync_busy: false,
-            sync_summary: String::new(),
-            last_sync_at: None,
-            last_error: None,
-            sites: Vec::new(),
-        }
-    }
 }
 
 /// Handle returned when a TUI client attaches to a live background sync daemon.
@@ -186,7 +165,7 @@ enum WireCoreEvent {
     OpenIssueRevision {
         #[serde(default)]
         site_id: String,
-        summary: IssueSummary,
+        summary: Box<IssueSummary>,
     },
     OpenPageRevision {
         #[serde(default)]
@@ -351,7 +330,7 @@ enum ServerFrame {
     Status(DaemonStatus),
     Ack { ok: bool, error: Option<String> },
     Subscribed(DaemonStatus),
-    Event(WireCoreEvent),
+    Event(Box<WireCoreEvent>),
     Pong,
     Error { message: String },
 }
@@ -721,7 +700,7 @@ fn ensure_parent(path: &Path) -> Result<()> {
 fn generate_secret() -> String {
     let mut bytes = [0u8; 32];
     rand::thread_rng().fill_bytes(&mut bytes);
-    hex::encode(bytes)
+    crate::encode_hex(bytes)
 }
 
 fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
@@ -857,7 +836,7 @@ fn data_dir_short_hash(data_dir: &Path) -> String {
     {
         hasher.update(canonical.to_string_lossy().as_bytes());
     }
-    let digest = hex::encode(hasher.finalize());
+    let digest = crate::encode_hex(hasher.finalize());
     digest[..12].to_string()
 }
 
@@ -1421,7 +1400,7 @@ async fn try_connect_tui_at(cfg: &AppConfig, paths: &DaemonPaths) -> Option<TuiD
                         Ok(Some(raw)) => {
                             match serde_json::from_str::<ServerFrame>(&raw) {
                                 Ok(ServerFrame::Event(wire_ev)) => {
-                                    if events_tx.send(wire_ev.into()).is_err() {
+                                    if events_tx.send((*wire_ev).into()).is_err() {
                                         break;
                                     }
                                 }
@@ -1449,7 +1428,7 @@ async fn try_connect_tui_at(cfg: &AppConfig, paths: &DaemonPaths) -> Option<TuiD
 pub(crate) enum DaemonMode {
     /// One logged-in site: the single-site engine with that site's pool client
     /// (which keeps its cloud_id and per-product credentials).
-    Single(AtlassianClient),
+    Single(Box<AtlassianClient>),
     /// Two or more logged-in sites: the multi-site engine.
     Multi(Vec<sync::SiteSyncTarget>),
     NotLoggedIn,
@@ -1462,7 +1441,7 @@ pub(crate) fn plan_daemon_mode(pool: &SiteClientPool) -> DaemonMode {
         .collect();
     match targets.len() {
         0 => DaemonMode::NotLoggedIn,
-        1 => DaemonMode::Single(targets.remove(0).client),
+        1 => DaemonMode::Single(Box::new(targets.remove(0).client)),
         _ => DaemonMode::Multi(targets),
     }
 }
@@ -1479,7 +1458,9 @@ pub async fn run_daemon_foreground(cfg: AppConfig) -> Result<()> {
     let paths = DaemonPaths::for_config(&cfg);
 
     match mode {
-        DaemonMode::Single(client) => run_daemon_inner(cfg, paths, client, storage, true, true).await,
+        DaemonMode::Single(client) => {
+            run_daemon_inner(cfg, paths, *client, storage, true, true).await
+        }
         DaemonMode::Multi(targets) => {
             run_daemon_multi_site_inner(
                 cfg,
@@ -1938,7 +1919,7 @@ async fn handle_client_connection(
                     ev_res = broadcast_rx.recv() => {
                         match ev_res {
                             Ok(ev) => {
-                                let wire = ServerFrame::Event(ev.into());
+                                let wire = ServerFrame::Event(Box::new(ev.into()));
                                 if write_json_line(&mut write_half, &wire).await.is_err() {
                                     break;
                                 }
@@ -1971,8 +1952,8 @@ async fn send_lag_recovery_snapshots<W: AsyncWrite + Unpin>(
         for (site_id, items) in group_rows_by_site(projects) {
             write_json_line(
                 write_half,
-                &ServerFrame::Event(WireCoreEvent::ProjectsUpdated(WireSiteList::scoped(
-                    site_id, items,
+                &ServerFrame::Event(Box::new(WireCoreEvent::ProjectsUpdated(
+                    WireSiteList::scoped(site_id, items),
                 ))),
             )
             .await?;
@@ -1985,8 +1966,8 @@ async fn send_lag_recovery_snapshots<W: AsyncWrite + Unpin>(
         for (site_id, items) in group_rows_by_site(boards) {
             write_json_line(
                 write_half,
-                &ServerFrame::Event(WireCoreEvent::BoardsUpdated(WireSiteList::scoped(
-                    site_id, items,
+                &ServerFrame::Event(Box::new(WireCoreEvent::BoardsUpdated(
+                    WireSiteList::scoped(site_id, items),
                 ))),
             )
             .await?;
@@ -1999,8 +1980,8 @@ async fn send_lag_recovery_snapshots<W: AsyncWrite + Unpin>(
         for (site_id, items) in group_rows_by_site(spaces) {
             write_json_line(
                 write_half,
-                &ServerFrame::Event(WireCoreEvent::SpacesUpdated(WireSiteList::scoped(
-                    site_id, items,
+                &ServerFrame::Event(Box::new(WireCoreEvent::SpacesUpdated(
+                    WireSiteList::scoped(site_id, items),
                 ))),
             )
             .await?;
@@ -2285,7 +2266,7 @@ mod tests {
         ];
 
         for ev in events {
-            let sf = ServerFrame::Event(ev.into());
+            let sf = ServerFrame::Event(Box::new(ev.into()));
             let raw = serde_json::to_string(&sf).unwrap();
             let parsed: ServerFrame = serde_json::from_str(&raw).unwrap();
             assert!(matches!(parsed, ServerFrame::Event(_)));
@@ -2302,12 +2283,12 @@ mod tests {
                 ..Default::default()
             }],
         };
-        let raw = serde_json::to_string(&ServerFrame::Event(ev.into())).unwrap();
+        let raw = serde_json::to_string(&ServerFrame::Event(Box::new(ev.into()))).unwrap();
         assert!(raw.contains("\"site_id\":\"site-b\""), "{raw}");
         let ServerFrame::Event(wire) = serde_json::from_str::<ServerFrame>(&raw).unwrap() else {
             panic!("expected event frame: {raw}");
         };
-        match CoreEvent::from(wire) {
+        match CoreEvent::from(*wire) {
             CoreEvent::BoardsUpdated { site_id, items } => {
                 assert_eq!(site_id, "site-b");
                 assert_eq!(items.len(), 1);

@@ -3,7 +3,7 @@
 use std::collections::{HashMap, HashSet};
 
 use anyhow::{bail, Context, Result};
-use futures::{stream, StreamExt};
+use futures_util::{stream, StreamExt};
 use regex::Regex;
 use serde_json::{json, Map, Value};
 
@@ -906,13 +906,13 @@ impl AtlassianClient {
                 payload.insert("spaceId".into(), Value::String(space_id));
                 payload.insert("status".into(), Value::String("current".into()));
                 payload.insert("title".into(), Value::String(req.title.clone()));
-                if let Some(ref pid) = req
+                if let Some(pid) = req
                     .parent_id
                     .as_deref()
                     .map(str::trim)
                     .filter(|s| !s.is_empty())
                 {
-                    payload.insert("parentId".into(), Value::String((*pid).to_string()));
+                    payload.insert("parentId".into(), Value::String(pid.to_string()));
                 }
                 payload.insert(
                     "body".into(),

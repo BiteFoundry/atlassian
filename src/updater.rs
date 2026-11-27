@@ -429,7 +429,7 @@ pub(crate) fn verify_sha256_sums(
         bail!("Checksum entry for '{asset_name}' not found in SHA256SUMS.txt");
     };
 
-    let actual = hex::encode(Sha256::digest(asset_bytes));
+    let actual = crate::encode_hex(Sha256::digest(asset_bytes));
     if !actual.eq_ignore_ascii_case(&expected) {
         bail!("SHA-256 integrity check failed ({asset_name}): expected {expected}, got {actual}");
     }
@@ -712,7 +712,7 @@ mod tests {
     #[test]
     fn test_sha256_verification_success_and_mismatch() {
         let payload = b"jira-binary-content-v0.9.0";
-        let digest = hex::encode(Sha256::digest(payload));
+        let digest = crate::encode_hex(Sha256::digest(payload));
         let sums = format!(
             "{digest}  jira.exe\n0000000000000000000000000000000000000000000000000000000000000000  other.tar.gz\n"
         );
@@ -833,7 +833,7 @@ mod tests {
 
         let new_binary = b"NEW-ATLASSIAN-JIRA-BINARY-V9.9.9".to_vec();
         let asset_name = if cfg!(windows) { "jira.exe" } else { "jira" }.to_string();
-        let digest = hex::encode(Sha256::digest(&new_binary));
+        let digest = crate::encode_hex(Sha256::digest(&new_binary));
         let sums_text = format!("{digest}  {asset_name}\n");
 
         let state = MockReleaseState {

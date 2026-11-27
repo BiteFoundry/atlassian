@@ -314,14 +314,16 @@ struct TerminalGuard {
     orig_conin_mode: Option<u32>,
 }
 
+type TerminalSession = (
+    TerminalGuard,
+    Terminal<CrosstermBackend<BufWriter<Stdout>>>,
+    TerminalGraphicsCaps,
+);
+
+type FetchedImageBytes = (Option<Arc<[u8]>>, Result<Arc<[u8]>, String>);
+
 impl TerminalGuard {
-    fn enter(
-        image_pref: ImageProtocolPreference,
-    ) -> Result<(
-        Self,
-        Terminal<CrosstermBackend<BufWriter<Stdout>>>,
-        TerminalGraphicsCaps,
-    )> {
+    fn enter(image_pref: ImageProtocolPreference) -> Result<TerminalSession> {
         #[cfg(windows)]
         let orig_conin_mode = win_console::snapshot_console_mode();
 
@@ -700,9 +702,9 @@ impl PixelPreviewRuntime {
         let cache_key = ov.preview_image_cache_key(&att, ui.term_width, ui.term_height);
 
         if let Some(cached) = self.decoded_cache.get(&cache_key) {
-            if !app.pixel_image_cache.contains_key(&cache_key) {
-                app.pixel_image_cache.insert(cache_key, cached.clone());
-            }
+            app.pixel_image_cache
+                .entry(cache_key)
+                .or_insert_with(|| cached.clone());
             return;
         }
 
@@ -722,7 +724,7 @@ impl PixelPreviewRuntime {
         let bg_rgb = theme_preview_bg_rgb(&ui.theme);
 
         tokio::spawn(async move {
-            let (raw_opt, bytes_res): (Option<Arc<[u8]>>, Result<Arc<[u8]>, String>) =
+            let (raw_opt, bytes_res): FetchedImageBytes =
                 if let Some(raw) = cached_raw {
                     (None, Ok(raw))
                 } else {
@@ -1577,7 +1579,7 @@ mod tests {
         tracker.commit(vec![img_a.clone()], (120, 36));
 
         // Same graphic & size -> no erase, no re-emit
-        let same = tracker.plan_transition(&[img_a.clone()], (120, 36), false);
+        let same = tracker.plan_transition(std::slice::from_ref(&img_a), (120, 36), false);
         assert!(!same.erase_and_redraw);
         assert!(!same.emit_desired);
 

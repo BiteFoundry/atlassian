@@ -315,14 +315,14 @@ fn quote_windows_arg(arg: &str) -> String {
             '\\' => backslashes += 1,
             '"' => {
                 // Backslashes before a quote are doubled, and the quote itself is escaped.
-                quoted.extend(std::iter::repeat('\\').take(backslashes + 1));
+                quoted.extend(std::iter::repeat_n('\\', backslashes + 1));
                 backslashes = 0;
             }
             _ => backslashes = 0,
         }
         quoted.push(ch);
     }
-    quoted.extend(std::iter::repeat('\\').take(backslashes));
+    quoted.extend(std::iter::repeat_n('\\', backslashes));
     quoted.push('"');
     quoted
 }

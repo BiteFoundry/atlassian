@@ -434,7 +434,7 @@ impl CircuitBreakerRegistry {
     }
 
     fn state(&self) -> MutexGuard<'_, CircuitBreakerState> {
-        self.state.lock().expect("circuit breaker state poisoned")
+        self.state.lock().unwrap_or_else(|e| e.into_inner())
     }
 
     pub fn is_auth_paused_for_site(&self, site_id: &str, now: Instant) -> bool {
@@ -1349,7 +1349,7 @@ pub async fn run_multi_site_sync(
         });
     }
 
-    let per_site = futures::future::join_all(futs).await;
+    let per_site = futures_util::future::join_all(futs).await;
 
     let total_sites = per_site.len();
     let succeeded_sites = per_site.iter().filter(|r| r.succeeded).count();
@@ -1790,7 +1790,7 @@ async fn run_open_item_revision_check(
                     breakers.record_success_site(breaker_site, SyncEndpoint::JiraIssues);
                     let _ = core_tx.send(CoreEvent::OpenIssueRevision {
                         site_id: site_id.clone(),
-                        summary,
+                        summary: Box::new(summary),
                     });
                 }
                 Err(err) => {
@@ -1802,11 +1802,11 @@ async fn run_open_item_revision_check(
                     {
                         let _ = core_tx.send(CoreEvent::OpenIssueRevision {
                             site_id: site_id.clone(),
-                            summary: IssueSummary {
+                            summary: Box::new(IssueSummary {
                                 id: OPEN_ITEM_NOT_FOUND_SENTINEL.to_string(),
                                 key: key.clone(),
                                 ..Default::default()
-                            },
+                            }),
                         });
                     } else {
                         breakers.record_failure_kind_site(

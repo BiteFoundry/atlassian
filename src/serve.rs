@@ -2709,9 +2709,11 @@ mod tests {
             let _ = axum::serve(up_listener, upstream).await;
         });
 
-        let mut cfg = AppConfig::default();
-        cfg.site_url = up_base.clone();
-        cfg.confluence_url = format!("{up_base}/wiki");
+        let cfg = AppConfig {
+            site_url: up_base.clone(),
+            confluence_url: format!("{up_base}/wiki"),
+            ..AppConfig::default()
+        };
         let auth = AuthManager::with_credentials(
             "serve-par",
             crate::auth::StoredCredentials::ApiToken {

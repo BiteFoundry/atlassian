@@ -1520,10 +1520,10 @@ pub fn looks_like_html_bytes(bytes: &[u8]) -> bool {
             }
         }
     }
-    if lower.starts_with("<?xml") || lower.starts_with("<!--") {
-        if lower.contains("<!doctype html") || lower.contains("<html") {
-            return true;
-        }
+    if (lower.starts_with("<?xml") || lower.starts_with("<!--"))
+        && (lower.contains("<!doctype html") || lower.contains("<html"))
+    {
+        return true;
     }
     false
 }
@@ -1687,9 +1687,10 @@ pub fn decode_and_render_halfblocks_with_cell_px(
     let resized = image::imageops::resize(&rgba, target_w, target_h, FilterType::Lanczos3);
     let mut lines = Vec::with_capacity((target_h / 2) as usize);
 
+    type Rgb = (u8, u8, u8);
     for y in (0..target_h).step_by(2) {
         let mut spans: Vec<Span<'static>> = Vec::new();
-        let mut current_pair: Option<((u8, u8, u8), (u8, u8, u8))> = None;
+        let mut current_pair: Option<(Rgb, Rgb)> = None;
         let mut run = String::new();
 
         for x in 0..target_w {
@@ -1997,7 +1998,7 @@ pub(crate) fn compute_halfblock_dims(
         target_h = target_h.min((view_rows as u32) * 2).max(2);
     }
 
-    if target_h % 2 != 0 {
+    if !target_h.is_multiple_of(2) {
         if !fit.scrollable && zoom_pct <= 100 && target_h + 1 > (view_rows as u32) * 2 {
             target_h = target_h.saturating_sub(1).max(2);
         } else {
@@ -2257,7 +2258,7 @@ fn quantize_rgba_to_256_with_stats(
     let mut indexed = Vec::with_capacity(pixel_count);
     let mut overflow = false;
 
-    for px in flat_rgba.chunks_exact(4).take(pixel_count) {
+    for px in flat_rgba.as_chunks::<4>().0.iter().take(pixel_count) {
         let key = ((px[0] as u32) << 16) | ((px[1] as u32) << 8) | (px[2] as u32);
         if let Some(&idx) = exact_map.get(&key) {
             indexed.push(idx);
@@ -2278,7 +2279,7 @@ fn quantize_rgba_to_256_with_stats(
 
     // Perceptually-weighted median-cut over 5-bit-per-channel RGB buckets for > 256 distinct colors.
     let mut hist: HashMap<u16, (u32, u64, u64, u64)> = HashMap::new();
-    for px in flat_rgba.chunks_exact(4).take(pixel_count) {
+    for px in flat_rgba.as_chunks::<4>().0.iter().take(pixel_count) {
         let qkey = (((px[0] as u16) >> 3) << 10)
             | (((px[1] as u16) >> 3) << 5)
             | ((px[2] as u16) >> 3);
@@ -2395,11 +2396,11 @@ fn quantize_rgba_to_256_with_stats(
                 sg += b.sum_g;
                 sb += b.sum_b;
             }
-            if cnt == 0 {
-                (0, 0, 0)
-            } else {
-                ((sr / cnt) as u8, (sg / cnt) as u8, (sb / cnt) as u8)
-            }
+            (
+                sr.checked_div(cnt).unwrap_or(0) as u8,
+                sg.checked_div(cnt).unwrap_or(0) as u8,
+                sb.checked_div(cnt).unwrap_or(0) as u8,
+            )
         })
         .collect();
 
@@ -2410,7 +2411,9 @@ fn quantize_rgba_to_256_with_stats(
 
     // Serpentine Floyd-Steinberg error diffusion with [-48, 48] error clamp and flat-region guard.
     let mut work: Vec<[f32; 3]> = flat_rgba
-        .chunks_exact(4)
+        .as_chunks::<4>()
+        .0
+        .iter()
         .take(pixel_count)
         .map(|px| [px[0] as f32, px[1] as f32, px[2] as f32])
         .collect();
@@ -3316,7 +3319,7 @@ mod tests {
         assert!(indexed.iter().all(|&i| (i as usize) < palette.len()));
 
         // Verify average reconstructed luminance closely matches source luminance (no clipping drift).
-        let src_avg_r: f64 = flat.chunks_exact(4).map(|p| p[0] as f64).sum::<f64>() / (w * h) as f64;
+        let src_avg_r: f64 = flat.as_chunks::<4>().0.iter().map(|p| p[0] as f64).sum::<f64>() / (w * h) as f64;
         let dst_avg_r: f64 = indexed
             .iter()
             .map(|&i| palette[i as usize].0 as f64)
@@ -3851,7 +3854,7 @@ mod tests {
             for x in 0..w {
                 let (r, g, b) = if y < 2 && x < 180 {
                     // 360 distinct colors so total distinct > 256
-                    (((x * 255) / 180) as u8, ((y * 120 + x) % 256) as u8, (((x * 3) % 256)) as u8)
+                    (((x * 255) / 180) as u8, ((y * 120 + x) % 256) as u8, ((x * 3) % 256) as u8)
                 } else if y == 10 && (10..50).contains(&x) {
                     (0, 100, 255) // vivid UI accent blue
                 } else if y == 12 && (10..50).contains(&x) {
@@ -3908,7 +3911,7 @@ mod tests {
                 huge_grad.extend_from_slice(&[
                     ((x * 255) / (gw - 1)) as u8,
                     ((y * 255) / (gh - 1)) as u8,
-                    (((x * 7 + y * 13) % 256)) as u8,
+                    ((x * 7 + y * 13) % 256) as u8,
                     255,
                 ]);
             }

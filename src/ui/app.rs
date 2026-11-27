@@ -7,7 +7,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use futures::{stream, StreamExt};
+use futures_util::{stream, StreamExt};
 use regex::Regex;
 use tokio::sync::mpsc;
 
@@ -15,6 +15,11 @@ use tokio::sync::mpsc;
 const INTERACTIVE_SIBLING_PREFETCH_LIMIT: usize = 3;
 /// Bounded concurrency for interactive TUI sibling detail prefetch.
 const INTERACTIVE_SIBLING_PREFETCH_CONCURRENCY: usize = 2;
+
+type RemoteSearchHits = (Vec<UnifiedSearchHit>, Vec<String>, Vec<Option<String>>);
+type SiteTaggedIssue = (String, Option<String>, IssueSummary);
+type SiteTaggedPage = (String, Option<String>, PageSummary);
+type SiteTaggedHit = (String, Option<String>, UnifiedSearchHit);
 
 use crate::{
     adf,
@@ -414,7 +419,7 @@ pub enum UiMsg {
     RemoteSearchLoaded {
         seq: u64,
         query: String,
-        hits: Result<(Vec<UnifiedSearchHit>, Vec<String>, Vec<Option<String>>), String>,
+        hits: Result<RemoteSearchHits, String>,
     },
     CloudSitesDiscovered(Result<Vec<SiteProfile>, String>),
     MultiSiteSyncFinished(MultiSiteSyncOutcome),
@@ -4178,7 +4183,7 @@ impl AppState {
         let target = homepage_id
             .as_deref()
             .and_then(|hid| roots.iter().find(|p| p.id == hid))
-            .or_else(|| match roots.as_slice() {
+            .or(match roots.as_slice() {
                 [only] => Some(only),
                 _ => None,
             });
@@ -4693,10 +4698,7 @@ impl AppState {
         let storage = self.storage.clone();
         let tx = self.ui_tx.clone();
         tokio::spawn(async move {
-            let per_site: Vec<(
-                Vec<(String, Option<String>, IssueSummary)>,
-                Vec<(String, Option<String>, PageSummary)>,
-            )> = stream::iter(clients)
+            let per_site: Vec<(Vec<SiteTaggedIssue>, Vec<SiteTaggedPage>)> = stream::iter(clients)
                 .map(|(site_id, site_label, me_id, client)| {
                     let storage = storage.clone();
                     async move {
@@ -4820,7 +4822,7 @@ impl AppState {
             let escaped = q.replace('"', "\\\"");
             let jql = format!("text ~ \"{escaped}\" ORDER BY updated DESC");
             let cql = format!("text ~ \"{escaped}\" AND type = page");
-            let per_site: Vec<(Vec<(String, Option<String>, UnifiedSearchHit)>, Option<String>)> =
+            let per_site: Vec<(Vec<SiteTaggedHit>, Option<String>)> =
                 stream::iter(clients)
                     .map(|(site_id, site_label, client)| {
                         let jql = &jql;
@@ -5842,7 +5844,7 @@ impl AppState {
                     }
                     pages.iter().find(|p| p.id == open_pid).and_then(|inc| {
                         self.page_revision_needs_detail(&effective_sid, inc)
-                            .then(|| (open_sid, open_pid, inc.version_number))
+                            .then_some((open_sid, open_pid, inc.version_number))
                     })
                 });
                 let matches_space_site = self
@@ -6932,7 +6934,7 @@ impl AppState {
                         HtmlPreviewOverlay::new(title, body)
                     };
                     ov.source_url = source_url;
-                    ui.push_overlay(Overlay::HtmlPreview(ov));
+                    ui.push_overlay(Overlay::HtmlPreview(Box::new(ov)));
                 } else if let Err(err) = result {
                     ui.error(format!("Failed to load attachment preview: {err}"));
                 }
@@ -6947,7 +6949,7 @@ impl AppState {
                 }
                 let mut ov = HtmlPreviewOverlay::new(title, html);
                 ov.source_url = source_url;
-                ui.push_overlay(Overlay::HtmlPreview(ov));
+                ui.push_overlay(Overlay::HtmlPreview(Box::new(ov)));
                 ui.info("Detected HTML content — opened in interactive HTML Preview");
             }
             UiMsg::HtmlServed(res) => match res {
@@ -7705,13 +7707,15 @@ mod tests {
         children_map.insert(SiteKey::new("default", "100"), vec![child]);
 
         let mut expanded = HashSet::new();
-        let collapsed = flatten_page_tree(&[root.clone()], "default", &children_map, &expanded);
+        let collapsed =
+            flatten_page_tree(std::slice::from_ref(&root), "default", &children_map, &expanded);
         assert_eq!(collapsed.len(), 1);
         assert!(!collapsed[0].expanded);
         assert!(collapsed[0].has_children);
 
         expanded.insert(SiteKey::new("DEFAULT", "100"));
-        let open = flatten_page_tree(&[root.clone()], "default", &children_map, &expanded);
+        let open =
+            flatten_page_tree(std::slice::from_ref(&root), "default", &children_map, &expanded);
         assert_eq!(open.len(), 2);
         assert_eq!(open[0].depth, 0);
         assert!(open[0].expanded);
@@ -8217,9 +8221,11 @@ mod tests {
             let _ = axum::serve(listener, mock).await;
         });
 
-        let mut cfg = AppConfig::default();
-        cfg.site_url = base_url.clone();
-        cfg.sync_interval_secs = 300;
+        let cfg = AppConfig {
+            site_url: base_url.clone(),
+            sync_interval_secs: 300,
+            ..AppConfig::default()
+        };
         let tmp_dir = tempfile::tempdir().unwrap();
         let auth = AuthManager::new("dedup-test")
             .with_fallback_path(tmp_dir.path().join("creds.json"));
@@ -8300,7 +8306,7 @@ mod tests {
             &mut ui,
             CoreEvent::OpenIssueRevision {
                 site_id: "default".into(),
-                summary: new_issue_summary.clone(),
+                summary: Box::new(new_issue_summary.clone()),
             },
         );
         app.handle_core_event(
@@ -8357,33 +8363,35 @@ mod tests {
 
     #[tokio::test]
     async fn multisite_same_key_id_late_response_isolated_and_open_edit_forms_preserved() {
-        let mut cfg = AppConfig::default();
-        cfg.sites = vec![
-            SiteProfile {
-                id: "site-a".into(),
-                name: "Site A".into(),
-                site_url: "https://site-a.example.com".into(),
-                confluence_url: String::new(),
-                deployment: DeploymentKind::Cloud,
-                cloud_id: None,
-                account_id: "default".into(),
-                enabled: true,
-                ..Default::default()
-            },
-            SiteProfile {
-                id: "site-b".into(),
-                name: "Site B".into(),
-                site_url: "https://site-b.example.com".into(),
-                confluence_url: String::new(),
-                deployment: DeploymentKind::Cloud,
-                cloud_id: None,
-                account_id: "default".into(),
-                enabled: true,
-                ..Default::default()
-            },
-        ];
-        cfg.default_site = Some("site-a".into());
-        cfg.active_site = Some("site-a".into());
+        let cfg = AppConfig {
+            sites: vec![
+                SiteProfile {
+                    id: "site-a".into(),
+                    name: "Site A".into(),
+                    site_url: "https://site-a.example.com".into(),
+                    confluence_url: String::new(),
+                    deployment: DeploymentKind::Cloud,
+                    cloud_id: None,
+                    account_id: "default".into(),
+                    enabled: true,
+                    ..Default::default()
+                },
+                SiteProfile {
+                    id: "site-b".into(),
+                    name: "Site B".into(),
+                    site_url: "https://site-b.example.com".into(),
+                    confluence_url: String::new(),
+                    deployment: DeploymentKind::Cloud,
+                    cloud_id: None,
+                    account_id: "default".into(),
+                    enabled: true,
+                    ..Default::default()
+                },
+            ],
+            default_site: Some("site-a".into()),
+            active_site: Some("site-a".into()),
+            ..AppConfig::default()
+        };
 
         let auth = AuthManager::new("ms-iso");
         let client = AtlassianClient::new(cfg.clone(), auth.clone()).unwrap();
@@ -8473,7 +8481,7 @@ mod tests {
             &mut ui,
             CoreEvent::OpenIssueRevision {
                 site_id: "site-a".into(),
-                summary: late_a_rev,
+                summary: Box::new(late_a_rev),
             },
         );
         app.handle_ui_msg(
@@ -8598,9 +8606,11 @@ mod tests {
             let _ = axum::serve(listener, mock).await;
         });
 
-        let mut cfg = AppConfig::default();
-        cfg.site_url = base_url.clone();
-        cfg.sync_interval_secs = 300;
+        let cfg = AppConfig {
+            site_url: base_url.clone(),
+            sync_interval_secs: 300,
+            ..AppConfig::default()
+        };
         let tmp_dir = tempfile::tempdir().unwrap();
         let auth = AuthManager::new("panel-refresh")
             .with_fallback_path(tmp_dir.path().join("creds.json"));
@@ -9125,10 +9135,12 @@ mod tests {
             let _ = axum::serve(listener, mock).await;
         });
 
-        let mut cfg = AppConfig::default();
-        cfg.site_url = base_url.clone();
-        cfg.confluence_url = format!("{base_url}/wiki");
-        cfg.sync_interval_secs = 300;
+        let cfg = AppConfig {
+            site_url: base_url.clone(),
+            confluence_url: format!("{base_url}/wiki"),
+            sync_interval_secs: 300,
+            ..AppConfig::default()
+        };
         let auth = AuthManager::with_credentials(
             "boot-par",
             StoredCredentials::ApiToken {
@@ -9253,10 +9265,12 @@ mod tests {
             let _ = axum::serve(listener, mock).await;
         });
 
-        let mut cfg = AppConfig::default();
-        cfg.site_url = base_url.clone();
-        cfg.confluence_url = format!("{base_url}/wiki");
-        cfg.sync_interval_secs = 300;
+        let cfg = AppConfig {
+            site_url: base_url.clone(),
+            confluence_url: format!("{base_url}/wiki"),
+            sync_interval_secs: 300,
+            ..AppConfig::default()
+        };
         let auth = AuthManager::with_credentials(
             "board-mw-par",
             StoredCredentials::ApiToken {
@@ -9354,9 +9368,11 @@ mod tests {
             let _ = axum::serve(listener, mock).await;
         });
 
-        let mut cfg = AppConfig::default();
-        cfg.site_url = base_url.clone();
-        cfg.sync_interval_secs = 300;
+        let cfg = AppConfig {
+            site_url: base_url.clone(),
+            sync_interval_secs: 300,
+            ..AppConfig::default()
+        };
         let auth = AuthManager::with_credentials(
             "prefetch-test",
             StoredCredentials::ApiToken {

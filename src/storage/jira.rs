@@ -2091,7 +2091,7 @@ mod tests {
             avatar_url: None,
             pinned: false,
         };
-        storage.upsert_projects(&[p.clone()]).unwrap();
+        storage.upsert_projects(std::slice::from_ref(&p)).unwrap();
         storage.set_project_pinned("PROJ", true).unwrap();
         // Re-upsert with pinned: false should preserve pinned = true
         storage.upsert_projects(&[p]).unwrap();
@@ -2104,7 +2104,7 @@ mod tests {
     fn test_issue_detail_preserved_on_summary_upsert_and_korean_2char_search() {
         let storage = Storage::open_in_memory().unwrap();
         let summary = sample_issue("PROJ-1", "PROJ", "OAuth2 로그인 개선", Some(42));
-        storage.upsert_issues(&[summary.clone()]).unwrap();
+        storage.upsert_issues(std::slice::from_ref(&summary)).unwrap();
 
         let detail = IssueDetail {
             summary: summary.clone(),
@@ -2792,7 +2792,7 @@ mod tests {
         let storage = Storage::open_in_memory().unwrap();
         let first = sample_issue("ENG-1", "ENG", "Original summary", None);
         storage
-            .upsert_issues_for_site("site-a", &[first.clone()])
+            .upsert_issues_for_site("site-a", std::slice::from_ref(&first))
             .unwrap();
 
         let mut untimed = first.clone();
@@ -2828,7 +2828,7 @@ mod tests {
         let storage = Storage::open_in_memory().unwrap();
         let first = sample_issue("ENG-1", "ENG", "Original summary", None);
         storage
-            .upsert_issues_for_site("site-a", &[first.clone()])
+            .upsert_issues_for_site("site-a", std::slice::from_ref(&first))
             .unwrap();
 
         let mut untimed = first.clone();

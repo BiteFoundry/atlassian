@@ -8,7 +8,7 @@ use std::{
 
 use anyhow::{bail, Context, Result};
 use clap::{Parser, Subcommand, ValueEnum};
-use futures::{stream, StreamExt};
+use futures_util::{stream, StreamExt};
 use serde_json::{json, Map, Value};
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
@@ -3843,8 +3843,8 @@ async fn cmd_sites(cfg: &mut AppConfig, action: SitesCommand) -> Result<()> {
                 println!("No Atlassian sites registered. Run `atlassian login --oauth` or `atlassian sites add <URL>`.");
             } else {
                 println!(
-                    "{:<16} {:<18} {:<12} {:<10} {:<8} {:<8} {}",
-                    "ID", "NAME", "DEPLOYMENT", "ENABLED", "ISSUES", "PAGES", "URL"
+                    "{:<16} {:<18} {:<12} {:<10} {:<8} {:<8} URL",
+                    "ID", "NAME", "DEPLOYMENT", "ENABLED", "ISSUES", "PAGES"
                 );
                 for (site, row) in sites.iter().zip(rows.iter()) {
                     let mark = if row["is_default"].as_bool().unwrap_or(false) {
@@ -5371,7 +5371,7 @@ async fn cmd_issue_transition(
     let (_auth, client, storage) = open_runtime(cfg, true)?;
     let site_id = client.site_id();
 
-    if list || status.is_none() {
+    let Some(target) = status.filter(|_| !list) else {
         let transitions = client.list_transitions(key).await?;
         if json_out {
             println!(
@@ -5387,9 +5387,8 @@ async fn cmd_issue_transition(
             }
         }
         return Ok(());
-    }
+    };
 
-    let target = status.unwrap();
     let executed = client.transition_issue(key, target, comment).await?;
     refresh_cli_issue_cache(&client, &storage, key).await;
 
@@ -5430,7 +5429,9 @@ async fn cmd_issue_assign(
     let (mut target_id, raw_assignee) = if unassign {
         (None, None)
     } else {
-        let raw = to.unwrap().trim();
+        let Some(raw) = to.map(str::trim) else {
+            bail!("Specify `--to <USER_OR_ME>` or `--unassign`.");
+        };
         if raw.eq_ignore_ascii_case("me") {
             (Some(client.get_myself().await?.id), None)
         } else {

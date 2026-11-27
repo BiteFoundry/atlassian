@@ -3,11 +3,7 @@
 //! only when `<script>` or `on*` handlers are present, dropped immediately on close) and
 //! lazy localhost Axum browser serving (`o` via `bitefoundry_html::NativeHtmlServer`).
 
-use std::{
-    collections::HashMap,
-    fmt,
-    sync::{Arc, OnceLock},
-};
+use std::{collections::HashMap, fmt, sync::Arc};
 
 use bitefoundry_html::{ContentKind, HtmlEffect, HtmlTheme, HtmlViewSession, SourceKind};
 use ratatui::{
@@ -20,7 +16,6 @@ use ratatui::{
     },
     Frame,
 };
-use regex::Regex;
 use scraper::{ElementRef, Html, Node};
 use unicode_width::UnicodeWidthStr;
 
@@ -71,9 +66,11 @@ pub struct HtmlPreviewOverlay {
     last_browser_pill_rect: Rect,
     /// Decoded/encoded inline graphic cache keyed by `(node_id, width_cols, protocol)`.
     /// Also tracks source `Arc<[u8]>` identity so dynamic JS canvas/SVG updates invalidate cleanly.
-    graphic_cache:
-        HashMap<(usize, u16, TerminalImageProtocol), (Arc<[u8]>, RenderedTerminalImage)>,
+    graphic_cache: HashMap<GraphicCacheKey, GraphicCacheEntry>,
 }
+
+type GraphicCacheKey = (usize, u16, TerminalImageProtocol);
+type GraphicCacheEntry = (Arc<[u8]>, RenderedTerminalImage);
 
 impl Drop for HtmlPreviewOverlay {
     fn drop(&mut self) {
@@ -971,19 +968,7 @@ pub fn normalize_confluence_storage_xhtml(raw: &str) -> String {
         return raw.to_string();
     }
 
-    static CDATA_RE: OnceLock<Regex> = OnceLock::new();
-    static SELF_CLOSING_RE: OnceLock<Regex> = OnceLock::new();
-    let cdata_re =
-        CDATA_RE.get_or_init(|| Regex::new(r"(?s)<!\[CDATA\[(.*?)\]\]>").expect("valid cdata regex"));
-    let self_closing_re = SELF_CLOSING_RE.get_or_init(|| {
-        Regex::new(r"<((?:ac|ri):[a-zA-Z0-9_-]+)([^>]*?)\s*/>")
-            .expect("valid self-closing xml regex")
-    });
-
-    let escaped_cdata = cdata_re.replace_all(raw, |caps: &regex::Captures<'_>| {
-        escape_html(&caps[1])
-    });
-    let normalized = self_closing_re.replace_all(&escaped_cdata, "<$1$2></$1>");
+    let normalized = crate::adf::preprocess_storage_xhtml(raw);
 
     let fragment = Html::parse_fragment(&normalized);
     let mut out = String::with_capacity(raw.len());

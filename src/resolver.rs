@@ -739,29 +739,27 @@ pub fn collect_cached_users(storage: &Storage) -> Result<Vec<UserSummary>> {
     let mut by_id: HashMap<String, UserSummary> = HashMap::new();
 
     for issue in issues {
-        for maybe_user in [issue.assignee, issue.reporter] {
-            if let Some(user) = maybe_user {
-                let id = user.id.trim();
-                if id.is_empty() {
-                    continue;
-                }
-                by_id
-                    .entry(id.to_string())
-                    .and_modify(|existing| {
-                        if existing.display_name.trim().is_empty()
-                            && !user.display_name.trim().is_empty()
-                        {
-                            existing.display_name = user.display_name.clone();
-                        }
-                        if existing.email.is_none() && user.email.is_some() {
-                            existing.email = user.email.clone();
-                        }
-                        if existing.avatar_url.is_none() && user.avatar_url.is_some() {
-                            existing.avatar_url = user.avatar_url.clone();
-                        }
-                    })
-                    .or_insert(user);
+        for user in [issue.assignee, issue.reporter].into_iter().flatten() {
+            let id = user.id.trim();
+            if id.is_empty() {
+                continue;
             }
+            by_id
+                .entry(id.to_string())
+                .and_modify(|existing| {
+                    if existing.display_name.trim().is_empty()
+                        && !user.display_name.trim().is_empty()
+                    {
+                        existing.display_name = user.display_name.clone();
+                    }
+                    if existing.email.is_none() && user.email.is_some() {
+                        existing.email = user.email.clone();
+                    }
+                    if existing.avatar_url.is_none() && user.avatar_url.is_some() {
+                        existing.avatar_url = user.avatar_url.clone();
+                    }
+                })
+                .or_insert(user);
         }
     }
 
