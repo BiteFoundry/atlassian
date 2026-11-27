@@ -1,6 +1,6 @@
 {
   "name": "@bitefoundry/atlassian-darwin-x64",
-  "version": "0.8.8",
+  "version": "0.8.9",
   "description": "Prebuilt atlassian binary for macOS x64",
   "repository": {
     "type": "git",
