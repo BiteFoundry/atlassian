@@ -1817,9 +1817,11 @@ fn extract_linked_issue_keys(blocks: &[crate::models::DocBlock], raw: &str) -> V
 }
 
 fn extract_space_key_from_webui(webui: &str) -> Option<String> {
-    Regex::new(r"/spaces/([^/?#]+)")
-        .ok()
-        .and_then(|re| re.captures(webui))
+    static SPACE_WEBUI_RE: std::sync::LazyLock<Regex> = std::sync::LazyLock::new(|| {
+        Regex::new(r"/spaces/([^/?#]+)").expect("valid confluence webui space regex")
+    });
+    SPACE_WEBUI_RE
+        .captures(webui)
         .and_then(|c| c.get(1))
         .map(|m| m.as_str().to_string())
 }

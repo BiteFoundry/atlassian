@@ -89,6 +89,14 @@ CREATE TABLE IF NOT EXISTS site_identities (
 );
 ";
 
+/// Lightweight internal metadata markers (additive to schema v2, e.g., `fts_rowid_aligned`).
+const CACHE_META_TABLE_SQL: &str = "
+CREATE TABLE IF NOT EXISTS cache_meta (
+    key   TEXT PRIMARY KEY,
+    value TEXT NOT NULL
+);
+";
+
 const V2_ISSUES_TABLE_SQL: &str = "
 CREATE TABLE IF NOT EXISTS issues (
     site_id TEXT NOT NULL DEFAULT 'default',
@@ -244,6 +252,9 @@ pub fn open_file(path: &Path) -> Result<Storage> {
     init_connection(&conn, false)?;
     Ok(Storage {
         conn: Arc::new(Mutex::new(conn)),
+        readers: Some(Arc::new(Mutex::new(Vec::with_capacity(
+            super::MAX_READER_POOL_SIZE,
+        )))),
         path: Some(path.to_path_buf()),
     })
 }
@@ -254,6 +265,7 @@ pub fn open_memory() -> Result<Storage> {
     init_connection(&conn, true)?;
     Ok(Storage {
         conn: Arc::new(Mutex::new(conn)),
+        readers: None,
         path: None,
     })
 }
@@ -262,22 +274,79 @@ pub fn init_schema(conn: &Connection) -> Result<()> {
     init_connection(conn, false)
 }
 
+/// Configures a read-only WAL reader connection for concurrent reads.
+pub(crate) fn init_reader_connection(conn: &Connection) -> Result<()> {
+    conn.set_prepared_statement_cache_capacity(64);
+    conn.execute_batch(
+        "
+        PRAGMA query_only = ON;
+        PRAGMA busy_timeout = 5000;
+        PRAGMA temp_store = MEMORY;
+        PRAGMA cache_size = -4000;
+        PRAGMA mmap_size = 67108864;
+        ",
+    )
+    .context("Failed to configure SQLite reader PRAGMAs")?;
+    Ok(())
+}
+
+fn is_v2_schema_current(conn: &Connection) -> bool {
+    let tables_and_cols_ok: bool = conn
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='cache_meta')
+             AND EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='board_sprints')
+             AND EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='site_identities')
+             AND EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='issues_fts')
+             AND EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='pages_fts')
+             AND EXISTS(SELECT 1 FROM pragma_table_info('issues') WHERE name='detail_updated_at')
+             AND EXISTS(SELECT 1 FROM pragma_table_info('pages') WHERE name='detail_version')",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap_or(false);
+    if !tables_and_cols_ok {
+        return false;
+    }
+    conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM cache_meta WHERE key = 'fts_rowid_aligned' AND value = '1')
+         AND NOT (EXISTS(SELECT 1 FROM sprints) AND NOT EXISTS(SELECT 1 FROM board_sprints))",
+        [],
+        |row| row.get(0),
+    )
+    .unwrap_or(false)
+}
+
 fn init_connection(conn: &Connection, is_memory: bool) -> Result<()> {
+    conn.set_prepared_statement_cache_capacity(64);
     if !is_memory {
-        let _ = conn.execute_batch("PRAGMA journal_mode = WAL;");
+        let _ = conn.execute_batch(
+            "
+            PRAGMA journal_mode = WAL;
+            PRAGMA journal_size_limit = 67108864;
+            ",
+        );
     }
     conn.execute_batch(
         "
         PRAGMA synchronous = NORMAL;
         PRAGMA foreign_keys = ON;
         PRAGMA busy_timeout = 5000;
+        PRAGMA temp_store = MEMORY;
+        PRAGMA cache_size = -8000;
         ",
     )
     .context("Failed to configure SQLite PRAGMAs")?;
+    if !is_memory {
+        let _ = conn.execute_batch("PRAGMA mmap_size = 67108864;");
+    }
 
     let user_version: i32 = conn
         .query_row("PRAGMA user_version", [], |row| row.get(0))
         .context("Failed to read SQLite PRAGMA user_version")?;
+
+    if !is_memory && user_version == SCHEMA_VERSION && is_v2_schema_current(conn) {
+        return Ok(());
+    }
 
     if user_version < SCHEMA_VERSION && has_legacy_v1_schema(conn)? {
         migrate_v1_to_v2(conn).context("Failed to migrate SQLite schema from v1 to v2")?;
@@ -292,7 +361,180 @@ fn init_connection(conn: &Connection, is_memory: bool) -> Result<()> {
     ensure_board_sprints(conn)?;
     conn.execute_batch(SITE_IDENTITIES_TABLE_SQL)
         .context("Failed to create site_identities table")?;
+    ensure_fts_rowid_aligned(conn)?;
 
+    Ok(())
+}
+
+/// Ensures `issues_fts.rowid == issues.rowid` and `pages_fts.rowid == pages.rowid` so FTS5
+/// updates and deletes execute in `O(log N)` by `rowid` instead of `O(N)` full scans.
+/// Runs at most once on legacy v2 databases and records a marker in `cache_meta`.
+fn ensure_fts_rowid_aligned(conn: &Connection) -> Result<()> {
+    conn.execute_batch(CACHE_META_TABLE_SQL)
+        .context("Failed to create cache_meta table")?;
+    let aligned: bool = conn
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM cache_meta WHERE key = 'fts_rowid_aligned' AND value = '1')",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap_or(false);
+    if aligned {
+        return Ok(());
+    }
+
+    let has_issues: bool = conn
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM issues) OR EXISTS(SELECT 1 FROM issues_fts)",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap_or(false);
+    let has_pages: bool = conn
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM pages) OR EXISTS(SELECT 1 FROM pages_fts)",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap_or(false);
+
+    let tx = conn
+        .unchecked_transaction()
+        .context("Failed to begin FTS5 rowid alignment transaction")?;
+
+    if has_issues {
+        let mut preserved: HashMap<(String, String), (String, String)> = HashMap::new();
+        if let Ok(mut stmt) = tx.prepare(
+            "SELECT site_id, issue_key, description_text, labels_text FROM issues_fts",
+        ) {
+            if let Ok(rows) = stmt.query_map([], |row| {
+                Ok((
+                    (row.get::<_, String>(0)?, row.get::<_, String>(1)?),
+                    (
+                        row.get::<_, String>(2).unwrap_or_default(),
+                        row.get::<_, String>(3).unwrap_or_default(),
+                    ),
+                ))
+            }) {
+                for (k, v) in rows.flatten() {
+                    preserved.insert(k, v);
+                }
+            }
+        }
+        tx.execute("DELETE FROM issues_fts", [])
+            .context("Failed to clear issues_fts for rowid alignment")?;
+        let issue_rows: Vec<(i64, String, String, String, String, String, String)> = {
+            let mut stmt = tx.prepare(
+                "SELECT rowid, site_id, key, project_key, summary, description_markdown, labels_json FROM issues",
+            )?;
+            let mapped = stmt.query_map([], |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                    row.get(5)?,
+                    row.get(6)?,
+                ))
+            })?;
+            mapped.collect::<rusqlite::Result<Vec<_>>>()?
+        };
+        let mut insert_stmt = tx.prepare(
+            "INSERT INTO issues_fts (rowid, site_id, issue_key, project_key, summary, description_text, labels_text)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+        )?;
+        for (rowid, site_id, key, project_key, summary, desc_md, labels_json) in issue_rows {
+            let fallback_labels = serde_json::from_str::<Vec<String>>(&labels_json)
+                .map(|v| v.join(" "))
+                .unwrap_or(labels_json);
+            let (desc_text, labels_text) = match preserved.get(&(site_id.clone(), key.clone())) {
+                Some((old_desc, old_labels)) => (
+                    if !old_desc.is_empty() {
+                        old_desc.clone()
+                    } else {
+                        desc_md
+                    },
+                    if !old_labels.is_empty() {
+                        old_labels.clone()
+                    } else {
+                        fallback_labels
+                    },
+                ),
+                None => (desc_md, fallback_labels),
+            };
+            insert_stmt.execute(params![
+                rowid,
+                site_id,
+                key,
+                project_key,
+                summary,
+                desc_text,
+                labels_text,
+            ])?;
+        }
+    }
+
+    if has_pages {
+        let mut preserved: HashMap<(String, String), String> = HashMap::new();
+        if let Ok(mut stmt) = tx.prepare("SELECT site_id, page_id, body_text FROM pages_fts") {
+            if let Ok(rows) = stmt.query_map([], |row| {
+                Ok((
+                    (row.get::<_, String>(0)?, row.get::<_, String>(1)?),
+                    row.get::<_, String>(2).unwrap_or_default(),
+                ))
+            }) {
+                for (k, v) in rows.flatten() {
+                    preserved.insert(k, v);
+                }
+            }
+        }
+        tx.execute("DELETE FROM pages_fts", [])
+            .context("Failed to clear pages_fts for rowid alignment")?;
+        let page_rows: Vec<(i64, String, String, String, String, String)> = {
+            let mut stmt = tx.prepare(
+                "SELECT rowid, site_id, id, space_key, title, body_markdown FROM pages",
+            )?;
+            let mapped = stmt.query_map([], |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                    row.get(5)?,
+                ))
+            })?;
+            mapped.collect::<rusqlite::Result<Vec<_>>>()?
+        };
+        let mut insert_stmt = tx.prepare(
+            "INSERT INTO pages_fts (rowid, site_id, page_id, space_key, title, body_text)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+        )?;
+        for (rowid, site_id, page_id, space_key, title, body_md) in page_rows {
+            let body_text = preserved
+                .get(&(site_id.clone(), page_id.clone()))
+                .filter(|s| !s.is_empty())
+                .cloned()
+                .unwrap_or(body_md);
+            insert_stmt.execute(params![
+                rowid,
+                site_id,
+                page_id,
+                space_key,
+                title,
+                body_text,
+            ])?;
+        }
+    }
+
+    tx.execute(
+        "INSERT OR REPLACE INTO cache_meta (key, value) VALUES ('fts_rowid_aligned', '1')",
+        [],
+    )
+    .context("Failed to record fts_rowid_aligned marker")?;
+    tx.commit()
+        .context("Failed to commit FTS5 rowid alignment transaction")?;
     Ok(())
 }
 
@@ -538,9 +780,9 @@ fn migrate_issues_fts_if_v1(conn: &Connection) -> Result<()> {
     )?;
 
     let mut select_stmt = conn.prepare(
-        "SELECT site_id, key, project_key, summary, description_markdown, labels_json FROM issues",
+        "SELECT rowid, site_id, key, project_key, summary, description_markdown, labels_json FROM issues",
     )?;
-    let issues_rows: Vec<(String, String, String, String, String, String)> = select_stmt
+    let issues_rows: Vec<(i64, String, String, String, String, String, String)> = select_stmt
         .query_map([], |row| {
             Ok((
                 row.get(0)?,
@@ -549,18 +791,19 @@ fn migrate_issues_fts_if_v1(conn: &Connection) -> Result<()> {
                 row.get(3)?,
                 row.get(4)?,
                 row.get(5)?,
+                row.get(6)?,
             ))
         })?
         .collect::<rusqlite::Result<Vec<_>>>()?;
 
     let mut insert_stmt = conn.prepare(
         "
-        INSERT INTO issues_fts (site_id, issue_key, project_key, summary, description_text, labels_text)
-        VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+        INSERT INTO issues_fts (rowid, site_id, issue_key, project_key, summary, description_text, labels_text)
+        VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
         ",
     )?;
 
-    for (site_id, key, project_key, summary, desc_md, labels_json) in issues_rows {
+    for (rowid, site_id, key, project_key, summary, desc_md, labels_json) in issues_rows {
         let fallback_labels = serde_json::from_str::<Vec<String>>(&labels_json)
             .map(|v| v.join(" "))
             .unwrap_or_else(|_| labels_json.clone());
@@ -584,6 +827,7 @@ fn migrate_issues_fts_if_v1(conn: &Connection) -> Result<()> {
             (desc_md, fallback_labels)
         };
         insert_stmt.execute(params![
+            rowid,
             site_id,
             key,
             project_key,
@@ -629,8 +873,8 @@ fn migrate_pages_fts_if_v1(conn: &Connection) -> Result<()> {
     )?;
 
     let mut select_stmt =
-        conn.prepare("SELECT site_id, id, space_key, title, body_markdown FROM pages")?;
-    let pages_rows: Vec<(String, String, String, String, String)> = select_stmt
+        conn.prepare("SELECT rowid, site_id, id, space_key, title, body_markdown FROM pages")?;
+    let pages_rows: Vec<(i64, String, String, String, String, String)> = select_stmt
         .query_map([], |row| {
             Ok((
                 row.get(0)?,
@@ -638,18 +882,19 @@ fn migrate_pages_fts_if_v1(conn: &Connection) -> Result<()> {
                 row.get(2)?,
                 row.get(3)?,
                 row.get(4)?,
+                row.get(5)?,
             ))
         })?
         .collect::<rusqlite::Result<Vec<_>>>()?;
 
     let mut insert_stmt = conn.prepare(
         "
-        INSERT INTO pages_fts (site_id, page_id, space_key, title, body_text)
-        VALUES (?1, ?2, ?3, ?4, ?5)
+        INSERT INTO pages_fts (rowid, site_id, page_id, space_key, title, body_text)
+        VALUES (?1, ?2, ?3, ?4, ?5, ?6)
         ",
     )?;
 
-    for (site_id, page_id, space_key, title, body_md) in pages_rows {
+    for (rowid, site_id, page_id, space_key, title, body_md) in pages_rows {
         let body_text = if site_id == DEFAULT_SITE_ID {
             preserved
                 .get(&page_id)
@@ -659,7 +904,7 @@ fn migrate_pages_fts_if_v1(conn: &Connection) -> Result<()> {
         } else {
             body_md
         };
-        insert_stmt.execute(params![site_id, page_id, space_key, title, body_text])?;
+        insert_stmt.execute(params![rowid, site_id, page_id, space_key, title, body_text])?;
     }
 
     Ok(())

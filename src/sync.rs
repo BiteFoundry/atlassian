@@ -1942,6 +1942,17 @@ struct FullSyncOutcome {
     first_error_kind: Option<SyncErrorKind>,
 }
 
+async fn run_db<F, T>(storage: &Storage, f: F) -> Result<T>
+where
+    F: FnOnce(Storage) -> Result<T> + Send + 'static,
+    T: Send + 'static,
+{
+    let storage = storage.clone();
+    tokio::task::spawn_blocking(move || f(storage))
+        .await
+        .map_err(|e| anyhow::anyhow!("SQLite blocking task panicked: {e}"))?
+}
+
 async fn run_full_sync(
     client: &AtlassianClient,
     storage: &Storage,
@@ -1993,12 +2004,20 @@ async fn run_full_sync_for_site(
         Some(match client.list_projects().await {
             Ok(projects) => {
                 let count = projects.len();
-                let storage_err = match storage.upsert_projects_for_site(site_id, &projects) {
-                    Ok(()) => {
-                        if let Some(tx) = core_tx {
-                            let stored = storage
-                                .list_projects_for_site(site_id)
-                                .unwrap_or(projects);
+                let sid = site_id.to_string();
+                let want_stored = core_tx.is_some();
+                let storage_err = match run_db(storage, move |st| {
+                    st.upsert_projects_for_site(&sid, &projects)?;
+                    if want_stored {
+                        Ok(Some(st.list_projects_for_site(&sid).unwrap_or(projects)))
+                    } else {
+                        Ok(None)
+                    }
+                })
+                .await
+                {
+                    Ok(stored_opt) => {
+                        if let (Some(tx), Some(stored)) = (core_tx, stored_opt) {
                             let _ = tx.send(CoreEvent::ProjectsUpdated {
                                 site_id: site_id.to_string(),
                                 items: stored,
@@ -2022,7 +2041,13 @@ async fn run_full_sync_for_site(
             Ok(mut boards) => {
                 let count = boards.len();
                 let mut board_issues = 0usize;
-                let storage_err = storage.upsert_boards_for_site(site_id, &boards).err();
+                let storage_err = {
+                    let sid = site_id.to_string();
+                    let to_store = boards.clone();
+                    run_db(storage, move |st| st.upsert_boards_for_site(&sid, &to_store))
+                        .await
+                        .err()
+                };
                 if let Some(target_board) = select_default_board(&boards, client.config()) {
                     let board_id = target_board.id;
                     let (cols_res, details_res) = tokio::join!(
@@ -2040,7 +2065,11 @@ async fn run_full_sync_for_site(
                         if let Some(b) = boards.iter_mut().find(|b| b.id == board_id) {
                             b.columns = cols;
                         }
-                        let _ = storage.upsert_boards_for_site(site_id, &boards);
+                        let sid = site_id.to_string();
+                        let to_store = boards.clone();
+                        let _ =
+                            run_db(storage, move |st| st.upsert_boards_for_site(&sid, &to_store))
+                                .await;
                     }
                     if let Ok((_, fetched_count)) = details_res {
                         board_issues += fetched_count;
@@ -2069,13 +2098,19 @@ async fn run_full_sync_for_site(
             {
                 Ok(collected) => {
                     let fetched = collected.items.len();
-                    let storage_err = match storage.upsert_issues_for_site(site_id, &collected.items)
+                    let sid = site_id.to_string();
+                    let items = collected.items;
+                    let storage_err = match run_db(storage, move |st| {
+                        st.upsert_issues_for_site(&sid, &items)?;
+                        Ok(items)
+                    })
+                    .await
                     {
-                        Ok(()) => {
+                        Ok(items) => {
                             if let Some(tx) = core_tx {
                                 let _ = tx.send(CoreEvent::IssuesUpdated {
                                     site_id: site_id.to_string(),
-                                    issues: collected.items,
+                                    issues: items,
                                 });
                             }
                             None
@@ -2098,12 +2133,22 @@ async fn run_full_sync_for_site(
         Some(match client.list_all_spaces_collected().await.map(|all| all.items) {
             Ok(spaces) => {
                 let count = spaces.len();
-                let storage_err = match storage.upsert_spaces_for_site(site_id, &spaces) {
-                    Ok(()) => {
-                        if let Some(tx) = core_tx {
-                            let stored = storage
-                                .list_spaces_for_site(site_id)
-                                .unwrap_or_else(|_| spaces.clone());
+                let default_space_key =
+                    select_default_space(&spaces, client.config()).map(|s| s.key.clone());
+                let sid = site_id.to_string();
+                let want_stored = core_tx.is_some();
+                let storage_err = match run_db(storage, move |st| {
+                    st.upsert_spaces_for_site(&sid, &spaces)?;
+                    if want_stored {
+                        Ok(Some(st.list_spaces_for_site(&sid).unwrap_or(spaces)))
+                    } else {
+                        Ok(None)
+                    }
+                })
+                .await
+                {
+                    Ok(stored_opt) => {
+                        if let (Some(tx), Some(stored)) = (core_tx, stored_opt) {
                             let _ = tx.send(CoreEvent::SpacesUpdated {
                                 site_id: site_id.to_string(),
                                 items: stored,
@@ -2113,16 +2158,14 @@ async fn run_full_sync_for_site(
                     }
                     Err(err) => Some(err),
                 };
-                let pages_outcome = if let Some(target_space) =
-                    select_default_space(&spaces, client.config())
-                {
+                let pages_outcome = if let Some(space_key) = default_space_key {
                     if allow_pages {
                         Some(
                             sync_space_pages_for_site(
                                 site_id,
                                 client,
                                 storage,
-                                &target_space.key,
+                                &space_key,
                                 core_tx,
                             )
                             .await
@@ -2271,7 +2314,15 @@ async fn run_full_sync_for_site(
     } else {
         None
     };
-    let _ = storage.record_site_sync(site_id, &synced_at, err_note.as_deref());
+    {
+        let sid = site_id.to_string();
+        let synced_at_owned = synced_at;
+        let err_note_owned = err_note;
+        let _ = run_db(storage, move |st| {
+            st.record_site_sync(&sid, &synced_at_owned, err_note_owned.as_deref())
+        })
+        .await;
+    }
 
     let summary = format_sync_summary(project_count, board_count, issue_count, space_count);
     FullSyncOutcome {
@@ -2301,10 +2352,19 @@ async fn sync_board(
         sync_board_details_for_site(site_id, client, storage, board_id, sprint_id, core_tx),
     );
     if let Ok(cols) = cols_res {
-        let mut boards = storage.list_boards_for_site(site_id, None).unwrap_or_default();
-        if let Some(b) = boards.iter_mut().find(|b| b.id == board_id) {
-            b.columns = cols;
-            let _ = storage.upsert_boards_for_site(site_id, &boards);
+        let sid = site_id.to_string();
+        if let Ok(Some(boards)) = run_db(storage, move |st| {
+            let mut boards = st.list_boards_for_site(&sid, None).unwrap_or_default();
+            if let Some(b) = boards.iter_mut().find(|b| b.id == board_id) {
+                b.columns = cols;
+                let _ = st.upsert_boards_for_site(&sid, &boards);
+                Ok(Some(boards))
+            } else {
+                Ok(None)
+            }
+        })
+        .await
+        {
             if let Some(tx) = core_tx {
                 let _ = tx.send(CoreEvent::BoardsUpdated {
                     site_id: site_id.to_string(),
@@ -2331,13 +2391,23 @@ async fn sync_board_details_for_site(
         );
         let sprints = sprints_res.unwrap_or_default();
         if !sprints.is_empty() {
-            storage.upsert_sprints_for_site(site_id, &sprints)?;
+            let site_owned = site_id.to_string();
+            let to_store = sprints.clone();
+            run_db(storage, move |st| {
+                st.upsert_sprints_for_site(&site_owned, &to_store)
+            })
+            .await?;
         }
         (sprints, Some(sid), collected_res?)
     } else {
         let sprints = client.list_board_sprints(board_id).await.unwrap_or_default();
         if !sprints.is_empty() {
-            storage.upsert_sprints_for_site(site_id, &sprints)?;
+            let site_owned = site_id.to_string();
+            let to_store = sprints.clone();
+            run_db(storage, move |st| {
+                st.upsert_sprints_for_site(&site_owned, &to_store)
+            })
+            .await?;
         }
         let target_sprint_id = sprints
             .iter()
@@ -2352,7 +2422,14 @@ async fn sync_board_details_for_site(
     let active_sprint = target_sprint_id
         .and_then(|sid| sprints.iter().find(|s| s.id == sid).cloned());
 
-    store_board_issues_for_site(storage, site_id, board_id, target_sprint_id, &collected)?;
+    let collected = {
+        let site_owned = site_id.to_string();
+        run_db(storage, move |st| {
+            store_board_issues_for_site(&st, &site_owned, board_id, target_sprint_id, &collected)?;
+            Ok(collected)
+        })
+        .await?
+    };
     let issues: Vec<IssueSummary> = collected.items;
     let count = issues.len();
 
@@ -2379,7 +2456,12 @@ async fn sync_project_issues(
         .await?
         .items;
     let count = issues.len();
-    storage.upsert_issues_for_site(client.site_id(), &issues)?;
+    let sid = client.site_id().to_string();
+    let issues = run_db(storage, move |st| {
+        st.upsert_issues_for_site(&sid, &issues)?;
+        Ok(issues)
+    })
+    .await?;
     if let Some(tx) = core_tx {
         let _ = tx.send(CoreEvent::IssuesUpdated {
             site_id: client.site_id().to_string(),
@@ -2451,7 +2533,16 @@ pub async fn load_board_issues_for_site(
     let collected = client
         .list_all_board_issues(board_id, sprint_id, SYNC_BOARD_ISSUE_CAP)
         .await?;
-    let _ = store_board_issues_for_site(storage, site_id, board_id, sprint_id, &collected);
+    let sid = site_id.to_string();
+    let collected = match run_db(storage, move |st| {
+        let _ = store_board_issues_for_site(&st, &sid, board_id, sprint_id, &collected);
+        Ok(collected)
+    })
+    .await
+    {
+        Ok(c) => c,
+        Err(_) => return Ok(Vec::new()),
+    };
     Ok(collected.items)
 }
 
@@ -2465,7 +2556,17 @@ pub async fn load_space_root_pages_for_site(
     let collected = client
         .list_all_space_root_pages(space_key, SYNC_ROOT_PAGE_CAP)
         .await?;
-    let _ = store_space_root_pages_for_site(storage, site_id, space_key, &collected);
+    let sid = site_id.to_string();
+    let sk = space_key.to_string();
+    let collected = match run_db(storage, move |st| {
+        let _ = store_space_root_pages_for_site(&st, &sid, &sk, &collected);
+        Ok(collected)
+    })
+    .await
+    {
+        Ok(c) => c,
+        Err(_) => return Ok(Vec::new()),
+    };
     Ok(collected.items)
 }
 
@@ -2479,7 +2580,17 @@ pub async fn load_child_pages_for_site(
     let collected = client
         .list_all_child_pages(parent_id, SYNC_ROOT_PAGE_CAP)
         .await?;
-    let _ = store_child_pages_for_site(storage, site_id, parent_id, &collected);
+    let sid = site_id.to_string();
+    let pid = parent_id.to_string();
+    let collected = match run_db(storage, move |st| {
+        let _ = store_child_pages_for_site(&st, &sid, &pid, &collected);
+        Ok(collected)
+    })
+    .await
+    {
+        Ok(c) => c,
+        Err(_) => return Ok(Vec::new()),
+    };
     Ok(collected.items)
 }
 
@@ -2502,7 +2613,13 @@ async fn sync_space_pages_for_site(
     let collected = client
         .list_all_space_root_pages(space_key, SYNC_ROOT_PAGE_CAP)
         .await?;
-    store_space_root_pages_for_site(storage, site_id, space_key, &collected)?;
+    let sid = site_id.to_string();
+    let sk = space_key.to_string();
+    let collected = run_db(storage, move |st| {
+        store_space_root_pages_for_site(&st, &sid, &sk, &collected)?;
+        Ok(collected)
+    })
+    .await?;
     let pages = collected.items;
     let count = pages.len();
     if let Some(tx) = core_tx {

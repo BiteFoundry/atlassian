@@ -60,9 +60,49 @@ impl<T> From<(String, T)> for SiteScoped<T> {
     }
 }
 
+pub(crate) const MAX_READER_POOL_SIZE: usize = 4;
+
+enum ReadConnInner<'a> {
+    Pooled {
+        conn: Option<Connection>,
+        pool: &'a Arc<Mutex<Vec<Connection>>>,
+    },
+    Writer(std::sync::MutexGuard<'a, Connection>),
+}
+
+pub(crate) struct ReadConnGuard<'a>(ReadConnInner<'a>);
+
+impl std::ops::Deref for ReadConnGuard<'_> {
+    type Target = Connection;
+
+    fn deref(&self) -> &Self::Target {
+        match &self.0 {
+            ReadConnInner::Pooled { conn, .. } => conn
+                .as_ref()
+                .expect("pooled reader connection available until Drop"),
+            ReadConnInner::Writer(guard) => guard,
+        }
+    }
+}
+
+impl Drop for ReadConnGuard<'_> {
+    fn drop(&mut self) {
+        if let ReadConnInner::Pooled { conn, pool } = &mut self.0 {
+            if let Some(c) = conn.take() {
+                if let Ok(mut guard) = pool.lock() {
+                    if guard.len() < MAX_READER_POOL_SIZE {
+                        guard.push(c);
+                    }
+                }
+            }
+        }
+    }
+}
+
 #[derive(Clone)]
 pub struct Storage {
     pub(crate) conn: Arc<Mutex<Connection>>,
+    pub(crate) readers: Option<Arc<Mutex<Vec<Connection>>>>,
     pub(crate) path: Option<PathBuf>,
 }
 
@@ -83,6 +123,33 @@ impl Storage {
         self.conn
             .lock()
             .map_err(|_| anyhow!("SQLite connection mutex poisoned"))
+    }
+
+    pub(crate) fn read_conn(&self) -> Result<ReadConnGuard<'_>> {
+        if let (Some(pool), Some(path)) = (&self.readers, &self.path) {
+            let existing = {
+                let mut guard = pool
+                    .lock()
+                    .map_err(|_| anyhow!("SQLite reader pool mutex poisoned"))?;
+                guard.pop()
+            };
+            let conn = match existing {
+                Some(c) => c,
+                None => {
+                    let flags = rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY
+                        | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX;
+                    let c = Connection::open_with_flags(path, flags)?;
+                    db::init_reader_connection(&c)?;
+                    c
+                }
+            };
+            Ok(ReadConnGuard(ReadConnInner::Pooled {
+                conn: Some(conn),
+                pool,
+            }))
+        } else {
+            Ok(ReadConnGuard(ReadConnInner::Writer(self.lock_conn()?)))
+        }
     }
 
     pub fn upsert_site(&self, site: &SiteRecord) -> Result<()> {
@@ -117,8 +184,8 @@ impl Storage {
     }
 
     pub fn list_sites(&self) -> Result<Vec<SiteRecord>> {
-        let conn = self.lock_conn()?;
-        let mut stmt = conn.prepare(
+        let conn = self.read_conn()?;
+        let mut stmt = conn.prepare_cached(
             "
             SELECT site_id, name, site_url, deployment, enabled, last_synced_at, last_error
             FROM sites
@@ -130,18 +197,15 @@ impl Storage {
     }
 
     pub fn get_site(&self, site_id: &str) -> Result<Option<SiteRecord>> {
-        let conn = self.lock_conn()?;
-        let record = conn
-            .query_row(
-                "
-                SELECT site_id, name, site_url, deployment, enabled, last_synced_at, last_error
-                FROM sites
-                WHERE site_id = ?1
-                ",
-                [site_id],
-                map_site_record_row,
-            )
-            .optional()?;
+        let conn = self.read_conn()?;
+        let mut stmt = conn.prepare_cached(
+            "
+            SELECT site_id, name, site_url, deployment, enabled, last_synced_at, last_error
+            FROM sites
+            WHERE site_id = ?1
+            ",
+        )?;
+        let record = stmt.query_row([site_id], map_site_record_row).optional()?;
         Ok(record)
     }
 
@@ -152,18 +216,24 @@ impl Storage {
         err: Option<&str>,
     ) -> Result<()> {
         let conn = self.lock_conn()?;
-        conn.execute(
+        let mut stmt = conn.prepare_cached(
             "UPDATE sites SET last_synced_at = ?1, last_error = ?2 WHERE site_id = ?3",
-            params![synced_at, err, site_id],
         )?;
+        stmt.execute(params![synced_at, err, site_id])?;
         Ok(())
     }
 
     pub fn delete_site_data(&self, site_id: &str) -> Result<()> {
         let mut conn = self.lock_conn()?;
         let tx = conn.transaction()?;
-        tx.execute("DELETE FROM issues_fts WHERE site_id = ?1", [site_id])?;
-        tx.execute("DELETE FROM pages_fts WHERE site_id = ?1", [site_id])?;
+        tx.execute(
+            "DELETE FROM issues_fts WHERE rowid IN (SELECT rowid FROM issues WHERE site_id = ?1)",
+            [site_id],
+        )?;
+        tx.execute(
+            "DELETE FROM pages_fts WHERE rowid IN (SELECT rowid FROM pages WHERE site_id = ?1)",
+            [site_id],
+        )?;
         tx.execute("DELETE FROM issues WHERE site_id = ?1", [site_id])?;
         tx.execute("DELETE FROM board_sprints WHERE site_id = ?1", [site_id])?;
         tx.execute("DELETE FROM sprints WHERE site_id = ?1", [site_id])?;
@@ -197,21 +267,17 @@ impl Storage {
 
     /// The user [Self::save_identity_for_site] stored for a site, if any.
     pub fn identity_for_site(&self, site_id: &str) -> Result<Option<UserSummary>> {
-        let conn = self.lock_conn()?;
-        let user_json: Option<String> = conn
-            .query_row(
-                "SELECT user_json FROM site_identities WHERE site_id = ?1",
-                [site_id],
-                |row| row.get(0),
-            )
-            .optional()?;
+        let conn = self.read_conn()?;
+        let mut stmt =
+            conn.prepare_cached("SELECT user_json FROM site_identities WHERE site_id = ?1")?;
+        let user_json: Option<String> = stmt.query_row([site_id], |row| row.get(0)).optional()?;
         Ok(user_json.and_then(|raw| serde_json::from_str(&raw).ok()))
     }
 
     /// All cached per-site signed-in identities, keyed by `site_id`.
     pub fn list_identities(&self) -> Result<HashMap<String, UserSummary>> {
-        let conn = self.lock_conn()?;
-        let mut stmt = conn.prepare("SELECT site_id, user_json FROM site_identities")?;
+        let conn = self.read_conn()?;
+        let mut stmt = conn.prepare_cached("SELECT site_id, user_json FROM site_identities")?;
         let mut out = HashMap::new();
         let rows = stmt.query_map([], |row| {
             let sid: String = row.get(0)?;
@@ -228,12 +294,22 @@ impl Storage {
     }
 
     pub fn cache_counts(&self) -> Result<CacheCounts> {
-        let conn = self.lock_conn()?;
-        let projects: i64 = conn.query_row("SELECT COUNT(*) FROM projects", [], |r| r.get(0))?;
-        let boards: i64 = conn.query_row("SELECT COUNT(*) FROM boards", [], |r| r.get(0))?;
-        let issues: i64 = conn.query_row("SELECT COUNT(*) FROM issues", [], |r| r.get(0))?;
-        let spaces: i64 = conn.query_row("SELECT COUNT(*) FROM spaces", [], |r| r.get(0))?;
-        let pages: i64 = conn.query_row("SELECT COUNT(*) FROM pages", [], |r| r.get(0))?;
+        let conn = self.read_conn()?;
+        let projects: i64 = conn
+            .prepare_cached("SELECT COUNT(*) FROM projects")?
+            .query_row([], |r| r.get(0))?;
+        let boards: i64 = conn
+            .prepare_cached("SELECT COUNT(*) FROM boards")?
+            .query_row([], |r| r.get(0))?;
+        let issues: i64 = conn
+            .prepare_cached("SELECT COUNT(*) FROM issues")?
+            .query_row([], |r| r.get(0))?;
+        let spaces: i64 = conn
+            .prepare_cached("SELECT COUNT(*) FROM spaces")?
+            .query_row([], |r| r.get(0))?;
+        let pages: i64 = conn
+            .prepare_cached("SELECT COUNT(*) FROM pages")?
+            .query_row([], |r| r.get(0))?;
         Ok(CacheCounts {
             projects: projects.max(0) as usize,
             boards: boards.max(0) as usize,
@@ -244,32 +320,22 @@ impl Storage {
     }
 
     pub fn cache_counts_for_site(&self, site_id: &str) -> Result<CacheCounts> {
-        let conn = self.lock_conn()?;
-        let projects: i64 = conn.query_row(
-            "SELECT COUNT(*) FROM projects WHERE site_id = ?1",
-            [site_id],
-            |r| r.get(0),
-        )?;
-        let boards: i64 = conn.query_row(
-            "SELECT COUNT(*) FROM boards WHERE site_id = ?1",
-            [site_id],
-            |r| r.get(0),
-        )?;
-        let issues: i64 = conn.query_row(
-            "SELECT COUNT(*) FROM issues WHERE site_id = ?1",
-            [site_id],
-            |r| r.get(0),
-        )?;
-        let spaces: i64 = conn.query_row(
-            "SELECT COUNT(*) FROM spaces WHERE site_id = ?1",
-            [site_id],
-            |r| r.get(0),
-        )?;
-        let pages: i64 = conn.query_row(
-            "SELECT COUNT(*) FROM pages WHERE site_id = ?1",
-            [site_id],
-            |r| r.get(0),
-        )?;
+        let conn = self.read_conn()?;
+        let projects: i64 = conn
+            .prepare_cached("SELECT COUNT(*) FROM projects WHERE site_id = ?1")?
+            .query_row([site_id], |r| r.get(0))?;
+        let boards: i64 = conn
+            .prepare_cached("SELECT COUNT(*) FROM boards WHERE site_id = ?1")?
+            .query_row([site_id], |r| r.get(0))?;
+        let issues: i64 = conn
+            .prepare_cached("SELECT COUNT(*) FROM issues WHERE site_id = ?1")?
+            .query_row([site_id], |r| r.get(0))?;
+        let spaces: i64 = conn
+            .prepare_cached("SELECT COUNT(*) FROM spaces WHERE site_id = ?1")?
+            .query_row([site_id], |r| r.get(0))?;
+        let pages: i64 = conn
+            .prepare_cached("SELECT COUNT(*) FROM pages WHERE site_id = ?1")?
+            .query_row([site_id], |r| r.get(0))?;
         Ok(CacheCounts {
             projects: projects.max(0) as usize,
             boards: boards.max(0) as usize,

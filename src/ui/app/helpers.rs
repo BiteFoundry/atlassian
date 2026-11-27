@@ -186,15 +186,16 @@ pub fn flatten_page_tree(
 }
 
 pub(super) fn scan_issue_keys(text: &str) -> Vec<String> {
-    let Ok(re) = Regex::new(r"\b([A-Z][A-Z0-9]{1,9}-\d+)\b") else {
-        return Vec::new();
-    };
+    static ISSUE_KEY_RE: std::sync::LazyLock<Regex> = std::sync::LazyLock::new(|| {
+        Regex::new(r"\b([A-Z][A-Z0-9]{1,9}-\d+)\b").expect("valid issue key regex")
+    });
+    let mut seen: HashSet<&str> = HashSet::new();
     let mut out = Vec::new();
-    for cap in re.captures_iter(text) {
+    for cap in ISSUE_KEY_RE.captures_iter(text) {
         if let Some(m) = cap.get(1) {
-            let s = m.as_str().to_string();
-            if !out.contains(&s) {
-                out.push(s);
+            let key = m.as_str();
+            if seen.insert(key) {
+                out.push(key.to_string());
             }
         }
     }

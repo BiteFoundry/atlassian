@@ -424,6 +424,11 @@ fn base_http_client_builder() -> reqwest::ClientBuilder {
     reqwest::Client::builder()
         .user_agent(format!("atlassian-cli/{}", env!("CARGO_PKG_VERSION")))
         .timeout(Duration::from_secs(30))
+        .connect_timeout(Duration::from_secs(15))
+        .tcp_nodelay(true)
+        .pool_max_idle_per_host(8)
+        .pool_idle_timeout(Duration::from_secs(90))
+        .tcp_keepalive(Duration::from_secs(60))
 }
 
 /// The one place HTTP clients are configured: user agent, 30 s timeout, the OS trust store

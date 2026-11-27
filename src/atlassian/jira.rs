@@ -1423,6 +1423,11 @@ fn parse_sprint_field(val: Option<&Value>) -> (Option<i64>, Option<String>) {
 }
 
 fn extract_single_sprint(val: &Value) -> (Option<i64>, Option<String>) {
+    static SPRINT_ID_RE: std::sync::LazyLock<Regex> =
+        std::sync::LazyLock::new(|| Regex::new(r"\bid=(\d+)").expect("valid sprint id regex"));
+    static SPRINT_NAME_RE: std::sync::LazyLock<Regex> = std::sync::LazyLock::new(|| {
+        Regex::new(r"\bname=([^,\]]+)").expect("valid sprint name regex")
+    });
     if let Some(obj) = val.as_object() {
         let id = obj.get("id").and_then(|v| v.as_i64());
         let name = obj
@@ -1433,14 +1438,12 @@ fn extract_single_sprint(val: &Value) -> (Option<i64>, Option<String>) {
     }
     // Data Center GreenHopper legacy string format: `...Sprint@...[id=42,rapidViewId=1,state=ACTIVE,name=Sprint 42,...]`
     if let Some(raw) = val.as_str() {
-        let id = Regex::new(r"\bid=(\d+)")
-            .ok()
-            .and_then(|re| re.captures(raw))
+        let id = SPRINT_ID_RE
+            .captures(raw)
             .and_then(|c| c.get(1))
             .and_then(|m| m.as_str().parse::<i64>().ok());
-        let name = Regex::new(r"\bname=([^,\]]+)")
-            .ok()
-            .and_then(|re| re.captures(raw))
+        let name = SPRINT_NAME_RE
+            .captures(raw)
             .and_then(|c| c.get(1))
             .map(|m| m.as_str().trim().to_string());
         return (id, name);
@@ -1589,10 +1592,10 @@ fn collect_confluence_links_from_text(
         scan_sources.push((&[], &c.body_markdown));
     }
 
-    let url_re = Regex::new(
-        r#"https?://[^\s"'<>)\]]+(?:/pages/\d+[^\s"'<>)\]]*|pageId=\d+[^\s"'<>)\]]*)"#,
-    )
-    .ok();
+    static CONFLUENCE_URL_RE: std::sync::LazyLock<Regex> = std::sync::LazyLock::new(|| {
+        Regex::new(r#"https?://[^\s"'<>)\]]+(?:/pages/\d+[^\s"'<>)\]]*|pageId=\d+[^\s"'<>)\]]*)"#)
+            .expect("valid confluence url regex")
+    });
 
     for (blocks, text) in scan_sources {
         for xref in extract_cross_refs(blocks, text) {
@@ -1610,36 +1613,39 @@ fn collect_confluence_links_from_text(
                 }
             }
         }
-        if let Some(ref re) = url_re {
-            for m in re.find_iter(text) {
-                let found_url = m.as_str().trim_end_matches(['.', ',', ';']);
-                let (page_id_opt, space_key) = parse_confluence_url_parts(found_url);
-                if let Some(page_id) = page_id_opt {
-                    push_unique_linked_page(
-                        out,
-                        LinkedConfluencePage {
-                            page_id: page_id.clone(),
-                            title: format!("Page {page_id}"),
-                            space_key,
-                            web_url: found_url.to_string(),
-                        },
-                    );
-                }
+        for m in CONFLUENCE_URL_RE.find_iter(text) {
+            let found_url = m.as_str().trim_end_matches(['.', ',', ';']);
+            let (page_id_opt, space_key) = parse_confluence_url_parts(found_url);
+            if let Some(page_id) = page_id_opt {
+                push_unique_linked_page(
+                    out,
+                    LinkedConfluencePage {
+                        page_id: page_id.clone(),
+                        title: format!("Page {page_id}"),
+                        space_key,
+                        web_url: found_url.to_string(),
+                    },
+                );
             }
         }
     }
 }
 
 fn parse_confluence_url_parts(url: &str) -> (Option<String>, Option<String>) {
-    let space_key = Regex::new(r"/spaces/([^/?#]+)/pages/")
-        .ok()
-        .and_then(|re| re.captures(url))
+    static SPACE_RE: std::sync::LazyLock<Regex> = std::sync::LazyLock::new(|| {
+        Regex::new(r"/spaces/([^/?#]+)/pages/").expect("valid confluence space regex")
+    });
+    static PAGE_ID_RE: std::sync::LazyLock<Regex> = std::sync::LazyLock::new(|| {
+        Regex::new(r"/pages/(\d+)").expect("valid confluence page id regex")
+    });
+
+    let space_key = SPACE_RE
+        .captures(url)
         .and_then(|c| c.get(1))
         .map(|m| m.as_str().to_string());
 
-    let page_id = Regex::new(r"/pages/(\d+)")
-        .ok()
-        .and_then(|re| re.captures(url))
+    let page_id = PAGE_ID_RE
+        .captures(url)
         .and_then(|c| c.get(1))
         .map(|m| m.as_str().to_string())
         .or_else(|| parse_page_id_from_query(url));
@@ -1648,20 +1654,17 @@ fn parse_confluence_url_parts(url: &str) -> (Option<String>, Option<String>) {
 }
 
 fn parse_page_id_from_query(input: &str) -> Option<String> {
-    Regex::new(r"pageId=(\d+)")
-        .ok()
-        .and_then(|re| re.captures(input))
+    static QUERY_PAGE_ID_RE: std::sync::LazyLock<Regex> = std::sync::LazyLock::new(|| {
+        Regex::new(r"pageId=(\d+)").expect("valid confluence query pageId regex")
+    });
+    QUERY_PAGE_ID_RE
+        .captures(input)
         .and_then(|c| c.get(1))
         .map(|m| m.as_str().to_string())
 }
 
 fn push_unique_linked_page(out: &mut Vec<LinkedConfluencePage>, candidate: LinkedConfluencePage) {
-    let seen_ids: HashSet<String> = out
-        .iter()
-        .filter(|p| !p.page_id.is_empty())
-        .map(|p| p.page_id.clone())
-        .collect();
-    if !candidate.page_id.is_empty() && seen_ids.contains(&candidate.page_id) {
+    if !candidate.page_id.is_empty() {
         if let Some(existing) = out.iter_mut().find(|p| p.page_id == candidate.page_id) {
             if existing.web_url.is_empty() && !candidate.web_url.is_empty() {
                 existing.web_url = candidate.web_url;
@@ -1669,10 +1672,9 @@ fn push_unique_linked_page(out: &mut Vec<LinkedConfluencePage>, candidate: Linke
             if existing.space_key.is_none() && candidate.space_key.is_some() {
                 existing.space_key = candidate.space_key;
             }
+            return;
         }
-        return;
-    }
-    if candidate.page_id.is_empty() && out.iter().any(|p| p.web_url == candidate.web_url) {
+    } else if out.iter().any(|p| p.web_url == candidate.web_url) {
         return;
     }
     out.push(candidate);

@@ -36,6 +36,7 @@ use crate::{
 };
 
 pub use helpers::{build_kanban_columns_for_board, builtin_filters, flatten_page_tree, SiteKey};
+pub(crate) use state::{CachedLineHit, CachedRenderedDoc};
 pub use state::{
     config_protocol_to_img_pref, space_group_key, BoardUiState, ConfluenceUiState,
     DirectoryUiState, ExternalEditorTarget, IssueUiState, KanbanColumn, MyWorkUiState, PaneFocus,

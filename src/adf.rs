@@ -739,7 +739,7 @@ fn parse_xhtml_children(parent: ElementRef<'_>) -> Vec<DocBlock> {
                 }
             }
             Node::Element(el) => {
-                let tag = el.name().to_ascii_lowercase();
+                let tag = ascii_lower_cow(el.name());
                 if let Some(el_ref) = ElementRef::wrap(child) {
                     if is_inline_xhtml_element(&tag, el_ref) {
                         parse_xhtml_inline_element(el_ref, &InlineStyle::default(), &mut pending_inlines);
@@ -760,21 +760,16 @@ fn is_inline_xhtml_element(tag: &str, el: ElementRef<'_>) -> bool {
     match tag {
         "a" | "strong" | "b" | "em" | "i" | "del" | "s" | "u" | "code" | "span" | "br"
         | "sub" | "sup" | "ac:link" | "time" => true,
-        "ac:structured-macro" => {
-            let name = el
-                .value()
-                .attr("ac:name")
-                .unwrap_or("")
-                .to_ascii_lowercase();
-            matches!(name.as_str(), "status" | "jira")
-        }
+        "ac:structured-macro" => el.value().attr("ac:name").is_some_and(|n| {
+            n.eq_ignore_ascii_case("status") || n.eq_ignore_ascii_case("jira")
+        }),
         _ => false,
     }
 }
 
 fn parse_xhtml_block_element(el: ElementRef<'_>) -> Vec<DocBlock> {
-    let tag = el.value().name().to_ascii_lowercase();
-    match tag.as_str() {
+    let tag = ascii_lower_cow(el.value().name());
+    match tag.as_ref() {
         "style" | "script" | "noscript" | "head" | "meta" | "title" | "xml" | "svg" | "canvas"
         | "ac:parameter" => Vec::new(),
         "p" => {
@@ -865,12 +860,12 @@ fn parse_xhtml_block_element(el: ElementRef<'_>) -> Vec<DocBlock> {
             let mut filename: Option<String> = None;
             let mut url: Option<String> = None;
             for child in el.descendants().filter_map(ElementRef::wrap) {
-                let cname = child.value().name().to_ascii_lowercase();
-                if cname == "ri:attachment" {
+                let cname = child.value().name();
+                if cname.eq_ignore_ascii_case("ri:attachment") {
                     if let Some(f) = child.value().attr("ri:filename") {
                         filename = Some(f.to_string());
                     }
-                } else if cname == "ri:url" {
+                } else if cname.eq_ignore_ascii_case("ri:url") {
                     if let Some(u) = child.value().attr("ri:value") {
                         url = Some(u.to_string());
                     }
@@ -892,11 +887,14 @@ fn parse_xhtml_block_element(el: ElementRef<'_>) -> Vec<DocBlock> {
                     let mut checked = false;
                     let mut content = Vec::new();
                     for sub in child.children().filter_map(ElementRef::wrap) {
-                        let sname = sub.value().name().to_ascii_lowercase();
-                        if sname == "ac:task-status" {
-                            let status = collect_raw_text(sub).trim().to_ascii_lowercase();
-                            checked = matches!(status.as_str(), "complete" | "completed" | "done");
-                        } else if sname == "ac:task-body" {
+                        let sname = sub.value().name();
+                        if sname.eq_ignore_ascii_case("ac:task-status") {
+                            let status = collect_raw_text(sub);
+                            let status = status.trim();
+                            checked = status.eq_ignore_ascii_case("complete")
+                                || status.eq_ignore_ascii_case("completed")
+                                || status.eq_ignore_ascii_case("done");
+                        } else if sname.eq_ignore_ascii_case("ac:task-body") {
                             parse_xhtml_inlines_of(sub, &InlineStyle::default(), &mut content);
                         }
                     }
@@ -914,32 +912,28 @@ fn parse_xhtml_block_element(el: ElementRef<'_>) -> Vec<DocBlock> {
 }
 
 fn parse_xhtml_macro(el: ElementRef<'_>) -> Vec<DocBlock> {
-    let macro_name = el
-        .value()
-        .attr("ac:name")
-        .unwrap_or("")
-        .to_ascii_lowercase();
+    let macro_name = ascii_lower_cow(el.value().attr("ac:name").unwrap_or(""));
 
     let mut params = std::collections::HashMap::<String, String>::new();
     let mut plain_body: Option<String> = None;
     let mut rich_body_el: Option<ElementRef<'_>> = None;
 
     for child in el.children().filter_map(ElementRef::wrap) {
-        let cname = child.value().name().to_ascii_lowercase();
-        if cname == "ac:parameter" {
+        let cname = child.value().name();
+        if cname.eq_ignore_ascii_case("ac:parameter") {
             if let Some(pname) = child.value().attr("ac:name") {
                 params.insert(pname.to_ascii_lowercase(), collect_raw_text(child).trim().to_string());
             }
-        } else if cname == "ac:plain-text-body" {
+        } else if cname.eq_ignore_ascii_case("ac:plain-text-body") {
             plain_body = Some(collect_raw_text(child));
-        } else if cname == "ac:rich-text-body" {
+        } else if cname.eq_ignore_ascii_case("ac:rich-text-body") {
             rich_body_el = Some(child);
         }
     }
 
-    match macro_name.as_str() {
+    match macro_name.as_ref() {
         "info" | "note" | "warning" | "tip" | "panel" => {
-            let kind = match macro_name.as_str() {
+            let kind = match macro_name.as_ref() {
                 "note" => PanelKind::Note,
                 "warning" => PanelKind::Warning,
                 "tip" => PanelKind::Success,
@@ -1048,10 +1042,11 @@ fn parse_xhtml_table(table_el: ElementRef<'_>) -> DocBlock {
         let mut any_cell = false;
 
         for cell in tr.children().filter_map(ElementRef::wrap) {
-            let cname = cell.value().name().to_ascii_lowercase();
-            if cname == "th" || cname == "td" {
+            let cname = cell.value().name();
+            let is_th = cname.eq_ignore_ascii_case("th");
+            if is_th || cname.eq_ignore_ascii_case("td") {
                 any_cell = true;
-                if cname != "th" {
+                if !is_th {
                     all_th = false;
                 }
                 let cell_blocks = parse_xhtml_children(cell);
@@ -1074,10 +1069,13 @@ fn parse_xhtml_table(table_el: ElementRef<'_>) -> DocBlock {
 
 fn collect_table_rows<'a>(el: ElementRef<'a>, out: &mut Vec<ElementRef<'a>>) {
     for child in el.children().filter_map(ElementRef::wrap) {
-        let cname = child.value().name().to_ascii_lowercase();
-        if cname == "tr" {
+        let cname = child.value().name();
+        if cname.eq_ignore_ascii_case("tr") {
             out.push(child);
-        } else if matches!(cname.as_str(), "thead" | "tbody" | "tfoot") {
+        } else if cname.eq_ignore_ascii_case("thead")
+            || cname.eq_ignore_ascii_case("tbody")
+            || cname.eq_ignore_ascii_case("tfoot")
+        {
             collect_table_rows(child, out);
         }
     }
@@ -1107,8 +1105,8 @@ fn parse_xhtml_inline_element(
     parent_style: &InlineStyle,
     out: &mut Vec<InlineNode>,
 ) {
-    let tag = el.value().name().to_ascii_lowercase();
-    match tag.as_str() {
+    let tag = ascii_lower_cow(el.value().name());
+    match tag.as_ref() {
         "style" | "script" | "noscript" | "head" | "meta" | "title" | "xml" | "svg" | "canvas"
         | "ac:parameter" => {}
         "strong" | "b" => {
@@ -1160,11 +1158,7 @@ fn parse_xhtml_inline_element(
         }
         "br" => out.push(InlineNode::HardBreak),
         "ac:structured-macro" => {
-            let macro_name = el
-                .value()
-                .attr("ac:name")
-                .unwrap_or("")
-                .to_ascii_lowercase();
+            let macro_name = ascii_lower_cow(el.value().attr("ac:name").unwrap_or(""));
             let mut params = std::collections::HashMap::<String, String>::new();
             for child in el.children().filter_map(ElementRef::wrap) {
                 if child.value().name().eq_ignore_ascii_case("ac:parameter") {
@@ -1181,12 +1175,14 @@ fn parse_xhtml_inline_element(
                 let colour = params
                     .get("colour")
                     .or_else(|| params.get("color"))
-                    .map(|s| s.to_ascii_lowercase())
-                    .unwrap_or_default();
-                let category = match colour.as_str() {
-                    "green" => StatusCategory::Done,
-                    "blue" | "purple" => StatusCategory::InProgress,
-                    _ => StatusCategory::Todo,
+                    .map(String::as_str)
+                    .unwrap_or("");
+                let category = if colour.eq_ignore_ascii_case("green") {
+                    StatusCategory::Done
+                } else if colour.eq_ignore_ascii_case("blue") || colour.eq_ignore_ascii_case("purple") {
+                    StatusCategory::InProgress
+                } else {
+                    StatusCategory::Todo
                 };
                 out.push(InlineNode::StatusLozenge { text, category });
             } else if macro_name == "jira" {
@@ -1201,7 +1197,7 @@ fn parse_xhtml_inline_element(
                     style: parent_style.clone(),
                 });
             } else if matches!(
-                macro_name.as_str(),
+                macro_name.as_ref(),
                 "mermaid" | "drawio" | "gliffy" | "plantuml" | "chart"
             ) {
                 out.push(InlineNode::Text {
@@ -1221,20 +1217,22 @@ fn parse_xhtml_inline_element(
             let mut page_title: Option<String> = None;
             let mut link_body: Option<String> = None;
             for child in el.descendants().filter_map(ElementRef::wrap) {
-                let cname = child.value().name().to_ascii_lowercase();
-                if cname == "ri:user" {
+                let cname = child.value().name();
+                if cname.eq_ignore_ascii_case("ri:user") {
                     user_key = child
                         .value()
                         .attr("ri:account-id")
                         .or_else(|| child.value().attr("ri:userkey"))
                         .or_else(|| child.value().attr("ri:username"))
                         .map(str::to_string);
-                } else if cname == "ri:page" {
+                } else if cname.eq_ignore_ascii_case("ri:page") {
                     page_title = child
                         .value()
                         .attr("ri:content-title")
                         .map(str::to_string);
-                } else if cname == "ac:plain-text-link-body" || cname == "ac:link-body" {
+                } else if cname.eq_ignore_ascii_case("ac:plain-text-link-body")
+                    || cname.eq_ignore_ascii_case("ac:link-body")
+                {
                     link_body = Some(collect_raw_text(child).trim().to_string());
                 }
             }
@@ -3518,11 +3516,44 @@ fn inlines_to_adf(spans: &[InlineNode]) -> Vec<Value> {
         .collect()
 }
 
-pub(crate) fn xml_escape(s: &str) -> String {
-    s.replace('&', "&amp;")
-        .replace('<', "&lt;")
-        .replace('>', "&gt;")
-        .replace('"', "&quot;")
+#[inline]
+fn ascii_lower_cow(s: &str) -> std::borrow::Cow<'_, str> {
+    if s.bytes().any(|b| b.is_ascii_uppercase()) {
+        std::borrow::Cow::Owned(s.to_ascii_lowercase())
+    } else {
+        std::borrow::Cow::Borrowed(s)
+    }
+}
+
+pub(crate) fn xml_escape(s: &str) -> std::borrow::Cow<'_, str> {
+    let bytes = s.as_bytes();
+    let Some(first) = bytes
+        .iter()
+        .position(|&b| matches!(b, b'&' | b'<' | b'>' | b'"'))
+    else {
+        return std::borrow::Cow::Borrowed(s);
+    };
+    let mut out = String::with_capacity(s.len() + 16);
+    out.push_str(&s[..first]);
+    let mut last = first;
+    for (i, &b) in bytes.iter().enumerate().skip(first) {
+        let repl = match b {
+            b'&' => "&amp;",
+            b'<' => "&lt;",
+            b'>' => "&gt;",
+            b'"' => "&quot;",
+            _ => continue,
+        };
+        if i > last {
+            out.push_str(&s[last..i]);
+        }
+        out.push_str(repl);
+        last = i + 1;
+    }
+    if last < s.len() {
+        out.push_str(&s[last..]);
+    }
+    std::borrow::Cow::Owned(out)
 }
 
 /// Compiles Markdown into Confluence Storage XHTML (for Data Center v1 page/comment writes).
@@ -3678,7 +3709,7 @@ fn inlines_to_storage_xhtml(spans: &[InlineNode]) -> String {
     for node in spans {
         match node {
             InlineNode::Text { text, style } => {
-                let mut inner = xml_escape(text);
+                let mut inner = xml_escape(text).into_owned();
                 if style.code {
                     inner = format!("<code>{inner}</code>");
                 }

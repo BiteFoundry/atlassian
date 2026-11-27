@@ -590,13 +590,17 @@ impl AppState {
                         });
                         return;
                     }
-                    let res = img_preview::decode_and_render_halfblocks_with_cell_px(
-                        &bytes,
-                        fit,
-                        bg_rgb,
-                        caps.cell_px,
-                    )
-                    .map_err(|e| e.to_string());
+                    let res = tokio::task::spawn_blocking(move || {
+                        img_preview::decode_and_render_halfblocks_with_cell_px(
+                            &bytes,
+                            fit,
+                            bg_rgb,
+                            caps.cell_px,
+                        )
+                        .map_err(|e| e.to_string())
+                    })
+                    .await
+                    .unwrap_or_else(|e| Err(format!("Image decode task failed: {e}")));
                     let _ = tx.send(UiMsg::ImageLoaded {
                         cache_key,
                         rendered: res,

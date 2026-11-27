@@ -754,6 +754,17 @@ fn resolve_site_client(
     Err(ApiError::not_found(format!("site not found: '{trimmed}'")))
 }
 
+async fn run_db<F, T>(storage: &Storage, f: F) -> Result<T>
+where
+    F: FnOnce(Storage) -> Result<T> + Send + 'static,
+    T: Send + 'static,
+{
+    let storage = storage.clone();
+    tokio::task::spawn_blocking(move || f(storage))
+        .await
+        .context("SQLite blocking task panicked")?
+}
+
 async fn refresh_issue_cache_after_write(
     client: &AtlassianClient,
     storage: &Storage,
@@ -761,11 +772,12 @@ async fn refresh_issue_cache_after_write(
     key: &str,
 ) {
     if let Ok((mut detail, meta)) = client.get_issue_with_meta(key).await {
-        let _ = storage.upsert_issue_detail_for_site_merging(
-            site_id,
-            &mut detail,
-            !meta.remote_links_ok,
-        );
+        let site_id = site_id.to_string();
+        let preserve_links = !meta.remote_links_ok;
+        let _ = run_db(storage, move |st| {
+            st.upsert_issue_detail_for_site_merging(&site_id, &mut detail, preserve_links)
+        })
+        .await;
     }
 }
 
@@ -779,7 +791,11 @@ async fn refresh_page_cache_after_write(
         .get_page_with_meta_in_cache(page_id, site_id, storage)
         .await
     {
-        let _ = storage.upsert_page_detail_for_site_with_meta(site_id, &mut detail, meta);
+        let site_id = site_id.to_string();
+        let _ = run_db(storage, move |st| {
+            st.upsert_page_detail_for_site_with_meta(&site_id, &mut detail, meta)
+        })
+        .await;
     }
 }
 
@@ -790,56 +806,55 @@ fn site_name_lookup(config: &AppConfig, site_id: &str) -> Option<String> {
 }
 
 async fn list_sites(State(state): State<Arc<AppState>>) -> Result<Json<Value>, ApiError> {
-    let mut sites_out = Vec::new();
-    let mut seen_ids = std::collections::HashSet::new();
+    let effective_sites = state.config.effective_sites();
+    let sites_out = run_db(&state.storage, move |st| {
+        let mut sites_out = Vec::new();
+        let mut seen_ids = std::collections::HashSet::new();
 
-    for site in state.config.effective_sites() {
-        seen_ids.insert(site.id.to_ascii_lowercase());
-        let counts = state
-            .storage
-            .cache_counts_for_site(&site.id)
-            .unwrap_or_default();
-        let db_rec = state.storage.get_site(&site.id).ok().flatten();
-        sites_out.push(json!({
-            "id": site.id,
-            "name": site.display_name(),
-            "site_url": site.site_url,
-            "confluence_url": site.effective_confluence_root(),
-            "deployment": site.deployment.as_str(),
-            "cloud_id": site.cloud_id,
-            "account_id": site.account_id,
-            "enabled": site.enabled,
-            "issue_count": counts.issues,
-            "page_count": counts.pages,
-            "last_synced_at": db_rec.as_ref().and_then(|r| r.last_synced_at.clone()),
-            "last_error": db_rec.as_ref().and_then(|r| r.last_error.clone()),
-        }));
-    }
+        for site in effective_sites {
+            seen_ids.insert(site.id.to_ascii_lowercase());
+            let counts = st.cache_counts_for_site(&site.id).unwrap_or_default();
+            let db_rec = st.get_site(&site.id).ok().flatten();
+            sites_out.push(json!({
+                "id": site.id,
+                "name": site.display_name(),
+                "site_url": site.site_url,
+                "confluence_url": site.effective_confluence_root(),
+                "deployment": site.deployment.as_str(),
+                "cloud_id": site.cloud_id,
+                "account_id": site.account_id,
+                "enabled": site.enabled,
+                "issue_count": counts.issues,
+                "page_count": counts.pages,
+                "last_synced_at": db_rec.as_ref().and_then(|r| r.last_synced_at.clone()),
+                "last_error": db_rec.as_ref().and_then(|r| r.last_error.clone()),
+            }));
+        }
 
-    if let Ok(db_sites) = state.storage.list_sites() {
-        for rec in db_sites {
-            if seen_ids.insert(rec.site_id.to_ascii_lowercase()) {
-                let counts = state
-                    .storage
-                    .cache_counts_for_site(&rec.site_id)
-                    .unwrap_or_default();
-                sites_out.push(json!({
-                    "id": rec.site_id,
-                    "name": rec.name,
-                    "site_url": rec.site_url,
-                    "confluence_url": "",
-                    "deployment": rec.deployment,
-                    "cloud_id": null,
-                    "account_id": "default",
-                    "enabled": rec.enabled,
-                    "issue_count": counts.issues,
-                    "page_count": counts.pages,
-                    "last_synced_at": rec.last_synced_at,
-                    "last_error": rec.last_error,
-                }));
+        if let Ok(db_sites) = st.list_sites() {
+            for rec in db_sites {
+                if seen_ids.insert(rec.site_id.to_ascii_lowercase()) {
+                    let counts = st.cache_counts_for_site(&rec.site_id).unwrap_or_default();
+                    sites_out.push(json!({
+                        "id": rec.site_id,
+                        "name": rec.name,
+                        "site_url": rec.site_url,
+                        "confluence_url": "",
+                        "deployment": rec.deployment,
+                        "cloud_id": null,
+                        "account_id": "default",
+                        "enabled": rec.enabled,
+                        "issue_count": counts.issues,
+                        "page_count": counts.pages,
+                        "last_synced_at": rec.last_synced_at,
+                        "last_error": rec.last_error,
+                    }));
+                }
             }
         }
-    }
+        Ok(sites_out)
+    })
+    .await?;
 
     Ok(Json(json!({
         "active_site": state.config.active_site,
@@ -863,18 +878,21 @@ async fn list_projects(
     Query(query): Query<RefreshQuery>,
 ) -> Result<Json<Value>, ApiError> {
     let target_site = resolve_single_site_id(&state, query.site.as_deref())?;
-    let cached = state.storage.list_projects_for_site(&target_site)?;
+    let cached = {
+        let sid = target_site.clone();
+        run_db(&state.storage, move |st| st.list_projects_for_site(&sid)).await?
+    };
     let projects = if query.refresh || cached.is_empty() {
         let (target_site, client) = resolve_site_client(&state, query.site.as_deref())?;
         match client.list_projects().await {
             Ok(fetched) => {
-                let _ = state.storage.upsert_projects_for_site(&target_site, &fetched);
-                let stored = state.storage.list_projects_for_site(&target_site)?;
-                if stored.is_empty() {
-                    fetched
-                } else {
-                    stored
-                }
+                let sid = target_site.clone();
+                run_db(&state.storage, move |st| {
+                    let _ = st.upsert_projects_for_site(&sid, &fetched);
+                    let stored = st.list_projects_for_site(&sid)?;
+                    Ok(if stored.is_empty() { fetched } else { stored })
+                })
+                .await?
             }
             Err(err) if !query.refresh && !cached.is_empty() => {
                 let _ = err;
@@ -906,20 +924,28 @@ async fn list_boards(
         .map(str::trim)
         .filter(|s| !s.is_empty());
     let target_site = resolve_single_site_id(&state, query.site.as_deref())?;
-    let cached = state.storage.list_boards_for_site(&target_site, project)?;
+    let cached = {
+        let sid = target_site.clone();
+        let proj = project.map(str::to_string);
+        run_db(&state.storage, move |st| {
+            st.list_boards_for_site(&sid, proj.as_deref())
+        })
+        .await?
+    };
     let boards = if query.refresh || cached.is_empty() {
         if !query.refresh && state.config.site_url.trim().is_empty() && state.config.sites.is_empty() {
             cached
         } else {
             let (target_site, client) = resolve_site_client(&state, query.site.as_deref())?;
             let fetched = client.list_boards(project).await?;
-            let _ = state.storage.upsert_boards_for_site(&target_site, &fetched);
-            let stored = state.storage.list_boards_for_site(&target_site, project)?;
-            if stored.is_empty() {
-                fetched
-            } else {
-                stored
-            }
+            let sid = target_site.clone();
+            let proj = project.map(str::to_string);
+            run_db(&state.storage, move |st| {
+                let _ = st.upsert_boards_for_site(&sid, &fetched);
+                let stored = st.list_boards_for_site(&sid, proj.as_deref())?;
+                Ok(if stored.is_empty() { fetched } else { stored })
+            })
+            .await?
         }
     } else {
         cached
@@ -935,11 +961,20 @@ async fn list_board_sprints(
 ) -> Result<Json<Value>, ApiError> {
     let target_site = resolve_single_site_id(&state, query.site.as_deref())?;
     let sprints = if query.offline {
-        state.storage.list_sprints_for_site(&target_site, board_id)?
+        let sid = target_site.clone();
+        run_db(&state.storage, move |st| {
+            st.list_sprints_for_site(&sid, board_id)
+        })
+        .await?
     } else {
         let (target_site, client) = resolve_site_client(&state, query.site.as_deref())?;
         let fetched = client.list_board_sprints(board_id).await?;
-        let _ = state.storage.upsert_sprints_for_site(&target_site, &fetched);
+        let sid = target_site.clone();
+        let to_store = fetched.clone();
+        let _ = run_db(&state.storage, move |st| {
+            st.upsert_sprints_for_site(&sid, &to_store)
+        })
+        .await;
         fetched
     };
 
@@ -956,29 +991,34 @@ async fn list_board_issues(
     let target_site = resolve_single_site_id(&state, query.site.as_deref())?;
     let page = if query.offline {
         // One row past the page tells whether the cache holds more.
-        slice_page(
-            state.storage.list_board_issues_for_site(
-                &target_site,
-                board_id,
-                query.sprint_id,
-                start.saturating_add(limit).saturating_add(1),
-            )?,
-            start,
-            limit,
-        )
+        let sid = target_site.clone();
+        let sprint_id = query.sprint_id;
+        let fetch_limit = start.saturating_add(limit).saturating_add(1);
+        let rows = run_db(&state.storage, move |st| {
+            st.list_board_issues_for_site(&sid, board_id, sprint_id, fetch_limit)
+        })
+        .await?;
+        slice_page(rows, start, limit)
     } else {
         let (target_site, client) = resolve_site_client(&state, query.site.as_deref())?;
         let page = client
             .list_board_issues_page(board_id, query.sprint_id, limit, start)
             .await?;
         // Prunes only on a first page the server marked as the last one.
-        let _ = state.storage.record_board_issues_page_for_site(
-            &target_site,
-            board_id,
-            query.sprint_id,
-            &page,
-            start == 0,
-        );
+        let sid = target_site.clone();
+        let sprint_id = query.sprint_id;
+        let page_to_store = page.clone();
+        let first_page = start == 0;
+        let _ = run_db(&state.storage, move |st| {
+            st.record_board_issues_page_for_site(
+                &sid,
+                board_id,
+                sprint_id,
+                &page_to_store,
+                first_page,
+            )
+        })
+        .await;
         page
     };
 
@@ -1022,17 +1062,20 @@ async fn list_issues(
             ));
         }
         let target_site = resolve_single_site_id(&state, query.site.as_deref())?;
-        let filter = IssueListFilter {
-            project,
-            status_contains: status,
-            ..Default::default()
-        };
-        let issues = state
-            .storage
-            .list_issues_filtered_for_site(&target_site, &filter, limit)?;
-        let total = state
-            .storage
-            .count_issues_filtered_for_site(&target_site, &filter)?;
+        let sid = target_site.clone();
+        let proj = project.map(str::to_string);
+        let st_filter = status.map(str::to_string);
+        let (issues, total) = run_db(&state.storage, move |st| {
+            let filter = IssueListFilter {
+                project: proj.as_deref(),
+                status_contains: st_filter.as_deref(),
+                ..Default::default()
+            };
+            let issues = st.list_issues_filtered_for_site(&sid, &filter, limit)?;
+            let total = st.count_issues_filtered_for_site(&sid, &filter)?;
+            Ok((issues, total))
+        })
+        .await?;
         return Ok(Json(json!({
             "site_id": target_site,
             "issues": issues,
@@ -1063,7 +1106,14 @@ async fn list_issues(
     let page = client
         .search_issues_jql(&jql, limit, page_token, query.start_at)
         .await?;
-    let _ = state.storage.upsert_issues_for_site(&target_site, &page.issues);
+    {
+        let sid = target_site.clone();
+        let to_store = page.issues.clone();
+        let _ = run_db(&state.storage, move |st| {
+            st.upsert_issues_for_site(&sid, &to_store)
+        })
+        .await;
+    }
 
     Ok(Json(json!({
         "site_id": target_site,
@@ -1133,7 +1183,14 @@ async fn create_issue(
             }
         }
     };
-    let _ = state.storage.upsert_issue_detail_for_site(&target_site, &detail);
+    {
+        let sid = target_site.clone();
+        let detail_clone = detail.clone();
+        let _ = run_db(&state.storage, move |st| {
+            st.upsert_issue_detail_for_site(&sid, &detail_clone)
+        })
+        .await;
+    }
 
     let mut payload = json!({ "ok": true, "site_id": target_site, "issue": detail });
     if let Some(user) = resolved_assignee {
@@ -1177,14 +1234,18 @@ async fn get_issue(
 
     if query.offline {
         let target_site = resolve_single_site_id(&state, query.site.as_deref())?;
-        let detail = state
-            .storage
-            .get_issue_detail_for_site(&target_site, key)?
+        let sid = target_site.clone();
+        let key_owned = key.to_string();
+        let (detail_opt, stale) = run_db(&state.storage, move |st| {
+            let detail = st.get_issue_detail_for_site(&sid, &key_owned)?;
+            let stale = st
+                .is_issue_detail_stale_for_site(&sid, &key_owned)
+                .unwrap_or(false);
+            Ok((detail, stale))
+        })
+        .await?;
+        let detail = detail_opt
             .ok_or_else(|| ApiError::not_found(format!("issue not found in cache: {key}")))?;
-        let stale = state
-            .storage
-            .is_issue_detail_stale_for_site(&target_site, key)
-            .unwrap_or(false);
         return Ok(Json(json!({
             "site_id": target_site,
             "detail_stale": stale,
@@ -1197,19 +1258,34 @@ async fn get_issue(
         Ok(res) => res,
         Err(err) => {
             if is_not_found_error(&err) {
-                let _ = state.storage.delete_issue_for_site(&target_site, key);
+                let sid = target_site.clone();
+                let key_owned = key.to_string();
+                let _ = run_db(&state.storage, move |st| {
+                    st.delete_issue_for_site(&sid, &key_owned)
+                })
+                .await;
             }
             return Err(err.into());
         }
     };
-    let _ = state.storage.upsert_issue_detail_for_site_merging(
-        &target_site,
-        &mut fetched,
-        !meta.remote_links_ok,
-    );
+    let sid = target_site.clone();
+    let preserve_links = !meta.remote_links_ok;
+    if let Ok(updated) = run_db(&state.storage, move |st| {
+        let _ = st.upsert_issue_detail_for_site_merging(&sid, &mut fetched, preserve_links);
+        Ok(fetched)
+    })
+    .await
+    {
+        return Ok(Json(json!({
+            "site_id": target_site,
+            "detail_stale": false,
+            "issue": format_issue(&updated),
+        })));
+    }
 
-    Ok(Json(
-        json!({ "site_id": target_site, "detail_stale": false, "issue": format_issue(&fetched) }),
+    Err(ApiError::new(
+        StatusCode::INTERNAL_SERVER_ERROR,
+        "failed to persist issue detail",
     ))
 }
 
@@ -1283,9 +1359,14 @@ async fn patch_issue(
             }
         }
     };
-    let _ = state
-        .storage
-        .upsert_issue_detail_for_site(&target_site, &detail);
+    {
+        let sid = target_site.clone();
+        let detail_clone = detail.clone();
+        let _ = run_db(&state.storage, move |st| {
+            st.upsert_issue_detail_for_site(&sid, &detail_clone)
+        })
+        .await;
+    }
 
     let mut payload = json!({ "ok": true, "site_id": target_site, "issue": detail });
     if let Some(user) = resolved_assignee {
@@ -1308,7 +1389,14 @@ async fn delete_issue(
     }
     let (target_site, client) = resolve_write_client(&state, query.site.as_deref())?;
     client.delete_issue(key).await?;
-    let _ = state.storage.delete_issue_for_site(&target_site, key);
+    {
+        let sid = target_site.clone();
+        let key_owned = key.to_string();
+        let _ = run_db(&state.storage, move |st| {
+            st.delete_issue_for_site(&sid, &key_owned)
+        })
+        .await;
+    }
     Ok(Json(json!({ "ok": true, "site_id": target_site, "key": key })))
 }
 
@@ -1441,17 +1529,27 @@ async fn add_issue_comment(
     let comment = client
         .add_issue_comment(key, &body.body_markdown)
         .await?;
-    if state
-        .storage
-        .get_issue_detail_for_site(&target_site, key)
-        .ok()
-        .flatten()
-        .is_some()
-    {
-        let _ = state
-            .storage
-            .append_issue_comment_for_site(&target_site, key, &comment);
-    } else {
+    let appended = {
+        let sid = target_site.clone();
+        let key_owned = key.to_string();
+        let comment_clone = comment.clone();
+        run_db(&state.storage, move |st| {
+            if st
+                .get_issue_detail_for_site(&sid, &key_owned)
+                .ok()
+                .flatten()
+                .is_some()
+            {
+                let _ = st.append_issue_comment_for_site(&sid, &key_owned, &comment_clone);
+                Ok(true)
+            } else {
+                Ok(false)
+            }
+        })
+        .await
+        .unwrap_or(false)
+    };
+    if !appended {
         refresh_issue_cache_after_write(&client, &state.storage, &target_site, key).await;
     }
     Ok(Json(json!({ "ok": true, "site_id": target_site, "comment": comment })))
@@ -1464,7 +1562,10 @@ async fn list_spaces(
     let limit = clamp_limit(query.limit.unwrap_or(50));
     let start = parse_offset_cursor(query.cursor.as_deref()).map_err(ApiError::bad_request)?;
     let target_site = resolve_single_site_id(&state, query.site.as_deref())?;
-    let cached = state.storage.list_spaces_for_site(&target_site)?;
+    let cached = {
+        let sid = target_site.clone();
+        run_db(&state.storage, move |st| st.list_spaces_for_site(&sid)).await?
+    };
     let spaces = if query.refresh || cached.is_empty() {
         if !query.refresh && state.config.site_url.trim().is_empty() && state.config.sites.is_empty() {
             cached
@@ -1473,13 +1574,13 @@ async fn list_spaces(
             // The whole catalog, whatever "limit" says: a partial catalog in the cache would
             // be what every later request gets back.
             let fetched = client.list_all_spaces().await?;
-            let _ = state.storage.upsert_spaces_for_site(&target_site, &fetched);
-            let stored = state.storage.list_spaces_for_site(&target_site)?;
-            if stored.is_empty() {
-                fetched
-            } else {
-                stored
-            }
+            let sid = target_site.clone();
+            run_db(&state.storage, move |st| {
+                let _ = st.upsert_spaces_for_site(&sid, &fetched);
+                let stored = st.list_spaces_for_site(&sid)?;
+                Ok(if stored.is_empty() { fetched } else { stored })
+            })
+            .await?
         }
     } else {
         cached
@@ -1504,27 +1605,27 @@ async fn list_space_pages(
     let cursor = query.cursor.as_deref().map(str::trim).filter(|c| !c.is_empty());
     let page = if query.offline {
         let start = parse_offset_cursor(cursor).map_err(ApiError::bad_request)?;
-        slice_page(
-            state
-                .storage
-                .list_space_root_pages_for_site(&target_site, space)?,
-            start,
-            limit,
-        )
+        let sid = target_site.clone();
+        let space_owned = space.to_string();
+        let rows = run_db(&state.storage, move |st| {
+            st.list_space_root_pages_for_site(&sid, &space_owned)
+        })
+        .await?;
+        slice_page(rows, start, limit)
     } else {
         let (target_site, client) = resolve_site_client(&state, query.site.as_deref())?;
         check_listing_cursor(&client, cursor)?;
         let mut page = client.list_space_root_pages_page(space, limit, cursor).await?;
         // Prunes only on a first page the server marked as the last one.
-        let _ = state.storage.record_root_pages_page_for_site(
-            &target_site,
-            space,
-            &page,
-            cursor.is_none(),
-        );
-        let _ = state
-            .storage
-            .overlay_children_state_for_site(&target_site, &mut page.items);
+        let sid = target_site.clone();
+        let space_owned = space.to_string();
+        let first_page = cursor.is_none();
+        page = run_db(&state.storage, move |st| {
+            let _ = st.record_root_pages_page_for_site(&sid, &space_owned, &page, first_page);
+            let _ = st.overlay_children_state_for_site(&sid, &mut page.items);
+            Ok(page)
+        })
+        .await?;
         page
     };
     Ok(Json(json!({
@@ -1544,14 +1645,18 @@ async fn get_page(
     let id = id.trim();
     if query.offline {
         let target_site = resolve_single_site_id(&state, query.site.as_deref())?;
-        let detail = state
-            .storage
-            .get_page_detail_for_site(&target_site, id)?
+        let sid = target_site.clone();
+        let id_owned = id.to_string();
+        let (detail_opt, stale) = run_db(&state.storage, move |st| {
+            let detail = st.get_page_detail_for_site(&sid, &id_owned)?;
+            let stale = st
+                .is_page_detail_stale_for_site(&sid, &id_owned)
+                .unwrap_or(false);
+            Ok((detail, stale))
+        })
+        .await?;
+        let detail = detail_opt
             .ok_or_else(|| ApiError::not_found(format!("page not found in cache: {id}")))?;
-        let stale = state
-            .storage
-            .is_page_detail_stale_for_site(&target_site, id)
-            .unwrap_or(false);
         return Ok(Json(json!({
             "site_id": target_site,
             "detail_stale": stale,
@@ -1567,14 +1672,22 @@ async fn get_page(
         Ok(res) => res,
         Err(err) => {
             if is_not_found_error(&err) {
-                let _ = state.storage.delete_page_for_site(&target_site, id);
+                let sid = target_site.clone();
+                let id_owned = id.to_string();
+                let _ = run_db(&state.storage, move |st| {
+                    st.delete_page_for_site(&sid, &id_owned)
+                })
+                .await;
             }
             return Err(err.into());
         }
     };
-    let _ = state
-        .storage
-        .upsert_page_detail_for_site_with_meta(&target_site, &mut fetched, meta);
+    let sid = target_site.clone();
+    let fetched = run_db(&state.storage, move |st| {
+        let _ = st.upsert_page_detail_for_site_with_meta(&sid, &mut fetched, meta);
+        Ok(fetched)
+    })
+    .await?;
     Ok(Json(
         json!({ "site_id": target_site, "detail_stale": false, "page": fetched.output(query.compact) }),
     ))
@@ -1589,7 +1702,12 @@ async fn list_child_pages(
     let target_site = resolve_single_site_id(&state, query.site.as_deref())?;
     let cursor = query.cursor.as_deref().map(str::trim).filter(|c| !c.is_empty());
     let page = if query.offline {
-        let cached = state.storage.list_child_pages_for_site(&target_site, id)?;
+        let sid = target_site.clone();
+        let id_owned = id.to_string();
+        let cached = run_db(&state.storage, move |st| {
+            st.list_child_pages_for_site(&sid, &id_owned)
+        })
+        .await?;
         match (query.limit, cursor) {
             // Without "limit" and "cursor" the cached children come back whole, as before.
             (None, None) => ListPage {
@@ -1609,15 +1727,15 @@ async fn list_child_pages(
         let limit = clamp_limit(query.limit.unwrap_or(100));
         let mut page = client.list_child_pages_page(id, limit, cursor).await?;
         // Prunes only on a first page the server marked as the last one.
-        let _ = state.storage.record_child_pages_page_for_site(
-            &target_site,
-            id,
-            &page,
-            cursor.is_none(),
-        );
-        let _ = state
-            .storage
-            .overlay_children_state_for_site(&target_site, &mut page.items);
+        let sid = target_site.clone();
+        let id_owned = id.to_string();
+        let first_page = cursor.is_none();
+        page = run_db(&state.storage, move |st| {
+            let _ = st.record_child_pages_page_for_site(&sid, &id_owned, &page, first_page);
+            let _ = st.overlay_children_state_for_site(&sid, &mut page.items);
+            Ok(page)
+        })
+        .await?;
         page
     };
     Ok(Json(json!({
@@ -1651,7 +1769,14 @@ async fn create_page(
         body_markdown: body.body_markdown,
     };
     let detail = client.create_page(&req).await?;
-    let _ = state.storage.upsert_page_detail_for_site(&target_site, &detail);
+    {
+        let sid = target_site.clone();
+        let detail_clone = detail.clone();
+        let _ = run_db(&state.storage, move |st| {
+            st.upsert_page_detail_for_site(&sid, &detail_clone)
+        })
+        .await;
+    }
     Ok(Json(json!({ "ok": true, "site_id": target_site, "page": detail })))
 }
 
@@ -1681,9 +1806,14 @@ async fn update_page(
             body.version_message,
         )
         .await?;
-    let _ = state
-        .storage
-        .upsert_page_detail_for_site(&target_site, &detail);
+    {
+        let sid = target_site.clone();
+        let detail_clone = detail.clone();
+        let _ = run_db(&state.storage, move |st| {
+            st.upsert_page_detail_for_site(&sid, &detail_clone)
+        })
+        .await;
+    }
     Ok(Json(
         json!({ "ok": true, "site_id": target_site, "page": detail }),
     ))
@@ -1700,7 +1830,14 @@ async fn delete_page(
     }
     let (target_site, client) = resolve_write_client(&state, query.site.as_deref())?;
     client.delete_page(id).await?;
-    let _ = state.storage.delete_page_for_site(&target_site, id);
+    {
+        let sid = target_site.clone();
+        let id_owned = id.to_string();
+        let _ = run_db(&state.storage, move |st| {
+            st.delete_page_for_site(&sid, &id_owned)
+        })
+        .await;
+    }
     Ok(Json(json!({ "ok": true, "site_id": target_site, "id": id })))
 }
 
@@ -1730,17 +1867,27 @@ async fn add_page_comment(
     let comment = client
         .add_page_comment(id, &body.body_markdown)
         .await?;
-    if state
-        .storage
-        .get_page_detail_for_site(&target_site, id)
-        .ok()
-        .flatten()
-        .is_some()
-    {
-        let _ = state
-            .storage
-            .append_page_comment_for_site(&target_site, id, &comment);
-    } else {
+    let appended = {
+        let sid = target_site.clone();
+        let id_owned = id.to_string();
+        let comment_clone = comment.clone();
+        run_db(&state.storage, move |st| {
+            if st
+                .get_page_detail_for_site(&sid, &id_owned)
+                .ok()
+                .flatten()
+                .is_some()
+            {
+                let _ = st.append_page_comment_for_site(&sid, &id_owned, &comment_clone);
+                Ok(true)
+            } else {
+                Ok(false)
+            }
+        })
+        .await
+        .unwrap_or(false)
+    };
+    if !appended {
         refresh_page_cache_after_write(&client, &state.storage, &target_site, id).await;
     }
     Ok(Json(json!({ "ok": true, "site_id": target_site, "comment": comment })))
@@ -1770,17 +1917,15 @@ async fn search(
     let scoped_site = resolve_site_id(&state, query.site.as_deref())?;
 
     let hits: Vec<FederatedSearchHit> = if !query.remote {
-        let scoped_hits = match scope.as_str() {
-            "jira" => state
-                .storage
-                .search_issues_scoped(q, scoped_site.as_deref(), limit)?,
-            "confluence" => state
-                .storage
-                .search_pages_scoped(q, scoped_site.as_deref(), limit)?,
-            _ => state
-                .storage
-                .unified_search_scoped(q, scoped_site.as_deref(), limit)?,
-        };
+        let q_owned = q.to_string();
+        let scope_owned = scope.clone();
+        let scoped_site_clone = scoped_site.clone();
+        let scoped_hits = run_db(&state.storage, move |st| match scope_owned.as_str() {
+            "jira" => st.search_issues_scoped(&q_owned, scoped_site_clone.as_deref(), limit),
+            "confluence" => st.search_pages_scoped(&q_owned, scoped_site_clone.as_deref(), limit),
+            _ => st.unified_search_scoped(&q_owned, scoped_site_clone.as_deref(), limit),
+        })
+        .await?;
         scoped_hits
             .into_iter()
             .map(|(sid, hit)| {
@@ -1818,15 +1963,23 @@ async fn search(
         };
         let (jira_res, conf_res) = tokio::join!(jira_fut, conf_fut);
         if let Some(page) = jira_res? {
-            let _ = state
-                .storage
-                .upsert_issues_for_site(&target_site, &page.issues);
+            let sid = target_site.clone();
+            let to_store = page.issues.clone();
+            let _ = run_db(&state.storage, move |st| {
+                st.upsert_issues_for_site(&sid, &to_store)
+            })
+            .await;
             combined.extend(page.issues.iter().map(|i| {
                 FederatedSearchHit::new(target_site.clone(), target_name.clone(), issue_to_hit(i))
             }));
         }
         if let Some(pages) = conf_res? {
-            let _ = state.storage.upsert_pages_for_site(&target_site, &pages);
+            let sid = target_site.clone();
+            let to_store = pages.clone();
+            let _ = run_db(&state.storage, move |st| {
+                st.upsert_pages_for_site(&sid, &to_store)
+            })
+            .await;
             combined.extend(pages.iter().map(|p| {
                 FederatedSearchHit::new(target_site.clone(), target_name.clone(), page_to_hit(p))
             }));
@@ -1862,7 +2015,7 @@ async fn sync_workspace(
             None,
         )
         .await;
-        let counts = state.storage.cache_counts()?;
+        let counts = run_db(&state.storage, |st| st.cache_counts()).await?;
         return Ok(Json(json!({
             "ok": outcome.succeeded_sites > 0,
             "summary": outcome.summary,
@@ -1872,7 +2025,7 @@ async fn sync_workspace(
     }
     let (site_id, client) = resolve_site_client(&state, scope.as_deref())?;
     let summary = sync::bootstrap_workspace_for_site(&site_id, &client, &state.storage).await?;
-    let counts = state.storage.cache_counts()?;
+    let counts = run_db(&state.storage, |st| st.cache_counts()).await?;
     Ok(Json(json!({
         "ok": true,
         "site_id": site_id,

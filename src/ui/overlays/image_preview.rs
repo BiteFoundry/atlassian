@@ -716,8 +716,13 @@ impl ImagePreviewOverlay {
                     }
                 }
             } else if target_rect.width > 0 && target_rect.height > 0 {
+                let start = (sy as usize).min(rendered.lines.len());
+                let end = start
+                    .saturating_add(target_rect.height as usize)
+                    .min(rendered.lines.len());
+                let visible_lines = rendered.lines[start..end].to_vec();
                 frame.render_widget(
-                    Paragraph::new(rendered.lines.clone()).scroll((sy, sx)),
+                    Paragraph::new(visible_lines).scroll((0, sx)),
                     target_rect,
                 );
             }

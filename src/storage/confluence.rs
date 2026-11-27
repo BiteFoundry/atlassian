@@ -29,7 +29,7 @@ impl Storage {
         let mut conn = self.lock_conn()?;
         let tx = conn.transaction()?;
         {
-            let mut stmt = tx.prepare(
+            let mut stmt = tx.prepare_cached(
                 "
                 INSERT INTO spaces (site_id, key, id, name, space_type, homepage_id, description, web_url, pinned)
                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
@@ -66,8 +66,8 @@ impl Storage {
     }
 
     pub fn list_spaces_for_site(&self, site_id: &str) -> Result<Vec<SpaceSummary>> {
-        let conn = self.lock_conn()?;
-        let mut stmt = conn.prepare(
+        let conn = self.read_conn()?;
+        let mut stmt = conn.prepare_cached(
             "
             SELECT id, key, name, space_type, homepage_id, description, web_url, pinned
             FROM spaces
@@ -80,8 +80,8 @@ impl Storage {
     }
 
     pub fn list_spaces_all_sites(&self) -> Result<Vec<(String, SpaceSummary)>> {
-        let conn = self.lock_conn()?;
-        let mut stmt = conn.prepare(
+        let conn = self.read_conn()?;
+        let mut stmt = conn.prepare_cached(
             "
             SELECT site_id, id, key, name, space_type, homepage_id, description, web_url, pinned
             FROM spaces
@@ -361,8 +361,8 @@ impl Storage {
         if ids.is_empty() {
             return Ok(HashMap::new());
         }
-        let conn = self.lock_conn()?;
-        let mut stmt = conn.prepare(
+        let conn = self.read_conn()?;
+        let mut stmt = conn.prepare_cached(
             "SELECT title FROM pages WHERE site_id = ?1 AND id = ?2",
         )?;
         let mut titles = HashMap::new();
@@ -389,24 +389,23 @@ impl Storage {
         site_id: &str,
         page_id: &str,
     ) -> Result<Option<PageDetail>> {
-        let conn = self.lock_conn()?;
-        let row_opt: Option<(PageSummary, Option<String>)> = conn
-            .query_row(
-                "
-                SELECT
-                    id, space_id, space_key, parent_id, title, status,
-                    version_number, author_name, updated_at, position, has_children, web_url,
-                    detail_json
-                FROM pages
-                WHERE site_id = ?1 AND id = ?2
-                ",
-                params![site_id, page_id],
-                |row| {
-                    let summary = map_page_summary_row(row, 0)?;
-                    let detail_json: Option<String> = row.get(12)?;
-                    Ok((summary, detail_json))
-                },
-            )
+        let conn = self.read_conn()?;
+        let mut stmt = conn.prepare_cached(
+            "
+            SELECT
+                id, space_id, space_key, parent_id, title, status,
+                version_number, author_name, updated_at, position, has_children, web_url,
+                detail_json
+            FROM pages
+            WHERE site_id = ?1 AND id = ?2
+            ",
+        )?;
+        let row_opt: Option<(PageSummary, Option<String>)> = stmt
+            .query_row(params![site_id, page_id], |row| {
+                let summary = map_page_summary_row(row, 0)?;
+                let detail_json: Option<String> = row.get(12)?;
+                Ok((summary, detail_json))
+            })
             .optional()?;
         match row_opt {
             Some((summary, Some(json_str))) if !json_str.trim().is_empty() => {
@@ -424,13 +423,14 @@ impl Storage {
     /// Returns `true` when cached `detail_json` was captured at an older `version_number` than
     /// the latest list/sync summary row for `(site_id, page_id)`.
     pub fn is_page_detail_stale_for_site(&self, site_id: &str, page_id: &str) -> Result<bool> {
-        let conn = self.lock_conn()?;
-        let row_opt: Option<(i32, Option<i32>, Option<String>)> = conn
-            .query_row(
-                "SELECT version_number, detail_version, detail_json FROM pages WHERE site_id = ?1 AND id = ?2",
-                params![site_id, page_id],
-                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
-            )
+        let conn = self.read_conn()?;
+        let mut stmt = conn.prepare_cached(
+            "SELECT version_number, detail_version, detail_json FROM pages WHERE site_id = ?1 AND id = ?2",
+        )?;
+        let row_opt: Option<(i32, Option<i32>, Option<String>)> = stmt
+            .query_row(params![site_id, page_id], |row| {
+                Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+            })
             .optional()?;
         let Some((row_ver, detail_ver, detail_json)) = row_opt else {
             return Ok(false);
@@ -453,13 +453,12 @@ impl Storage {
         site_id: &str,
         page_id: &str,
     ) -> Result<Option<i32>> {
-        let conn = self.lock_conn()?;
-        let row_opt: Option<(Option<i32>, Option<String>)> = conn
-            .query_row(
-                "SELECT detail_version, detail_json FROM pages WHERE site_id = ?1 AND id = ?2",
-                params![site_id, page_id],
-                |row| Ok((row.get(0)?, row.get(1)?)),
-            )
+        let conn = self.read_conn()?;
+        let mut stmt = conn.prepare_cached(
+            "SELECT detail_version, detail_json FROM pages WHERE site_id = ?1 AND id = ?2",
+        )?;
+        let row_opt: Option<(Option<i32>, Option<String>)> = stmt
+            .query_row(params![site_id, page_id], |row| Ok((row.get(0)?, row.get(1)?)))
             .optional()?;
         let Some((detail_ver, detail_json)) = row_opt else {
             return Ok(None);
@@ -480,13 +479,12 @@ impl Storage {
         site_id: &str,
         page_id: &str,
     ) -> Result<Option<i32>> {
-        let conn = self.lock_conn()?;
-        let ver: Option<i32> = conn
-            .query_row(
-                "SELECT version_number FROM pages WHERE site_id = ?1 AND id = ?2",
-                params![site_id, page_id],
-                |row| row.get(0),
-            )
+        let conn = self.read_conn()?;
+        let mut stmt = conn.prepare_cached(
+            "SELECT version_number FROM pages WHERE site_id = ?1 AND id = ?2",
+        )?;
+        let ver: Option<i32> = stmt
+            .query_row(params![site_id, page_id], |row| row.get(0))
             .optional()?;
         Ok(ver)
     }
@@ -740,9 +738,9 @@ impl Storage {
         if pages.is_empty() {
             return Ok(());
         }
-        let conn = self.lock_conn()?;
+        let conn = self.read_conn()?;
         let mut stmt =
-            conn.prepare("SELECT has_children FROM pages WHERE site_id = ?1 AND id = ?2")?;
+            conn.prepare_cached("SELECT has_children FROM pages WHERE site_id = ?1 AND id = ?2")?;
         for page in pages {
             if let Some(raw) = stmt
                 .query_row(params![site_id, &page.id], |row| row.get::<_, i32>(0))
@@ -767,9 +765,9 @@ impl Storage {
         if limit == 0 {
             return Ok(Vec::new());
         }
-        let conn = self.lock_conn()?;
+        let conn = self.read_conn()?;
         if let Some(sk) = space_key {
-            let mut stmt = conn.prepare(
+            let mut stmt = conn.prepare_cached(
                 "
                 SELECT
                     id, space_id, space_key, parent_id, title, status,
@@ -785,7 +783,7 @@ impl Storage {
             })?;
             Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
         } else {
-            let mut stmt = conn.prepare(
+            let mut stmt = conn.prepare_cached(
                 "
                 SELECT
                     id, space_id, space_key, parent_id, title, status,
@@ -812,8 +810,8 @@ impl Storage {
         site_id: &str,
         space_key: &str,
     ) -> Result<Vec<PageSummary>> {
-        let conn = self.lock_conn()?;
-        let mut stmt = conn.prepare(
+        let conn = self.read_conn()?;
+        let mut stmt = conn.prepare_cached(
             "
             SELECT
                 id, space_id, space_key, parent_id, title, status,
@@ -838,8 +836,8 @@ impl Storage {
         site_id: &str,
         parent_id: &str,
     ) -> Result<Vec<PageSummary>> {
-        let conn = self.lock_conn()?;
-        let mut stmt = conn.prepare(
+        let conn = self.read_conn()?;
+        let mut stmt = conn.prepare_cached(
             "
             SELECT
                 id, space_id, space_key, parent_id, title, status,
@@ -871,8 +869,8 @@ impl Storage {
         if limit == 0 {
             return Ok(Vec::new());
         }
-        let conn = self.lock_conn()?;
-        let mut stmt = conn.prepare(
+        let conn = self.read_conn()?;
+        let mut stmt = conn.prepare_cached(
             "
             SELECT
                 p.site_id,
@@ -901,14 +899,12 @@ impl Storage {
     pub fn delete_page_for_site(&self, site_id: &str, page_id: &str) -> Result<()> {
         let mut conn = self.lock_conn()?;
         let tx = conn.transaction()?;
-        tx.execute(
-            "DELETE FROM pages_fts WHERE site_id = ?1 AND page_id = ?2",
-            params![site_id, page_id],
-        )?;
-        tx.execute(
-            "DELETE FROM pages WHERE site_id = ?1 AND id = ?2",
-            params![site_id, page_id],
-        )?;
+        tx.prepare_cached(
+            "DELETE FROM pages_fts WHERE rowid = (SELECT rowid FROM pages WHERE site_id = ?1 AND id = ?2)",
+        )?
+        .execute(params![site_id, page_id])?;
+        tx.prepare_cached("DELETE FROM pages WHERE site_id = ?1 AND id = ?2")?
+            .execute(params![site_id, page_id])?;
         tx.commit()?;
         Ok(())
     }
@@ -928,23 +924,24 @@ impl Storage {
         if trimmed.is_empty() || limit == 0 {
             return Ok(Vec::new());
         }
-        let conn = self.lock_conn()?;
+        let conn = self.read_conn()?;
         let mut results: Vec<(String, UnifiedSearchHit)> = Vec::new();
         let mut seen = HashSet::<(String, String)>::new();
 
-        if trimmed.chars().count() >= 3 {
-            if let Some(fts_q) = build_fts_query(trimmed) {
-                if let Ok(fts_hits) = run_page_fts_search(&conn, &fts_q, trimmed, site_id, limit) {
-                    for (sid, hit) in fts_hits {
-                        if seen.insert((sid.clone(), hit.id_or_key.clone())) {
-                            results.push((sid, hit));
-                        }
+        let fts_q = build_fts_query(trimmed);
+        if let Some(ref fts_q) = fts_q {
+            if let Ok(fts_hits) = run_page_fts_search(&conn, fts_q, trimmed, site_id, limit) {
+                for (sid, hit) in fts_hits {
+                    if seen.insert((sid.clone(), hit.id_or_key.clone())) {
+                        results.push((sid, hit));
                     }
                 }
             }
         }
 
-        if results.len() < limit {
+        // Only fall back to full-table LIKE scan when the query has a <3-char CJK/short token
+        // (so FTS5 trigram cannot index it) or when FTS5 returned 0 hits.
+        if fts_q.is_none() || results.is_empty() {
             let like_hits = run_page_like_search(&conn, trimmed, site_id, limit)?;
             for (sid, hit) in like_hits {
                 if seen.insert((sid.clone(), hit.id_or_key.clone())) {
@@ -1139,7 +1136,7 @@ fn upsert_page_row(
         0i32
     };
 
-    conn.execute(
+    conn.prepare_cached(
         "
         INSERT INTO pages (
             site_id, id, space_id, space_key, parent_id, title, status,
@@ -1165,32 +1162,30 @@ fn upsert_page_row(
             has_children = CASE WHEN excluded.has_children != 0 THEN excluded.has_children ELSE pages.has_children END,
             web_url = CASE WHEN excluded.web_url != '' THEN excluded.web_url ELSE pages.web_url END
         ",
-        params![
-            site_id,
-            page.id,
-            incoming_space_id,
-            resolved_space_key,
-            incoming_parent,
-            page.title,
-            page.status,
-            page.version_number,
-            page.author_name,
-            page.updated_at,
-            page.position,
-            match page.has_children {
-                Some(true) => 1i32,
-                Some(false) => 2i32,
-                None => 0i32,
-            },
-            page.web_url,
-            authoritative_flag,
-        ],
-    )?;
+    )?
+    .execute(params![
+        site_id,
+        page.id,
+        incoming_space_id,
+        resolved_space_key,
+        incoming_parent,
+        page.title,
+        page.status,
+        page.version_number,
+        page.author_name,
+        page.updated_at,
+        page.position,
+        match page.has_children {
+            Some(true) => 1i32,
+            Some(false) => 2i32,
+            None => 0i32,
+        },
+        page.web_url,
+        authoritative_flag,
+    ])?;
     if let Some(pid) = incoming_parent {
-        conn.execute(
-            "UPDATE pages SET has_children = 1 WHERE site_id = ?1 AND id = ?2",
-            params![site_id, pid],
-        )?;
+        conn.prepare_cached("UPDATE pages SET has_children = 1 WHERE site_id = ?1 AND id = ?2")?
+            .execute(params![site_id, pid])?;
     }
     Ok(UpsertPageRowOutcome {
         applied: true,
@@ -1206,17 +1201,37 @@ fn refresh_page_fts(
     title: &str,
     body_text: &str,
 ) -> Result<()> {
-    conn.execute(
-        "DELETE FROM pages_fts WHERE site_id = ?1 AND page_id = ?2",
-        params![site_id, page_id],
-    )?;
-    conn.execute(
+    let Some(rowid): Option<i64> = conn
+        .prepare_cached("SELECT rowid FROM pages WHERE site_id = ?1 AND id = ?2")?
+        .query_row(params![site_id, page_id], |r| r.get(0))
+        .optional()?
+    else {
+        return Ok(());
+    };
+    if let Some((cur_space, cur_title, cur_body)) = conn
+        .prepare_cached("SELECT space_key, title, body_text FROM pages_fts WHERE rowid = ?1")?
+        .query_row([rowid], |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, String>(2)?,
+            ))
+        })
+        .optional()?
+    {
+        if cur_space == space_key && cur_title == title && cur_body == body_text {
+            return Ok(());
+        }
+        conn.prepare_cached("DELETE FROM pages_fts WHERE rowid = ?1")?
+            .execute([rowid])?;
+    }
+    conn.prepare_cached(
         "
-        INSERT INTO pages_fts (site_id, page_id, space_key, title, body_text)
-        VALUES (?1, ?2, ?3, ?4, ?5)
+        INSERT INTO pages_fts (rowid, site_id, page_id, space_key, title, body_text)
+        VALUES (?1, ?2, ?3, ?4, ?5, ?6)
         ",
-        params![site_id, page_id, space_key, title, body_text],
-    )?;
+    )?
+    .execute(params![rowid, site_id, page_id, space_key, title, body_text])?;
     Ok(())
 }
 
@@ -1249,7 +1264,7 @@ fn run_page_fts_search(
     limit: usize,
 ) -> Result<Vec<(String, UnifiedSearchHit)>> {
     if let Some(sid) = site_id {
-        let mut stmt = conn.prepare(
+        let mut stmt = conn.prepare_cached(
             "
             SELECT
                 p.site_id,
@@ -1261,8 +1276,8 @@ fn run_page_fts_search(
                 p.updated_at,
                 p.web_url
             FROM pages_fts f
-            JOIN pages p ON p.site_id = f.site_id AND p.id = f.page_id
-            WHERE pages_fts MATCH ?1 AND f.site_id = ?2
+            JOIN pages p ON p.rowid = f.rowid
+            WHERE pages_fts MATCH ?1 AND p.site_id = ?2
             ORDER BY p.updated_at DESC, p.site_id ASC, p.title COLLATE NOCASE ASC
             LIMIT ?3
             ",
@@ -1272,7 +1287,7 @@ fn run_page_fts_search(
         })?;
         Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
     } else {
-        let mut stmt = conn.prepare(
+        let mut stmt = conn.prepare_cached(
             "
             SELECT
                 p.site_id,
@@ -1284,7 +1299,7 @@ fn run_page_fts_search(
                 p.updated_at,
                 p.web_url
             FROM pages_fts f
-            JOIN pages p ON p.site_id = f.site_id AND p.id = f.page_id
+            JOIN pages p ON p.rowid = f.rowid
             WHERE pages_fts MATCH ?1
             ORDER BY p.updated_at DESC, p.site_id ASC, p.title COLLATE NOCASE ASC
             LIMIT ?2
@@ -1424,15 +1439,13 @@ fn delete_pages_with_descendants(
     }
 
     let mut removed = 0usize;
+    let mut del_fts = conn.prepare_cached(
+        "DELETE FROM pages_fts WHERE rowid = (SELECT rowid FROM pages WHERE site_id = ?1 AND id = ?2)",
+    )?;
+    let mut del_page = conn.prepare_cached("DELETE FROM pages WHERE site_id = ?1 AND id = ?2")?;
     for pid in &queue {
-        conn.execute(
-            "DELETE FROM pages_fts WHERE site_id = ?1 AND page_id = ?2",
-            params![site_id, pid],
-        )?;
-        removed += conn.execute(
-            "DELETE FROM pages WHERE site_id = ?1 AND id = ?2",
-            params![site_id, pid],
-        )?;
+        del_fts.execute(params![site_id, pid])?;
+        removed += del_page.execute(params![site_id, pid])?;
     }
     Ok(removed)
 }

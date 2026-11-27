@@ -118,6 +118,20 @@ pub fn render_blocks_with_options(
     inline_images: bool,
     show_hrefs: bool,
 ) -> Vec<Line<'static>> {
+    render_blocks_with_prefix(blocks, width, theme, image_cache, inline_images, show_hrefs, &[])
+}
+
+/// Renders a slice of `DocBlock`s into styled ratatui `Line`s with a leading `prefix` baked into
+/// each line during wrapping (avoiding post-hoc `Vec::insert(0, ...)` shifts).
+pub fn render_blocks_with_prefix(
+    blocks: &[DocBlock],
+    width: u16,
+    theme: &Theme,
+    image_cache: Option<&DecodedImageCache>,
+    inline_images: bool,
+    show_hrefs: bool,
+    prefix: &[Span<'static>],
+) -> Vec<Line<'static>> {
     if width == 0 {
         return Vec::new();
     }
@@ -130,13 +144,14 @@ pub fn render_blocks_with_options(
         image_cache,
         inline_images,
         show_hrefs,
-        &[],
+        prefix,
         &mut out,
     );
     // Trim trailing blank lines for tidy layout.
+    let prefix_w: usize = prefix.iter().map(|s| s.content.width()).sum();
     while out
         .last()
-        .is_some_and(|l| l.spans.is_empty() || l.width() == 0)
+        .is_some_and(|l| l.spans.is_empty() || l.width() <= prefix_w)
     {
         out.pop();
     }

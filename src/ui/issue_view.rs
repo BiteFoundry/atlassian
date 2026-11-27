@@ -1,5 +1,11 @@
 //! Tab 1 (`Ctrl+2`): Minimal-chrome Jira Issue Explorer, JQL Navigator, and Native Issue Inspector.
 
+use std::{
+    collections::hash_map::DefaultHasher,
+    hash::{Hash, Hasher},
+    sync::Arc,
+};
+
 use bitefoundry_html::layout::{windowed_single_line_input, wrap_styled_spans, WrapPrefix};
 use ratatui::{
     layout::{Constraint, Direction, Layout, Rect},
@@ -14,9 +20,9 @@ use crate::{
     config::DensityMode,
     models::{IssueDetail, StatusCategory},
     ui::{
-        app::{AppState, PaneFocus, UiState, WorkspaceTab},
+        app::{AppState, CachedLineHit, CachedRenderedDoc, PaneFocus, UiState, WorkspaceTab},
         doc_view::{
-            blocks_or_markdown, pad_right_width, render_blocks_with_options, truncate_width,
+            blocks_or_markdown, pad_right_width, render_blocks_with_prefix, truncate_width,
         },
         draw_horizontal_hairline, fill_surface,
         hitmap::{ButtonId, HitMap, HitTarget},
@@ -797,11 +803,36 @@ pub fn draw_issue_inspector_pane(
         return;
     };
 
-    let (lines, action_row, row_hits) =
-        build_issue_inspector_lines_with_hits(detail, inner.width, app, ui, compact_drawer);
-
-    let max_scroll = lines.len().saturating_sub(inner.height as usize) as u16;
+    let cache_key = issue_render_cache_key(detail, inner.width, compact_drawer, app, ui);
+    let cache_hit = ui
+        .issue_render_cache
+        .as_ref()
+        .is_some_and(|c| c.key == cache_key);
+    if !cache_hit {
+        let (lines, action_row, row_hits) =
+            build_issue_inspector_lines_with_hits(detail, inner.width, app, ui, compact_drawer);
+        ui.issue_render_cache = Some(CachedRenderedDoc {
+            key: cache_key,
+            lines: Arc::from(lines),
+            action_row,
+            hits: Arc::from(row_hits),
+        });
+    }
+    let cached = ui
+        .issue_render_cache
+        .as_ref()
+        .expect("issue render cache populated");
+    let total_lines = cached.lines.len();
+    let max_scroll = total_lines.saturating_sub(inner.height as usize) as u16;
     let clamped_scroll = scroll.min(max_scroll);
+    let action_row_u16 = cached.action_row as u16;
+    let scroll_usize = clamped_scroll as usize;
+    let vis_end = scroll_usize
+        .saturating_add(inner.height as usize)
+        .min(total_lines);
+    let visible_lines: Vec<Line<'static>> = cached.lines[scroll_usize..vis_end].to_vec();
+    let hits = Arc::clone(&cached.hits);
+
     if ui.active_tab == WorkspaceTab::Board {
         ui.board_ui.detail_max_scroll = max_scroll;
         ui.board_ui.detail_scroll = clamped_scroll;
@@ -811,7 +842,6 @@ pub fn draw_issue_inspector_pane(
     }
 
     // Register clickable action bar buttons whenever the action bar row is visible.
-    let action_row_u16 = action_row as u16;
     if clamped_scroll <= action_row_u16 {
         let vis_row = action_row_u16 - clamped_scroll;
         if vis_row < inner.height {
@@ -826,8 +856,7 @@ pub fn draw_issue_inspector_pane(
     }
 
     // Register clickable subtasks, linked issues/pages, attachments, and Add Comment prompt.
-    let scroll_usize = clamped_scroll as usize;
-    for hit in row_hits {
+    for hit in hits.iter() {
         if hit.line_idx >= scroll_usize {
             let vis_row = hit.line_idx - scroll_usize;
             if vis_row < inner.height as usize {
@@ -842,12 +871,73 @@ pub fn draw_issue_inspector_pane(
         }
     }
 
-    frame.render_widget(
-        Paragraph::new(lines)
-            .style(pane_surface)
-            .scroll((clamped_scroll, 0)),
-        inner,
-    );
+    frame.render_widget(Paragraph::new(visible_lines).style(pane_surface), inner);
+}
+
+fn issue_render_cache_key(
+    detail: &IssueDetail,
+    width: u16,
+    compact: bool,
+    app: &AppState,
+    ui: &UiState,
+) -> u64 {
+    let mut h = DefaultHasher::new();
+    width.hash(&mut h);
+    compact.hash(&mut h);
+    (app.config.density == DensityMode::Compact).hash(&mut h);
+    ui.theme.no_color.hash(&mut h);
+    format!("{:?}", ui.theme.accent).hash(&mut h);
+    ui.inline_images.hash(&mut h);
+    ui.show_hrefs.hash(&mut h);
+    app.image_cache.len().hash(&mut h);
+    app.image_cache.total_bytes().hash(&mut h);
+    let s = &detail.summary;
+    s.key.hash(&mut h);
+    s.project_key.hash(&mut h);
+    s.parent_key.hash(&mut h);
+    s.summary.hash(&mut h);
+    s.status.id.hash(&mut h);
+    s.status.name.hash(&mut h);
+    (s.status.category as u8).hash(&mut h);
+    s.priority.as_ref().map(|p| &p.name).hash(&mut h);
+    s.issue_type.name.hash(&mut h);
+    s.assignee.as_ref().map(|u| &u.display_name).hash(&mut h);
+    s.reporter.as_ref().map(|u| &u.display_name).hash(&mut h);
+    s.labels.hash(&mut h);
+    s.sprint_name.hash(&mut h);
+    s.story_points.map(f64::to_bits).hash(&mut h);
+    s.updated_at.hash(&mut h);
+    detail.fix_versions.hash(&mut h);
+    detail.description_markdown.hash(&mut h);
+    detail.description_blocks.len().hash(&mut h);
+    for st in &detail.subtasks {
+        st.key.hash(&mut h);
+        st.summary.hash(&mut h);
+        (st.status.category as u8).hash(&mut h);
+    }
+    for lp in &detail.linked_pages {
+        lp.page_id.hash(&mut h);
+        lp.title.hash(&mut h);
+    }
+    for li in &detail.linked_issues {
+        li.key.hash(&mut h);
+        li.summary.hash(&mut h);
+        li.status.name.hash(&mut h);
+    }
+    for att in &detail.attachments {
+        att.id.hash(&mut h);
+        att.filename.hash(&mut h);
+        att.size.hash(&mut h);
+        att.mime_type.hash(&mut h);
+    }
+    for c in &detail.comments {
+        c.id.hash(&mut h);
+        c.author.display_name.hash(&mut h);
+        c.created_at.hash(&mut h);
+        c.body_markdown.hash(&mut h);
+        c.blocks.len().hash(&mut h);
+    }
+    h.finish()
 }
 
 const COMPACT_ISSUE_ACTION_BUTTONS: &[(&str, ButtonId)] = &[
@@ -904,12 +994,7 @@ fn register_issue_action_buttons(
     }
 }
 
-struct IssueLineHit {
-    line_idx: usize,
-    x_offset: u16,
-    width: Option<u16>,
-    target: HitTarget,
-}
+type IssueLineHit = CachedLineHit;
 
 pub fn build_issue_inspector_lines(
     detail: &IssueDetail,
@@ -1147,17 +1232,15 @@ fn build_issue_inspector_lines_with_hits(
             theme.muted_style(),
         )));
     } else {
-        for mut l in render_blocks_with_options(
+        lines.extend(render_blocks_with_prefix(
             &desc_blocks,
-            w.saturating_sub(2) as u16,
+            w as u16,
             theme,
             Some(&app.image_cache),
             ui.inline_images,
             ui.show_hrefs,
-        ) {
-            l.spans.insert(0, Span::raw("  "));
-            lines.push(l);
-        }
+            &[Span::raw("  ")],
+        ));
     }
     if !is_compact {
         lines.push(Line::from(""));
@@ -1393,17 +1476,15 @@ fn build_issue_inspector_lines_with_hits(
                 Span::styled(c.created_at.clone(), theme.muted_style()),
             ]));
             let c_blocks = blocks_or_markdown(&c.blocks, Some(&c.body_markdown));
-            for mut l in render_blocks_with_options(
+            lines.extend(render_blocks_with_prefix(
                 &c_blocks,
-                w.saturating_sub(4) as u16,
+                w as u16,
                 theme,
                 None,
                 false,
                 ui.show_hrefs,
-            ) {
-                l.spans.insert(0, Span::raw("    "));
-                lines.push(l);
-            }
+                &[Span::raw("    ")],
+            ));
             if !is_compact {
                 lines.push(Line::from(""));
             }

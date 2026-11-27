@@ -10,7 +10,7 @@ use crate::{
     models::{
         AttachmentItem, BoardColumn, BoardSummary, IssueComment, IssueDetail, IssuePriority,
         IssueStatus, IssueSummary, IssueType, ListPage, ProjectSummary, SavedFilter, SearchHitKind,
-        SprintSummary, StatusCategory, UnifiedSearchHit, UserSummary,
+        SprintSummary, UnifiedSearchHit, UserSummary,
     },
     storage::{
         db::{build_contextual_snippet, build_fts_query, escape_like, DEFAULT_SITE_ID},
@@ -48,7 +48,7 @@ impl Storage {
         let mut conn = self.lock_conn()?;
         let tx = conn.transaction()?;
         {
-            let mut stmt = tx.prepare(
+            let mut stmt = tx.prepare_cached(
                 "
                 INSERT INTO projects (site_id, key, id, name, project_type, lead_name, avatar_url, pinned)
                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
@@ -83,8 +83,8 @@ impl Storage {
     }
 
     pub fn list_projects_for_site(&self, site_id: &str) -> Result<Vec<ProjectSummary>> {
-        let conn = self.lock_conn()?;
-        let mut stmt = conn.prepare(
+        let conn = self.read_conn()?;
+        let mut stmt = conn.prepare_cached(
             "
             SELECT id, key, name, project_type, lead_name, avatar_url, pinned
             FROM projects
@@ -97,8 +97,8 @@ impl Storage {
     }
 
     pub fn list_projects_all_sites(&self) -> Result<Vec<(String, ProjectSummary)>> {
-        let conn = self.lock_conn()?;
-        let mut stmt = conn.prepare(
+        let conn = self.read_conn()?;
+        let mut stmt = conn.prepare_cached(
             "
             SELECT site_id, id, key, name, project_type, lead_name, avatar_url, pinned
             FROM projects
@@ -142,7 +142,7 @@ impl Storage {
         let mut conn = self.lock_conn()?;
         let tx = conn.transaction()?;
         {
-            let mut stmt = tx.prepare(
+            let mut stmt = tx.prepare_cached(
                 "
                 INSERT INTO boards (site_id, id, name, board_type, project_key, project_name, columns_json)
                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
@@ -183,9 +183,9 @@ impl Storage {
         site_id: &str,
         project_key: Option<&str>,
     ) -> Result<Vec<BoardSummary>> {
-        let conn = self.lock_conn()?;
+        let conn = self.read_conn()?;
         if let Some(pk) = project_key {
-            let mut stmt = conn.prepare(
+            let mut stmt = conn.prepare_cached(
                 "
                 SELECT id, name, board_type, project_key, project_name, columns_json
                 FROM boards
@@ -196,7 +196,7 @@ impl Storage {
             let rows = stmt.query_map(params![site_id, pk], |row| map_board_row(row, 0))?;
             Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
         } else {
-            let mut stmt = conn.prepare(
+            let mut stmt = conn.prepare_cached(
                 "
                 SELECT id, name, board_type, project_key, project_name, columns_json
                 FROM boards
@@ -213,9 +213,9 @@ impl Storage {
         &self,
         project_key: Option<&str>,
     ) -> Result<Vec<(String, BoardSummary)>> {
-        let conn = self.lock_conn()?;
+        let conn = self.read_conn()?;
         if let Some(pk) = project_key {
-            let mut stmt = conn.prepare(
+            let mut stmt = conn.prepare_cached(
                 "
                 SELECT site_id, id, name, board_type, project_key, project_name, columns_json
                 FROM boards
@@ -230,7 +230,7 @@ impl Storage {
             })?;
             Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
         } else {
-            let mut stmt = conn.prepare(
+            let mut stmt = conn.prepare_cached(
                 "
                 SELECT site_id, id, name, board_type, project_key, project_name, columns_json
                 FROM boards
@@ -257,7 +257,7 @@ impl Storage {
         let mut conn = self.lock_conn()?;
         let tx = conn.transaction()?;
         {
-            let mut stmt = tx.prepare(
+            let mut stmt = tx.prepare_cached(
                 "
                 INSERT INTO sprints (site_id, id, board_id, name, state, start_date, end_date, goal)
                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
@@ -270,7 +270,7 @@ impl Storage {
                     goal = COALESCE(excluded.goal, sprints.goal)
                 ",
             )?;
-            let mut link = tx.prepare(
+            let mut link = tx.prepare_cached(
                 "INSERT OR IGNORE INTO board_sprints (site_id, board_id, sprint_id) VALUES (?1, ?2, ?3)",
             )?;
             for s in sprints {
@@ -309,8 +309,8 @@ impl Storage {
         site_id: &str,
         board_id: i64,
     ) -> Result<Vec<SprintSummary>> {
-        let conn = self.lock_conn()?;
-        let mut stmt = conn.prepare(
+        let conn = self.read_conn()?;
+        let mut stmt = conn.prepare_cached(
             "
             SELECT s.id, s.board_id, s.name, s.state, s.start_date, s.end_date, s.goal
             FROM sprints s
@@ -518,26 +518,25 @@ impl Storage {
         site_id: &str,
         key: &str,
     ) -> Result<Option<IssueDetail>> {
-        let conn = self.lock_conn()?;
-        let row_opt: Option<(IssueSummary, Option<String>)> = conn
-            .query_row(
-                "
-                SELECT
-                    id, key, project_key, summary, status_json, priority_json,
-                    issue_type_json, assignee_json, reporter_json, parent_key,
-                    parent_summary, labels_json, story_points, sprint_id,
-                    sprint_name, comment_count, attachment_count, created_at,
-                    updated_at, web_url, detail_json
-                FROM issues
-                WHERE site_id = ?1 AND key = ?2
-                ",
-                params![site_id, key],
-                |row| {
-                    let summary = map_issue_summary_row(row, 0)?;
-                    let detail_json: Option<String> = row.get(20)?;
-                    Ok((summary, detail_json))
-                },
-            )
+        let conn = self.read_conn()?;
+        let mut stmt = conn.prepare_cached(
+            "
+            SELECT
+                id, key, project_key, summary, status_json, priority_json,
+                issue_type_json, assignee_json, reporter_json, parent_key,
+                parent_summary, labels_json, story_points, sprint_id,
+                sprint_name, comment_count, attachment_count, created_at,
+                updated_at, web_url, detail_json
+            FROM issues
+            WHERE site_id = ?1 AND key = ?2
+            ",
+        )?;
+        let row_opt: Option<(IssueSummary, Option<String>)> = stmt
+            .query_row(params![site_id, key], |row| {
+                let summary = map_issue_summary_row(row, 0)?;
+                let detail_json: Option<String> = row.get(20)?;
+                Ok((summary, detail_json))
+            })
             .optional()?;
         match row_opt {
             Some((summary, Some(json_str))) if !json_str.trim().is_empty() => {
@@ -555,13 +554,14 @@ impl Storage {
     /// Returns `true` when cached `detail_json` was captured at an older `updated_at` than the
     /// latest list/sync summary row for `(site_id, key)`.
     pub fn is_issue_detail_stale_for_site(&self, site_id: &str, key: &str) -> Result<bool> {
-        let conn = self.lock_conn()?;
-        let row_opt: Option<(String, Option<String>, Option<String>)> = conn
-            .query_row(
-                "SELECT updated_at, detail_updated_at, detail_json FROM issues WHERE site_id = ?1 AND key = ?2",
-                params![site_id, key],
-                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
-            )
+        let conn = self.read_conn()?;
+        let mut stmt = conn.prepare_cached(
+            "SELECT updated_at, detail_updated_at, detail_json FROM issues WHERE site_id = ?1 AND key = ?2",
+        )?;
+        let row_opt: Option<(String, Option<String>, Option<String>)> = stmt
+            .query_row(params![site_id, key], |row| {
+                Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+            })
             .optional()?;
         let Some((row_updated, detail_updated, detail_json)) = row_opt else {
             return Ok(false);
@@ -596,13 +596,12 @@ impl Storage {
         site_id: &str,
         key: &str,
     ) -> Result<Option<String>> {
-        let conn = self.lock_conn()?;
-        let row_opt: Option<(Option<String>, Option<String>)> = conn
-            .query_row(
-                "SELECT detail_updated_at, detail_json FROM issues WHERE site_id = ?1 AND key = ?2",
-                params![site_id, key],
-                |row| Ok((row.get(0)?, row.get(1)?)),
-            )
+        let conn = self.read_conn()?;
+        let mut stmt = conn.prepare_cached(
+            "SELECT detail_updated_at, detail_json FROM issues WHERE site_id = ?1 AND key = ?2",
+        )?;
+        let row_opt: Option<(Option<String>, Option<String>)> = stmt
+            .query_row(params![site_id, key], |row| Ok((row.get(0)?, row.get(1)?)))
             .optional()?;
         let Some((detail_updated, detail_json)) = row_opt else {
             return Ok(None);
@@ -629,13 +628,12 @@ impl Storage {
         site_id: &str,
         key: &str,
     ) -> Result<Option<String>> {
-        let conn = self.lock_conn()?;
-        let updated: Option<String> = conn
-            .query_row(
-                "SELECT updated_at FROM issues WHERE site_id = ?1 AND key = ?2",
-                params![site_id, key],
-                |row| row.get(0),
-            )
+        let conn = self.read_conn()?;
+        let mut stmt = conn.prepare_cached(
+            "SELECT updated_at FROM issues WHERE site_id = ?1 AND key = ?2",
+        )?;
+        let updated: Option<String> = stmt
+            .query_row(params![site_id, key], |row| row.get(0))
             .optional()?;
         Ok(updated.filter(|s| !s.trim().is_empty()))
     }
@@ -1067,9 +1065,9 @@ impl Storage {
         if limit == 0 {
             return Ok(Vec::new());
         }
-        let conn = self.lock_conn()?;
+        let conn = self.read_conn()?;
         if let Some(pk) = project_key {
-            let mut stmt = conn.prepare(
+            let mut stmt = conn.prepare_cached(
                 "
                 SELECT
                     id, key, project_key, summary, status_json, priority_json,
@@ -1088,7 +1086,7 @@ impl Storage {
             })?;
             Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
         } else {
-            let mut stmt = conn.prepare(
+            let mut stmt = conn.prepare_cached(
                 "
                 SELECT
                     id, key, project_key, summary, status_json, priority_json,
@@ -1114,25 +1112,20 @@ impl Storage {
         site_id: &str,
         project_key: Option<&str>,
     ) -> Result<usize> {
-        let conn = self.lock_conn()?;
+        let conn = self.read_conn()?;
         let count: i64 = if let Some(pk) = project_key {
-            conn.query_row(
+            conn.prepare_cached(
                 "SELECT COUNT(*) FROM issues WHERE site_id = ?1 AND project_key = ?2",
-                params![site_id, pk],
-                |row| row.get(0),
             )?
+            .query_row(params![site_id, pk], |row| row.get(0))?
         } else {
-            conn.query_row(
-                "SELECT COUNT(*) FROM issues WHERE site_id = ?1",
-                [site_id],
-                |row| row.get(0),
-            )?
+            conn.prepare_cached("SELECT COUNT(*) FROM issues WHERE site_id = ?1")?
+                .query_row([site_id], |row| row.get(0))?
         };
         Ok(count.max(0) as usize)
     }
 
     /// Cached issues of a site that match `filter`, newest first, at most `limit` of them.
-    /// Status and assignee live in JSON columns, so they are matched here rather than in SQL.
     pub fn list_issues_filtered_for_site(
         &self,
         site_id: &str,
@@ -1146,17 +1139,47 @@ impl Storage {
             .status_contains
             .map(|s| s.trim().to_lowercase())
             .filter(|s| !s.is_empty());
-        let matches = |issue: &IssueSummary| {
-            status_needle
-                .as_deref()
-                .is_none_or(|needle| issue.status.name.to_lowercase().contains(needle))
-                && filter.assignee_id.is_none_or(|id| {
-                    issue.assignee.as_ref().is_some_and(|user| user.id == id)
-                })
-                && !(filter.open_only && matches!(issue.status.category, StatusCategory::Done))
-        };
-        let conn = self.lock_conn()?;
-        let mut stmt = conn.prepare(
+        let ascii_status_like = status_needle
+            .as_deref()
+            .filter(|s| s.is_ascii())
+            .map(|s| format!("%{}%", escape_like(s)));
+        let open_flag: i32 = if filter.open_only { 1 } else { 0 };
+        let conn = self.read_conn()?;
+        if status_needle.is_none() || ascii_status_like.is_some() {
+            let mut stmt = conn.prepare_cached(
+                "
+                SELECT
+                    id, key, project_key, summary, status_json, priority_json,
+                    issue_type_json, assignee_json, reporter_json, parent_key,
+                    parent_summary, labels_json, story_points, sprint_id,
+                    sprint_name, comment_count, attachment_count, created_at,
+                    updated_at, web_url
+                FROM issues
+                WHERE site_id = ?1
+                  AND (?2 IS NULL OR project_key = ?2)
+                  AND (?3 IS NULL OR LOWER(COALESCE(json_extract(status_json, '$.name'), '')) LIKE ?3 ESCAPE '\\')
+                  AND (?4 IS NULL OR json_extract(assignee_json, '$.id') = ?4)
+                  AND (?5 = 0 OR COALESCE(json_extract(status_json, '$.category'), '') != 'done')
+                ORDER BY updated_at DESC, key ASC
+                LIMIT ?6
+                ",
+            )?;
+            let rows = stmt.query_map(
+                params![
+                    site_id,
+                    filter.project,
+                    ascii_status_like,
+                    filter.assignee_id,
+                    open_flag,
+                    limit.min(i64::MAX as usize) as i64,
+                ],
+                |row| map_issue_summary_row(row, 0),
+            )?;
+            return Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?);
+        }
+
+        let needle = status_needle.as_deref().unwrap_or("");
+        let mut stmt = conn.prepare_cached(
             "
             SELECT
                 id, key, project_key, summary, status_json, priority_json,
@@ -1165,15 +1188,18 @@ impl Storage {
                 sprint_name, comment_count, attachment_count, created_at,
                 updated_at, web_url
             FROM issues
-            WHERE site_id = ?1 AND (?2 IS NULL OR project_key = ?2)
+            WHERE site_id = ?1
+              AND (?2 IS NULL OR project_key = ?2)
+              AND (?3 IS NULL OR json_extract(assignee_json, '$.id') = ?3)
+              AND (?4 = 0 OR COALESCE(json_extract(status_json, '$.category'), '') != 'done')
             ORDER BY updated_at DESC, key ASC
             ",
         )?;
-        let mut rows = stmt.query(params![site_id, filter.project])?;
+        let mut rows = stmt.query(params![site_id, filter.project, filter.assignee_id, open_flag])?;
         let mut out = Vec::new();
         while let Some(row) = rows.next()? {
             let issue = map_issue_summary_row(row, 0)?;
-            if matches(&issue) {
+            if issue.status.name.to_lowercase().contains(needle) {
                 out.push(issue);
                 if out.len() == limit {
                     break;
@@ -1189,10 +1215,73 @@ impl Storage {
         site_id: &str,
         filter: &IssueListFilter<'_>,
     ) -> Result<usize> {
-        if filter.status_contains.is_none() && filter.assignee_id.is_none() && !filter.open_only {
+        let status_needle = filter
+            .status_contains
+            .map(|s| s.trim().to_lowercase())
+            .filter(|s| !s.is_empty());
+        if status_needle.is_none() && filter.assignee_id.is_none() && !filter.open_only {
             return self.count_issues_for_site(site_id, filter.project);
         }
-        Ok(self.list_issues_filtered_for_site(site_id, filter, usize::MAX)?.len())
+        let open_flag: i32 = if filter.open_only { 1 } else { 0 };
+        let conn = self.read_conn()?;
+        if let Some(needle) = status_needle.as_deref() {
+            if needle.is_ascii() {
+                let like_pat = format!("%{}%", escape_like(needle));
+                let count: i64 = conn
+                    .prepare_cached(
+                        "
+                        SELECT COUNT(*)
+                        FROM issues
+                        WHERE site_id = ?1
+                          AND (?2 IS NULL OR project_key = ?2)
+                          AND LOWER(COALESCE(json_extract(status_json, '$.name'), '')) LIKE ?3 ESCAPE '\\'
+                          AND (?4 IS NULL OR json_extract(assignee_json, '$.id') = ?4)
+                          AND (?5 = 0 OR COALESCE(json_extract(status_json, '$.category'), '') != 'done')
+                        ",
+                    )?
+                    .query_row(
+                        params![site_id, filter.project, like_pat, filter.assignee_id, open_flag],
+                        |row| row.get(0),
+                    )?;
+                return Ok(count.max(0) as usize);
+            }
+            let mut stmt = conn.prepare_cached(
+                "
+                SELECT COALESCE(json_extract(status_json, '$.name'), '')
+                FROM issues
+                WHERE site_id = ?1
+                  AND (?2 IS NULL OR project_key = ?2)
+                  AND (?3 IS NULL OR json_extract(assignee_json, '$.id') = ?3)
+                  AND (?4 = 0 OR COALESCE(json_extract(status_json, '$.category'), '') != 'done')
+                ",
+            )?;
+            let mut rows = stmt.query(params![site_id, filter.project, filter.assignee_id, open_flag])?;
+            let mut count = 0usize;
+            while let Some(row) = rows.next()? {
+                let status_name: String = row.get(0)?;
+                if status_name.to_lowercase().contains(needle) {
+                    count += 1;
+                }
+            }
+            return Ok(count);
+        }
+
+        let count: i64 = conn
+            .prepare_cached(
+                "
+                SELECT COUNT(*)
+                FROM issues
+                WHERE site_id = ?1
+                  AND (?2 IS NULL OR project_key = ?2)
+                  AND (?3 IS NULL OR json_extract(assignee_json, '$.id') = ?3)
+                  AND (?4 = 0 OR COALESCE(json_extract(status_json, '$.category'), '') != 'done')
+                ",
+            )?
+            .query_row(
+                params![site_id, filter.project, filter.assignee_id, open_flag],
+                |row| row.get(0),
+            )?;
+        Ok(count.max(0) as usize)
     }
 
     pub fn list_issues_all_sites(
@@ -1203,9 +1292,9 @@ impl Storage {
         if limit == 0 {
             return Ok(Vec::new());
         }
-        let conn = self.lock_conn()?;
+        let conn = self.read_conn()?;
         if let Some(pk) = project_key {
-            let mut stmt = conn.prepare(
+            let mut stmt = conn.prepare_cached(
                 "
                 SELECT
                     site_id,
@@ -1227,7 +1316,7 @@ impl Storage {
             })?;
             Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
         } else {
-            let mut stmt = conn.prepare(
+            let mut stmt = conn.prepare_cached(
                 "
                 SELECT
                     site_id,
@@ -1278,8 +1367,8 @@ impl Storage {
         if normalized.is_empty() {
             return self.query_my_work(None, None, limit);
         }
-        let conn = self.lock_conn()?;
-        let mut stmt = conn.prepare(
+        let conn = self.read_conn()?;
+        let mut stmt = conn.prepare_cached(
             "
             SELECT
                 i.site_id,
@@ -1344,8 +1433,8 @@ impl Storage {
             return Ok(Vec::new());
         }
         let me_id = me_id.map(str::trim).filter(|s| !s.is_empty());
-        let conn = self.lock_conn()?;
-        let mut stmt = conn.prepare(
+        let conn = self.read_conn()?;
+        let mut stmt = conn.prepare_cached(
             "
             SELECT
                 i.site_id,
@@ -1392,9 +1481,9 @@ impl Storage {
         if limit == 0 {
             return Ok(Vec::new());
         }
-        let conn = self.lock_conn()?;
+        let conn = self.read_conn()?;
         if let Some(sid) = sprint_id {
-            let mut stmt = conn.prepare(
+            let mut stmt = conn.prepare_cached(
                 "
                 SELECT
                     id, key, project_key, summary, status_json, priority_json,
@@ -1419,7 +1508,7 @@ impl Storage {
             })?;
             Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
         } else {
-            let mut stmt = conn.prepare(
+            let mut stmt = conn.prepare_cached(
                 "
                 SELECT
                     id, key, project_key, summary, status_json, priority_json,
@@ -1455,14 +1544,12 @@ impl Storage {
     pub fn delete_issue_for_site(&self, site_id: &str, key: &str) -> Result<()> {
         let mut conn = self.lock_conn()?;
         let tx = conn.transaction()?;
-        tx.execute(
-            "DELETE FROM issues_fts WHERE site_id = ?1 AND issue_key = ?2",
-            params![site_id, key],
-        )?;
-        tx.execute(
-            "DELETE FROM issues WHERE site_id = ?1 AND key = ?2",
-            params![site_id, key],
-        )?;
+        tx.prepare_cached(
+            "DELETE FROM issues_fts WHERE rowid = (SELECT rowid FROM issues WHERE site_id = ?1 AND key = ?2)",
+        )?
+        .execute(params![site_id, key])?;
+        tx.prepare_cached("DELETE FROM issues WHERE site_id = ?1 AND key = ?2")?
+            .execute(params![site_id, key])?;
         tx.commit()?;
         Ok(())
     }
@@ -1482,23 +1569,24 @@ impl Storage {
         if trimmed.is_empty() || limit == 0 {
             return Ok(Vec::new());
         }
-        let conn = self.lock_conn()?;
+        let conn = self.read_conn()?;
         let mut results: Vec<(String, UnifiedSearchHit)> = Vec::new();
         let mut seen = HashSet::<(String, String)>::new();
 
-        if trimmed.chars().count() >= 3 {
-            if let Some(fts_q) = build_fts_query(trimmed) {
-                if let Ok(fts_hits) = run_issue_fts_search(&conn, &fts_q, trimmed, site_id, limit) {
-                    for (sid, hit) in fts_hits {
-                        if seen.insert((sid.clone(), hit.id_or_key.clone())) {
-                            results.push((sid, hit));
-                        }
+        let fts_q = build_fts_query(trimmed);
+        if let Some(ref fts_q) = fts_q {
+            if let Ok(fts_hits) = run_issue_fts_search(&conn, fts_q, trimmed, site_id, limit) {
+                for (sid, hit) in fts_hits {
+                    if seen.insert((sid.clone(), hit.id_or_key.clone())) {
+                        results.push((sid, hit));
                     }
                 }
             }
         }
 
-        if results.len() < limit {
+        // Only fall back to full-table LIKE scan when the query has a <3-char CJK/short token
+        // (so FTS5 trigram cannot index it) or when FTS5 returned 0 hits.
+        if fts_q.is_none() || results.is_empty() {
             let like_hits = run_issue_like_search(&conn, trimmed, site_id, limit)?;
             for (sid, hit) in like_hits {
                 if seen.insert((sid.clone(), hit.id_or_key.clone())) {
@@ -1529,7 +1617,7 @@ impl Storage {
         let mut conn = self.lock_conn()?;
         let tx = conn.transaction()?;
         {
-            let mut stmt = tx.prepare(
+            let mut stmt = tx.prepare_cached(
                 "
                 INSERT INTO saved_filters (site_id, id, name, jql, builtin)
                 VALUES (?1, ?2, ?3, ?4, ?5)
@@ -1558,8 +1646,8 @@ impl Storage {
     }
 
     pub fn list_saved_filters_for_site(&self, site_id: &str) -> Result<Vec<SavedFilter>> {
-        let conn = self.lock_conn()?;
-        let mut stmt = conn.prepare(
+        let conn = self.read_conn()?;
+        let mut stmt = conn.prepare_cached(
             "
             SELECT id, name, jql, builtin
             FROM saved_filters
@@ -1635,19 +1723,16 @@ fn upsert_issue_row(
     sprint_id: Option<i64>,
 ) -> Result<bool> {
     if let Some(existing_updated) = conn
-        .query_row(
-            "SELECT updated_at FROM issues WHERE site_id = ?1 AND key = ?2",
-            params![site_id, &issue.key],
-            |row| row.get::<_, String>(0),
-        )
+        .prepare_cached("SELECT updated_at FROM issues WHERE site_id = ?1 AND key = ?2")?
+        .query_row(params![site_id, &issue.key], |row| row.get::<_, String>(0))
         .optional()?
     {
         if compare_updated_at(&issue.updated_at, &existing_updated) == std::cmp::Ordering::Less {
             if let Some(bid) = board_id {
-                conn.execute(
+                conn.prepare_cached(
                     "UPDATE issues SET board_id = COALESCE(board_id, ?1), sprint_id = COALESCE(sprint_id, ?2) WHERE site_id = ?3 AND key = ?4",
-                    params![bid, sprint_id, site_id, &issue.key],
-                )?;
+                )?
+                .execute(params![bid, sprint_id, site_id, &issue.key])?;
             }
             return Ok(false);
         }
@@ -1672,13 +1757,7 @@ fn upsert_issue_row(
         .transpose()?;
     let labels_json = serde_json::to_string(&issue.labels)?;
 
-    let sprint_update_sql = if board_id.is_some() {
-        "sprint_id = excluded.sprint_id,\n            sprint_name = excluded.sprint_name,"
-    } else {
-        "sprint_id = COALESCE(excluded.sprint_id, issues.sprint_id),\n            sprint_name = COALESCE(excluded.sprint_name, issues.sprint_name),"
-    };
-    let sql = format!(
-        "
+    const UPSERT_ISSUE_WITH_BOARD_SQL: &str = "
         INSERT INTO issues (
             site_id, key, id, project_key, board_id, sprint_id, summary,
             status_json, priority_json, issue_type_json, assignee_json, reporter_json,
@@ -1694,7 +1773,8 @@ fn upsert_issue_row(
             id = excluded.id,
             project_key = excluded.project_key,
             board_id = COALESCE(excluded.board_id, issues.board_id),
-            {sprint_update_sql}
+            sprint_id = excluded.sprint_id,
+            sprint_name = excluded.sprint_name,
             summary = excluded.summary,
             status_json = excluded.status_json,
             priority_json = excluded.priority_json,
@@ -1713,35 +1793,73 @@ fn upsert_issue_row(
                 ELSE excluded.updated_at
             END,
             web_url = excluded.web_url
-        "
-    );
-    conn.execute(
-        &sql,
-        params![
-            site_id,
-            issue.key,
-            issue.id,
-            issue.project_key,
-            board_id,
-            sprint_id,
-            issue.summary,
-            status_json,
-            priority_json,
-            issue_type_json,
-            assignee_json,
-            reporter_json,
-            issue.parent_key,
-            issue.parent_summary,
-            labels_json,
-            issue.story_points,
-            issue.sprint_name,
-            issue.comment_count as i64,
-            issue.attachment_count as i64,
-            issue.created_at,
-            issue.updated_at,
-            issue.web_url,
-        ],
-    )?;
+    ";
+    const UPSERT_ISSUE_NO_BOARD_SQL: &str = "
+        INSERT INTO issues (
+            site_id, key, id, project_key, board_id, sprint_id, summary,
+            status_json, priority_json, issue_type_json, assignee_json, reporter_json,
+            parent_key, parent_summary, labels_json, story_points, sprint_name,
+            comment_count, attachment_count, created_at, updated_at, web_url
+        ) VALUES (
+            ?1, ?2, ?3, ?4, ?5, ?6, ?7,
+            ?8, ?9, ?10, ?11, ?12,
+            ?13, ?14, ?15, ?16, ?17,
+            ?18, ?19, ?20, ?21, ?22
+        )
+        ON CONFLICT(site_id, key) DO UPDATE SET
+            id = excluded.id,
+            project_key = excluded.project_key,
+            board_id = COALESCE(excluded.board_id, issues.board_id),
+            sprint_id = COALESCE(excluded.sprint_id, issues.sprint_id),
+            sprint_name = COALESCE(excluded.sprint_name, issues.sprint_name),
+            summary = excluded.summary,
+            status_json = excluded.status_json,
+            priority_json = excluded.priority_json,
+            issue_type_json = excluded.issue_type_json,
+            assignee_json = excluded.assignee_json,
+            reporter_json = excluded.reporter_json,
+            parent_key = excluded.parent_key,
+            parent_summary = excluded.parent_summary,
+            labels_json = excluded.labels_json,
+            story_points = excluded.story_points,
+            comment_count = excluded.comment_count,
+            attachment_count = excluded.attachment_count,
+            created_at = excluded.created_at,
+            updated_at = CASE
+                WHEN TRIM(excluded.updated_at) = '' THEN issues.updated_at
+                ELSE excluded.updated_at
+            END,
+            web_url = excluded.web_url
+    ";
+    let sql = if board_id.is_some() {
+        UPSERT_ISSUE_WITH_BOARD_SQL
+    } else {
+        UPSERT_ISSUE_NO_BOARD_SQL
+    };
+    conn.prepare_cached(sql)?.execute(params![
+        site_id,
+        issue.key,
+        issue.id,
+        issue.project_key,
+        board_id,
+        sprint_id,
+        issue.summary,
+        status_json,
+        priority_json,
+        issue_type_json,
+        assignee_json,
+        reporter_json,
+        issue.parent_key,
+        issue.parent_summary,
+        labels_json,
+        issue.story_points,
+        issue.sprint_name,
+        issue.comment_count as i64,
+        issue.attachment_count as i64,
+        issue.created_at,
+        issue.updated_at,
+        issue.web_url,
+    ])?;
     Ok(true)
 }
 
@@ -1754,17 +1872,52 @@ fn refresh_issue_fts(
     description_text: &str,
     labels_text: &str,
 ) -> Result<()> {
-    conn.execute(
-        "DELETE FROM issues_fts WHERE site_id = ?1 AND issue_key = ?2",
-        params![site_id, key],
-    )?;
-    conn.execute(
+    let Some(rowid): Option<i64> = conn
+        .prepare_cached("SELECT rowid FROM issues WHERE site_id = ?1 AND key = ?2")?
+        .query_row(params![site_id, key], |r| r.get(0))
+        .optional()?
+    else {
+        return Ok(());
+    };
+    if let Some((cur_proj, cur_summary, cur_desc, cur_labels)) = conn
+        .prepare_cached(
+            "SELECT project_key, summary, description_text, labels_text FROM issues_fts WHERE rowid = ?1",
+        )?
+        .query_row([rowid], |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, String>(2)?,
+                r.get::<_, String>(3)?,
+            ))
+        })
+        .optional()?
+    {
+        if cur_proj == project_key
+            && cur_summary == summary
+            && cur_desc == description_text
+            && cur_labels == labels_text
+        {
+            return Ok(());
+        }
+        conn.prepare_cached("DELETE FROM issues_fts WHERE rowid = ?1")?
+            .execute([rowid])?;
+    }
+    conn.prepare_cached(
         "
-        INSERT INTO issues_fts (site_id, issue_key, project_key, summary, description_text, labels_text)
-        VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+        INSERT INTO issues_fts (rowid, site_id, issue_key, project_key, summary, description_text, labels_text)
+        VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
         ",
-        params![site_id, key, project_key, summary, description_text, labels_text],
-    )?;
+    )?
+    .execute(params![
+        rowid,
+        site_id,
+        key,
+        project_key,
+        summary,
+        description_text,
+        labels_text,
+    ])?;
     Ok(())
 }
 
@@ -1821,7 +1974,7 @@ fn run_issue_fts_search(
     limit: usize,
 ) -> Result<Vec<(String, UnifiedSearchHit)>> {
     if let Some(sid) = site_id {
-        let mut stmt = conn.prepare(
+        let mut stmt = conn.prepare_cached(
             "
             SELECT
                 i.site_id,
@@ -1834,8 +1987,8 @@ fn run_issue_fts_search(
                 i.updated_at,
                 i.web_url
             FROM issues_fts f
-            JOIN issues i ON i.site_id = f.site_id AND i.key = f.issue_key
-            WHERE issues_fts MATCH ?1 AND f.site_id = ?2
+            JOIN issues i ON i.rowid = f.rowid
+            WHERE issues_fts MATCH ?1 AND i.site_id = ?2
             ORDER BY i.updated_at DESC, i.site_id ASC, i.key ASC
             LIMIT ?3
             ",
@@ -1845,7 +1998,7 @@ fn run_issue_fts_search(
         })?;
         Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
     } else {
-        let mut stmt = conn.prepare(
+        let mut stmt = conn.prepare_cached(
             "
             SELECT
                 i.site_id,
@@ -1858,7 +2011,7 @@ fn run_issue_fts_search(
                 i.updated_at,
                 i.web_url
             FROM issues_fts f
-            JOIN issues i ON i.site_id = f.site_id AND i.key = f.issue_key
+            JOIN issues i ON i.rowid = f.rowid
             WHERE issues_fts MATCH ?1
             ORDER BY i.updated_at DESC, i.site_id ASC, i.key ASC
             LIMIT ?2
@@ -2913,5 +3066,189 @@ mod tests {
             .update_issue_comments_for_site("site-a", "ENG-1", &comments[..2])
             .unwrap();
         assert_eq!(cached(&storage), (2, 2));
+    }
+
+    #[test]
+    fn fts_rowid_alignment_delete_skip_and_legacy_migration() {
+        // 1) Verify fresh DB aligns issues_fts.rowid == issues.rowid, skips unchanged re-upsert,
+        //    and removes FTS entries via rowid on delete.
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("fts_rowid_test.db");
+        {
+            let storage = Storage::open(&db_path).unwrap();
+            let a = sample_issue("ENG-1", "ENG", "Quantum flux capacitor", None);
+            let b = sample_issue("ENG-2", "ENG", "Nebula hyperdrive engine", None);
+            storage
+                .upsert_issues_for_site("site-a", &[a.clone(), b])
+                .unwrap();
+
+            {
+                let conn = storage.lock_conn().unwrap();
+                let issue_rowid: i64 = conn
+                    .query_row(
+                        "SELECT rowid FROM issues WHERE site_id = 'site-a' AND key = 'ENG-1'",
+                        [],
+                        |r| r.get(0),
+                    )
+                    .unwrap();
+                let fts_rowid: i64 = conn
+                    .query_row(
+                        "SELECT rowid FROM issues_fts WHERE site_id = 'site-a' AND issue_key = 'ENG-1'",
+                        [],
+                        |r| r.get(0),
+                    )
+                    .unwrap();
+                assert_eq!(fts_rowid, issue_rowid);
+            }
+
+            // Re-upserting with identical indexed fields preserves FTS hit and rowid.
+            let mut same_text = a.clone();
+            same_text.updated_at = "2026-11-28T00:00:00Z".into();
+            same_text.comment_count = 9;
+            storage
+                .upsert_issues_for_site("site-a", &[same_text])
+                .unwrap();
+            let hits = storage
+                .search_issues_scoped("capacitor", Some("site-a"), 10)
+                .unwrap();
+            assert_eq!(hits.len(), 1);
+            assert_eq!(hits[0].1.id_or_key, "ENG-1");
+
+            // Delete removes from both issues and issues_fts via rowid.
+            storage.delete_issue_for_site("site-a", "ENG-1").unwrap();
+            let after_del = storage
+                .search_issues_scoped("capacitor", Some("site-a"), 10)
+                .unwrap();
+            assert!(after_del.is_empty());
+            let remaining = storage
+                .search_issues_scoped("hyperdrive", Some("site-a"), 10)
+                .unwrap();
+            assert_eq!(remaining.len(), 1);
+            assert_eq!(remaining[0].1.id_or_key, "ENG-2");
+        }
+
+        // 2) Simulate a legacy v2 DB whose issues_fts rowid is misaligned and cache_meta flag is absent.
+        {
+            let conn = Connection::open(&db_path).unwrap();
+            conn.execute("DELETE FROM cache_meta WHERE key = 'fts_rowid_aligned'", [])
+                .unwrap();
+            conn.execute("DELETE FROM issues_fts", []).unwrap();
+            conn.execute(
+                "INSERT INTO issues_fts (rowid, site_id, issue_key, project_key, summary, description_text, labels_text)
+                 VALUES (9999, 'site-a', 'ENG-2', 'ENG', 'Nebula hyperdrive engine', 'legacy description', 'rocket')",
+                [],
+            )
+            .unwrap();
+        }
+
+        let reopened = Storage::open(&db_path).unwrap();
+        {
+            let conn = reopened.lock_conn().unwrap();
+            let issue_rowid: i64 = conn
+                .query_row(
+                    "SELECT rowid FROM issues WHERE site_id = 'site-a' AND key = 'ENG-2'",
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            let fts_rowid: i64 = conn
+                .query_row(
+                    "SELECT rowid FROM issues_fts WHERE site_id = 'site-a' AND issue_key = 'ENG-2'",
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert_eq!(fts_rowid, issue_rowid, "migration must align issues_fts.rowid to issues.rowid");
+        }
+        let hits = reopened
+            .search_issues_scoped("rocket", Some("site-a"), 10)
+            .unwrap();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].1.id_or_key, "ENG-2");
+    }
+
+    #[test]
+    fn count_issues_filtered_matches_list_across_filters() {
+        let storage = Storage::open_in_memory().unwrap();
+        let make = |key: &str,
+                    project: &str,
+                    status: &str,
+                    category: StatusCategory,
+                    assignee: Option<&str>| {
+            let mut issue = sample_issue(key, project, &format!("Summary {key}"), None);
+            issue.status = IssueStatus {
+                id: "1".into(),
+                name: status.into(),
+                category,
+            };
+            issue.assignee = assignee.map(|id| UserSummary {
+                id: id.into(),
+                display_name: id.into(),
+                ..Default::default()
+            });
+            issue
+        };
+
+        let items = vec![
+            make("ENG-1", "ENG", "In Progress", StatusCategory::InProgress, Some("u1")),
+            make("ENG-2", "ENG", "Done", StatusCategory::Done, Some("u1")),
+            make("ENG-3", "ENG", "진행 중", StatusCategory::InProgress, Some("u2")),
+            make("ENG-4", "ENG", "To Do", StatusCategory::Todo, None),
+            make("OPS-1", "OPS", "In Review", StatusCategory::InProgress, Some("u1")),
+            make("OPS-2", "OPS", "완료", StatusCategory::Done, Some("u2")),
+        ];
+        storage.upsert_issues_for_site("site-a", &items).unwrap();
+
+        let cases = [
+            IssueListFilter::default(),
+            IssueListFilter {
+                project: Some("ENG"),
+                ..Default::default()
+            },
+            IssueListFilter {
+                status_contains: Some("progress"),
+                ..Default::default()
+            },
+            IssueListFilter {
+                status_contains: Some("진행"),
+                ..Default::default()
+            },
+            IssueListFilter {
+                assignee_id: Some("u1"),
+                ..Default::default()
+            },
+            IssueListFilter {
+                open_only: true,
+                ..Default::default()
+            },
+            IssueListFilter {
+                project: Some("ENG"),
+                assignee_id: Some("u1"),
+                open_only: true,
+                status_contains: Some("PROG"),
+            },
+            IssueListFilter {
+                project: Some("OPS"),
+                status_contains: Some("완료"),
+                assignee_id: Some("u2"),
+                open_only: false,
+            },
+            IssueListFilter {
+                project: Some("OPS"),
+                status_contains: Some("완료"),
+                assignee_id: Some("u2"),
+                open_only: true,
+            },
+        ];
+
+        for filter in &cases {
+            let listed = storage
+                .list_issues_filtered_for_site("site-a", filter, usize::MAX)
+                .unwrap();
+            let counted = storage
+                .count_issues_filtered_for_site("site-a", filter)
+                .unwrap();
+            assert_eq!(counted, listed.len(), "parity mismatch for filter {filter:?}");
+        }
     }
 }

@@ -1,5 +1,11 @@
 //! Tab 3 (`Ctrl+4`): Minimal-chrome Confluence Space Selector, Page Tree, Wiki Reader & TOC Drawer.
 
+use std::{
+    collections::hash_map::DefaultHasher,
+    hash::{Hash, Hasher},
+    sync::Arc,
+};
+
 use bitefoundry_html::layout::{windowed_single_line_input, wrap_styled_spans, WrapPrefix};
 use ratatui::{
     layout::{Constraint, Direction, Layout, Rect},
@@ -14,8 +20,11 @@ use crate::{
     config::DensityMode,
     models::PageDetail,
     ui::{
-        app::{space_group_key, AppState, PaneFocus, SpacePaneRow, UiState},
-        doc_view::{blocks_or_markdown, render_blocks_with_options, truncate_width},
+        app::{
+            space_group_key, AppState, CachedLineHit, CachedRenderedDoc, PaneFocus, SpacePaneRow,
+            UiState,
+        },
+        doc_view::{blocks_or_markdown, render_blocks_with_prefix, truncate_width},
         draw_horizontal_hairline, fill_surface,
         hitmap::{ButtonId, HitMap, HitTarget},
         visible_window,
@@ -489,14 +498,40 @@ fn draw_wiki_reader(frame: &mut Frame, area: Rect, app: &AppState, ui: &mut UiSt
         return;
     };
 
-    let (lines, action_row, row_hits) = build_wiki_reader_lines_with_hits(page, inner.width, app, ui);
-    let max_scroll = lines.len().saturating_sub(inner.height as usize) as u16;
+    let cache_key = wiki_render_cache_key(page, inner.width, app, ui);
+    let cache_hit = ui
+        .wiki_render_cache
+        .as_ref()
+        .is_some_and(|c| c.key == cache_key);
+    if !cache_hit {
+        let (lines, action_row, row_hits) =
+            build_wiki_reader_lines_with_hits(page, inner.width, app, ui);
+        ui.wiki_render_cache = Some(CachedRenderedDoc {
+            key: cache_key,
+            lines: Arc::from(lines),
+            action_row,
+            hits: Arc::from(row_hits),
+        });
+    }
+    let cached = ui
+        .wiki_render_cache
+        .as_ref()
+        .expect("wiki render cache populated");
+    let total_lines = cached.lines.len();
+    let max_scroll = total_lines.saturating_sub(inner.height as usize) as u16;
     let clamped_scroll = ui.confluence_ui.reader_scroll.min(max_scroll);
+    let action_row_u16 = cached.action_row as u16;
+    let scroll_usize = clamped_scroll as usize;
+    let vis_end = scroll_usize
+        .saturating_add(inner.height as usize)
+        .min(total_lines);
+    let visible_lines: Vec<Line<'static>> = cached.lines[scroll_usize..vis_end].to_vec();
+    let hits = Arc::clone(&cached.hits);
+
     ui.confluence_ui.reader_max_scroll = max_scroll;
     ui.confluence_ui.reader_scroll = clamped_scroll;
 
     // Register clickable action bar buttons whenever the action bar row is visible.
-    let action_row_u16 = action_row as u16;
     if clamped_scroll <= action_row_u16 {
         let vis_row = action_row_u16 - clamped_scroll;
         if vis_row < inner.height {
@@ -505,8 +540,7 @@ fn draw_wiki_reader(frame: &mut Frame, area: Rect, app: &AppState, ui: &mut UiSt
     }
 
     // Register visible breadcrumb segments, attachment rows, and [c] Add Comment prompt.
-    let scroll_usize = clamped_scroll as usize;
-    for hit in row_hits {
+    for hit in hits.iter() {
         if hit.line_idx >= scroll_usize {
             let vis_row = hit.line_idx - scroll_usize;
             if vis_row < inner.height as usize {
@@ -521,10 +555,46 @@ fn draw_wiki_reader(frame: &mut Frame, area: Rect, app: &AppState, ui: &mut UiSt
         }
     }
 
-    frame.render_widget(
-        Paragraph::new(lines).scroll((clamped_scroll, 0)),
-        inner,
-    );
+    frame.render_widget(Paragraph::new(visible_lines), inner);
+}
+
+fn wiki_render_cache_key(page: &PageDetail, width: u16, app: &AppState, ui: &UiState) -> u64 {
+    let mut h = DefaultHasher::new();
+    width.hash(&mut h);
+    (app.config.density == DensityMode::Compact).hash(&mut h);
+    ui.theme.no_color.hash(&mut h);
+    format!("{:?}", ui.theme.accent).hash(&mut h);
+    ui.inline_images.hash(&mut h);
+    ui.show_hrefs.hash(&mut h);
+    app.image_cache.len().hash(&mut h);
+    app.image_cache.total_bytes().hash(&mut h);
+    page.summary.id.hash(&mut h);
+    page.summary.space_key.hash(&mut h);
+    page.summary.title.hash(&mut h);
+    page.summary.version_number.hash(&mut h);
+    page.summary.updated_at.hash(&mut h);
+    page.summary.author_name.hash(&mut h);
+    page.labels.hash(&mut h);
+    page.body_markdown.hash(&mut h);
+    page.blocks.len().hash(&mut h);
+    for anc in &page.ancestors {
+        anc.id.hash(&mut h);
+        anc.title.hash(&mut h);
+    }
+    for att in &page.attachments {
+        att.id.hash(&mut h);
+        att.filename.hash(&mut h);
+        att.size.hash(&mut h);
+        att.mime_type.hash(&mut h);
+    }
+    for c in &page.comments {
+        c.id.hash(&mut h);
+        c.author_name.hash(&mut h);
+        c.created_at.hash(&mut h);
+        c.body_markdown.hash(&mut h);
+        c.blocks.len().hash(&mut h);
+    }
+    h.finish()
 }
 
 const WIKI_ACTION_BUTTONS: &[(&str, ButtonId)] = &[
@@ -553,12 +623,7 @@ fn register_wiki_action_buttons(x: u16, row: u16, width: u16, hitmap: &mut HitMa
     }
 }
 
-struct WikiLineHit {
-    line_idx: usize,
-    x_offset: u16,
-    width: Option<u16>,
-    target: HitTarget,
-}
+type WikiLineHit = CachedLineHit;
 
 fn build_wiki_reader_lines_with_hits(
     page: &PageDetail,
@@ -680,17 +745,15 @@ fn build_wiki_reader_lines_with_hits(
             theme.muted_style(),
         )));
     } else {
-        for mut l in render_blocks_with_options(
+        lines.extend(render_blocks_with_prefix(
             &body_blocks,
-            w.saturating_sub(2) as u16,
+            w.saturating_sub(1) as u16,
             theme,
             Some(&app.image_cache),
             ui.inline_images,
             ui.show_hrefs,
-        ) {
-            l.spans.insert(0, Span::raw(" "));
-            lines.push(l);
-        }
+            &[Span::raw(" ")],
+        ));
     }
     if !is_compact {
         lines.push(Line::from(""));
@@ -803,17 +866,15 @@ fn build_wiki_reader_lines_with_hits(
                 Span::styled(c.created_at.clone(), theme.muted_style()),
             ]));
             let c_blocks = blocks_or_markdown(&c.blocks, Some(&c.body_markdown));
-            for mut l in render_blocks_with_options(
+            lines.extend(render_blocks_with_prefix(
                 &c_blocks,
-                w.saturating_sub(4) as u16,
+                w as u16,
                 theme,
                 None,
                 false,
                 ui.show_hrefs,
-            ) {
-                l.spans.insert(0, Span::raw("    "));
-                lines.push(l);
-            }
+                &[Span::raw("    ")],
+            ));
             if !is_compact {
                 lines.push(Line::from(""));
             }

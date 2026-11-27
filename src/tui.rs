@@ -37,8 +37,9 @@ use crate::{
     auth::AuthManager,
     config::{AppConfig, Persona},
     img_preview::{
-        self, ActivePixelGraphic, DecodedImageCache, ImageProtocolPreference,
-        RenderedTerminalImage, TerminalGraphicsCaps, TerminalImageProtocol,
+        self, ActivePixelGraphic, ImageProtocolPreference, RenderedTerminalImage,
+        TerminalGraphicsCaps, TerminalImageProtocol, DEFAULT_MAX_IMAGE_CACHE_ENTRIES,
+        MAX_IMAGE_CACHE_BYTES,
     },
     models::CoreEvent,
     storage::Storage,
@@ -621,11 +622,13 @@ struct PixelDecodeMsg {
     rendered: std::result::Result<RenderedTerminalImage, String>,
 }
 
-/// Manages startup-probed terminal graphics capabilities, the 8 MiB decoded image cache,
+/// Manages startup-probed terminal graphics capabilities, the 8 MiB decoded image cache
+/// (stored once in `AppState::pixel_image_cache` without duplicate clones),
 /// raw attachment byte reuse across protocol/zoom toggles, and synchronized pixel placement state.
 struct PixelPreviewRuntime {
     graphics_caps: TerminalGraphicsCaps,
-    decoded_cache: DecodedImageCache,
+    decoded_order: VecDeque<(String, usize)>,
+    decoded_bytes: usize,
     raw_cache: HashMap<String, Arc<[u8]>>,
     raw_order: VecDeque<String>,
     raw_bytes: usize,
@@ -640,7 +643,8 @@ impl PixelPreviewRuntime {
         let (pixel_tx, pixel_rx) = mpsc::unbounded_channel();
         Self {
             graphics_caps,
-            decoded_cache: DecodedImageCache::new(),
+            decoded_order: VecDeque::new(),
+            decoded_bytes: 0,
             raw_cache: HashMap::new(),
             raw_order: VecDeque::new(),
             raw_bytes: 0,
@@ -700,13 +704,6 @@ impl PixelPreviewRuntime {
         let fit = ov.fit_box(ui.term_width, ui.term_height);
         let att_id = ov.cache_id(&att);
         let cache_key = ov.preview_image_cache_key(&att, ui.term_width, ui.term_height);
-
-        if let Some(cached) = self.decoded_cache.get(&cache_key) {
-            app.pixel_image_cache
-                .entry(cache_key)
-                .or_insert_with(|| cached.clone());
-            return;
-        }
 
         if app.pixel_image_cache.contains_key(&cache_key)
             || self.in_flight.contains(&cache_key)
@@ -779,11 +776,27 @@ impl PixelPreviewRuntime {
         }
         match msg.rendered {
             Ok(img) => {
-                let evicted = self.decoded_cache.insert(msg.cache_key.clone(), img.clone());
-                for old_key in evicted {
+                let entry_bytes = img.approx_heap_bytes().max(64);
+                if let Some(prev) = app.pixel_image_cache.remove(&msg.cache_key) {
+                    self.decoded_bytes = self
+                        .decoded_bytes
+                        .saturating_sub(prev.approx_heap_bytes().max(64));
+                    self.decoded_order.retain(|(k, _)| k != &msg.cache_key);
+                }
+                self.decoded_order
+                    .push_back((msg.cache_key.clone(), entry_bytes));
+                self.decoded_bytes = self.decoded_bytes.saturating_add(entry_bytes);
+                app.pixel_image_cache.insert(msg.cache_key, img);
+
+                while self.decoded_order.len() > DEFAULT_MAX_IMAGE_CACHE_ENTRIES
+                    || (self.decoded_bytes > MAX_IMAGE_CACHE_BYTES && self.decoded_order.len() > 1)
+                {
+                    let Some((old_key, old_bytes)) = self.decoded_order.pop_front() else {
+                        break;
+                    };
+                    self.decoded_bytes = self.decoded_bytes.saturating_sub(old_bytes);
                     app.pixel_image_cache.remove(&old_key);
                 }
-                app.pixel_image_cache.insert(msg.cache_key, img);
             }
             Err(err) => {
                 if let Some(Overlay::ImagePreview(ov)) = ui.overlays.last_mut() {
@@ -863,14 +876,10 @@ fn current_pending_pixel_graphic(
 
 fn resolve_pixel_payload<'a>(
     cache_key: &str,
-    pixel_rt: &'a PixelPreviewRuntime,
     app: &'a AppState,
 ) -> Option<(Cow<'a, str>, u16, u16)> {
     let (base_key, crop) = parse_pixel_key(cache_key);
-    let rendered = pixel_rt
-        .decoded_cache
-        .get(base_key)
-        .or_else(|| app.pixel_image_cache.get(base_key))?;
+    let rendered = app.pixel_image_cache.get(base_key)?;
     if let Some((sx, sy, vw, vh)) = crop {
         rendered
             .viewport_pixel_payload(sx, sy, vw, vh)
@@ -922,16 +931,18 @@ fn draw_frame(
         })?;
 
         let mut desired: Vec<ActivePixelGraphic> = Vec::new();
-        let mut desired_payloads: Vec<String> = Vec::new();
+        let mut desired_inline_payloads: Vec<Option<String>> = Vec::new();
 
         let pending_list: Vec<PendingPixelGraphic> = if !ui.pending_pixel_graphics.is_empty() {
-            ui.pending_pixel_graphics.clone()
+            std::mem::take(&mut ui.pending_pixel_graphics)
         } else if let Some(pg) = current_pending_pixel_graphic(frame_area, app, ui) {
             vec![pg]
         } else {
             Vec::new()
         };
 
+        // Plan transitions using geometry & cache keys BEFORE encoding any viewport crops so
+        // unchanged frames never re-encode PNG/Sixel payloads.
         let safe_bottom = ui.term_height.saturating_sub(1);
         for pg in pending_list {
             if !pixel_graphics_allowed_for_overlays(&ui.overlays, &pg.cache_key) {
@@ -940,25 +951,28 @@ fn draw_frame(
             if pg.rect.y >= safe_bottom || pg.rect.x >= ui.term_width {
                 continue;
             }
-            let resolved = if let Some(inline_payload) = pg.payload {
-                Some((Cow::Owned(inline_payload), pg.rect.width, pg.rect.height))
-            } else {
-                resolve_pixel_payload(&pg.cache_key, pixel_rt, app)
-            };
-            if let Some((payload, draw_cols, draw_rows)) = resolved {
-                let clamped_w = draw_cols.min(ui.term_width.saturating_sub(pg.rect.x));
-                let clamped_h = draw_rows.min(safe_bottom.saturating_sub(pg.rect.y));
-                if clamped_w > 0 && clamped_h > 0 {
-                    desired.push(ActivePixelGraphic {
-                        cache_key: pg.cache_key,
-                        rect: Rect::new(pg.rect.x, pg.rect.y, clamped_w, clamped_h),
-                        protocol: pg.protocol,
-                        cols: clamped_w,
-                        rows: clamped_h,
-                        payload_len: payload.len(),
-                    });
-                    desired_payloads.push(payload.into_owned());
+            if pg.payload.is_none() {
+                let (base_key, _) = parse_pixel_key(&pg.cache_key);
+                if app
+                    .pixel_image_cache
+                    .get(base_key)
+                    .is_none_or(|r| !r.protocol.is_pixel() || r.pixel_payload.is_none())
+                {
+                    continue;
                 }
+            }
+            let clamped_w = pg.rect.width.min(ui.term_width.saturating_sub(pg.rect.x));
+            let clamped_h = pg.rect.height.min(safe_bottom.saturating_sub(pg.rect.y));
+            if clamped_w > 0 && clamped_h > 0 {
+                desired.push(ActivePixelGraphic {
+                    cache_key: pg.cache_key,
+                    rect: Rect::new(pg.rect.x, pg.rect.y, clamped_w, clamped_h),
+                    protocol: pg.protocol,
+                    cols: clamped_w,
+                    rows: clamped_h,
+                    payload_len: pg.payload.as_ref().map_or(0, String::len),
+                });
+                desired_inline_payloads.push(pg.payload);
             }
         }
 
@@ -1010,9 +1024,26 @@ fn draw_frame(
                     guard.kitty_used = true;
                     KITTY_USED_GLOBAL.store(true, Ordering::Relaxed);
                 }
-                for (idx, (graphic, payload)) in
-                    desired.iter().zip(desired_payloads.iter()).enumerate()
+                for (idx, (graphic, inline_payload)) in desired
+                    .iter_mut()
+                    .zip(desired_inline_payloads)
+                    .enumerate()
                 {
+                    let resolved = if let Some(p) = inline_payload {
+                        Some(Cow::Owned(p))
+                    } else {
+                        resolve_pixel_payload(&graphic.cache_key, app).map(|(p, c, r)| {
+                            graphic.cols = c.min(ui.term_width.saturating_sub(graphic.rect.x));
+                            graphic.rows = r.min(safe_bottom.saturating_sub(graphic.rect.y));
+                            graphic.rect.width = graphic.cols;
+                            graphic.rect.height = graphic.rows;
+                            graphic.payload_len = p.len();
+                            p
+                        })
+                    };
+                    let Some(payload) = resolved else {
+                        continue;
+                    };
                     queue!(
                         terminal.backend_mut(),
                         MoveTo(graphic.rect.x, graphic.rect.y)

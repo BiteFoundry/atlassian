@@ -639,32 +639,39 @@ impl HtmlPreviewOverlay {
         let mut status_text: Option<String> = None;
 
         if let Some(sess) = self.session.as_mut() {
-            // Two-pass scrollbar check: first render at full width, re-render at width - 1 if scrollbar is needed.
-            let initial_w = content_area.width.max(12);
-            let initial_len = sess.render(initial_w, &html_theme, ui.show_hrefs).lines.len();
-            let show_scrollbar =
-                initial_len > content_area.height as usize && content_area.width > 2;
-            let avail_w = if show_scrollbar {
+            // Reserve scrollbar column upfront so `HtmlViewSession`'s 1-slot render cache hits
+            // every frame instead of thrashing between `width` and `width - 1`.
+            let avail_w = if content_area.width > 2 {
                 content_area.width.saturating_sub(1)
             } else {
                 content_area.width
             };
 
-            let (mut lines, total_lines, ctrl_len, graphics) = {
+            let prev_scroll_y = sess.scroll_y;
+            let (total_lines, ctrl_len, graphics, visible_lines, sy) = {
                 let rendered = sess.render(avail_w.max(12), &html_theme, ui.show_hrefs);
-                (
-                    rendered.lines.clone(),
-                    rendered.lines.len(),
-                    rendered.controls.len(),
-                    rendered.graphics.clone(),
-                )
+                let total_lines = rendered.lines.len();
+                let max_scroll_y = total_lines.saturating_sub(content_area.height as usize) as u16;
+                let sy = prev_scroll_y.min(max_scroll_y);
+                let view_start = sy as usize;
+                let view_end = view_start
+                    .saturating_add(content_area.height as usize)
+                    .min(total_lines);
+                let visible_lines = rendered.lines[view_start..view_end].to_vec();
+                let graphics = if rendered.graphics.is_empty() {
+                    Vec::new()
+                } else {
+                    rendered.graphics.clone()
+                };
+                (total_lines, rendered.controls.len(), graphics, visible_lines, sy)
             };
+            sess.scroll_y = sy;
+            let show_scrollbar =
+                total_lines > content_area.height as usize && content_area.width > 2;
+            let max_scroll_y = total_lines.saturating_sub(content_area.height as usize) as u16;
             control_count = ctrl_len;
             status_text = sess.last_status.clone();
 
-            let max_scroll_y = total_lines.saturating_sub(content_area.height as usize) as u16;
-            sess.scroll_y = sess.scroll_y.min(max_scroll_y);
-            let sy = sess.scroll_y;
             self.last_scroll_y = sy;
             self.last_content_rect =
                 Rect::new(content_area.x, content_area.y, avail_w, content_area.height);
@@ -673,6 +680,7 @@ impl HtmlPreviewOverlay {
             // reserved vertical slots so scroll offsets and click_at(line, col) stay exact.
             let view_start = sy as usize;
             let view_end = view_start.saturating_add(content_area.height as usize);
+            let mut visible_lines = visible_lines;
             let caps = ui.graphics_caps;
             let proto = caps.protocol;
             let bg_rgb = img_preview::color_to_rgb(
@@ -719,15 +727,14 @@ impl HtmlPreviewOverlay {
                         continue;
                     };
 
+                    let vis_start = g_start.max(view_start);
+                    let vis_end = g_end.min(view_end);
                     if rendered_img.protocol.is_pixel() && rendered_img.pixel_payload.is_some() {
-                        for row_offset in 0..g.line_count {
-                            let line_idx = g_start + row_offset;
-                            if line_idx < lines.len() {
-                                lines[line_idx] = Line::default();
+                        for line_idx in vis_start..vis_end {
+                            if let Some(slot) = visible_lines.get_mut(line_idx - view_start) {
+                                *slot = Line::default();
                             }
                         }
-                        let vis_start = g_start.max(view_start);
-                        let vis_end = g_end.min(view_end);
                         let crop_scroll_y = vis_start.saturating_sub(g_start) as u16;
                         let vis_rows = vis_end.saturating_sub(vis_start) as u16;
                         if vis_rows > 0 && crop_scroll_y < rendered_img.rows {
@@ -768,10 +775,10 @@ impl HtmlPreviewOverlay {
                             }
                         }
                     } else {
-                        for row_offset in 0..g.line_count {
-                            let line_idx = g_start + row_offset;
-                            if line_idx < lines.len() {
-                                lines[line_idx] = rendered_img
+                        for line_idx in vis_start..vis_end {
+                            let row_offset = line_idx - g_start;
+                            if let Some(slot) = visible_lines.get_mut(line_idx - view_start) {
+                                *slot = rendered_img
                                     .lines
                                     .get(row_offset)
                                     .cloned()
@@ -784,7 +791,7 @@ impl HtmlPreviewOverlay {
 
             if avail_w > 0 && content_area.height > 0 {
                 frame.render_widget(
-                    Paragraph::new(lines).style(modal_style).scroll((sy, 0)),
+                    Paragraph::new(visible_lines).style(modal_style),
                     self.last_content_rect,
                 );
                 if !pixel_skip_rects.is_empty() {

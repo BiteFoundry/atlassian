@@ -3,13 +3,17 @@
 
 use std::collections::{HashMap, VecDeque};
 use std::fmt::Write as _;
-use std::io::{Cursor, IsTerminal, Write as IoWrite};
+use std::io::{IsTerminal, Write as IoWrite};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use anyhow::{bail, Context, Result};
 use base64::{engine::general_purpose::STANDARD as B64_STANDARD, Engine as _};
-use image::{imageops::FilterType, DynamicImage, ImageFormat, Rgba};
+use image::{
+    codecs::png::{CompressionType, FilterType as PngFilterType, PngEncoder},
+    imageops::FilterType,
+    DynamicImage, ImageFormat, Rgba,
+};
 use ratatui::{
     layout::Rect,
     style::{Color, Style},
@@ -541,7 +545,7 @@ impl RenderedTerminalImage {
 
 /// Tracks an active terminal pixel graphic placement (Kitty / iTerm2 / Sixel) painted onto the screen
 /// so frame transitions can deterministically erase stale pixels before Ratatui redraws.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Eq)]
 pub struct ActivePixelGraphic {
     pub cache_key: String,
     pub rect: Rect,
@@ -549,6 +553,16 @@ pub struct ActivePixelGraphic {
     pub cols: u16,
     pub rows: u16,
     pub payload_len: usize,
+}
+
+impl PartialEq for ActivePixelGraphic {
+    fn eq(&self, other: &Self) -> bool {
+        self.cache_key == other.cache_key
+            && self.rect == other.rect
+            && self.protocol == other.protocol
+            && self.cols == other.cols
+            && self.rows == other.rows
+    }
 }
 
 /// Memory-budgeted FIFO cache for decoded [`RenderedTerminalImage`] entries (default 8 MiB budget).
@@ -1693,7 +1707,12 @@ pub fn decode_and_render_halfblocks_with_cell_px(
 
     let (target_w, target_h) = compute_halfblock_dims(width_px, height_px, fit, cell_px);
 
-    let resized = image::imageops::resize(&rgba, target_w, target_h, FilterType::Lanczos3);
+    let filter = if target_w < width_px || target_h < height_px {
+        FilterType::Triangle
+    } else {
+        FilterType::Lanczos3
+    };
+    let resized = image::imageops::resize(&rgba, target_w, target_h, filter);
     let mut lines = Vec::with_capacity((target_h / 2) as usize);
 
     type Rgb = (u8, u8, u8);
@@ -1865,17 +1884,32 @@ pub fn decode_and_render_for_protocol(
             (payload, Some(backing))
         }
         TerminalImageProtocol::Sixel => {
-            let rgba = dyn_img.to_rgba8();
-            let resized = if width_px == target_px_w && height_px == target_px_h {
-                rgba
-            } else {
-                image::imageops::resize(&rgba, target_px_w, target_px_h, FilterType::Lanczos3)
+            let flat_rgba = match dyn_img {
+                DynamicImage::ImageRgb8(rgb) => {
+                    let resized = if width_px == target_px_w && height_px == target_px_h {
+                        rgb
+                    } else {
+                        image::imageops::resize(&rgb, target_px_w, target_px_h, FilterType::Lanczos3)
+                    };
+                    let raw = resized.into_raw();
+                    let mut rgba_buf = Vec::with_capacity((target_px_w * target_px_h * 4) as usize);
+                    for px in raw.as_chunks::<3>().0 {
+                        rgba_buf.extend_from_slice(&[px[0], px[1], px[2], 255]);
+                    }
+                    rgba_buf
+                }
+                other => {
+                    let rgba = other.into_rgba8();
+                    let resized = if width_px == target_px_w && height_px == target_px_h {
+                        rgba
+                    } else {
+                        image::imageops::resize(&rgba, target_px_w, target_px_h, FilterType::Lanczos3)
+                    };
+                    let mut buf = resized.into_raw();
+                    blend_rgba_in_place(&mut buf, bg_rgb);
+                    buf
+                }
             };
-            let mut flat_rgba = Vec::with_capacity((target_px_w * target_px_h * 4) as usize);
-            for px in resized.pixels() {
-                let (r, g, b) = blend_over_bg(*px, bg_rgb);
-                flat_rgba.extend_from_slice(&[r, g, b, 255]);
-            }
             let (palette, indexed) =
                 quantize_rgba_to_256(&flat_rgba, target_px_w as usize, target_px_h as usize);
             let payload = encode_sixel_indexed_slice(
@@ -2125,6 +2159,37 @@ pub fn encode_sixel_rgba(flat_rgba: &[u8], width: u32, height: u32) -> String {
     encode_sixel_indexed_slice(&palette, &indexed, w, 0, 0, w, h)
 }
 
+#[inline]
+fn push_usize_ascii(out: &mut String, mut n: usize) {
+    let mut buf = [0u8; 20];
+    let mut idx = buf.len();
+    loop {
+        idx -= 1;
+        buf[idx] = b'0' + (n % 10) as u8;
+        n /= 10;
+        if n == 0 {
+            break;
+        }
+    }
+    // SAFETY: `buf[idx..]` contains only ASCII digits `'0'..='9'`.
+    let s = unsafe { std::str::from_utf8_unchecked(&buf[idx..]) };
+    out.push_str(s);
+}
+
+#[inline]
+fn write_sixel_run(run_len: usize, bits: u8, out: &mut String) {
+    let ch = (bits + 63) as char;
+    if run_len >= 4 {
+        out.push('!');
+        push_usize_ascii(out, run_len);
+        out.push(ch);
+    } else {
+        for _ in 0..run_len {
+            out.push(ch);
+        }
+    }
+}
+
 fn encode_sixel_indexed_slice(
     palette: &[(u8, u8, u8)],
     indexed: &[u8],
@@ -2139,16 +2204,28 @@ fn encode_sixel_indexed_slice(
     }
 
     let mut out = String::with_capacity(crop_w * crop_h / 2 + palette.len() * 16 + 32);
-    let _ = write!(out, "\x1bP0;1;q\"1;1;{crop_w};{crop_h}");
+    out.push_str("\x1bP0;1;q\"1;1;");
+    push_usize_ascii(&mut out, crop_w);
+    out.push(';');
+    push_usize_ascii(&mut out, crop_h);
 
     for (idx, &(r, g, b)) in palette.iter().enumerate() {
         let r_pct = (r as u32 * 100 + 127) / 255;
         let g_pct = (g as u32 * 100 + 127) / 255;
         let b_pct = (b as u32 * 100 + 127) / 255;
-        let _ = write!(out, "#{idx};2;{r_pct};{g_pct};{b_pct}");
+        out.push('#');
+        push_usize_ascii(&mut out, idx);
+        out.push_str(";2;");
+        push_usize_ascii(&mut out, r_pct as usize);
+        out.push(';');
+        push_usize_ascii(&mut out, g_pct as usize);
+        out.push(';');
+        push_usize_ascii(&mut out, b_pct as usize);
     }
 
     let mut color_seen = [false; 256];
+    let mut color_min_x = [usize::MAX; 256];
+    let mut color_max_x = [0usize; 256];
     let mut band_colors: Vec<u8> = Vec::with_capacity(palette.len().min(64));
     let mut band_masks = vec![0u8; palette.len().max(1) * crop_w];
 
@@ -2159,36 +2236,50 @@ fn encode_sixel_indexed_slice(
         for dy in 0..band_h {
             let bit = 1u8 << dy;
             let row_offset = (y0 + band_y + dy) * full_w + x0;
-            for x in 0..crop_w {
-                let c = indexed[row_offset + x];
-                if !color_seen[c as usize] {
-                    color_seen[c as usize] = true;
+            let row_indexed = &indexed[row_offset..row_offset + crop_w];
+            for (x, &c) in row_indexed.iter().enumerate() {
+                let ci = c as usize;
+                if !color_seen[ci] {
+                    color_seen[ci] = true;
                     band_colors.push(c);
+                    color_min_x[ci] = x;
+                    color_max_x[ci] = x;
+                } else {
+                    if x < color_min_x[ci] {
+                        color_min_x[ci] = x;
+                    }
+                    if x > color_max_x[ci] {
+                        color_max_x[ci] = x;
+                    }
                 }
-                band_masks[c as usize * crop_w + x] |= bit;
+                band_masks[ci * crop_w + x] |= bit;
             }
         }
 
-        for (ci, &color_idx) in band_colors.iter().enumerate() {
-            if ci > 0 {
+        for (ci_pos, &color_idx) in band_colors.iter().enumerate() {
+            if ci_pos > 0 {
                 out.push('$');
             }
-            let _ = write!(out, "#{color_idx}");
+            let ci = color_idx as usize;
+            out.push('#');
+            push_usize_ascii(&mut out, ci);
 
-            let mask_start = color_idx as usize * crop_w;
-            let row_slice = &band_masks[mask_start..mask_start + crop_w];
-            let end = row_slice
-                .iter()
-                .rposition(|&bits| bits != 0)
-                .map_or(0, |idx| idx + 1);
-
-            write_sixel_rle(&row_slice[..end], &mut out);
+            let min_x = color_min_x[ci];
+            let max_x = color_max_x[ci];
+            let mask_start = ci * crop_w;
+            if min_x > 0 {
+                write_sixel_run(min_x, 0, &mut out);
+            }
+            write_sixel_rle(&band_masks[mask_start + min_x..=mask_start + max_x], &mut out);
         }
 
         for &c in &band_colors {
-            color_seen[c as usize] = false;
-            let start = c as usize * crop_w;
-            band_masks[start..start + crop_w].fill(0);
+            let ci = c as usize;
+            color_seen[ci] = false;
+            let start = ci * crop_w;
+            let min_x = color_min_x[ci];
+            let max_x = color_max_x[ci];
+            band_masks[start + min_x..=start + max_x].fill(0);
         }
 
         if band_y + 6 < crop_h {
@@ -2208,14 +2299,7 @@ fn write_sixel_rle(masks: &[u8], out: &mut String) {
         while i + run_len < masks.len() && masks[i + run_len] == bits {
             run_len += 1;
         }
-        let ch = (bits + 63) as char;
-        if run_len >= 4 {
-            let _ = write!(out, "!{run_len}{ch}");
-        } else {
-            for _ in 0..run_len {
-                out.push(ch);
-            }
-        }
+        write_sixel_run(run_len, bits, out);
         i += run_len;
     }
 }
@@ -2295,33 +2379,41 @@ fn quantize_rgba_to_256_with_stats(
     }
 
     // Perceptually-weighted median-cut over 5-bit-per-channel RGB buckets for > 256 distinct colors.
-    let mut hist: HashMap<u16, (u32, u64, u64, u64)> = HashMap::new();
+    // Flat 32K heap array avoids SipHash overhead on every pixel.
+    let mut hist: Box<[(u32, u32, u32, u32); 32_768]> = vec![(0u32, 0u32, 0u32, 0u32); 32_768]
+        .into_boxed_slice()
+        .try_into()
+        .expect("32768 histogram slots");
     for px in flat_rgba.as_chunks::<4>().0.iter().take(pixel_count) {
-        let qkey = (((px[0] as u16) >> 3) << 10)
-            | (((px[1] as u16) >> 3) << 5)
-            | ((px[2] as u16) >> 3);
-        let entry = hist.entry(qkey).or_insert((0, 0, 0, 0));
-        entry.0 += 1;
-        entry.1 += px[0] as u64;
-        entry.2 += px[1] as u64;
-        entry.3 += px[2] as u64;
+        let qkey = (((px[0] as usize) >> 3) << 10)
+            | (((px[1] as usize) >> 3) << 5)
+            | ((px[2] as usize) >> 3);
+        let entry = &mut hist[qkey];
+        entry.0 = entry.0.saturating_add(1);
+        entry.1 = entry.1.saturating_add(px[0] as u32);
+        entry.2 = entry.2.saturating_add(px[1] as u32);
+        entry.3 = entry.3.saturating_add(px[2] as u32);
     }
 
-    let mut buckets: Vec<ColorBucket> = hist
-        .into_values()
-        .map(|(count, sum_r, sum_g, sum_b)| {
-            let c = count as u64;
-            ColorBucket {
-                r_avg: (sum_r / c) as u8,
-                g_avg: (sum_g / c) as u8,
-                b_avg: (sum_b / c) as u8,
-                count,
-                sum_r,
-                sum_g,
-                sum_b,
-            }
-        })
-        .collect();
+    let mut buckets: Vec<ColorBucket> = Vec::with_capacity(2048);
+    for &(count, sum_r, sum_g, sum_b) in hist.iter() {
+        if count == 0 {
+            continue;
+        }
+        let c = count as u64;
+        let sr = sum_r as u64;
+        let sg = sum_g as u64;
+        let sb = sum_b as u64;
+        buckets.push(ColorBucket {
+            r_avg: (sr / c) as u8,
+            g_avg: (sg / c) as u8,
+            b_avg: (sb / c) as u8,
+            count,
+            sum_r: sr,
+            sum_g: sg,
+            sum_b: sb,
+        });
+    }
 
     let total_buckets = buckets.len();
     let mut boxes: Vec<(usize, usize)> = vec![(0, total_buckets)];
@@ -2423,17 +2515,27 @@ fn quantize_rgba_to_256_with_stats(
 
     indexed.clear();
     indexed.resize(pixel_count, 0);
-    let mut lookup_cache: HashMap<u32, u8> = HashMap::with_capacity(4096);
-    let mut used = vec![false; raw_palette.len()];
+    let pal_len = raw_palette.len().min(256);
+    let mut pal_r = [0u8; 256];
+    let mut pal_g = [0u8; 256];
+    let mut pal_b = [0u8; 256];
+    for (i, &(r, g, b)) in raw_palette.iter().take(pal_len).enumerate() {
+        pal_r[i] = r;
+        pal_g[i] = g;
+        pal_b[i] = b;
+    }
 
-    // Serpentine Floyd-Steinberg error diffusion with [-48, 48] error clamp and flat-region guard.
-    let mut work: Vec<[f32; 3]> = flat_rgba
-        .as_chunks::<4>()
-        .0
-        .iter()
-        .take(pixel_count)
-        .map(|px| [px[0] as f32, px[1] as f32, px[2] as f32])
-        .collect();
+    // Lazily populated direct 5-5-5 LUT (32,768 cells, 64 KiB) backed by SoA palette scans.
+    let mut lut: Box<[u16; 32_768]> = vec![u16::MAX; 32_768]
+        .into_boxed_slice()
+        .try_into()
+        .expect("32768 LUT slots");
+    let mut lut_populated = 0usize;
+    let mut used = [false; 256];
+
+    // 2-row i16 Q4 fixed-point rolling error buffers (12 bytes/col vs 48 MiB f32 frame buffer).
+    let mut err_curr = vec![[0i16; 3]; width];
+    let mut err_next = vec![[0i16; 3]; width];
 
     let orig_rgb = |p: usize| -> (u8, u8, u8) {
         let o = p * 4;
@@ -2446,19 +2548,27 @@ fn quantize_rgba_to_256_with_stats(
         for step in 0..width {
             let x = if reverse { width - 1 - step } else { step };
             let pos = row_base + x;
-            let [rf, gf, bf] = work[pos];
-            let r = rf.round().clamp(0.0, 255.0) as u8;
-            let g = gf.round().clamp(0.0, 255.0) as u8;
-            let b = bf.round().clamp(0.0, 255.0) as u8;
+            let o = pos * 4;
+            let [er_q4, eg_q4, eb_q4] = err_curr[x];
+            let r = (flat_rgba[o] as i16 + ((er_q4 + 8) >> 4)).clamp(0, 255) as u8;
+            let g = (flat_rgba[o + 1] as i16 + ((eg_q4 + 8) >> 4)).clamp(0, 255) as u8;
+            let b = (flat_rgba[o + 2] as i16 + ((eb_q4 + 8) >> 4)).clamp(0, 255) as u8;
 
-            let key = ((r as u32) << 16) | ((g as u32) << 8) | (b as u32);
-            let best_idx = if let Some(&cached) = lookup_cache.get(&key) {
-                cached
+            let r5 = (r >> 3) as usize;
+            let g5 = (g >> 3) as usize;
+            let b5 = (b >> 3) as usize;
+            let lidx = (r5 << 10) | (g5 << 5) | b5;
+            let cached = lut[lidx];
+            let best_idx = if cached != u16::MAX {
+                cached as u8
             } else {
+                let cr = ((r5 << 3) | (r5 >> 2)) as u8;
+                let cg = ((g5 << 3) | (g5 >> 2)) as u8;
+                let cb = ((b5 << 3) | (b5 >> 2)) as u8;
                 let mut best_i = 0u8;
                 let mut best_dist = u32::MAX;
-                for (pi, &(pr, pg, pb)) in raw_palette.iter().enumerate() {
-                    let dist = redmean_dist_sq(r, g, b, pr, pg, pb);
+                for pi in 0..pal_len {
+                    let dist = redmean_dist_sq(cr, cg, cb, pal_r[pi], pal_g[pi], pal_b[pi]);
                     if dist < best_dist {
                         best_dist = dist;
                         best_i = pi as u8;
@@ -2467,8 +2577,9 @@ fn quantize_rgba_to_256_with_stats(
                         }
                     }
                 }
-                if lookup_cache.len() < MAX_QUANT_LOOKUP_CACHE {
-                    lookup_cache.insert(key, best_i);
+                if lut_populated < MAX_QUANT_LOOKUP_CACHE {
+                    lut[lidx] = best_i as u16;
+                    lut_populated += 1;
                 }
                 best_i
             };
@@ -2476,15 +2587,17 @@ fn quantize_rgba_to_256_with_stats(
             used[best_idx as usize] = true;
             indexed[pos] = best_idx;
 
-            let (pr, pg, pb) = raw_palette[best_idx as usize];
-            let er = (r as f32 - pr as f32).clamp(-48.0, 48.0);
-            let eg = (g as f32 - pg as f32).clamp(-48.0, 48.0);
-            let eb = (b as f32 - pb as f32).clamp(-48.0, 48.0);
+            let pr = pal_r[best_idx as usize];
+            let pg = pal_g[best_idx as usize];
+            let pb = pal_b[best_idx as usize];
+            let er = (r as i16 - pr as i16).clamp(-48, 48);
+            let eg = (g as i16 - pg as i16).clamp(-48, 48);
+            let eb = (b as i16 - pb as i16).clamp(-48, 48);
 
-            if er.abs() <= 3.0 && eg.abs() <= 3.0 && eb.abs() <= 3.0 {
+            if er.abs() <= 3 && eg.abs() <= 3 && eb.abs() <= 3 {
                 continue;
             }
-            let cur_orig = orig_rgb(pos);
+            let cur_orig = (flat_rgba[o], flat_rgba[o + 1], flat_rgba[o + 2]);
             let flat_neighbor = (x > 0 && orig_rgb(pos - 1) == cur_orig)
                 || (y > 0 && orig_rgb(pos - width) == cur_orig)
                 || (x == 0 && x + 1 < width && orig_rgb(pos + 1) == cur_orig)
@@ -2493,46 +2606,46 @@ fn quantize_rgba_to_256_with_stats(
                 continue;
             }
 
-            let diffuse = |buf: &mut [[f32; 3]], idx: usize, weight: f32| {
-                let p = &mut buf[idx];
-                p[0] = (p[0] + er * weight).clamp(0.0, 255.0);
-                p[1] = (p[1] + eg * weight).clamp(0.0, 255.0);
-                p[2] = (p[2] + eb * weight).clamp(0.0, 255.0);
-            };
+            #[inline]
+            fn add_err(slot: &mut [i16; 3], er: i16, eg: i16, eb: i16, w: i16) {
+                slot[0] = (slot[0] + er * w).clamp(-4096, 4096);
+                slot[1] = (slot[1] + eg * w).clamp(-4096, 4096);
+                slot[2] = (slot[2] + eb * w).clamp(-4096, 4096);
+            }
 
             if !reverse {
                 if x + 1 < width {
-                    diffuse(&mut work, pos + 1, 7.0 / 16.0);
+                    add_err(&mut err_curr[x + 1], er, eg, eb, 7);
                 }
                 if y + 1 < height {
-                    let next_row = pos + width;
                     if x > 0 {
-                        diffuse(&mut work, next_row - 1, 3.0 / 16.0);
+                        add_err(&mut err_next[x - 1], er, eg, eb, 3);
                     }
-                    diffuse(&mut work, next_row, 5.0 / 16.0);
+                    add_err(&mut err_next[x], er, eg, eb, 5);
                     if x + 1 < width {
-                        diffuse(&mut work, next_row + 1, 1.0 / 16.0);
+                        add_err(&mut err_next[x + 1], er, eg, eb, 1);
                     }
                 }
             } else {
                 if x > 0 {
-                    diffuse(&mut work, pos - 1, 7.0 / 16.0);
+                    add_err(&mut err_curr[x - 1], er, eg, eb, 7);
                 }
                 if y + 1 < height {
-                    let next_row = pos + width;
                     if x + 1 < width {
-                        diffuse(&mut work, next_row + 1, 3.0 / 16.0);
+                        add_err(&mut err_next[x + 1], er, eg, eb, 3);
                     }
-                    diffuse(&mut work, next_row, 5.0 / 16.0);
+                    add_err(&mut err_next[x], er, eg, eb, 5);
                     if x > 0 {
-                        diffuse(&mut work, next_row - 1, 1.0 / 16.0);
+                        add_err(&mut err_next[x - 1], er, eg, eb, 1);
                     }
                 }
             }
         }
+        std::mem::swap(&mut err_curr, &mut err_next);
+        err_next.fill([0i16; 3]);
     }
 
-    let lookup_cache_len = lookup_cache.len();
+    let lookup_cache_len = lut_populated;
 
     // Compact palette so every emitted `#idx;2;...` entry is actually referenced.
     let mut remap = vec![0u8; raw_palette.len()];
@@ -2695,20 +2808,26 @@ pub fn render_ansi_stdout_with_caps(
             )?;
             let mut out = String::new();
             for line in &rendered.lines {
+                let mut last_fg: Option<(u8, u8, u8)> = None;
+                let mut last_bg: Option<(u8, u8, u8)> = None;
                 for span in &line.spans {
-                    let (tr, tg, tb) = match span.style.fg {
+                    let fg = match span.style.fg {
                         Some(Color::Rgb(r, g, b)) => (r, g, b),
                         _ => (255, 255, 255),
                     };
-                    let (br, bg_c, bb) = match span.style.bg {
+                    let bg = match span.style.bg {
                         Some(Color::Rgb(r, g, b)) => (r, g, b),
                         _ => DEFAULT_PREVIEW_BG_RGB,
                     };
-                    let _ = write!(
-                        out,
-                        "\x1b[38;2;{tr};{tg};{tb}m\x1b[48;2;{br};{bg_c};{bb}m{}",
-                        span.content
-                    );
+                    if last_fg != Some(fg) {
+                        let _ = write!(out, "\x1b[38;2;{};{};{}m", fg.0, fg.1, fg.2);
+                        last_fg = Some(fg);
+                    }
+                    if last_bg != Some(bg) {
+                        let _ = write!(out, "\x1b[48;2;{};{};{}m", bg.0, bg.1, bg.2);
+                        last_bg = Some(bg);
+                    }
+                    out.push_str(&span.content);
                 }
                 out.push_str("\x1b[0m\n");
             }
@@ -2728,32 +2847,51 @@ fn format_label_for(fmt: Option<ImageFormat>) -> String {
     }
 }
 
+#[inline]
+fn blend_channel(fg: u8, bg: u8, a: u32, inv: u32) -> u8 {
+    let x = fg as u32 * a + bg as u32 * inv + 128;
+    ((x + (x >> 8)) >> 8) as u8
+}
+
+#[inline]
 fn blend_over_bg(px: Rgba<u8>, bg: (u8, u8, u8)) -> (u8, u8, u8) {
-    let a = px[3] as u16;
-    if a == 255 {
-        return (px[0], px[1], px[2]);
-    }
-    if a == 0 {
-        return bg;
-    }
+    let a = px[3] as u32;
     let inv = 255 - a;
-    let r = ((px[0] as u16 * a + bg.0 as u16 * inv + 127) / 255) as u8;
-    let g = ((px[1] as u16 * a + bg.1 as u16 * inv + 127) / 255) as u8;
-    let b = ((px[2] as u16 * a + bg.2 as u16 * inv + 127) / 255) as u8;
-    (r, g, b)
+    (
+        blend_channel(px[0], bg.0, a, inv),
+        blend_channel(px[1], bg.1, a, inv),
+        blend_channel(px[2], bg.2, a, inv),
+    )
+}
+
+fn blend_rgba_in_place(buf: &mut [u8], bg: (u8, u8, u8)) {
+    for px in buf.as_chunks_mut::<4>().0 {
+        let a = px[3] as u32;
+        let inv = 255 - a;
+        px[0] = blend_channel(px[0], bg.0, a, inv);
+        px[1] = blend_channel(px[1], bg.1, a, inv);
+        px[2] = blend_channel(px[2], bg.2, a, inv);
+        px[3] = 255;
+    }
 }
 
 fn encode_png(img: &DynamicImage) -> Result<Vec<u8>> {
-    let mut buf = Cursor::new(Vec::new());
-    img.write_to(&mut buf, ImageFormat::Png)
+    let mut out = Vec::new();
+    let encoder = PngEncoder::new_with_quality(
+        &mut out,
+        CompressionType::Fast,
+        PngFilterType::NoFilter,
+    );
+    img.write_with_encoder(encoder)
         .context("Failed to encode PNG")?;
-    Ok(buf.into_inner())
+    Ok(out)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use image::{ImageBuffer, RgbaImage};
+    use std::io::Cursor;
 
     fn make_test_png(w: u32, h: u32) -> Vec<u8> {
         let img: RgbaImage = ImageBuffer::from_fn(w, h, |x, y| {
@@ -3981,5 +4119,31 @@ mod tests {
                 assert_eq!(span.style.bg, Some(Color::Rgb(245, 247, 250)));
             }
         }
+    }
+
+    #[test]
+    fn test_sixel_lut_quantization_valid_and_fast() {
+        let w = 256usize;
+        let h = 192usize;
+        let mut flat = Vec::with_capacity(w * h * 4);
+        for y in 0..h {
+            for x in 0..w {
+                flat.extend_from_slice(&[
+                    x as u8,
+                    ((y * 255) / (h - 1)) as u8,
+                    ((x ^ y) as u8).wrapping_mul(3),
+                    255,
+                ]);
+            }
+        }
+        let t0 = Instant::now();
+        let sixel = encode_sixel_rgba(&flat, w as u32, h as u32);
+        let elapsed = t0.elapsed();
+        assert!(sixel.starts_with("\x1bP0;1;q\"1;1;256;192#"));
+        assert!(sixel.ends_with("\x1b\\"));
+        assert!(
+            elapsed < Duration::from_secs(2),
+            "Sixel LUT encode took unexpectedly long: {elapsed:?}"
+        );
     }
 }

@@ -1,6 +1,8 @@
 //! UI state containers, workspace tabs, pane focus, and async UI message definitions.
 
-use std::{collections::HashSet, time::Instant};
+use std::{collections::HashSet, sync::Arc, time::Instant};
+
+use ratatui::text::Line;
 
 use crate::{
     config::{
@@ -410,6 +412,24 @@ pub enum UiMsg {
     UpdateChecked(Result<UpdateCheckResult, String>),
 }
 
+/// One clickable hit span cached alongside rendered document lines.
+#[derive(Debug, Clone)]
+pub(crate) struct CachedLineHit {
+    pub line_idx: usize,
+    pub x_offset: u16,
+    pub width: Option<u16>,
+    pub target: crate::ui::hitmap::HitTarget,
+}
+
+/// Key-cached rendered lines & hit targets for `confluence_view` / `issue_view` scroll frames.
+#[derive(Debug, Clone)]
+pub(crate) struct CachedRenderedDoc {
+    pub key: u64,
+    pub lines: Arc<[Line<'static>]>,
+    pub action_row: usize,
+    pub hits: Arc<[CachedLineHit]>,
+}
+
 pub struct UiState {
     pub active_tab: WorkspaceTab,
     pub focus: PaneFocus,
@@ -446,6 +466,10 @@ pub struct UiState {
     pub help_max_scroll: u16,
     /// Last left-click timestamp & target for double-click detection.
     pub last_click: Option<(Instant, crate::ui::hitmap::HitTarget)>,
+    /// Key-cached rendered lines for the active Confluence wiki page.
+    pub(crate) wiki_render_cache: Option<CachedRenderedDoc>,
+    /// Key-cached rendered lines for the active Jira issue inspector (main or board drawer).
+    pub(crate) issue_render_cache: Option<CachedRenderedDoc>,
 }
 
 impl UiState {
@@ -490,6 +514,8 @@ impl UiState {
             help_scroll: 0,
             help_max_scroll: 0,
             last_click: None,
+            wiki_render_cache: None,
+            issue_render_cache: None,
         }
     }
 
