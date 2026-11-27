@@ -21,7 +21,7 @@ base64 = "0.22"
 bitefoundry-html = { git = "https://github.com/BiteFoundry/bitefoundry-html", rev = "4d9f94b14c8a8b9a8775b630af4510483e0efe45" }
 chrono = { version = "0.4", default-features = false, features = ["clock", "std", "serde"] }
 clap = { version = "4", features = ["derive", "env"] }
-crossterm = { version = "0.28", features = ["event-stream"] }
+crossterm = "0.28"
 dirs = "5"
 futures-util = { version = "0.3", default-features = false, features = ["alloc"] }
 image = { version = "0.25", default-features = false, features = ["png", "jpeg", "gif", "webp"] }
@@ -30,7 +30,7 @@ open = "5"
 rand = "0.8"
 ratatui = "0.28"
 regex = "1"
-reqwest = { version = "0.12", default-features = false, features = ["json", "multipart", "rustls-tls", "rustls-tls-native-roots", "stream"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "multipart", "rustls-tls", "rustls-tls-native-roots"] }
 rpassword = "7"
 rusqlite = { version = "0.32", features = ["bundled"] }
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12", "logging"] }
@@ -38,7 +38,6 @@ scraper = "0.20"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 sha2 = "0.10"
-tempfile = "3"
 thiserror = "2"
 tokio = { version = "1", features = ["fs", "io-std", "io-util", "macros", "net", "process", "rt-multi-thread", "signal", "sync", "time"] }
 toml = "0.8"
@@ -46,7 +45,9 @@ tower-http = { version = "0.6", features = ["cors"] }
 unicode-width = "0.2"
 url = "2"
 urlencoding = "2"
-uuid = { version = "1", features = ["v4"] }
+
+[dev-dependencies]
+tempfile = "3"
 
 [target.'cfg(windows)'.dependencies]
 keyring = { version = "3", features = ["windows-native"] }
@@ -58,6 +59,8 @@ keyring = { version = "3", features = ["apple-native"] }
 keyring = { version = "3", features = ["async-secret-service", "async-io", "crypto-rust"] }
 
 [profile.release]
+opt-level = "s"
 lto = "fat"
 codegen-units = 1
+panic = "abort"
 strip = "symbols"

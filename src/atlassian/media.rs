@@ -280,7 +280,7 @@ fn deduplicate_path(dest_dir: &Path, safe_name: &str) -> PathBuf {
 }
 
 async fn write_bytes_atomic(path: &Path, bytes: &[u8]) -> Result<()> {
-    let tmp = path.with_file_name(format!(".{}.tmp", uuid::Uuid::new_v4()));
+    let tmp = path.with_file_name(format!(".{}.tmp", crate::new_uuid_v4()));
     tokio::fs::write(&tmp, bytes)
         .await
         .with_context(|| format!("Failed to write temporary attachment file: {}", tmp.display()))?;

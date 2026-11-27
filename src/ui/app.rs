@@ -3915,7 +3915,7 @@ impl AppState {
             CommentTarget::Page { .. } => site.or_else(|| self.active_page_site_id.clone()),
         };
         let (site_id, client) = self.site_id_and_client_for(site.as_deref());
-        let optimistic_id = format!("optimistic:{}", uuid::Uuid::new_v4());
+        let optimistic_id = format!("optimistic:{}", crate::new_uuid_v4());
         let now = chrono::Utc::now().to_rfc3339();
         let author = self
             .known_me_for_site(&site_id, &client)

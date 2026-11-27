@@ -589,7 +589,7 @@ pub async fn start_oauth_loopback_session(
     };
 
     let redirect_uri = format!("http://127.0.0.1:{}{}", addr.port(), normalized_path);
-    let state = uuid::Uuid::new_v4().simple().to_string();
+    let state = crate::new_uuid_v4().replace('-', "");
     let authorize_url = build_oauth_authorize_url(
         &opts.auth_base,
         &opts.client_id,
