@@ -1,6 +1,6 @@
 {
   "name": "@bitefoundry/atlassian",
-  "version": "0.8.7",
+  "version": "0.8.8",
   "mcpName": "io.github.BiteFoundry/atlassian",
   "description": "Unified Atlassian Jira & Confluence native terminal client & AI agent toolkit (CLI, TUI, HTTP API, MCP)",
   "license": "MIT",
@@ -41,11 +41,11 @@
     "build:npm": "node scripts/build-npm.mjs"
   },
   "optionalDependencies": {
-    "@bitefoundry/atlassian-win32-x64": "0.8.7",
-    "@bitefoundry/atlassian-win32-arm64": "0.8.7",
-    "@bitefoundry/atlassian-darwin-x64": "0.8.7",
-    "@bitefoundry/atlassian-darwin-arm64": "0.8.7",
-    "@bitefoundry/atlassian-linux-x64": "0.8.7",
-    "@bitefoundry/atlassian-linux-arm64": "0.8.7"
+    "@bitefoundry/atlassian-win32-x64": "0.8.8",
+    "@bitefoundry/atlassian-win32-arm64": "0.8.8",
+    "@bitefoundry/atlassian-darwin-x64": "0.8.8",
+    "@bitefoundry/atlassian-darwin-arm64": "0.8.8",
+    "@bitefoundry/atlassian-linux-x64": "0.8.8",
+    "@bitefoundry/atlassian-linux-arm64": "0.8.8"
   }
 }
