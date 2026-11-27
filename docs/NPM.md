@@ -136,8 +136,9 @@ git push origin v0.1.0
 Publishing is automated by `.github/workflows/release.yml`, which is triggered
 by pushing a `v*` tag (or manually via `workflow_dispatch`).
 
-1. Add a repository secret `NPM_TOKEN` (an npm automation token with publish
-   rights for the `@bitefoundry/atlassian` packages).
+1. Configure **Trusted Publishing (OIDC)** on npmjs.com (`Settings → Trusted Publishers`)
+   for `@bitefoundry/atlassian` and each platform package (`BiteFoundry/atlassian`,
+   workflow `release.yml`). No `NPM_TOKEN` secret is required.
 2. Bump the version in `Cargo.toml`, run `node scripts/sync-version.mjs`,
    commit, and push `v<version>`.
 3. The workflow builds six targets, stages binaries into the platform
@@ -198,4 +199,5 @@ the current host.
   `node -p "require.resolve('@bitefoundry/atlassian-win32-x64/package.json')"`
   (adjust for your platform) shows which platform package npm selected.
 - **Tag push did not publish** — check the publish job log; a tag/version
-  mismatch or a missing `NPM_TOKEN` fails the job before any publish.
+  mismatch or missing npmjs.com Trusted Publisher binding (`BiteFoundry/atlassian`,
+  `release.yml`) fails the job before publishing.
