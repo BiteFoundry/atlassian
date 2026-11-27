@@ -1634,6 +1634,7 @@ pub fn decode_and_render_halfblocks(
     )
 }
 
+#[cfg(feature = "svg-graphics")]
 fn svg_raster_bounds(fit: FitBox, cell_px: (u16, u16)) -> (u32, u32) {
     let zoom = fit.zoom_pct.clamp(25, 300) as u32;
     let max_px_w = ((fit.view_cols.max(1) as u32)
@@ -1662,15 +1663,23 @@ pub fn decode_and_render_halfblocks_with_cell_px(
     cell_px: (u16, u16),
 ) -> Result<RenderedTerminalImage> {
     reject_non_raster_markup_bytes(bytes)?;
+    #[cfg(feature = "svg-graphics")]
     let svg_png;
     let (decode_bytes, format_label): (&[u8], String) = if looks_like_svg_bytes(bytes) {
-        let (max_px_w, max_px_h) = svg_raster_bounds(fit, cell_px);
-        let rasterized = bitefoundry_html::graphics::rasterize_svg_to_png(
-            bytes, max_px_w, max_px_h, None,
-        )
-        .context("Failed to rasterize SVG image")?;
-        svg_png = rasterized.png_bytes;
-        (&svg_png[..], "SVG".to_string())
+        #[cfg(feature = "svg-graphics")]
+        {
+            let (max_px_w, max_px_h) = svg_raster_bounds(fit, cell_px);
+            let rasterized = bitefoundry_html::graphics::rasterize_svg_to_png(
+                bytes, max_px_w, max_px_h, None,
+            )
+            .context("Failed to rasterize SVG image")?;
+            svg_png = rasterized.png_bytes;
+            (&svg_png[..], "SVG".to_string())
+        }
+        #[cfg(not(feature = "svg-graphics"))]
+        {
+            bail!("SVG image preview requires the `svg-graphics` feature");
+        }
     } else {
         let guessed = image::guess_format(bytes).ok();
         (bytes, format_label_for(guessed))
@@ -1751,16 +1760,24 @@ pub fn decode_and_render_for_protocol(
         return decode_and_render_halfblocks_with_cell_px(bytes, fit, bg_rgb, caps.cell_px);
     }
 
+    #[cfg(feature = "svg-graphics")]
     let svg_png;
     let (decode_bytes, guessed, format_label): (&[u8], Option<ImageFormat>, String) =
         if looks_like_svg_bytes(bytes) {
-            let (max_px_w, max_px_h) = svg_raster_bounds(fit, caps.cell_px);
-            let rasterized = bitefoundry_html::graphics::rasterize_svg_to_png(
-                bytes, max_px_w, max_px_h, None,
-            )
-            .context("Failed to rasterize SVG image")?;
-            svg_png = rasterized.png_bytes;
-            (&svg_png[..], Some(ImageFormat::Png), "SVG".to_string())
+            #[cfg(feature = "svg-graphics")]
+            {
+                let (max_px_w, max_px_h) = svg_raster_bounds(fit, caps.cell_px);
+                let rasterized = bitefoundry_html::graphics::rasterize_svg_to_png(
+                    bytes, max_px_w, max_px_h, None,
+                )
+                .context("Failed to rasterize SVG image")?;
+                svg_png = rasterized.png_bytes;
+                (&svg_png[..], Some(ImageFormat::Png), "SVG".to_string())
+            }
+            #[cfg(not(feature = "svg-graphics"))]
+            {
+                bail!("SVG image preview requires the `svg-graphics` feature");
+            }
         } else {
             let guessed = image::guess_format(bytes).ok();
             (bytes, guessed, format_label_for(guessed))

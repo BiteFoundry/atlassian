@@ -14,7 +14,7 @@
 
 <br />
 
-![Atlassian TUI Demo](https://raw.githubusercontent.com/BiteFoundry/atlassian/master/assets/demo.gif)
+![Atlassian TUI Demo](https://bitefoundry.dev/assets/demos/atlassian.gif)
 
 </div>
 
