@@ -856,36 +856,6 @@ impl AtlassianClient {
         self.get_myself().await
     }
 
-    /// Asks Jira and Confluence separately who the credential belongs to. Jira is probed
-    /// when a site URL is configured, Confluence when a Confluence root resolves. A failure
-    /// on one product is recorded, never fatal by itself.
-    pub async fn probe_identity(&self) -> IdentityProbe {
-        let jira_fut = async {
-            if normalize_base_url(self.site_url()).is_empty() {
-                None
-            } else {
-                Some(
-                    self.get_myself()
-                        .await
-                        .map_err(|err| ProbeFailure::from_error(&err)),
-                )
-            }
-        };
-        let confluence_fut = async {
-            if self.confluence_root_url().trim().is_empty() {
-                None
-            } else {
-                Some(
-                    self.get_confluence_current_user()
-                        .await
-                        .map_err(|err| ProbeFailure::from_error(&err)),
-                )
-            }
-        };
-        let (jira, confluence) = tokio::join!(jira_fut, confluence_fut);
-        IdentityProbe { jira, confluence }
-    }
-
     /// "Confluence" or "Jira", for messages about "target_url".
     fn product_for_url(&self, target_url: &str) -> &'static str {
         let path = Url::parse(target_url)

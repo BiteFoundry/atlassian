@@ -14,9 +14,9 @@ use crate::{
         keymap::Action,
         overlays::{
             self,
-            attachments::{AttachmentCommand, AttachmentsOverlay},
+            attachments::AttachmentCommand,
             comment::{CommentOverlay, CommentTarget},
-            context_menu::{ContextMenuAction, ContextMenuOverlay},
+            context_menu::ContextMenuAction,
             cross_link::CrossLinkOverlay,
             file_picker::FilePickerOverlay,
             html_preview::{self, HtmlPreviewCommand, HtmlPreviewOverlay},
@@ -1192,12 +1192,12 @@ fn handle_mouse_right_click(row: u16, col: u16, app: &mut AppState, ui: &mut UiS
 }
 
 fn open_context_menu_at(anchor: (u16, u16), app: &AppState, ui: &mut UiState) {
-    let menu = ContextMenuOverlay::for_active_context(anchor, app, ui);
+    let menu = app.build_context_menu(anchor, ui);
     ui.push_overlay(Overlay::ContextMenu(menu));
 }
 
 fn open_attachments(app: &mut AppState, ui: &mut UiState, preferred_idx: Option<usize>) {
-    let mut ov = AttachmentsOverlay::from_app(app, ui);
+    let mut ov = app.build_attachments_overlay(ui);
     if let Some(idx) = preferred_idx {
         ov.select(idx);
     }
@@ -2483,7 +2483,7 @@ mod tests {
         models::{AttachmentItem, IssueDetail, IssueSummary, PageDetail, PageSummary, SpaceSummary},
         storage::Storage,
         sync,
-        ui::app::UiMsg,
+        ui::{app::UiMsg, overlays::context_menu::ContextMenuOverlay},
     };
     use tokio::sync::mpsc;
 

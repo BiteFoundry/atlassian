@@ -137,11 +137,6 @@ impl AttachmentsOverlay {
         }
     }
 
-    pub fn from_app(app: &AppState, ui: &UiState) -> Self {
-        let (label, items) = app.current_attachments(ui);
-        Self::new(label, items)
-    }
-
     pub fn rows(&self) -> Vec<AttachmentRow> {
         self.items
             .iter()

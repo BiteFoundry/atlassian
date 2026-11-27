@@ -10,7 +10,7 @@ use ratatui::{
 use unicode_width::UnicodeWidthStr;
 
 use crate::ui::{
-    app::{AppState, UiState, WorkspaceTab},
+    app::{AppState, UiState},
     doc_view::truncate_width,
     hitmap::{HitMap, HitTarget},
     keymap::Action,
@@ -246,121 +246,6 @@ impl ContextMenuOverlay {
             } => Self::for_confluence_page(page_id, title, url, anchor),
             ContextTarget::Global => Self::for_global(anchor),
         }
-    }
-
-    /// Builds a context menu inferred from the active workspace tab and current selection.
-    pub fn for_active_context(anchor: (u16, u16), app: &AppState, ui: &UiState) -> Self {
-        match ui.active_tab {
-            WorkspaceTab::MyWork => {
-                if ui.my_work_ui.active_column == 1 {
-                    if let Some(page) = app.my_pages.get(ui.my_work_ui.selected_page) {
-                        return Self::for_confluence_page(
-                            page.id.clone(),
-                            page.title.clone(),
-                            page.web_url.clone(),
-                            anchor,
-                        );
-                    }
-                    return Self::for_global(anchor);
-                }
-                if let Some(issue) = app.my_issues.get(ui.my_work_ui.selected_issue) {
-                    let url = if !issue.web_url.is_empty() {
-                        issue.web_url.clone()
-                    } else {
-                        let base = app.config.jira_base_url();
-                        if base.is_empty() {
-                            String::new()
-                        } else {
-                            format!("{base}/browse/{}", issue.key)
-                        }
-                    };
-                    return Self::for_jira_issue(issue.key.clone(), url, anchor);
-                }
-                return Self::for_global(anchor);
-            }
-            WorkspaceTab::Confluence => {
-                if ui.focus == crate::ui::app::PaneFocus::Nav {
-                    if ui.confluence_ui.nav_section == 0 {
-                        return Self::for_global(anchor);
-                    }
-                    let tree = app.current_confluence_tree(ui);
-                    if let Some(row) = tree.get(ui.confluence_ui.selected_tree_row) {
-                        return Self::for_confluence_page(
-                            row.page.id.clone(),
-                            row.page.title.clone(),
-                            row.page.web_url.clone(),
-                            anchor,
-                        );
-                    }
-                }
-                if let Some(page) = &app.active_page {
-                    return Self::for_confluence_page(
-                        page.summary.id.clone(),
-                        page.summary.title.clone(),
-                        page.summary.web_url.clone(),
-                        anchor,
-                    );
-                }
-                return Self::for_global(anchor);
-            }
-            WorkspaceTab::Search => {
-                if let Some(hit) = app.search_hits.get(ui.search_ui.selected_hit) {
-                    return match hit.kind {
-                        crate::models::SearchHitKind::JiraIssue => {
-                            let url = if !hit.web_url.is_empty() {
-                                hit.web_url.clone()
-                            } else {
-                                let base = app.config.jira_base_url();
-                                if base.is_empty() {
-                                    String::new()
-                                } else {
-                                    format!("{base}/browse/{}", hit.id_or_key)
-                                }
-                            };
-                            Self::for_jira_issue(hit.id_or_key.clone(), url, anchor)
-                        }
-                        crate::models::SearchHitKind::ConfluencePage => Self::for_confluence_page(
-                            hit.id_or_key.clone(),
-                            hit.title.clone(),
-                            hit.web_url.clone(),
-                            anchor,
-                        ),
-                    };
-                }
-                return Self::for_global(anchor);
-            }
-            WorkspaceTab::Directory => {
-                return Self::for_global(anchor);
-            }
-            WorkspaceTab::Board => {
-                if ui.focus == crate::ui::app::PaneFocus::Nav {
-                    return Self::for_global(anchor);
-                }
-            }
-            WorkspaceTab::Issues => {
-                if ui.focus == crate::ui::app::PaneFocus::Nav && ui.issue_ui.nav_section == 0 {
-                    return Self::for_global(anchor);
-                }
-            }
-        }
-        if let Some(key) = app.selected_issue_key(ui) {
-            let url = app
-                .active_issue
-                .as_ref()
-                .filter(|d| d.summary.key == key)
-                .map(|d| d.summary.web_url.clone())
-                .filter(|u| !u.is_empty())
-                .unwrap_or_else(|| {
-                    let base = app.config.jira_base_url();
-                    if base.is_empty() {
-                        String::new()
-                    } else {
-                        format!("{base}/browse/{key}")
-                    }
-                });
-            return Self::for_jira_issue(key, url, anchor);
-        }
-        Self::for_global(anchor)
     }
 
     pub fn next(&mut self) {
